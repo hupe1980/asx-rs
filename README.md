@@ -1,8 +1,8 @@
-# 📦 asx
+# 📦 asx-rs
 
 **Async-native, memory-safe AS2 + AS4 EDI transport library for Rust.**
 
-`asx` implements the [AS2 (RFC 4130)](https://www.rfc-editor.org/rfc/rfc4130) and [AS4 (OASIS ebMS3 + eDelivery)](https://docs.oasis-open.org/ebxml-msg/ebms/v3.0/profiles/AS4-profile/v1.0/) protocols — the wire formats used by PEPPOL, CEF eDelivery, and tens of thousands of EDI trading partner connections worldwide.
+`asx-rs` implements the [AS2 (RFC 4130)](https://www.rfc-editor.org/rfc/rfc4130) and [AS4 (OASIS ebMS3 + eDelivery)](https://docs.oasis-open.org/ebxml-msg/ebms/v3.0/profiles/AS4-profile/v1.0/) protocols — the wire formats used by PEPPOL, CEF eDelivery, and tens of thousands of EDI trading partner connections worldwide.
 
 > ⚠️ **Alpha quality.** Core AS2 send/receive and AS4 push/pull are working and tested. See [Status](#status) for known gaps before using in production.
 
@@ -292,7 +292,7 @@ let wrapped = doc.wrap()?;
 ## 🏗️ Architecture
 
 ```
-asx
+asx-rs
 ├── as2/            AS2 send, receive, MDN handling
 ├── as4/            AS4 push/pull, P-Mode registry, pull store
 │   ├── pmode.rs    P-Mode registry + resolution
@@ -349,7 +349,7 @@ DomainReady  ← your application code starts here
 
 ## 📊 Status
 
-`asx` is **alpha quality**. Core AS2 send/receive and AS4 push/pull flows are implemented and tested, but the crate is not yet production-hardened.
+`asx-rs` is **alpha quality**. Core AS2 send/receive and AS4 push/pull flows are implemented and tested, but the crate is not yet production-hardened.
 
 Current constraints to evaluate before production rollout:
 - Core send/receive entry points are synchronous, but async-safe wrappers are now available (`as2::send_async`, `as2::receive_async`, `as4::send_async`, `as4::receive_push_with_dedup_async`) to isolate blocking work on Tokio blocking threads.

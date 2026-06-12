@@ -4,7 +4,7 @@ Requires feature flag: `as4`
 
 ## Overview
 
-AS4 (ebMS3 + eDelivery) support in `asx` is exposed through free functions in `asx_rs::as4`.
+AS4 (ebMS3 + eDelivery) support in `asx-rs` is exposed through free functions in `asx_rs::as4`.
 
 Primary flows:
 

@@ -8,8 +8,8 @@
 //! ## Usage — sending a test ping
 //!
 //! ```rust
-//! # use asx::as4::test_service::{test_service_send_policy, TEST_SERVICE_URI, TEST_ACTION_URI};
-//! # use asx::core::InteropMode;
+//! # use asx_rs::as4::test_service::{test_service_send_policy, TEST_SERVICE_URI, TEST_ACTION_URI};
+//! # use asx_rs::core::InteropMode;
 //! let (policy, _creds) = test_service_send_policy()
 //!     .interop(InteropMode::Relaxed)
 //!     .sign(false)
@@ -22,13 +22,13 @@
 //! ## Usage — detecting a test ping on receive
 //!
 //! ```rust
-//! # use asx::as4::test_service::is_test_service_message;
-//! # use asx::as4::ParsedAs4UserMessage;
+//! # use asx_rs::as4::test_service::is_test_service_message;
+//! # use asx_rs::as4::ParsedAs4UserMessage;
 //! # let msg = ParsedAs4UserMessage {
-//! #     message_id: "x".into(), action: asx::as4::test_service::TEST_ACTION_URI.into(),
+//! #     message_id: "x".into(), action: asx_rs::as4::test_service::TEST_ACTION_URI.into(),
 //! #     from_party_ids: vec!["a".into()], to_party_ids: vec!["b".into()], mpc: None,
 //! #     conversation_id: None, has_ws_security_header: false,
-//! #     service: Some(asx::as4::test_service::TEST_SERVICE_URI.into()),
+//! #     service: Some(asx_rs::as4::test_service::TEST_SERVICE_URI.into()),
 //! #     ref_to_message_id: None,
 //! #     original_sender: None,
 //! #     final_recipient: None,
@@ -73,8 +73,8 @@ pub fn is_test_service_message(msg: &ParsedAs4UserMessage) -> bool {
 ///
 /// # Example
 /// ```rust
-/// # use asx::as4::test_service::test_service_send_policy;
-/// # use asx::core::InteropMode;
+/// # use asx_rs::as4::test_service::test_service_send_policy;
+/// # use asx_rs::core::InteropMode;
 /// let (policy, _creds) = test_service_send_policy()
 ///     .interop(InteropMode::Relaxed)
 ///     .sign(false)

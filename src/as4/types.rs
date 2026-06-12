@@ -859,7 +859,7 @@ impl As4SendPolicyBuilder {
     /// # Example
     ///
     /// ```rust,ignore
-    /// use asx::crypto::soap_builder::WsAddressingHeaders;
+    /// use asx_rs::crypto::soap_builder::WsAddressingHeaders;
     ///
     /// let wsa = WsAddressingHeaders::new(
     ///     format!("urn:uuid:{}", uuid::Uuid::new_v4()),

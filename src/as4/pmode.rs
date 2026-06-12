@@ -19,7 +19,7 @@
 //! ## Example
 //!
 //! ```rust
-//! # use asx::as4::pmode::{PModeRegistry, PMode, MepType, PModeSecurity, PayloadPackagingMode};
+//! # use asx_rs::as4::pmode::{PModeRegistry, PMode, MepType, PModeSecurity, PayloadPackagingMode};
 //! let mut registry = PModeRegistry::new();
 //!
 //! registry.register(PMode {
@@ -184,7 +184,7 @@ impl PMode {
     ///
     /// # Example
     /// ```rust
-    /// # use asx::as4::pmode::{PMode, MepType, PModeSecurity, PayloadPackagingMode};
+    /// # use asx_rs::as4::pmode::{PMode, MepType, PModeSecurity, PayloadPackagingMode};
     /// let pm = PMode {
     ///     id: "pm-1".into(), partner_id: "p1".into(),
     ///     service: "urn:svc".into(), service_type: "".into(),

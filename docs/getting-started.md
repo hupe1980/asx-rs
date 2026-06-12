@@ -2,7 +2,7 @@
 
 ## Installation
 
-Add `asx` to `Cargo.toml`. Because AS2 and AS4 are feature-gated, you must select at least one protocol:
+Add `asx-rs` to `Cargo.toml`. Because AS2 and AS4 are feature-gated, you must select at least one protocol:
 
 ```toml
 [dependencies]
@@ -25,7 +25,7 @@ asx-rs = { version = "0.1", features = ["as2", "as4", "client", "server", "async
 asx-rs = { version = "0.1", features = ["as2", "as4", "interop-relaxed", "async-ocsp"] }
 ```
 
-> **Note:** The default feature set is `["interop-strict", "async-ocsp"]`. Adding `asx` without explicit features gives you only the shared infrastructure — no AS2 or AS4 protocol functions are compiled.
+> **Note:** The default feature set is `["interop-strict", "async-ocsp"]`. Adding `asx-rs` without explicit features gives you only the shared infrastructure — no AS2 or AS4 protocol functions are compiled.
 
 ## Feature Flag Reference
 
@@ -45,7 +45,7 @@ asx-rs = { version = "0.1", features = ["as2", "as4", "interop-relaxed", "async-
 
 ## Tokio Runtime
 
-`asx` requires the Tokio async runtime. Add to `Cargo.toml`:
+`asx-rs` requires the Tokio async runtime. Add to `Cargo.toml`:
 
 ```toml
 [dependencies]

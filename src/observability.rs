@@ -361,7 +361,7 @@ fn ceil_div_u128(numerator: u128, denominator: u128) -> u128 {
 /// Example:
 ///
 /// ```
-/// # use asx::observability::{
+/// # use asx_rs::observability::{
 /// #   BackpressurePolicy, EventBusCapacitySizingInput, recommend_event_bus_capacity,
 /// # };
 /// let sizing = recommend_event_bus_capacity(EventBusCapacitySizingInput {
@@ -448,7 +448,7 @@ impl EventBus {
     ///
     /// # Example
     /// ```
-    /// use asx::observability::EventBus;
+    /// use asx_rs::observability::EventBus;
     ///
     /// let bus = EventBus::new(16).expect("bus");
     /// assert!(bus.is_compatible_with_fail_closed(), "strict mode is fail-closed safe");

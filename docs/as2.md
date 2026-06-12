@@ -4,7 +4,7 @@ Requires feature flag: `as2`
 
 ## Overview
 
-AS2 (RFC 4130) support in `asx` is exposed through free functions in `asx_rs::as2`.
+AS2 (RFC 4130) support in `asx-rs` is exposed through free functions in `asx_rs::as2`.
 
 Primary flows:
 

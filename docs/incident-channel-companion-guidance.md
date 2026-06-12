@@ -1,6 +1,6 @@
 # Incident Channel Companion Guidance
 
-This guide documents the trait-first contract for shipping vendor-specific incident delivery adapters in a companion crate while keeping `asx` core transport-agnostic.
+This guide documents the trait-first contract for shipping vendor-specific incident delivery adapters in a companion crate while keeping `asx-rs` core transport-agnostic.
 
 ## Scope
 
@@ -13,7 +13,7 @@ Core does not require any paging/webhook vendor SDK and should not gain vendor-s
 
 ## Companion Crate Pattern
 
-Create a separate crate (example name: `asx-incident-paging`) that depends on `asx` and the vendor SDK.
+Create a separate crate (example name: `asx-incident-paging`) that depends on `asx-rs` and the vendor SDK.
 
 ```rust
 use asx_rs::core::Result;
@@ -121,4 +121,4 @@ Companion adapters should treat these incident structs as the contract boundary:
 - `As4ReceiptTaxonomyAlertIncident`
 - `As2ProviderHealthAlertIncident`
 
-Breaking change policy is explicit in this RFC cycle, so companion crates should pin a major `asx` version and follow core changes intentionally.
+Breaking change policy is explicit in this RFC cycle, so companion crates should pin a major `asx-rs` version and follow core changes intentionally.

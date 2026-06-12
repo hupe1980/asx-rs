@@ -6,11 +6,11 @@ This guide shows how to add production-grade persistence for:
 - reconciliation (`ReconciliationStorage`)
 - durable audit (`DurableAuditSink`)
 
-without coupling `asx` to a gateway product.
+without coupling `asx-rs` to a gateway product.
 
 ## Why This Is a Library Concern
 
-`asx` is storage-agnostic by design. The core crate defines traits and default in-memory implementations. For production reliability, integrators should provide persistent backends and run restart-safety tests.
+`asx-rs` is storage-agnostic by design. The core crate defines traits and default in-memory implementations. For production reliability, integrators should provide persistent backends and run restart-safety tests.
 
 This keeps the library modular while still enabling strong delivery guarantees.
 

@@ -12,8 +12,8 @@
 //!
 //! ### Example — AS2 server
 //! ```ignore
-//! use asx::http::HttpRequest;
-//! use asx::transport::{as2_ingress_from_http};
+//! use asx_rs::http::HttpRequest;
+//! use asx_rs::transport::{as2_ingress_from_http};
 //!
 //! let http_req = /* incoming HTTP request from your framework */;
 //! let ingress = as2_ingress_from_http(http_req)?;

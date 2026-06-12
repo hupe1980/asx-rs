@@ -103,8 +103,8 @@ impl std::fmt::Debug for RevocationPolicy<'_> {
 ///
 /// # Example
 /// ```rust
-/// # use asx::crypto::wssec::{OwnedRevocationPolicy, RevocationPolicy};
-/// # use asx::core::{OcspMode, OcspFailureMode};
+/// # use asx_rs::crypto::wssec::{OwnedRevocationPolicy, RevocationPolicy};
+/// # use asx_rs::core::{OcspMode, OcspFailureMode};
 /// let owned = OwnedRevocationPolicy {
 ///     trust_anchor_pems: vec![],
 ///     revocation_crl_pems: vec![],

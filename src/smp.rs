@@ -30,9 +30,9 @@
 //! # Example
 //!
 //! ```rust,no_run
-//! use asx::smp::{SmpClient, SmpLookupRequest};
+//! use asx_rs::smp::{SmpClient, SmpLookupRequest};
 //!
-//! async fn example() -> asx::core::Result<()> {
+//! async fn example() -> asx_rs::core::Result<()> {
 //!     let client = SmpClient::new("acc.edelivery.tech.ec.europa.eu");
 //!     let endpoint = client.lookup_endpoint(SmpLookupRequest {
 //!         participant_id:   "0088:1234567890123".to_string(),

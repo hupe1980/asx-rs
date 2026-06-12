@@ -10,7 +10,7 @@
 //! ```rust,ignore
 //! use opentelemetry::metrics::MeterProvider as _;
 //! use opentelemetry_sdk::metrics::SdkMeterProvider;
-//! use asx::observability::OtelMetricsSink;
+//! use asx_rs::observability::OtelMetricsSink;
 //!
 //! // Configure your MeterProvider (here: the SDK default in-memory provider).
 //! let provider = SdkMeterProvider::default();

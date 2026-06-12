@@ -316,7 +316,7 @@ impl DeadLetterSink for NoopDeadLetterSink {
 /// ## Example
 ///
 /// ```rust
-/// use asx::reliability::{InMemoryDeadLetterSink, RetryConfig, RetryScheduler};
+/// use asx_rs::reliability::{InMemoryDeadLetterSink, RetryConfig, RetryScheduler};
 /// use std::sync::Arc;
 ///
 /// # #[tokio::main]
@@ -467,7 +467,7 @@ fn jitter_nanos(attempt: usize, ceiling_nanos: u128) -> u64 {
 /// # Example
 ///
 /// ```rust,no_run
-/// # use asx::reliability::{RetryConfig, RetryScheduler};
+/// # use asx_rs::reliability::{RetryConfig, RetryScheduler};
 /// # async fn example() {
 /// let scheduler = RetryScheduler::new(RetryConfig::peppol());
 /// let result: Result<&str, &str> = scheduler

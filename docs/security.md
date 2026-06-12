@@ -208,7 +208,7 @@ These controls are mandatory complements to in-process zeroization when handling
 
 ### Current State: Mixed OpenSSL + Pure-Rust
 
-`asx` currently uses two separate crypto ecosystems:
+`asx-rs` currently uses two separate crypto ecosystems:
 
 | Subsystem | Current backend | Role |
 |---|---|---|

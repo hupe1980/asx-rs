@@ -37,7 +37,7 @@
 //! ## Usage
 //!
 //! ```rust
-//! # use asx::sbdh::{StandardBusinessDocument, SbdhHeader, SbdhParty, SbdhDocumentIdentification};
+//! # use asx_rs::sbdh::{StandardBusinessDocument, SbdhHeader, SbdhParty, SbdhDocumentIdentification};
 //! let doc = StandardBusinessDocument {
 //!     header: SbdhHeader {
 //!         header_version: "1.0".into(),

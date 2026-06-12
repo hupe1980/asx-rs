@@ -4,8 +4,8 @@
 //!
 //! # Example — AS2
 //! ```ignore
-//! use asx::transport::egress::{As2HttpTransport, TransportConfig};
-//! use asx::as2::{send_sync, As2SendPolicy, As2SendCredentials, As2SendRequest};
+//! use asx_rs::transport::egress::{As2HttpTransport, TransportConfig};
+//! use asx_rs::as2::{send_sync, As2SendPolicy, As2SendCredentials, As2SendRequest};
 //!
 //! let transport = As2HttpTransport::new(TransportConfig::default())?;
 //! let output = send_sync(
@@ -24,10 +24,10 @@
 //! # Example — AS4
 //! ```ignore
 //! let transport = As4HttpTransport::new(TransportConfig::default())?;
-//! let output = asx::as4::send_sync(
+//! let output = asx_rs::as4::send_sync(
 //!     &session,
 //!     &bus,
-//!     asx::as4::As4SendRequest {
+//!     asx_rs::as4::As4SendRequest {
 //!         message_id: msg_id,
 //!         payload,
 //!         policy,

@@ -58,7 +58,7 @@ impl MimeEnvelope {
 /// # Example
 ///
 /// ```rust
-/// # use asx::as2::{As2SendPolicy, payload_content_type};
+/// # use asx_rs::as2::{As2SendPolicy, payload_content_type};
 /// let policy = As2SendPolicy {
 ///     payload_content_type: Some(payload_content_type::EDIFACT),
 ///     ..As2SendPolicy::strict()
@@ -407,8 +407,8 @@ impl As2ReceivePolicy {
 ///
 /// # Example
 /// ```
-/// use asx::as2::{As2ReceivePolicyBuilder, As2RegulatedSpoolKeyProvider};
-/// use asx::core::InteropMode;
+/// use asx_rs::as2::{As2ReceivePolicyBuilder, As2RegulatedSpoolKeyProvider};
+/// use asx_rs::core::InteropMode;
 ///
 /// let policy = As2ReceivePolicyBuilder::new()
 ///     .interop(InteropMode::Relaxed)

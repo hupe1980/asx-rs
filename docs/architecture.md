@@ -2,12 +2,12 @@
 
 ## Overview
 
-`asx` is a single-crate, async-native Rust library for the AS2 (RFC 4130) and AS4 (OASIS ebMS3 + eDelivery v1.15) EDI transport protocols. The design goal is protocol completeness with zero compromises on memory safety, streaming throughput, and async runtime compatibility.
+`asx-rs` is a single-crate, async-native Rust library for the AS2 (RFC 4130) and AS4 (OASIS ebMS3 + eDelivery v1.15) EDI transport protocols. The design goal is protocol completeness with zero compromises on memory safety, streaming throughput, and async runtime compatibility.
 
 ## Module Map
 
 ```text
-+------------------------- asx crate -------------------------+
++------------------------- asx-rs crate -------------------------+
 |                                                             |
 |  +---------+   +------+   +------+   +------------------+  |
 |  |  core   |<->| wire |<->| http |<->| transport        |  |

@@ -14,7 +14,7 @@
 //! ## Example — PEM key provider
 //!
 //! ```rust,no_run
-//! use asx::crypto::signing::{PemSigningKeyProvider, SigningKeyProvider};
+//! use asx_rs::crypto::signing::{PemSigningKeyProvider, SigningKeyProvider};
 //! use std::sync::Arc;
 //!
 //! # let signing_key_pem: &[u8] = b"";

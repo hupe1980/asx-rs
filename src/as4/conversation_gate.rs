@@ -55,16 +55,16 @@ use crate::core::{AsxError, ErrorCode, ErrorContext, Result};
 /// ## Example
 ///
 /// ```rust
-/// # use asx::as4::{
+/// # use asx_rs::as4::{
 /// #     receive_push_ordered, As4ConversationOrderGate, As4ReceivePushOrderedRequest,
 /// #     As4ReceivePushRequest,
 /// # };
 /// # async fn example(
-/// #     session: &asx::core::SessionContext,
-/// #     bus: &asx::observability::EventBus,
+/// #     session: &asx_rs::core::SessionContext,
+/// #     bus: &asx_rs::observability::EventBus,
 /// #     request: As4ReceivePushRequest,
-/// #     dedup: std::sync::Arc<dyn asx::storage::DedupStorage>,
-/// # ) -> asx::core::Result<()> {
+/// #     dedup: std::sync::Arc<dyn asx_rs::storage::DedupStorage>,
+/// # ) -> asx_rs::core::Result<()> {
 /// let gate = As4ConversationOrderGate::new(256);
 ///
 /// // Serializes all messages for the same ConversationId, lets distinct

@@ -16,8 +16,8 @@
 //! ```ignore
 //! use std::sync::Arc;
 //! use axum::Router;
-//! use asx::transport::server::{As2AxumHandler, as2_router, HandlerOutcome};
-//! use asx::transport::As2HttpIngress;
+//! use asx_rs::transport::server::{As2AxumHandler, as2_router, HandlerOutcome};
+//! use asx_rs::transport::As2HttpIngress;
 //!
 //! struct MyAs2Handler;
 //!
@@ -70,7 +70,7 @@ use crate::transport::ingress::as4_ingress_from_http;
 ///
 /// ```ignore
 /// use std::time::Duration;
-/// use asx::transport::server::RouterConfig;
+/// use asx_rs::transport::server::RouterConfig;
 ///
 /// let config = RouterConfig {
 ///     // 256 MiB EDIFACT Fahrplan payloads over a 100 Mbit/s uplink need ~20 s;
