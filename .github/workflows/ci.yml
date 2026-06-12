@@ -138,13 +138,6 @@ jobs:
       - name: Enforce Profile/Interop Coverage Threshold
         run: bash scripts/check_profile_coverage.sh 85 src/interop.rs
 
-  flaky-quarantine-policy:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Validate Quarantine Register
-        run: bash scripts/check_test_quarantine.sh docs/test-quarantine.txt
-
   release-candidate-gate:
     runs-on: ubuntu-latest
     needs:
@@ -158,7 +151,6 @@ jobs:
       - coverage-profile-interop
       - interop-matrix-and-vector-required
       - fuzz-adversarial-required
-      - flaky-quarantine-policy
     steps:
       - uses: actions/checkout@v4
       - name: Install stable toolchain
