@@ -1,28 +1,28 @@
-#[cfg(feature = "as2")]
+#[cfg(all(feature = "as2", feature = "testing"))]
 use asx::as2::{As2TrustVerifier, TrustResult, TrustVerifierSeal};
 use asx::core::SessionContext;
-#[cfg(feature = "as2")]
+#[cfg(all(feature = "as2", feature = "testing"))]
 use asx::core::{ReceivedBodyHandle, Result};
-#[cfg(feature = "as2")]
+#[cfg(all(feature = "as2", feature = "testing"))]
 use asx::lifecycle::TrustEvidence;
 
-#[cfg(feature = "as2")]
+#[cfg(all(feature = "as2", feature = "testing"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DeterministicTrustVerifier {
     trust: TrustEvidence,
 }
 
-#[cfg(feature = "as2")]
+#[cfg(all(feature = "as2", feature = "testing"))]
 impl DeterministicTrustVerifier {
     pub fn new(trust: TrustEvidence) -> Self {
         Self { trust }
     }
 }
 
-#[cfg(feature = "as2")]
+#[cfg(all(feature = "as2", feature = "testing"))]
 impl TrustVerifierSeal for DeterministicTrustVerifier {}
 
-#[cfg(feature = "as2")]
+#[cfg(all(feature = "as2", feature = "testing"))]
 impl As2TrustVerifier for DeterministicTrustVerifier {
     fn verify_and_decrypt(
         &self,

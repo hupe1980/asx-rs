@@ -572,3 +572,348 @@ fn profile_diff_blocks_release_for_high_risk_changes() {
             .any(|entry| entry.field == ResolutionField::Security)
     );
 }
+
+#[test]
+fn diff_no_changes_is_low_risk_and_does_not_block_release() {
+    let stack = ProfileStack {
+        base: base_profile(),
+        extensions: vec![],
+        overrides: vec![],
+        partner_overrides: vec![],
+    };
+    let session = SessionContext::new("s-nodiff", "partner-a", "p").expect("session");
+    let snapshot = stack.resolve(&session).snapshot;
+    let report = diff_effective_policy_snapshots(&snapshot, &snapshot);
+
+    assert!(report.changes.is_empty());
+    assert_eq!(report.highest_risk, DiffRiskLevel::Low);
+    assert!(!report.release_blocked);
+    report.to_json_pretty().expect("json serializable");
+}
+
+#[test]
+fn diff_encryption_disabled_is_high_risk() {
+    let before_stack = ProfileStack {
+        base: base_profile(),
+        extensions: vec![],
+        overrides: vec![],
+        partner_overrides: vec![],
+    };
+    let after_stack = ProfileStack {
+        base: BaseProfile {
+            security: SecurityPolicy {
+                require_encryption: false,
+                ..SecurityPolicy::default()
+            },
+            ..base_profile()
+        },
+        extensions: vec![],
+        overrides: vec![],
+        partner_overrides: vec![],
+    };
+    let session = SessionContext::new("s-enc", "partner-a", "p").expect("session");
+    let before = before_stack.resolve(&session).snapshot;
+    let after = after_stack.resolve(&session).snapshot;
+
+    let report = diff_effective_policy_snapshots(&before, &after);
+    assert_eq!(report.highest_risk, DiffRiskLevel::High);
+    assert!(report.release_blocked);
+}
+
+#[test]
+fn diff_payload_limits_disabled_is_high_risk() {
+    let before_stack = ProfileStack {
+        base: base_profile(),
+        extensions: vec![],
+        overrides: vec![],
+        partner_overrides: vec![],
+    };
+    let after_stack = ProfileStack {
+        base: BaseProfile {
+            validation: ValidationPolicy {
+                enforce_payload_limits: false,
+                ..ValidationPolicy::default()
+            },
+            ..base_profile()
+        },
+        extensions: vec![],
+        overrides: vec![],
+        partner_overrides: vec![],
+    };
+    let session = SessionContext::new("s-payload", "partner-a", "p").expect("session");
+    let before = before_stack.resolve(&session).snapshot;
+    let after = after_stack.resolve(&session).snapshot;
+
+    let report = diff_effective_policy_snapshots(&before, &after);
+    assert_eq!(report.highest_risk, DiffRiskLevel::High);
+    assert!(report.release_blocked);
+    assert!(
+        report
+            .changes
+            .iter()
+            .any(|e| e.field == ResolutionField::Validation)
+    );
+}
+
+#[test]
+fn diff_mic_requirement_change_is_medium_risk() {
+    let before_stack = ProfileStack {
+        base: base_profile(),
+        extensions: vec![],
+        overrides: vec![],
+        partner_overrides: vec![],
+    };
+    let after_stack = ProfileStack {
+        base: BaseProfile {
+            validation: ValidationPolicy {
+                require_as2_mic: false,
+                ..ValidationPolicy::default()
+            },
+            ..base_profile()
+        },
+        extensions: vec![],
+        overrides: vec![],
+        partner_overrides: vec![],
+    };
+    let session = SessionContext::new("s-mic", "partner-a", "p").expect("session");
+    let before = before_stack.resolve(&session).snapshot;
+    let after = after_stack.resolve(&session).snapshot;
+
+    let report = diff_effective_policy_snapshots(&before, &after);
+    assert_eq!(report.highest_risk, DiffRiskLevel::Medium);
+    assert!(!report.release_blocked);
+}
+
+#[test]
+fn diff_canonicalization_change_is_medium_risk() {
+    let alt_c14n = CanonicalizationPolicy {
+        normalize_mime_headers: false,
+        ..CanonicalizationPolicy::default()
+    };
+    let before_stack = ProfileStack {
+        base: base_profile(),
+        extensions: vec![],
+        overrides: vec![],
+        partner_overrides: vec![],
+    };
+    let after_stack = ProfileStack {
+        base: BaseProfile {
+            canonicalization: alt_c14n,
+            ..base_profile()
+        },
+        extensions: vec![],
+        overrides: vec![],
+        partner_overrides: vec![],
+    };
+    let session = SessionContext::new("s-c14n", "partner-a", "p").expect("session");
+    let before = before_stack.resolve(&session).snapshot;
+    let after = after_stack.resolve(&session).snapshot;
+
+    let report = diff_effective_policy_snapshots(&before, &after);
+    assert_eq!(report.highest_risk, DiffRiskLevel::Medium);
+    assert!(
+        report
+            .changes
+            .iter()
+            .any(|e| e.field == ResolutionField::Canonicalization)
+    );
+}
+
+#[test]
+fn snapshot_as_event_detail_empty_trace_shows_none() {
+    let snapshot = EffectivePolicySnapshot {
+        session_id: "s1".into(),
+        partner_id: "p1".into(),
+        profile_name: "prof".into(),
+        resolved_mode: InteropMode::Strict,
+        canonicalization: CanonicalizationPolicy::default(),
+        security: SecurityPolicy::default(),
+        validation: ValidationPolicy::default(),
+        resolution_trace: vec![],
+        resolution_diagnostics: vec![],
+    };
+    let detail = snapshot.as_event_detail();
+    assert!(detail.contains("trace=none"));
+}
+
+#[test]
+fn interop_guardrail_outcome_as_str() {
+    assert_eq!(InteropGuardrailOutcome::Allowed.as_str(), "Allowed");
+    assert_eq!(InteropGuardrailOutcome::Denied.as_str(), "Denied");
+}
+
+#[test]
+fn enforce_exception_strict_mode_returns_error() {
+    let session = SessionContext::new("s1", "p1", "strict-profile").expect("session");
+    let policy = InteropExceptionPolicy::default();
+    let err = enforce_exception(
+        &session,
+        InteropMode::Strict,
+        &policy,
+        InteropExceptionCode::As2AllowMissingMdnBoundary,
+        "test_stage",
+        "strict mode message",
+    )
+    .expect_err("must fail in strict mode");
+    assert!(err.to_string().contains("strict mode message"));
+}
+
+#[cfg(feature = "interop-relaxed")]
+#[test]
+fn enforce_exception_relaxed_allowed_returns_decision() {
+    let session = SessionContext::new("s1", "p1", "partner-quirks").expect("session");
+    let policy = InteropExceptionPolicy::scoped(
+        "partner-quirks",
+        vec![InteropExceptionCode::As2AllowMissingMdnBoundary],
+    );
+    let decision = enforce_exception(
+        &session,
+        InteropMode::Relaxed,
+        &policy,
+        InteropExceptionCode::As2AllowMissingMdnBoundary,
+        "test_stage",
+        "should not appear",
+    )
+    .expect("must succeed");
+    assert!(
+        matches!(decision, InteropDecision::RelaxedException { reason_code }
+            if reason_code == "as2_missing_mdn_boundary")
+    );
+}
+
+#[cfg(feature = "interop-relaxed")]
+#[test]
+fn enforce_exception_relaxed_denied_missing_policy_returns_error() {
+    let session = SessionContext::new("s1", "p1", "other-profile").expect("session");
+    let policy = InteropExceptionPolicy::default();
+    let err = enforce_exception(
+        &session,
+        InteropMode::Relaxed,
+        &policy,
+        InteropExceptionCode::As2AllowMissingMdnBoundary,
+        "test_stage",
+        "strict message not used",
+    )
+    .expect_err("must fail");
+    assert!(err.to_string().contains("missing scoped exception policy"));
+}
+
+#[test]
+fn regional_pack_from_json_rejects_oversized_input() {
+    let oversized = "x".repeat(RegionalProfilePack::MAX_PACK_JSON_BYTES + 1);
+    let err = RegionalProfilePack::from_json(&oversized).expect_err("must reject oversized");
+    assert_eq!(err.code, crate::core::ErrorCode::PayloadTooLarge);
+}
+
+#[test]
+fn regional_pack_from_json_rejects_invalid_json() {
+    let err = RegionalProfilePack::from_json("not-json!!").expect_err("must reject invalid json");
+    assert_eq!(err.code, crate::core::ErrorCode::ParseFailed);
+}
+
+#[test]
+fn regional_pack_validate_rejects_empty_pack_id() {
+    let json = serde_json::json!({
+        "pack_id": "",
+        "version": "1.0.0",
+        "applies_to_base_profile": "base",
+        "overrides": {}
+    })
+    .to_string();
+    let err = RegionalProfilePack::from_json(&json).expect_err("must reject empty pack_id");
+    assert_eq!(err.code, crate::core::ErrorCode::InvalidInput);
+}
+
+#[test]
+fn regional_pack_validate_rejects_empty_base_profile() {
+    let json = serde_json::json!({
+        "pack_id": "test-pack",
+        "version": "1.0.0",
+        "applies_to_base_profile": "",
+        "overrides": {}
+    })
+    .to_string();
+    let err =
+        RegionalProfilePack::from_json(&json).expect_err("must reject empty base profile name");
+    assert_eq!(err.code, crate::core::ErrorCode::InvalidInput);
+}
+
+#[test]
+fn regional_pack_validate_rejects_invalid_version() {
+    let json = serde_json::json!({
+        "pack_id": "test-pack",
+        "version": "not-semver",
+        "applies_to_base_profile": "base",
+        "overrides": {}
+    })
+    .to_string();
+    let err = RegionalProfilePack::from_json(&json).expect_err("must reject invalid version");
+    assert_eq!(err.code, crate::core::ErrorCode::InvalidInput);
+}
+
+#[test]
+fn regional_pack_validate_rejects_extra_version_parts() {
+    let json = serde_json::json!({
+        "pack_id": "test-pack",
+        "version": "1.2.3.4",
+        "applies_to_base_profile": "base",
+        "overrides": {}
+    })
+    .to_string();
+    let err = RegionalProfilePack::from_json(&json).expect_err("must reject 4-part version");
+    assert_eq!(err.code, crate::core::ErrorCode::InvalidInput);
+}
+
+#[test]
+fn regional_pack_apply_rejects_base_profile_mismatch() {
+    let stack = ProfileStack {
+        base: base_profile(),
+        extensions: vec![],
+        overrides: vec![],
+        partner_overrides: vec![],
+    };
+    let json = serde_json::json!({
+        "pack_id": "test-pack",
+        "version": "1.0.0",
+        "applies_to_base_profile": "wrong-base",
+        "overrides": {}
+    })
+    .to_string();
+    let pack = RegionalProfilePack::from_json(&json).expect("valid pack");
+    let err = stack
+        .apply_regional_pack(&pack)
+        .expect_err("must reject mismatched base");
+    assert_eq!(err.code, crate::core::ErrorCode::PolicyViolation);
+}
+
+#[test]
+fn regional_packs_apply_multiple_packs_in_order() {
+    let stack = ProfileStack {
+        base: base_profile(),
+        extensions: vec![],
+        overrides: vec![],
+        partner_overrides: vec![],
+    };
+    let pack_a = serde_json::json!({
+        "pack_id": "pack-a",
+        "version": "1.0.0",
+        "applies_to_base_profile": "base",
+        "overrides": {}
+    })
+    .to_string();
+    let pack_b = serde_json::json!({
+        "pack_id": "pack-b",
+        "version": "2.0.0",
+        "applies_to_base_profile": "base",
+        "overrides": {}
+    })
+    .to_string();
+    let p_a = RegionalProfilePack::from_json(&pack_a).expect("pack-a");
+    let p_b = RegionalProfilePack::from_json(&pack_b).expect("pack-b");
+    let merged = stack
+        .apply_regional_packs(&[p_a, p_b])
+        .expect("apply packs");
+    assert_eq!(merged.extensions.len(), 2);
+    assert!(merged.extensions[0].name.contains("pack-a"));
+    assert!(merged.extensions[1].name.contains("pack-b"));
+}

@@ -7,34 +7,36 @@ use std::time::Instant;
 #[cfg(feature = "as4")]
 use memchr::memmem;
 
-#[cfg(feature = "as2")]
+#[cfg(all(feature = "as2", feature = "testing"))]
 use asx::core::ReceivedBodyHandle;
 #[cfg(any(feature = "as2", feature = "as4"))]
 use asx::core::SessionContext;
-#[cfg(feature = "as2")]
+#[cfg(all(feature = "as2", feature = "testing"))]
 use asx::lifecycle::TrustEvidence;
 #[cfg(any(feature = "as2", feature = "as4"))]
 use asx::observability::EventBus;
-#[cfg(feature = "as2")]
-use asx::observability::audit_sink::InMemoryAuditSink;
-#[cfg(any(feature = "as2", feature = "as4"))]
+#[cfg(all(any(feature = "as2", feature = "as4"), feature = "testing"))]
 use asx::reliability::InMemoryDedupBackend;
-#[cfg(feature = "as2")]
+#[cfg(all(feature = "as2", feature = "testing"))]
 use asx::reliability::InMemoryReconciliationHook;
 
 #[cfg(feature = "as2")]
 use asx::as2::{
-    As2MdnMode, As2ReceiveMdnRequest, As2ReceivePolicy, As2SendCredentials, As2SendPolicy,
-    generate_mdn as as2_generate_mdn, send_sync as as2_send,
+    As2SendCredentials, As2SendPolicy, generate_mdn as as2_generate_mdn, send_sync as as2_send,
 };
 #[cfg(all(feature = "as2", feature = "testing"))]
 use asx::as2::{
-    As2TrustVerifier, TrustResult, TrustVerifierSeal, receive_with_mdn_with_reliability,
+    As2MdnMode, As2ReceiveMdnRequest, As2ReceivePolicy, As2TrustVerifier, TrustResult,
+    TrustVerifierSeal, receive_with_mdn_with_reliability,
 };
 #[cfg(feature = "as4")]
 use asx::as4::{
+    generate_receipt as as4_generate_receipt,
+};
+#[cfg(all(feature = "as4", feature = "testing"))]
+use asx::as4::{
     As4PushPolicyBuilder, As4ReceivePushRequest, As4ReceivePushSyncRequest,
-    generate_receipt as as4_generate_receipt, receive_push_with_dedup_sync,
+    receive_push_with_dedup_sync,
 };
 #[cfg(feature = "as2")]
 use openssl::asn1::Asn1Time;
@@ -260,8 +262,7 @@ fn run_results(#[allow(unused_variables)] iterations: u64) -> Vec<BenchResult> {
     #[cfg(feature = "as2")]
     {
         let session = SessionContext::new("bench-s-as2", "bench-p", "strict").expect("session");
-        let audit_sink = std::sync::Arc::new(InMemoryAuditSink::new());
-        let bus = EventBus::new_regulated(256, audit_sink).expect("bus");
+        let bus = EventBus::new(256).expect("bus");
         let _events = bus.subscribe_scoped_events();
         let payload = vec![b'A'; 2048];
         let credentials = bench_as2_credentials();

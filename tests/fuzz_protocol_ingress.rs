@@ -1,4 +1,4 @@
-#![cfg(all(feature = "as2", feature = "as4"))]
+#![cfg(all(feature = "as2", feature = "as4", feature = "testing"))]
 
 #[path = "common/as2_verifier.rs"]
 mod common;
