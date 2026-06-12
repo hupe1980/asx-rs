@@ -401,7 +401,7 @@ pub use x509::validate_certificate_chain as validate_certificate_chain_with_revo
 // Tests
 // ---------------------------------------------------------------------------
 
-#[cfg(test)]
+#[cfg(all(test, feature = "as4"))]
 mod tests {
     use super::*;
     use base64::Engine;

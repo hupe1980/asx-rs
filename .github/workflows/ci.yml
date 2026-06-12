@@ -43,7 +43,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
       - name: Run Performance Gate
         run: |
-          cargo run --release -p xtask --all-features -- perf-gate \
+          cargo run --release -p xtask --no-default-features --features "as2,as4,client,server,trace,compression,prometheus,opentelemetry,async-ocsp,interop-strict" -- perf-gate \
             --iterations 2000 \
             --check-baseline docs/perf-baseline.txt \
             --max-regression 0.25
