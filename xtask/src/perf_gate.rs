@@ -280,6 +280,7 @@ fn run_results(#[allow(unused_variables)] iterations: u64) -> Vec<BenchResult> {
                             sign: true,
                             encrypt: true,
                             compress: false,
+                            fail_closed_audit_events: false,
                             ..As2SendPolicy::default()
                         },
                         credentials: credentials.clone(),
