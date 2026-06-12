@@ -4,7 +4,7 @@ Requires feature flag: `as2`
 
 ## Overview
 
-AS2 (RFC 4130) support in `asx` is exposed through free functions in `asx::as2`.
+AS2 (RFC 4130) support in `asx` is exposed through free functions in `asx_rs::as2`.
 
 Primary flows:
 
@@ -68,18 +68,18 @@ For regulated deployments that require explicit startup proof, bind validated
 session context once and then use standard AS2 entry points:
 
 ```rust
-let strict_session = asx::presets::session_with_strict_runtime_bootstrap_token(
+let strict_session = asx_rs::presets::session_with_strict_runtime_bootstrap_token(
     "as2_receive_sync",
     &bootstrap_token,
     &session,
 )?;
 
-let received = asx::as2::receive_sync(&strict_session, payload, verifier)?;
+let received = asx_rs::as2::receive_sync(&strict_session, payload, verifier)?;
 ```
 
 In non-testing builds, strict interop AS2 entry points fail closed unless the
 session is startup-validated with
-`asx::presets::session_with_strict_runtime_bootstrap_token(...)`.
+`asx_rs::presets::session_with_strict_runtime_bootstrap_token(...)`.
 
 ### Receive (streaming ingress)
 

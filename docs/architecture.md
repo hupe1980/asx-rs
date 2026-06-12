@@ -94,7 +94,7 @@ This means protocol logic never depends on a specific HTTP framework.
 
 ## Envelope Lifecycle
 
-The sole lifecycle mechanism is the type-state pattern in `lifecycle.rs`. The earlier `envelope.rs` enum-based state machine has been removed. Protocol functions (`asx::as2::receive_sync`, `asx::as4::receive_push_with_dedup_sync`) use `lifecycle.rs` type-states exclusively.
+The sole lifecycle mechanism is the type-state pattern in `lifecycle.rs`. The earlier `envelope.rs` enum-based state machine has been removed. Protocol functions (`asx_rs::as2::receive_sync`, `asx_rs::as4::receive_push_with_dedup_sync`) use `lifecycle.rs` type-states exclusively.
 
 Allowed progression (forward-only):
 

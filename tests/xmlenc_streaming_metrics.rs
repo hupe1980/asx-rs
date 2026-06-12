@@ -5,7 +5,7 @@ use std::hint::black_box;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
-use asx::crypto::wssec::{decrypt_payload_xmlenc, encrypt_payload_xmlenc};
+use asx_rs::crypto::wssec::{decrypt_payload_xmlenc, encrypt_payload_xmlenc};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use openssl::encrypt::Decrypter;
@@ -50,19 +50,19 @@ fn alloc_stats() -> (usize, usize) {
 fn decrypt_payload_xmlenc_dom_baseline(
     encrypted_payload_xml: &[u8],
     recipient_key_pem: &[u8],
-) -> asx::core::Result<Vec<u8>> {
+) -> asx_rs::core::Result<Vec<u8>> {
     let xml = std::str::from_utf8(encrypted_payload_xml).map_err(|_| {
-        asx::core::AsxError::new(
-            asx::core::ErrorCode::ParseFailed,
+        asx_rs::core::AsxError::new(
+            asx_rs::core::ErrorCode::ParseFailed,
             "XML Encryption payload is not valid UTF-8",
-            asx::core::ErrorContext::new("wssec_decrypt_payload"),
+            asx_rs::core::ErrorContext::new("wssec_decrypt_payload"),
         )
     })?;
     let doc = Document::parse(xml).map_err(|err| {
-        asx::core::AsxError::new(
-            asx::core::ErrorCode::ParseFailed,
+        asx_rs::core::AsxError::new(
+            asx_rs::core::ErrorCode::ParseFailed,
             format!("failed to parse XML Encryption payload: {err}"),
-            asx::core::ErrorContext::new("wssec_decrypt_payload"),
+            asx_rs::core::ErrorContext::new("wssec_decrypt_payload"),
         )
     })?;
 
@@ -70,10 +70,10 @@ fn decrypt_payload_xmlenc_dom_baseline(
         .descendants()
         .find(|n| n.is_element() && n.tag_name().name() == "EncryptedData")
         .ok_or_else(|| {
-            asx::core::AsxError::new(
-                asx::core::ErrorCode::ParseFailed,
+            asx_rs::core::AsxError::new(
+                asx_rs::core::ErrorCode::ParseFailed,
                 "XML Encryption payload is missing xenc:EncryptedData",
-                asx::core::ErrorContext::new("wssec_decrypt_payload"),
+                asx_rs::core::ErrorContext::new("wssec_decrypt_payload"),
             )
         })?;
 
@@ -82,21 +82,21 @@ fn decrypt_payload_xmlenc_dom_baseline(
         .find(|n| n.is_element() && n.tag_name().name() == "EncryptionMethod")
         .and_then(|n| n.attribute("Algorithm"))
         .ok_or_else(|| {
-            asx::core::AsxError::new(
-                asx::core::ErrorCode::ParseFailed,
+            asx_rs::core::AsxError::new(
+                asx_rs::core::ErrorCode::ParseFailed,
                 "XML Encryption payload is missing xenc:EncryptedData/xenc:EncryptionMethod",
-                asx::core::ErrorContext::new("wssec_decrypt_payload"),
+                asx_rs::core::ErrorContext::new("wssec_decrypt_payload"),
             )
         })?;
     if data_algo != "http://www.w3.org/2009/xmlenc11#aes128-gcm"
         && data_algo != "http://www.w3.org/2009/xmlenc11#aes256-gcm"
     {
-        return Err(asx::core::AsxError::new(
-            asx::core::ErrorCode::DecryptionFailed,
+        return Err(asx_rs::core::AsxError::new(
+            asx_rs::core::ErrorCode::DecryptionFailed,
             format!(
                 "unsupported XML Encryption data algorithm: {data_algo} (only xmlenc11 AES-GCM is accepted)"
             ),
-            asx::core::ErrorContext::new("wssec_decrypt_payload"),
+            asx_rs::core::ErrorContext::new("wssec_decrypt_payload"),
         ));
     }
 
@@ -109,19 +109,19 @@ fn decrypt_payload_xmlenc_dom_baseline(
         })
         .and_then(|n| n.attribute("Algorithm"))
         .ok_or_else(|| {
-            asx::core::AsxError::new(
-                asx::core::ErrorCode::ParseFailed,
+            asx_rs::core::AsxError::new(
+                asx_rs::core::ErrorCode::ParseFailed,
                 "XML Encryption payload is missing xenc:EncryptedKey/xenc:EncryptionMethod",
-                asx::core::ErrorContext::new("wssec_decrypt_payload"),
+                asx_rs::core::ErrorContext::new("wssec_decrypt_payload"),
             )
         })?;
     if key_algo != "http://www.w3.org/2009/xmlenc11#rsa-oaep" {
-        return Err(asx::core::AsxError::new(
-            asx::core::ErrorCode::DecryptionFailed,
+        return Err(asx_rs::core::AsxError::new(
+            asx_rs::core::ErrorCode::DecryptionFailed,
             format!(
                 "unsupported XML Encryption key transport algorithm: {key_algo} (only xmlenc11 RSA-OAEP is accepted)"
             ),
-            asx::core::ErrorContext::new("wssec_decrypt_payload"),
+            asx_rs::core::ErrorContext::new("wssec_decrypt_payload"),
         ));
     }
 
@@ -136,10 +136,10 @@ fn decrypt_payload_xmlenc_dom_baseline(
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .ok_or_else(|| {
-            asx::core::AsxError::new(
-                asx::core::ErrorCode::ParseFailed,
+            asx_rs::core::AsxError::new(
+                asx_rs::core::ErrorCode::ParseFailed,
                 "XML Encryption payload is missing wrapped xenc:EncryptedKey/xenc:CipherValue",
-                asx::core::ErrorContext::new("wssec_decrypt_payload"),
+                asx_rs::core::ErrorContext::new("wssec_decrypt_payload"),
             )
         })?;
 
@@ -154,95 +154,95 @@ fn decrypt_payload_xmlenc_dom_baseline(
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .ok_or_else(|| {
-            asx::core::AsxError::new(
-                asx::core::ErrorCode::ParseFailed,
+            asx_rs::core::AsxError::new(
+                asx_rs::core::ErrorCode::ParseFailed,
                 "XML Encryption payload is missing xenc:EncryptedData/xenc:CipherData/xenc:CipherValue",
-                asx::core::ErrorContext::new("wssec_decrypt_payload"),
+                asx_rs::core::ErrorContext::new("wssec_decrypt_payload"),
             )
         })?;
 
     let wrapped_key = BASE64_STANDARD.decode(encrypted_key_b64).map_err(|err| {
-        asx::core::AsxError::new(
-            asx::core::ErrorCode::ParseFailed,
+        asx_rs::core::AsxError::new(
+            asx_rs::core::ErrorCode::ParseFailed,
             format!("failed to decode wrapped XML Encryption key: {err}"),
-            asx::core::ErrorContext::new("wssec_decrypt_payload"),
+            asx_rs::core::ErrorContext::new("wssec_decrypt_payload"),
         )
     })?;
 
     let cipher_blob = BASE64_STANDARD.decode(encrypted_data_b64).map_err(|err| {
-        asx::core::AsxError::new(
-            asx::core::ErrorCode::ParseFailed,
+        asx_rs::core::AsxError::new(
+            asx_rs::core::ErrorCode::ParseFailed,
             format!("failed to decode XML Encryption ciphertext: {err}"),
-            asx::core::ErrorContext::new("wssec_decrypt_payload"),
+            asx_rs::core::ErrorContext::new("wssec_decrypt_payload"),
         )
     })?;
 
     let pkey = PKey::private_key_from_pem(recipient_key_pem).map_err(|err| {
-        asx::core::AsxError::new(
-            asx::core::ErrorCode::DecryptionFailed,
+        asx_rs::core::AsxError::new(
+            asx_rs::core::ErrorCode::DecryptionFailed,
             format!("failed to parse XML Encryption recipient private key: {err}"),
-            asx::core::ErrorContext::new("wssec_decrypt_payload"),
+            asx_rs::core::ErrorContext::new("wssec_decrypt_payload"),
         )
     })?;
 
     let mut decrypter = Decrypter::new(&pkey).map_err(|err| {
-        asx::core::AsxError::new(
-            asx::core::ErrorCode::DecryptionFailed,
+        asx_rs::core::AsxError::new(
+            asx_rs::core::ErrorCode::DecryptionFailed,
             format!("failed to create RSA decrypter: {err}"),
-            asx::core::ErrorContext::new("wssec_decrypt_payload"),
+            asx_rs::core::ErrorContext::new("wssec_decrypt_payload"),
         )
     })?;
     decrypter
         .set_rsa_padding(Padding::PKCS1_OAEP)
         .map_err(|err| {
-            asx::core::AsxError::new(
-                asx::core::ErrorCode::DecryptionFailed,
+            asx_rs::core::AsxError::new(
+                asx_rs::core::ErrorCode::DecryptionFailed,
                 format!("failed to set RSA-OAEP padding: {err}"),
-                asx::core::ErrorContext::new("wssec_decrypt_payload"),
+                asx_rs::core::ErrorContext::new("wssec_decrypt_payload"),
             )
         })?;
     decrypter
         .set_rsa_oaep_md(MessageDigest::sha256())
         .map_err(|err| {
-            asx::core::AsxError::new(
-                asx::core::ErrorCode::DecryptionFailed,
+            asx_rs::core::AsxError::new(
+                asx_rs::core::ErrorCode::DecryptionFailed,
                 format!("failed to set RSA-OAEP SHA-256 digest: {err}"),
-                asx::core::ErrorContext::new("wssec_decrypt_payload"),
+                asx_rs::core::ErrorContext::new("wssec_decrypt_payload"),
             )
         })?;
     decrypter
         .set_rsa_mgf1_md(MessageDigest::sha256())
         .map_err(|err| {
-            asx::core::AsxError::new(
-                asx::core::ErrorCode::DecryptionFailed,
+            asx_rs::core::AsxError::new(
+                asx_rs::core::ErrorCode::DecryptionFailed,
                 format!("failed to set RSA MGF1-SHA-256 digest: {err}"),
-                asx::core::ErrorContext::new("wssec_decrypt_payload"),
+                asx_rs::core::ErrorContext::new("wssec_decrypt_payload"),
             )
         })?;
     let buf_len = decrypter.decrypt_len(&wrapped_key).map_err(|err| {
-        asx::core::AsxError::new(
-            asx::core::ErrorCode::DecryptionFailed,
+        asx_rs::core::AsxError::new(
+            asx_rs::core::ErrorCode::DecryptionFailed,
             format!("failed to compute decrypted key buffer length: {err}"),
-            asx::core::ErrorContext::new("wssec_decrypt_payload"),
+            asx_rs::core::ErrorContext::new("wssec_decrypt_payload"),
         )
     })?;
     let mut aes_key = vec![0u8; buf_len];
     let key_len = decrypter
         .decrypt(&wrapped_key, &mut aes_key)
         .map_err(|err| {
-            asx::core::AsxError::new(
-                asx::core::ErrorCode::DecryptionFailed,
+            asx_rs::core::AsxError::new(
+                asx_rs::core::ErrorCode::DecryptionFailed,
                 format!("failed to unwrap XML Encryption content key (OAEP/MGF1-SHA256): {err}"),
-                asx::core::ErrorContext::new("wssec_decrypt_payload"),
+                asx_rs::core::ErrorContext::new("wssec_decrypt_payload"),
             )
         })?;
     let aes_key = aes_key[..key_len].to_vec();
 
     if cipher_blob.len() < 28 {
-        return Err(asx::core::AsxError::new(
-            asx::core::ErrorCode::DecryptionFailed,
+        return Err(asx_rs::core::AsxError::new(
+            asx_rs::core::ErrorCode::DecryptionFailed,
             "AES-GCM ciphertext blob is too short (need nonce + tag)",
-            asx::core::ErrorContext::new("wssec_decrypt_payload"),
+            asx_rs::core::ErrorContext::new("wssec_decrypt_payload"),
         ));
     }
     let nonce = &cipher_blob[..12];
@@ -253,20 +253,20 @@ fn decrypt_payload_xmlenc_dom_baseline(
         16 => Cipher::aes_128_gcm(),
         32 => Cipher::aes_256_gcm(),
         other => {
-            return Err(asx::core::AsxError::new(
-                asx::core::ErrorCode::DecryptionFailed,
+            return Err(asx_rs::core::AsxError::new(
+                asx_rs::core::ErrorCode::DecryptionFailed,
                 format!(
                     "unsupported XML Encryption content key length: {other} (expected 16 or 32)"
                 ),
-                asx::core::ErrorContext::new("wssec_decrypt_payload"),
+                asx_rs::core::ErrorContext::new("wssec_decrypt_payload"),
             ));
         }
     };
     decrypt_aead(gcm_cipher, &aes_key, Some(nonce), &[], ciphertext, tag).map_err(|err| {
-        asx::core::AsxError::new(
-            asx::core::ErrorCode::DecryptionFailed,
+        asx_rs::core::AsxError::new(
+            asx_rs::core::ErrorCode::DecryptionFailed,
             format!("failed to decrypt AES-GCM ciphertext: {err}"),
-            asx::core::ErrorContext::new("wssec_decrypt_payload"),
+            asx_rs::core::ErrorContext::new("wssec_decrypt_payload"),
         )
     })
 }
@@ -277,7 +277,7 @@ fn benchmark_payload() -> Vec<u8> {
 
 fn measure<F>(label: &str, iterations: usize, mut f: F) -> (usize, usize, u128)
 where
-    F: FnMut() -> asx::core::Result<Vec<u8>>,
+    F: FnMut() -> asx_rs::core::Result<Vec<u8>>,
 {
     reset_alloc_stats();
     let start = Instant::now();
@@ -303,7 +303,7 @@ fn xmlenc_streaming_decrypt_metrics() {
     let ciphertext = encrypt_payload_xmlenc(
         &payload,
         cert_pem,
-        asx::crypto::wssec::XmlEncPayloadAlgorithm::Aes128Gcm,
+        asx_rs::crypto::wssec::XmlEncPayloadAlgorithm::Aes128Gcm,
     )
     .expect("encrypt");
 

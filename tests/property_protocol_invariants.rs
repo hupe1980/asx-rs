@@ -1,8 +1,8 @@
 #![cfg(all(feature = "as2", feature = "as4"))]
-use asx::as2::generate_mdn;
-use asx::as4::generate_receipt;
+use asx_rs::as2::generate_mdn;
+use asx_rs::as4::generate_receipt;
 
-use asx::core::SessionContext;
+use asx_rs::core::SessionContext;
 use proptest::prelude::*;
 
 fn session() -> SessionContext {

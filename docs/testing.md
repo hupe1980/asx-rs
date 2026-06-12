@@ -267,7 +267,7 @@ assert_eq!(response.status(), 200);
 ## Testing Feature Flag
 
 ```toml
-asx = { version = "0.1", features = ["testing"] }
+asx-rs = { version = "0.1", features = ["testing"] }
 ```
 
-The `testing` feature exposes `asx::fixtures` and `asx::matrix` — test scaffold modules with `InteropFixtureMetadata`, `FixtureCatalog`, `MatrixSummary`, and related helpers. These are not part of the production library surface and are absent from builds without this feature.
+The `testing` feature exposes `asx_rs::fixtures` and `asx_rs::matrix` — test scaffold modules with `InteropFixtureMetadata`, `FixtureCatalog`, `MatrixSummary`, and related helpers. These are not part of the production library surface and are absent from builds without this feature.

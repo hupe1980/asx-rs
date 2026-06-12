@@ -7,7 +7,7 @@
 /// - MIME multipart boundary scanning
 ///
 /// Run with: `cargo bench --bench as4_streaming_vs_buffer --features "as4"`
-use asx::crypto::wssec::{
+use asx_rs::crypto::wssec::{
     WsSecCanonicalizationProfile, canonicalize_reference, parse_signature_references,
 };
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};

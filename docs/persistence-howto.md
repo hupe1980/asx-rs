@@ -29,7 +29,7 @@ This keeps the library modular while still enabling strong delivery guarantees.
 pub trait DedupStorage: Send + Sync {
     fn is_durable(&self) -> bool;
     fn cluster_safe(&self) -> bool { false }
-    fn first_seen(&self, idempotency_key: &str) -> asx::core::Result<bool>;
+    fn first_seen(&self, idempotency_key: &str) -> asx_rs::core::Result<bool>;
 }
 ```
 
@@ -45,9 +45,9 @@ Semantics:
 pub trait ReconciliationStorage: Send + Sync {
     fn is_durable(&self) -> bool;
     fn cluster_safe(&self) -> bool { false }
-    fn enqueue(&self, request: ReconciliationRequest) -> asx::core::Result<bool>;
-    fn queued_requests(&self) -> asx::core::Result<Vec<ReconciliationRequest>>;
-    fn resolve(&self, idempotency_key: &str) -> asx::core::Result<bool>;
+    fn enqueue(&self, request: ReconciliationRequest) -> asx_rs::core::Result<bool>;
+    fn queued_requests(&self) -> asx_rs::core::Result<Vec<ReconciliationRequest>>;
+    fn resolve(&self, idempotency_key: &str) -> asx_rs::core::Result<bool>;
 }
 ```
 
@@ -56,18 +56,18 @@ pub trait ReconciliationStorage: Send + Sync {
 Enable feature `postgres-storage` to use first-party durable, cluster-safe storage:
 
 ```toml
-asx = { version = "0.1", features = ["as2", "as4", "postgres-storage"] }
+asx-rs = { version = "0.1", features = ["as2", "as4", "postgres-storage"] }
 ```
 
 Available implementations:
 
-- `asx::storage::PostgresDedupStorage`
-- `asx::storage::PostgresReconciliationStorage`
+- `asx_rs::storage::PostgresDedupStorage`
+- `asx_rs::storage::PostgresReconciliationStorage`
 
 Example bootstrap:
 
 ```rust,ignore
-use asx::storage::{PostgresDedupStorage, PostgresReconciliationStorage};
+use asx_rs::storage::{PostgresDedupStorage, PostgresReconciliationStorage};
 
 let dedup = PostgresDedupStorage::connect(
     "postgres://app:secret@db/asx",
@@ -137,10 +137,10 @@ VALUES (1, '0', 0, 0);
 ## Running Example Skeleton (SQLite + rusqlite)
 
 ```rust,ignore
-use asx::core::{AsxError, ErrorCode, ErrorContext, Result};
-use asx::observability::audit_sink::{AuditEvent, DurableAuditSink, ReplayCursor};
-use asx::reliability::ReconciliationRequest;
-use asx::storage::{DedupStorage, ReconciliationStorage};
+use asx_rs::core::{AsxError, ErrorCode, ErrorContext, Result};
+use asx_rs::observability::audit_sink::{AuditEvent, DurableAuditSink, ReplayCursor};
+use asx_rs::reliability::ReconciliationRequest;
+use asx_rs::storage::{DedupStorage, ReconciliationStorage};
 use rusqlite::{params, Connection};
 use std::sync::Mutex;
 

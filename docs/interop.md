@@ -26,7 +26,7 @@ let session = SessionContext::new("sess-1", "partner-a", "profile-a")?;
 
 `interop-strict` is in the default Cargo feature set. `interop-relaxed` is optional and must be explicitly enabled:
 ```toml
-asx = { version = "0.1", features = ["as2", "interop-relaxed"] }
+asx-rs = { version = "0.1", features = ["as2", "interop-relaxed"] }
 ```
 
 ---
@@ -36,8 +36,8 @@ asx = { version = "0.1", features = ["as2", "interop-relaxed"] }
 A profile stack is built by composing layers:
 
 ```rust
-use asx::core::InteropMode;
-use asx::interop::{
+use asx_rs::core::InteropMode;
+use asx_rs::interop::{
   BaseProfile, CanonicalizationPolicy, PartnerProfileOverlay, ProfileExtension,
   ProfilePolicyOverrides, ProfileStack, ProfileOverride, SecurityPolicy, ValidationPolicy,
 };
@@ -127,7 +127,7 @@ Snapshots are round-trippable: `EffectivePolicySnapshot::from_json(&json)?`.
 Compare two profile snapshots to detect security-relevant changes before a release:
 
 ```rust
-use asx::interop::diff_effective_policy_snapshots;
+use asx_rs::interop::diff_effective_policy_snapshots;
 
 let report = diff_effective_policy_snapshots(&before_snapshot, &after_snapshot)?;
 println!("{}", report.to_json_pretty()?);
@@ -178,7 +178,7 @@ Validation is enforced as a hard release gate (`scripts/check_profile_coverage.s
 Partner overlays apply per-partner policy specializations on top of the global profile without code changes:
 
 ```rust
-use asx::interop::PartnerProfileOverlay;
+use asx_rs::interop::PartnerProfileOverlay;
 
 let overlay = PartnerProfileOverlay {
   name: "partner-acme-overlay".into(),
@@ -199,7 +199,7 @@ Overlays are composable: multiple overlays for the same partner are merged in de
 Regional profile packs provide data-driven policy overlays loadable from JSON without code changes. They are designed for EU eDelivery network variants (Peppol, CEF, ENTSOG, BDEW) and other regional specifications.
 
 ```rust
-use asx::interop::RegionalProfilePack;
+use asx_rs::interop::RegionalProfilePack;
 
 let pack = RegionalProfilePack::from_json(json_str)?;
 let stack = ProfileStack::builder()
@@ -222,7 +222,7 @@ Packs are validated on load: unknown field names and type mismatches fail fast w
 Exception policies define a bounded allow-list for known non-compliant partner behaviors:
 
 ```rust
-use asx::interop::{InteropExceptionCode, InteropExceptionPolicy};
+use asx_rs::interop::{InteropExceptionCode, InteropExceptionPolicy};
 
 let exceptions = InteropExceptionPolicy::scoped(
   "profile-a",

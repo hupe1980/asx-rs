@@ -1,7 +1,7 @@
 #![cfg(feature = "as4")]
 
-use asx::core::{OcspFailureMode, OcspMode};
-use asx::crypto::wssec::{RevocationPolicy, validate_certificate_chain_with_revocation_vectors};
+use asx_rs::core::{OcspFailureMode, OcspMode};
+use asx_rs::crypto::wssec::{RevocationPolicy, validate_certificate_chain_with_revocation_vectors};
 
 fn leaf_chain_der() -> Vec<Vec<u8>> {
     vec![
@@ -60,7 +60,7 @@ fn vector_negative_anchor_missing_fails_closed() {
     )
     .expect_err("missing trust anchors must fail");
 
-    assert_eq!(err.code, asx::ErrorCode::SecurityVerificationFailed);
+    assert_eq!(err.code, asx_rs::ErrorCode::SecurityVerificationFailed);
 }
 
 #[test]
@@ -87,7 +87,7 @@ fn vector_negative_revoked_leaf_by_crl_fails() {
     )
     .expect_err("revoked leaf must fail");
 
-    assert_eq!(err.code, asx::ErrorCode::SecurityVerificationFailed);
+    assert_eq!(err.code, asx_rs::ErrorCode::SecurityVerificationFailed);
 }
 
 #[test]
@@ -114,7 +114,7 @@ fn vector_negative_revoked_intermediate_by_crl_fails() {
     )
     .expect_err("revoked intermediate must fail");
 
-    assert_eq!(err.code, asx::ErrorCode::SecurityVerificationFailed);
+    assert_eq!(err.code, asx_rs::ErrorCode::SecurityVerificationFailed);
 }
 
 #[test]
@@ -136,7 +136,7 @@ fn ocsp_policy_hard_fail_requires_usable_stapled_response() {
     )
     .expect_err("hard-fail OCSP policy must fail when no response is available");
 
-    assert_eq!(err.code, asx::ErrorCode::SecurityVerificationFailed);
+    assert_eq!(err.code, asx_rs::ErrorCode::SecurityVerificationFailed);
 }
 
 #[test]
@@ -184,7 +184,7 @@ fn ocsp_stapled_mode_rejects_revoked_leaf() {
     )
     .expect_err("revoked OCSP stapled response must fail");
 
-    assert_eq!(err.code, asx::ErrorCode::SecurityVerificationFailed);
+    assert_eq!(err.code, asx_rs::ErrorCode::SecurityVerificationFailed);
 }
 
 #[test]
@@ -208,7 +208,7 @@ fn ocsp_responder_mode_rejects_revoked_leaf() {
     )
     .expect_err("revoked responder OCSP response must fail");
 
-    assert_eq!(err.code, asx::ErrorCode::SecurityVerificationFailed);
+    assert_eq!(err.code, asx_rs::ErrorCode::SecurityVerificationFailed);
 }
 
 #[test]
@@ -232,5 +232,5 @@ fn ocsp_disabled_still_rejects_supplied_revoked_response() {
     )
     .expect_err("disabled OCSP mode must not ignore supplied revoked responses");
 
-    assert_eq!(err.code, asx::ErrorCode::SecurityVerificationFailed);
+    assert_eq!(err.code, asx_rs::ErrorCode::SecurityVerificationFailed);
 }

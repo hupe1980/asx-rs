@@ -8,10 +8,10 @@ mod common;
 // ebMS 3.0 §5, SOAP 1.2, and XML 1.0 processing rules.
 
 use crate::common::{as4_strict_push_policy, as4_unsigned_push_policy};
-use asx::as4::{As4ReceivePushRequest, As4ReceivePushSyncRequest, receive_push_with_dedup_sync};
-use asx::core::{ErrorCode, SessionContext};
-use asx::observability::EventBus;
-use asx::reliability::InMemoryDedupBackend;
+use asx_rs::as4::{As4ReceivePushRequest, As4ReceivePushSyncRequest, receive_push_with_dedup_sync};
+use asx_rs::core::{ErrorCode, SessionContext};
+use asx_rs::observability::EventBus;
+use asx_rs::reliability::InMemoryDedupBackend;
 
 fn session() -> SessionContext {
     SessionContext::new("s-adversarial", "p-adversarial", "strict").expect("session")
@@ -81,7 +81,7 @@ fn ensure_required_strict_properties_in_xml(xml: &str) -> String {
     out
 }
 
-fn push(payload: &[u8]) -> asx::core::Result<asx::as4::As4ReceivePushOutput> {
+fn push(payload: &[u8]) -> asx_rs::core::Result<asx_rs::as4::As4ReceivePushOutput> {
     let bus = bus();
     let _events = bus.subscribe_scoped_events();
     let normalized_payload = if detect_multipart_boundary(payload).is_none() {
@@ -111,7 +111,7 @@ fn push(payload: &[u8]) -> asx::core::Result<asx::as4::As4ReceivePushOutput> {
     )
 }
 
-fn push_signed_required(payload: &[u8]) -> asx::core::Result<asx::as4::As4ReceivePushOutput> {
+fn push_signed_required(payload: &[u8]) -> asx_rs::core::Result<asx_rs::as4::As4ReceivePushOutput> {
     let bus = bus();
     let _events = bus.subscribe_scoped_events();
     let normalized_payload = if detect_multipart_boundary(payload).is_none() {

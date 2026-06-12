@@ -1,13 +1,13 @@
-use asx::core::SessionContext;
-use asx::observability::{AsxEvent, BackpressurePolicy, EventBus, EventEmissionMode};
+use asx_rs::core::SessionContext;
+use asx_rs::observability::{AsxEvent, BackpressurePolicy, EventBus, EventEmissionMode};
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
 
 struct BenchState {
     bus: EventBus,
     session: SessionContext,
-    broadcast: asx::observability::ScopedEventSubscription,
+    broadcast: asx_rs::observability::ScopedEventSubscription,
     runtime: tokio::runtime::Runtime,
-    subscriptions: Vec<asx::observability::SessionEventSubscription>,
+    subscriptions: Vec<asx_rs::observability::SessionEventSubscription>,
 }
 
 fn build_bus_with_subscribers(

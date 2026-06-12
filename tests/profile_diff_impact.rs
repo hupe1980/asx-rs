@@ -1,7 +1,7 @@
 #![cfg_attr(not(feature = "interop-relaxed"), allow(unused_imports, dead_code))]
 #![cfg_attr(not(feature = "interop-relaxed"), allow(unused_imports))]
-use asx::core::{InteropMode, SessionContext};
-use asx::interop::{
+use asx_rs::core::{InteropMode, SessionContext};
+use asx_rs::interop::{
     BaseProfile, CanonicalizationPolicy, DiffRiskLevel, ProfileExtension, ProfilePolicyOverrides,
     ProfileStack, SecurityPolicy, ValidationPolicy, diff_effective_policy_snapshots,
 };

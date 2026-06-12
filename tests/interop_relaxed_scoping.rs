@@ -3,17 +3,19 @@
 #[path = "common/as2_verifier_fixture.rs"]
 mod common;
 
-use asx::as2::receive_with_mdn_with_reliability;
-use asx::as2::{As2MdnMode, As2ReceiveMdnRequest, As2ReceivePolicy, As2RegulatedSpoolKeyProvider};
-use asx::as4::{
+use asx_rs::as2::receive_with_mdn_with_reliability;
+use asx_rs::as2::{
+    As2MdnMode, As2ReceiveMdnRequest, As2ReceivePolicy, As2RegulatedSpoolKeyProvider,
+};
+use asx_rs::as4::{
     As4PushPolicyBuilder, As4ReceivePushRequest, As4ReceivePushSyncRequest,
     receive_push_with_dedup_sync,
 };
-use asx::core::{ErrorCode, InteropMode, SessionContext};
-use asx::interop::{InteropExceptionCode, InteropExceptionPolicy};
-use asx::lifecycle::TrustEvidence;
-use asx::observability::{AsxEvent, EventBus};
-use asx::reliability::{InMemoryDedupBackend, InMemoryReconciliationHook};
+use asx_rs::core::{ErrorCode, InteropMode, SessionContext};
+use asx_rs::interop::{InteropExceptionCode, InteropExceptionPolicy};
+use asx_rs::lifecycle::TrustEvidence;
+use asx_rs::observability::{AsxEvent, EventBus};
+use asx_rs::reliability::{InMemoryDedupBackend, InMemoryReconciliationHook};
 use common::{DeterministicTrustVerifier as InsecureBypassTrustVerifier, fixture};
 use tokio::time::{Duration, timeout};
 

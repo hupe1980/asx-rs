@@ -1,17 +1,17 @@
 #![cfg(all(feature = "as4", feature = "testing"))]
-use asx::as4::{enqueue_pull_with_reliability, receive_pull_with_reliability};
+use asx_rs::as4::{enqueue_pull_with_reliability, receive_pull_with_reliability};
 
-use asx::as4::{
+use asx_rs::as4::{
     As4EnqueuePullWithReliabilityRequest, As4PullEnqueueOutcome, As4PullPolicy,
     As4PullPolicyBuilder, As4PullStore, As4QueuedPullMessage, As4ReceivePullRequest,
     As4ReceivePullWithReliabilityRequest,
 };
-use asx::core::SessionContext;
-use asx::observability::EventBus;
-use asx::reliability::{
+use asx_rs::core::SessionContext;
+use asx_rs::observability::EventBus;
+use asx_rs::reliability::{
     DeliveryOutcome, InMemoryDedupBackend, InMemoryReconciliationHook, ReconciliationReason,
 };
-use asx::storage::{DedupStorage, ReconciliationStorage as _};
+use asx_rs::storage::{DedupStorage, ReconciliationStorage as _};
 use std::sync::Arc;
 use tokio::sync::Barrier;
 use tokio::time::{Duration, timeout};
@@ -442,13 +442,13 @@ async fn as4_pull_dedup_is_correct_under_parallel_duplicate_requests() {
     let mut duplicate_seen = false;
     for _ in 0..8 {
         if let Ok(Some(evt)) = timeout(Duration::from_millis(200), rx.recv()).await
-            && let asx::observability::AsxEvent::DuplicateDetected {
+            && let asx_rs::observability::AsxEvent::DuplicateDetected {
                 message_id,
                 ingress,
                 ..
             } = evt.as_ref()
             && message_id.as_ref() == "pull-parallel-dup"
-            && *ingress == asx::observability::AsxIngressStage::As4ReceivePull
+            && *ingress == asx_rs::observability::AsxIngressStage::As4ReceivePull
         {
             duplicate_seen = true;
             break;

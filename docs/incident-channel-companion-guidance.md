@@ -16,8 +16,8 @@ Core does not require any paging/webhook vendor SDK and should not gain vendor-s
 Create a separate crate (example name: `asx-incident-paging`) that depends on `asx` and the vendor SDK.
 
 ```rust
-use asx::core::Result;
-use asx::observability::{
+use asx_rs::core::Result;
+use asx_rs::observability::{
     As2ProviderHealthAlertIncident,
     As2ProviderHealthIncidentChannel,
     As4ReceiptTaxonomyAlertIncident,

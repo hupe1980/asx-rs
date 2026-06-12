@@ -1,7 +1,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use asx::core::{ReceivedBodyHandle, SpoolEncryption, SpoolLifecyclePolicy};
-use asx::wire::{StreamBodyPolicy, StreamLimits, read_bounded_stream_into_handle_async};
+use asx_rs::core::{ReceivedBodyHandle, SpoolEncryption, SpoolLifecyclePolicy};
+use asx_rs::wire::{StreamBodyPolicy, StreamLimits, read_bounded_stream_into_handle_async};
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
 
 static DIR_SEQUENCE: AtomicU64 = AtomicU64::new(0);

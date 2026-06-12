@@ -125,7 +125,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "asx"
+name = "asx-rs"
 version = "0.1.0"
 dependencies = [
  "aes-gcm",
@@ -2937,7 +2937,7 @@ dependencies = [
 name = "xtask"
 version = "0.1.0"
 dependencies = [
- "asx",
+ "asx-rs",
  "base64",
  "memchr",
  "openssl",

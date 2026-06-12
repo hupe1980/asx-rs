@@ -1,16 +1,16 @@
-use asx::core::SessionContext;
+use asx_rs::core::SessionContext;
 #[cfg(feature = "as4")]
-use asx::core::{CertHandle, OcspMode};
+use asx_rs::core::{CertHandle, OcspMode};
 #[cfg(feature = "as4")]
-use asx::crypto::wssec::{WsSecOutboundKeyInfoProfile, generate_xmlsig_signature};
-use asx::reliability::InMemoryDedupBackend;
+use asx_rs::crypto::wssec::{WsSecOutboundKeyInfoProfile, generate_xmlsig_signature};
+use asx_rs::reliability::InMemoryDedupBackend;
 #[cfg(feature = "as4")]
 use sha2::{Digest, Sha256};
 
 #[inline]
 #[cfg(feature = "as4")]
-pub fn as4_strict_push_policy() -> asx::as4::As4PushPolicy {
-    asx::as4::As4PushPolicyBuilder::new()
+pub fn as4_strict_push_policy() -> asx_rs::as4::As4PushPolicy {
+    asx_rs::as4::As4PushPolicyBuilder::new()
         .fail_closed_audit_events(false)
         .build()
         .expect("as4_strict_push_policy")
@@ -18,8 +18,8 @@ pub fn as4_strict_push_policy() -> asx::as4::As4PushPolicy {
 
 #[inline]
 #[cfg(feature = "as4")]
-pub fn as4_unsigned_push_policy() -> asx::as4::As4PushPolicy {
-    asx::as4::As4PushPolicyBuilder::new()
+pub fn as4_unsigned_push_policy() -> asx_rs::as4::As4PushPolicy {
+    asx_rs::as4::As4PushPolicyBuilder::new()
         .allow_unsigned_push(true)
         .fail_closed_audit_events(false)
         .build()

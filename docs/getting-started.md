@@ -7,22 +7,22 @@ Add `asx` to `Cargo.toml`. Because AS2 and AS4 are feature-gated, you must selec
 ```toml
 [dependencies]
 # AS2 only
-asx = { version = "0.1", features = ["as2", "async-ocsp"] }
+asx-rs = { version = "0.1", features = ["as2", "async-ocsp"] }
 
 # AS4 only
-asx = { version = "0.1", features = ["as4", "async-ocsp"] }
+asx-rs = { version = "0.1", features = ["as4", "async-ocsp"] }
 
 # Both protocols
-asx = { version = "0.1", features = ["as2", "as4", "async-ocsp"] }
+asx-rs = { version = "0.1", features = ["as2", "as4", "async-ocsp"] }
 
 # Both protocols with payload compression (RFC 5402)
-asx = { version = "0.1", features = ["as2", "as4", "compression", "async-ocsp"] }
+asx-rs = { version = "0.1", features = ["as2", "as4", "compression", "async-ocsp"] }
 
 # HTTP client (outbound) + server (inbound) with both protocols
-asx = { version = "0.1", features = ["as2", "as4", "client", "server", "async-ocsp"] }
+asx-rs = { version = "0.1", features = ["as2", "as4", "client", "server", "async-ocsp"] }
 
 # Relaxed interop for explicitly scoped partner exceptions
-asx = { version = "0.1", features = ["as2", "as4", "interop-relaxed", "async-ocsp"] }
+asx-rs = { version = "0.1", features = ["as2", "as4", "interop-relaxed", "async-ocsp"] }
 ```
 
 > **Note:** The default feature set is `["interop-strict", "async-ocsp"]`. Adding `asx` without explicit features gives you only the shared infrastructure — no AS2 or AS4 protocol functions are compiled.
@@ -59,22 +59,22 @@ In regulated deployments, validate runtime wiring before accepting traffic:
 ```rust
 use std::sync::Arc;
 
-use asx::presets::{
+use asx_rs::presets::{
     DeploymentTopology,
     StrictRuntimeBootstrapToken,
     issue_strict_runtime_bootstrap_token_with_as4_topology,
     strict_production_event_bus,
 };
-use asx::storage::{DedupStorage, ReconciliationStorage};
-use asx::as4::{As4ConversationOrderGate, As4PullStore};
+use asx_rs::storage::{DedupStorage, ReconciliationStorage};
+use asx_rs::as4::{As4ConversationOrderGate, As4PullStore};
 
 fn bootstrap_strict_runtime(
     reconciliation: Arc<dyn ReconciliationStorage>,
     dedup: Arc<dyn DedupStorage>,
-    audit_sink: Arc<dyn asx::observability::audit_sink::DurableAuditSink>,
+    audit_sink: Arc<dyn asx_rs::observability::audit_sink::DurableAuditSink>,
     pull_store: &As4PullStore,
     conversation_gate: &As4ConversationOrderGate,
-) -> asx::Result<asx::observability::EventBus> {
+) -> asx_rs::Result<asx_rs::observability::EventBus> {
     let bus = strict_production_event_bus(1024, audit_sink)?;
 
     let _token: StrictRuntimeBootstrapToken = issue_strict_runtime_bootstrap_token_with_as4_topology(
@@ -91,18 +91,18 @@ fn bootstrap_strict_runtime(
 }
 ```
 
-This fails closed when any strict-production invariant is missing (non-transactional event mode, missing durable audit sink, non-durable or non-cluster-safe reliability backends, or clustered AS4 startup with process-local pull/order coordination). In non-testing builds, strict interop entry points also fail closed unless startup validation is bound to the session with `asx::presets::session_with_strict_runtime_bootstrap_token`.
+This fails closed when any strict-production invariant is missing (non-transactional event mode, missing durable audit sink, non-durable or non-cluster-safe reliability backends, or clustered AS4 startup with process-local pull/order coordination). In non-testing builds, strict interop entry points also fail closed unless startup validation is bound to the session with `asx_rs::presets::session_with_strict_runtime_bootstrap_token`.
 
 Migration note: bind strict-runtime once per session with `session_with_strict_runtime_bootstrap_token(...)`, then call standard AS2/AS4 ingress helper methods.
 
 ## Quick Start: AS2 Send
 
 ```rust
-use asx::as2::{send_sync, As2SendCredentials, As2SendPolicy, As2SendRequest};
-use asx::core::SessionContext;
-use asx::observability::{BackpressurePolicy, EventBus, EventEmissionMode};
+use asx_rs::as2::{send_sync, As2SendCredentials, As2SendPolicy, As2SendRequest};
+use asx_rs::core::SessionContext;
+use asx_rs::observability::{BackpressurePolicy, EventBus, EventEmissionMode};
 
-fn main() -> asx::Result<()> {
+fn main() -> asx_rs::Result<()> {
     let session = SessionContext::new("sess-as2-1", "partner-acme", "strict")?;
     let bus = EventBus::new_with_config_and_mode(
         64,
@@ -139,11 +139,11 @@ fn main() -> asx::Result<()> {
 ## Quick Start: AS4 Send
 
 ```rust
-use asx::as4::{send_sync, As4SendPolicyBuilder, As4SendRequest};
-use asx::core::SessionContext;
-use asx::observability::{BackpressurePolicy, EventBus, EventEmissionMode};
+use asx_rs::as4::{send_sync, As4SendPolicyBuilder, As4SendRequest};
+use asx_rs::core::SessionContext;
+use asx_rs::observability::{BackpressurePolicy, EventBus, EventEmissionMode};
 
-fn main() -> asx::Result<()> {
+fn main() -> asx_rs::Result<()> {
     let session = SessionContext::new("sess-as4-1", "partner-b", "strict")?;
     let bus = EventBus::new_with_config_and_mode(
         64,
@@ -176,12 +176,12 @@ fn main() -> asx::Result<()> {
 ## Quick Start: AS2 Receive (Framework-Agnostic)
 
 ```rust
-use asx::as2::{receive_sync, CmsSmimeTrustVerifier};
-use asx::transport::ingress::{As2HttpIngress, as2_ingress_from_http};
-use asx::http::HttpRequest;
-use asx::core::SessionContext;
+use asx_rs::as2::{receive_sync, CmsSmimeTrustVerifier};
+use asx_rs::transport::ingress::{As2HttpIngress, as2_ingress_from_http};
+use asx_rs::http::HttpRequest;
+use asx_rs::core::SessionContext;
 
-fn main() -> asx::Result<()> {
+fn main() -> asx_rs::Result<()> {
     // Build a framework-agnostic HttpRequest (e.g., from your web framework)
     let http_req = HttpRequest { /* ... */ };
     let ingress = as2_ingress_from_http(http_req)?; // validates required headers
@@ -201,8 +201,8 @@ fn main() -> asx::Result<()> {
 Enable the `server` and `as2` features, then:
 
 ```rust
-use asx::transport::server::{as2_router, As2AxumHandler, HandlerOutcome};
-use asx::transport::ingress::As2HttpIngress;
+use asx_rs::transport::server::{as2_router, As2AxumHandler, HandlerOutcome};
+use asx_rs::transport::ingress::As2HttpIngress;
 use std::sync::Arc;
 
 struct MyAs2Handler;
@@ -230,17 +230,17 @@ This example shows the complete AS2 cycle: build a message, send it over HTTP,
 receive the synchronous MDN from the partner, and verify the MIC.
 
 ```rust
-use asx::as2::{
+use asx_rs::as2::{
     send_sync, receive_with_mdn_with_reliability,
     As2SendCredentials, As2SendPolicy, As2SendRequest,
     As2ReceiveMdnRequest, As2MdnMode, As2ReceivePolicy, CmsSmimeTrustVerifier,
 };
-use asx::core::SessionContext;
-use asx::observability::{BackpressurePolicy, EventBus, EventEmissionMode};
-use asx::storage::{InMemoryDedupStorage, InMemoryReconciliationStorage};
+use asx_rs::core::SessionContext;
+use asx_rs::observability::{BackpressurePolicy, EventBus, EventEmissionMode};
+use asx_rs::storage::{InMemoryDedupStorage, InMemoryReconciliationStorage};
 use std::sync::Arc;
 
-fn end_to_end_as2() -> asx::Result<()> {
+fn end_to_end_as2() -> asx_rs::Result<()> {
     // 1. Build a reusable session (one per trading-partner relationship).
     let session = SessionContext::new("sess-acme-prod", "partner-acme", "strict")?;
     let bus = EventBus::new_with_config_and_mode(
@@ -316,11 +316,11 @@ fn end_to_end_as2() -> asx::Result<()> {
 ## Quick Start: AS4 Receive (Push)
 
 ```rust
-use asx::as4::As4PushPolicy;
-use asx::transport::ingress::{As4HttpIngress, As4IngressReceivePushSyncRequest};
-use asx::core::SessionContext;
-use asx::observability::EventBus;
-use asx::storage::DedupStorage;
+use asx_rs::as4::As4PushPolicy;
+use asx_rs::transport::ingress::{As4HttpIngress, As4IngressReceivePushSyncRequest};
+use asx_rs::core::SessionContext;
+use asx_rs::observability::EventBus;
+use asx_rs::storage::DedupStorage;
 use std::sync::Arc;
 
 fn receive_as4_push(
@@ -328,7 +328,7 @@ fn receive_as4_push(
     dedup: Arc<dyn DedupStorage>,      // persistent dedup store (prevents replay)
     session: &SessionContext,
     bus: &EventBus,
-) -> asx::Result<()> {
+) -> asx_rs::Result<()> {
     let received = ingress.receive_push_with_dedup_sync(As4IngressReceivePushSyncRequest {
         session,
         event_bus: bus,

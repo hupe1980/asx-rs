@@ -2,7 +2,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use asx::as2::{As2RegulatedSpoolKeyProvider, compute_http_spool_key_auth_telemetry_labels};
+use asx_rs::as2::{As2RegulatedSpoolKeyProvider, compute_http_spool_key_auth_telemetry_labels};
 use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
 
 fn write_file(path: &PathBuf, bytes: &[u8]) {

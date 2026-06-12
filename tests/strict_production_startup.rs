@@ -3,16 +3,16 @@
 use std::sync::Arc;
 
 #[cfg(feature = "as4")]
-use asx::as4::{As4ConversationOrderGate, As4PullStore};
-use asx::core::{ErrorCode, Result};
-use asx::observability::audit_sink::{
+use asx_rs::as4::{As4ConversationOrderGate, As4PullStore};
+use asx_rs::core::{ErrorCode, Result};
+use asx_rs::observability::audit_sink::{
     AuditEvent, AuditSinkDurability, DurableAuditSink, ReplayCursor,
 };
-use asx::observability::{BackpressurePolicy, EventBus, EventEmissionMode};
+use asx_rs::observability::{BackpressurePolicy, EventBus, EventEmissionMode};
 #[cfg(feature = "as4")]
-use asx::presets::{DeploymentTopology, validate_strict_production_as4_topology_readiness};
-use asx::presets::{strict_production_event_bus, validate_strict_production_startup_readiness};
-use asx::storage::{DedupStorage, ReconciliationStorage};
+use asx_rs::presets::{DeploymentTopology, validate_strict_production_as4_topology_readiness};
+use asx_rs::presets::{strict_production_event_bus, validate_strict_production_startup_readiness};
+use asx_rs::storage::{DedupStorage, ReconciliationStorage};
 
 struct DurableTestAuditSink;
 
@@ -66,11 +66,11 @@ impl ReconciliationStorage for DurableClusterSafeReconciliation {
         true
     }
 
-    fn enqueue(&self, _request: asx::reliability::ReconciliationRequest) -> Result<bool> {
+    fn enqueue(&self, _request: asx_rs::reliability::ReconciliationRequest) -> Result<bool> {
         Ok(false)
     }
 
-    fn queued_requests(&self) -> Result<Vec<asx::reliability::ReconciliationRequest>> {
+    fn queued_requests(&self) -> Result<Vec<asx_rs::reliability::ReconciliationRequest>> {
         Ok(Vec::new())
     }
 
@@ -102,11 +102,11 @@ impl ReconciliationStorage for NonDurableReconciliation {
         false
     }
 
-    fn enqueue(&self, _request: asx::reliability::ReconciliationRequest) -> Result<bool> {
+    fn enqueue(&self, _request: asx_rs::reliability::ReconciliationRequest) -> Result<bool> {
         Ok(false)
     }
 
-    fn queued_requests(&self) -> Result<Vec<asx::reliability::ReconciliationRequest>> {
+    fn queued_requests(&self) -> Result<Vec<asx_rs::reliability::ReconciliationRequest>> {
         Ok(Vec::new())
     }
 

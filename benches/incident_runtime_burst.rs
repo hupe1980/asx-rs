@@ -7,11 +7,11 @@ use std::sync::{
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use asx::core::ErrorCode;
-use asx::incident_channels::{
+use asx_rs::core::ErrorCode;
+use asx_rs::incident_channels::{
     As2ProviderHealthWebhookIncidentChannel, IncidentDeliveryConfig, IncidentQueueOverflowPolicy,
 };
-use asx::observability::{
+use asx_rs::observability::{
     As2ProviderHealthAlertCategory, As2ProviderHealthAlertIncident, As2ProviderHealthAlertSeverity,
     As2ProviderHealthIncidentChannel,
 };

@@ -1,7 +1,7 @@
 #![cfg_attr(not(feature = "interop-relaxed"), allow(unused_imports, dead_code))]
 #![cfg_attr(not(feature = "interop-relaxed"), allow(unused_imports))]
-use asx::core::{InteropMode, SessionContext};
-use asx::interop::{
+use asx_rs::core::{InteropMode, SessionContext};
+use asx_rs::interop::{
     BaseProfile, CanonicalizationPolicy, PartnerProfileOverlay, ProfileExtension, ProfileOverride,
     ProfilePolicyOverrides, ProfileStack, SecurityPolicy, ValidationPolicy,
 };
@@ -108,7 +108,8 @@ fn resolve_for_session_attaches_snapshot_metadata() {
         .session
         .effective_policy_snapshot_json()
         .expect("snapshot metadata attached");
-    let decoded = asx::interop::EffectivePolicySnapshot::from_json(snapshot_json).expect("decode");
+    let decoded =
+        asx_rs::interop::EffectivePolicySnapshot::from_json(snapshot_json).expect("decode");
 
     assert_eq!(decoded, resolved.effective_profile.snapshot);
     assert_eq!(decoded.partner_id, "partner-acme");

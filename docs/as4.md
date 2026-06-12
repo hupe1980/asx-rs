@@ -4,7 +4,7 @@ Requires feature flag: `as4`
 
 ## Overview
 
-AS4 (ebMS3 + eDelivery) support in `asx` is exposed through free functions in `asx::as4`.
+AS4 (ebMS3 + eDelivery) support in `asx` is exposed through free functions in `asx_rs::as4`.
 
 Primary flows:
 
@@ -106,16 +106,16 @@ For regulated deployments that require explicit startup proof, bind validated
 session context once and then use standard AS4 entry points:
 
 ```rust
-let strict_session = asx::presets::session_with_strict_runtime_bootstrap_token(
+let strict_session = asx_rs::presets::session_with_strict_runtime_bootstrap_token(
     "as4_receive_push_sync",
     &bootstrap_token,
     &session,
 )?;
 
-let out = asx::as4::receive_push_with_dedup_sync(
+let out = asx_rs::as4::receive_push_with_dedup_sync(
     &strict_session,
     &event_bus,
-    asx::as4::As4ReceivePushSyncRequest {
+    asx_rs::as4::As4ReceivePushSyncRequest {
         request,
         dedup_backend,
     },
@@ -124,7 +124,7 @@ let out = asx::as4::receive_push_with_dedup_sync(
 
 In non-testing builds, strict interop AS4 entry points fail closed unless the
 session is startup-validated with
-`asx::presets::session_with_strict_runtime_bootstrap_token(...)`.
+`asx_rs::presets::session_with_strict_runtime_bootstrap_token(...)`.
 
 ### Strict production clustered topology gate
 
@@ -133,7 +133,7 @@ Before accepting traffic in clustered deployments, fail closed unless you have
 distributed replacements:
 
 ```rust
-use asx::presets::{
+use asx_rs::presets::{
     DeploymentTopology,
     validate_strict_production_as4_topology_readiness,
 };
@@ -163,7 +163,7 @@ policy.
 ### Signal generation
 
 `generate_receipt`, `generate_receipt_with_nri`, `generate_error_signal`, and
-`generate_pull_request` are available in `asx::as4`.
+`generate_pull_request` are available in `asx_rs::as4`.
 
 ## Core Types
 
@@ -190,7 +190,7 @@ policy.
 
 ## Test Service and P-Mode
 
-`asx::as4::test_service` and `asx::as4::pmode` provide profile/test-service helpers for standards-aligned partner agreements and conformance workflows.
+`asx_rs::as4::test_service` and `asx_rs::as4::pmode` provide profile/test-service helpers for standards-aligned partner agreements and conformance workflows.
 
 ## SMP Integration: Dynamic Partner Discovery (PEPPOL / CEF)
 
@@ -203,17 +203,17 @@ certificate from the SMP.
 Enable the `smp` module with the `client` feature:
 
 ```toml
-asx = { version = "0.1", features = ["as4", "client", "async-ocsp"] }
+asx-rs = { version = "0.1", features = ["as4", "client", "async-ocsp"] }
 ```
 
 ### Lookup and Register a Runtime P-Mode
 
 ```rust
-use asx::smp::{SmpClient, SmpLookupRequest};
-use asx::as4::pmode::{PMode, PModeRegistry, MepType, PModeSecurity};
+use asx_rs::smp::{SmpClient, SmpLookupRequest};
+use asx_rs::as4::pmode::{PMode, PModeRegistry, MepType, PModeSecurity};
 use std::sync::Arc;
 
-async fn build_registry_from_smp() -> asx::Result<Arc<PModeRegistry>> {
+async fn build_registry_from_smp() -> asx_rs::Result<Arc<PModeRegistry>> {
     // 1. Look up the recipient endpoint via PEPPOL SMP.
     let client = SmpClient::new("acc.edelivery.tech.ec.europa.eu");
     let endpoint = client.lookup_endpoint(SmpLookupRequest::peppol(
@@ -228,10 +228,10 @@ async fn build_registry_from_smp() -> asx::Result<Arc<PModeRegistry>> {
         // Convert DER → PEM (pseudocode; use openssl::x509::X509::from_der in production).
         format!("-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----\n", cert_b64)
     } else {
-        return Err(asx::AsxError::new(
-            asx::ErrorCode::InvalidInput,
+        return Err(asx_rs::AsxError::new(
+            asx_rs::ErrorCode::InvalidInput,
             "SMP endpoint has no certificate",
-            asx::ErrorContext::new("smp_lookup"),
+            asx_rs::ErrorContext::new("smp_lookup"),
         ));
     };
 

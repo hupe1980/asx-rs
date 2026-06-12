@@ -3,18 +3,18 @@
 
 #![cfg(all(feature = "as2", feature = "as4", feature = "testing"))]
 
-use asx::as4::{
+use asx_rs::as4::{
     As4PushPolicyBuilder, As4ReceivePushRequest, As4ReceivePushSyncRequest, generate_receipt,
     receive_push_with_dedup_sync,
 };
 
-use asx::as2::{
+use asx_rs::as2::{
     As2MdnMode, As2MicAlgorithm, As2SendCredentials, As2SendPolicy, As2SendRequest, SmimeCipher,
     generate_mdn, send_sync as as2_send,
 };
-use asx::core::{InteropMode, SessionContext};
-use asx::observability::EventBus;
-use asx::reliability::InMemoryDedupBackend;
+use asx_rs::core::{InteropMode, SessionContext};
+use asx_rs::observability::EventBus;
+use asx_rs::reliability::InMemoryDedupBackend;
 use proptest::prelude::*;
 
 // Strategy for valid AS2 message IDs (RFC 2822-like, but simplified for testing)
@@ -111,7 +111,7 @@ proptest! {
         let session = SessionContext::new("p-test", "partner", "strict")
             .expect("valid session");
 
-        let result: asx::core::Result<Vec<u8>> =
+        let result: asx_rs::core::Result<Vec<u8>> =
             generate_receipt(&session, "receipt-id", &message_id);
 
         prop_assert!(
@@ -142,7 +142,7 @@ proptest! {
         session_id in r"[a-zA-Z0-9._-]{1,32}",
         partner_id in r"[a-zA-Z0-9._-]{1,32}",
     ) {
-        use asx::core::ErrorContext;
+        use asx_rs::core::ErrorContext;
 
         let ctx1 = ErrorContext::new("test")
             .with_session_and_partner(&session_id, &partner_id);

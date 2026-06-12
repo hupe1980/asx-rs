@@ -3,16 +3,16 @@
 #[path = "common/as2_verifier.rs"]
 mod common;
 
-use asx::as2::{
+use asx_rs::as2::{
     As2MdnMode, As2ReceiveMdnRequest, As2ReceivePolicy, receive_sync as as2_receive,
     receive_with_mdn_with_reliability,
 };
-use asx::as4::{
+use asx_rs::as4::{
     As4PushPolicy, As4ReceivePushRequest, As4ReceivePushSyncRequest, receive_push_with_dedup_sync,
 };
-use asx::core::SessionContext;
-use asx::lifecycle::TrustEvidence;
-use asx::observability::EventBus;
+use asx_rs::core::SessionContext;
+use asx_rs::lifecycle::TrustEvidence;
+use asx_rs::observability::EventBus;
 use common::DeterministicTrustVerifier as InsecureBypassTrustVerifier;
 
 fn session() -> SessionContext {
@@ -47,8 +47,8 @@ fn fuzz_smoke_as2_receive_paths_do_not_panic() {
     for i in 0..256usize {
         let payload = pseudo_random_bytes(0xA5A5_0000_u64 + i as u64, i % 1024);
         let mdn = pseudo_random_bytes(0xC3C3_1000_u64 + i as u64, (i * 3) % 2048);
-        let hook = asx::reliability::InMemoryReconciliationHook::default();
-        let dedup = asx::reliability::InMemoryDedupBackend::default();
+        let hook = asx_rs::reliability::InMemoryReconciliationHook::default();
+        let dedup = asx_rs::reliability::InMemoryDedupBackend::default();
         let verifier =
             InsecureBypassTrustVerifier::new(trust_from_verdicts(i % 2 == 0, i % 3 != 0));
         let _ = as2_receive(&s, payload.clone(), &verifier);
@@ -78,7 +78,7 @@ fn fuzz_smoke_as4_receive_paths_do_not_panic() {
     for i in 0..256usize {
         let payload = pseudo_random_bytes(0xDEAD_2000_u64 + i as u64, i % 2048);
         let receipt = pseudo_random_bytes(0xBEEF_3000_u64 + i as u64, i % 1024);
-        let dedup = asx::reliability::InMemoryDedupBackend::default();
+        let dedup = asx_rs::reliability::InMemoryDedupBackend::default();
 
         let _ = receive_push_with_dedup_sync(
             &s,

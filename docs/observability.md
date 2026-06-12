@@ -9,7 +9,7 @@ The `observability` module provides structured audit event emission, per-session
 `EventBus` is the central fan-out hub for all protocol audit events. Core `as2` and `as4` operations take an `&EventBus` and emit typed `AuditEvent` records as processing proceeds.
 
 ```rust
-use asx::observability::{BackpressurePolicy, EventBus, EventEmissionMode};
+use asx_rs::observability::{BackpressurePolicy, EventBus, EventEmissionMode};
 
 // Strict transactional-by-default bus with 64-event channel depth:
 let bus = EventBus::new(64)?;
@@ -34,7 +34,7 @@ In strict default mode, emits are transactional with respect to strict precondit
 Configure backpressure limits with `EventBus::new_with_config_and_mode`:
 
 ```rust
-use asx::observability::{
+use asx_rs::observability::{
     BackpressureAction, BackpressurePolicy, EventBus, EventEmissionMode,
 };
 
@@ -66,7 +66,7 @@ Dropped and lagged counters reset automatically after `window_secs` seconds. Thi
 For incident webhook/paging channels, use the built-in sizing advisor to derive deterministic queue/timeout/backpressure settings from measured workload signals:
 
 ```rust
-use asx::{
+use asx_rs::{
     IncidentDeliverySizingInput, recommend_incident_delivery_config,
 };
 
@@ -93,41 +93,41 @@ Sizing semantics:
 `EventBus::new_with_config_and_mode` can attach a durable sink that persists every event before fan-out:
 
 ```rust
-use asx::observability::{
+use asx_rs::observability::{
     BackpressurePolicy, DurableAuditSink, EventBus, EventEmissionMode,
 };
-use asx::Result;
+use asx_rs::Result;
 use std::sync::Arc;
 
 struct PostgresAuditSink { /* pool */ }
 
 impl DurableAuditSink for PostgresAuditSink {
-    fn store_event(&self, event: &asx::observability::AuditEvent) -> Result<()> {
+    fn store_event(&self, event: &asx_rs::observability::AuditEvent) -> Result<()> {
         // INSERT INTO audit_events ...
         todo!()
     }
 
     fn retrieve_events_from(
         &self,
-        cursor: &asx::observability::ReplayCursor,
+        cursor: &asx_rs::observability::ReplayCursor,
         limit: usize,
-    ) -> Result<Vec<asx::observability::AuditEvent>> {
+    ) -> Result<Vec<asx_rs::observability::AuditEvent>> {
         // SELECT ... WHERE sequence > cursor.position LIMIT ?
         let _ = (cursor, limit);
         todo!()
     }
 
-    fn acknowledge_cursor(&self, cursor: &asx::observability::ReplayCursor) -> Result<()> {
+    fn acknowledge_cursor(&self, cursor: &asx_rs::observability::ReplayCursor) -> Result<()> {
         let _ = cursor;
         Ok(())
     }
 
-    fn current_cursor(&self) -> Result<asx::observability::ReplayCursor> {
+    fn current_cursor(&self) -> Result<asx_rs::observability::ReplayCursor> {
         todo!()
     }
 
-    fn durability(&self) -> asx::observability::AuditSinkDurability {
-        asx::observability::AuditSinkDurability::Durable
+    fn durability(&self) -> asx_rs::observability::AuditSinkDurability {
+        asx_rs::observability::AuditSinkDurability::Durable
     }
 }
 
@@ -241,7 +241,7 @@ These are `AtomicU64` values — safe to read from any thread without acquiring 
 Use the built-in evaluator to convert receipt taxonomy counters into SLO-friendly alerts:
 
 ```rust
-use asx::observability::As4ReceiptTaxonomyAlertPolicy;
+use asx_rs::observability::As4ReceiptTaxonomyAlertPolicy;
 
 let metrics = bus.metrics();
 let alerts = metrics.evaluate_as4_receipt_taxonomy_alerts(
@@ -274,8 +274,8 @@ Operational runbook mapping:
 Convert threshold breaches into exported events and metrics on a periodic loop:
 
 ```rust
-use asx::core::SessionContext;
-use asx::observability::As4ReceiptTaxonomyAlertPolicy;
+use asx_rs::core::SessionContext;
+use asx_rs::observability::As4ReceiptTaxonomyAlertPolicy;
 
 let sess = SessionContext::new("ops-taxonomy", "ops", "strict")?;
 let policy = As4ReceiptTaxonomyAlertPolicy::default();
@@ -301,11 +301,11 @@ Export side effects:
 Use the forwarding API to send threshold breaches to incident channels with stable dedup keys:
 
 ```rust
-use asx::observability::{
+use asx_rs::observability::{
     As4ReceiptTaxonomyAlertDispatchPolicy, As4ReceiptTaxonomyAlertIncident,
     As4ReceiptTaxonomyAlertPolicy, As4ReceiptTaxonomyIncidentChannel,
 };
-use asx::core::Result;
+use asx_rs::core::Result;
 
 #[derive(Debug)]
 struct IncidentBackendChannel;

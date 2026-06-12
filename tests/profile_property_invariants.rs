@@ -1,8 +1,8 @@
 #![cfg_attr(not(feature = "interop-relaxed"), allow(unused_imports, dead_code))]
 #![cfg(all(feature = "as2", feature = "as4"))]
 
-use asx::core::{InteropMode, SessionContext};
-use asx::interop::{
+use asx_rs::core::{InteropMode, SessionContext};
+use asx_rs::interop::{
     BaseProfile, CanonicalizationPolicy, PartnerProfileOverlay, ProfileExtension,
     ProfilePolicyOverrides, ProfileStack, ProfileValidationCode, SecurityPolicy, ValidationPolicy,
 };
@@ -43,7 +43,7 @@ proptest! {
             },
         }).collect();
 
-        let overrides = override_modes.iter().enumerate().map(|(idx, mode)| asx::interop::ProfileOverride {
+        let overrides = override_modes.iter().enumerate().map(|(idx, mode)| asx_rs::interop::ProfileOverride {
             name: format!("ov-{idx}"),
             overrides: ProfilePolicyOverrides {
                 mode: *mode,
@@ -92,7 +92,7 @@ proptest! {
                     ..ProfilePolicyOverrides::default()
                 },
             }],
-            overrides: vec![asx::interop::ProfileOverride {
+            overrides: vec![asx_rs::interop::ProfileOverride {
                 name: "global".to_string(),
                 overrides: ProfilePolicyOverrides {
                     mode: Some(global_mode),

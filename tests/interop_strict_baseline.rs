@@ -2,16 +2,16 @@
 #[path = "common/as2_verifier_fixture.rs"]
 mod common;
 
-use asx::as2::receive_with_mdn_with_reliability;
+use asx_rs::as2::receive_with_mdn_with_reliability;
 
-use asx::as2::{As2MdnMode, As2ReceiveMdnRequest, As2ReceivePolicy};
-use asx::as4::{
+use asx_rs::as2::{As2MdnMode, As2ReceiveMdnRequest, As2ReceivePolicy};
+use asx_rs::as4::{
     As4PushPolicy, As4PushPolicyBuilder, As4ReceivePushRequest, As4ReceivePushSyncRequest,
     receive_push_with_dedup_sync,
 };
-use asx::core::{ErrorCode, InteropMode, SessionContext};
-use asx::lifecycle::TrustEvidence;
-use asx::observability::EventBus;
+use asx_rs::core::{ErrorCode, InteropMode, SessionContext};
+use asx_rs::lifecycle::TrustEvidence;
+use asx_rs::observability::EventBus;
 use common::{DeterministicTrustVerifier as InsecureBypassTrustVerifier, fixture};
 
 fn session(profile: &str) -> SessionContext {
@@ -30,8 +30,8 @@ fn defaults_are_strict_for_as2_and_as4_policies() {
 #[test]
 fn as2_strict_mode_rejects_malformed_boundary_with_stage_context() {
     let mdn = fixture("as2_mdn_malformed_boundary.golden");
-    let hook = asx::reliability::InMemoryReconciliationHook::default();
-    let dedup = asx::reliability::InMemoryDedupBackend::default();
+    let hook = asx_rs::reliability::InMemoryReconciliationHook::default();
+    let dedup = asx_rs::reliability::InMemoryDedupBackend::default();
     let verifier = InsecureBypassTrustVerifier::new(TrustEvidence::verified_and_decryptable());
 
     let err = receive_with_mdn_with_reliability(
@@ -72,7 +72,7 @@ fn as4_strict_mode_rejects_missing_security_header_with_stage_context() {
     </S12:Header>
     <S12:Body/>
     </S12:Envelope>"#;
-    let dedup = asx::reliability::InMemoryDedupBackend::default();
+    let dedup = asx_rs::reliability::InMemoryDedupBackend::default();
 
     let err = receive_push_with_dedup_sync(
         &session("strict"),

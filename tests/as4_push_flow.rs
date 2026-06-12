@@ -25,10 +25,10 @@ use crate::common::{
     as4_strict_push_policy, as4_unsigned_push_policy, dedup_backend, fixture, pki_fixture, session,
     session_with_trust_anchor_and_fingerprint_pin, signed_receipt_fixture,
 };
-use asx::as4::{As4ReceivePushRequest, As4ReceivePushSyncRequest, receive_push_with_dedup_sync};
-use asx::core::{CertHandle, ErrorCode, OcspMode, SessionContext};
-use asx::observability::{AsxEvent, EventBus, ScopedEventTryRecvError};
-use asx::reliability::InMemoryDedupBackend;
+use asx_rs::as4::{As4ReceivePushRequest, As4ReceivePushSyncRequest, receive_push_with_dedup_sync};
+use asx_rs::core::{CertHandle, ErrorCode, OcspMode, SessionContext};
+use asx_rs::observability::{AsxEvent, EventBus, ScopedEventTryRecvError};
+use asx_rs::reliability::InMemoryDedupBackend;
 use tokio::time::{Duration, timeout};
 
 const PUSH_FLOW_BOUNDARY: &str = "asx-push-flow-boundary";
@@ -375,13 +375,13 @@ async fn duplicate_push_ingress_emits_duplicate_detected_event() {
     let mut duplicate_seen = false;
     for _ in 0..6 {
         if let Ok(Some(evt)) = timeout(Duration::from_millis(200), events.recv()).await
-            && let asx::observability::AsxEvent::DuplicateDetected {
+            && let asx_rs::observability::AsxEvent::DuplicateDetected {
                 message_id,
                 ingress,
                 ..
             } = evt.as_ref()
             && message_id.as_ref() == "msg-push-1"
-            && *ingress == asx::observability::AsxIngressStage::As4ReceivePush
+            && *ingress == asx_rs::observability::AsxIngressStage::As4ReceivePush
         {
             duplicate_seen = true;
             break;

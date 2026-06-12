@@ -1,11 +1,13 @@
 #![cfg(feature = "as2")]
-use asx::as2::send_sync;
+use asx_rs::as2::send_sync;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use sha2::{Digest, Sha256};
 
-use asx::as2::{As2MicAlgorithm, As2SendCredentials, As2SendPolicy, As2SendRequest, SmimeCipher};
-use asx::core::{InteropMode, SessionContext};
-use asx::observability::{AsxEvent, EventBus};
+use asx_rs::as2::{
+    As2MicAlgorithm, As2SendCredentials, As2SendPolicy, As2SendRequest, SmimeCipher,
+};
+use asx_rs::core::{InteropMode, SessionContext};
+use asx_rs::observability::{AsxEvent, EventBus};
 
 #[tokio::test]
 async fn as2_send_matches_golden_payload_and_mic() {

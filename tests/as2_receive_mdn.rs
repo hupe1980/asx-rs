@@ -4,18 +4,18 @@
 #[path = "common/as2_verifier.rs"]
 mod common;
 
-use asx::as2::{
+use asx_rs::as2::{
     As2MdnMode, As2ReceiveMdnRequest, As2ReceivePolicy, As2RegulatedSpoolKeyProvider,
     receive_with_mdn_with_reliability,
 };
-use asx::core::{ErrorCode, InteropMode, SessionContext};
-use asx::interop::{InteropExceptionCode, InteropExceptionPolicy};
-use asx::lifecycle::TrustEvidence;
-use asx::observability::EventBus;
-use asx::reliability::{
+use asx_rs::core::{ErrorCode, InteropMode, SessionContext};
+use asx_rs::interop::{InteropExceptionCode, InteropExceptionPolicy};
+use asx_rs::lifecycle::TrustEvidence;
+use asx_rs::observability::EventBus;
+use asx_rs::reliability::{
     DeliveryOutcome, InMemoryDedupBackend, InMemoryReconciliationHook, ReconciliationReason,
 };
-use asx::storage::ReconciliationStorage as _;
+use asx_rs::storage::ReconciliationStorage as _;
 use common::DeterministicTrustVerifier as InsecureBypassTrustVerifier;
 use tokio::time::{Duration, timeout};
 
@@ -321,7 +321,7 @@ async fn mdn_notification_with_non_utf8_octets_is_rejected() {
 
     assert_eq!(
         err.code,
-        asx::core::ErrorCode::ParseFailed,
+        asx_rs::core::ErrorCode::ParseFailed,
         "expected ParseFailed for non-UTF-8 MDN body, got: {err:?}"
     );
 }
@@ -506,7 +506,7 @@ async fn duplicate_mdn_ingress_emits_duplicate_detected_event() {
             Ok(None) | Err(_) => break,
         };
 
-        if let asx::observability::AsxEvent::DuplicateDetected {
+        if let asx_rs::observability::AsxEvent::DuplicateDetected {
             message_id,
             ingress,
             ..
@@ -515,7 +515,7 @@ async fn duplicate_mdn_ingress_emits_duplicate_detected_event() {
             assert_eq!(message_id.as_ref(), "<msg-42@example>");
             assert_eq!(
                 ingress,
-                &asx::observability::AsxIngressStage::As2ReceiveWithMdn
+                &asx_rs::observability::AsxIngressStage::As2ReceiveWithMdn
             );
             duplicate_seen = true;
             break;
@@ -562,7 +562,7 @@ async fn duplicate_async_mdn_does_not_emit_mdn_received_twice() {
             Ok(None) | Err(_) => break,
         };
 
-        if let asx::observability::AsxEvent::MdnReceived { .. } = scoped.event.as_ref() {
+        if let asx_rs::observability::AsxEvent::MdnReceived { .. } = scoped.event.as_ref() {
             mdn_received_count += 1;
         }
     }

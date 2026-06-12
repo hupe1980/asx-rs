@@ -144,7 +144,7 @@ Outbound timestamps include `wsu:Created` (now) and `wsu:Expires` (now + 5 minut
 ## `InsecureBypassTrustVerifier`
 
 ```rust
-use asx::lifecycle::InsecureBypassTrustVerifier;
+use asx_rs::lifecycle::InsecureBypassTrustVerifier;
 ```
 
 **For testing only.** This verifier passes any payload as fully trusted and decryptable without performing any cryptographic checks. Its name is intentionally explicit.
@@ -160,8 +160,8 @@ Never use `InsecureBypassTrustVerifier` in production. It bypasses:
 ## Payload Size Limits
 
 All inbound reads are bounded. The default limit is **256 MiB** (`DEFAULT_MAX_BODY_BYTES`). This applies to:
-- `asx::as2::receive_with_mdn_with_reliability`
-- `asx::as4::receive_push_with_dedup_sync`
+- `asx_rs::as2::receive_with_mdn_with_reliability`
+- `asx_rs::as4::receive_push_with_dedup_sync`
 - `transport::server` layer (axum handlers)
 
 Override per-session:

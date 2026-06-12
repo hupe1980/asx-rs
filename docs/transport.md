@@ -19,8 +19,8 @@ The `transport` module provides three independent layers for HTTP integration. E
 ### AS2 ingress
 
 ```rust
-use asx::transport::ingress::{As2HttpIngress, as2_ingress_from_http};
-use asx::http::HttpRequest;
+use asx_rs::transport::ingress::{As2HttpIngress, as2_ingress_from_http};
+use asx_rs::http::HttpRequest;
 
 let ingress: As2HttpIngress = as2_ingress_from_http(http_request)?;
 ```
@@ -67,7 +67,7 @@ After (default strict enforcement):
 
 ```rust
 let ingress = as2_ingress_from_http(req)?;
-let strict_session = asx::presets::session_with_strict_runtime_bootstrap_token(
+let strict_session = asx_rs::presets::session_with_strict_runtime_bootstrap_token(
     "transport_as2_ingress",
     &bootstrap_token,
     &session,
@@ -79,13 +79,13 @@ For AS4 push ingress helpers:
 
 ```rust
 let ingress = as4_ingress_from_http(req)?;
-let strict_session = asx::presets::session_with_strict_runtime_bootstrap_token(
+let strict_session = asx_rs::presets::session_with_strict_runtime_bootstrap_token(
     "transport_as4_ingress",
     &bootstrap_token,
     &session,
 )?;
 let out = ingress.receive_push_with_dedup_sync(
-    asx::transport::ingress::As4IngressReceivePushSyncRequest {
+    asx_rs::transport::ingress::As4IngressReceivePushSyncRequest {
         session: &strict_session,
         event_bus: &event_bus,
         policy: push_policy,
@@ -98,7 +98,7 @@ let out = ingress.receive_push_with_dedup_sync(
 ### AS4 ingress
 
 ```rust
-use asx::transport::ingress::{As4HttpIngress, as4_ingress_from_http};
+use asx_rs::transport::ingress::{As4HttpIngress, as4_ingress_from_http};
 
 let ingress: As4HttpIngress = as4_ingress_from_http(&http_request)?;
 ```
@@ -130,13 +130,13 @@ pub struct As4HttpIngress {
 ## Egress / HTTP Client (`client` feature)
 
 ```toml
-asx = { version = "0.1", features = ["as2", "as4", "client"] }
+asx-rs = { version = "0.1", features = ["as2", "as4", "client"] }
 ```
 
 ### AS2 send
 
 ```rust
-use asx::transport::egress::{As2HttpTransport, TransportConfig, HttpSendOutcome};
+use asx_rs::transport::egress::{As2HttpTransport, TransportConfig, HttpSendOutcome};
 
 let transport = As2HttpTransport::new(TransportConfig {
     timeout_secs: 30,
@@ -146,7 +146,7 @@ let transport = As2HttpTransport::new(TransportConfig {
 
 let outcome: HttpSendOutcome = transport.send_sync(
     "https://partner.example.com/as2/receive",
-    &send_output,       // As2SendOutput from asx::as2::send_sync
+    &send_output,       // As2SendOutput from asx_rs::as2::send_sync
 ).await?;
 
 if outcome.is_sync_mdn() {
@@ -158,13 +158,13 @@ if outcome.is_sync_mdn() {
 ### AS4 send
 
 ```rust
-use asx::transport::egress::{As4HttpTransport, TransportConfig, HttpSendOutcome};
+use asx_rs::transport::egress::{As4HttpTransport, TransportConfig, HttpSendOutcome};
 
 let transport = As4HttpTransport::new(TransportConfig { ... });
 
 let outcome: HttpSendOutcome = transport.send_sync(
     "https://partner.example.com/as4/receive",
-    &send_output,       // As4SendOutput from asx::as4::send_sync
+    &send_output,       // As4SendOutput from asx_rs::as4::send_sync
 ).await?;
 ```
 
@@ -201,7 +201,7 @@ impl HttpSendOutcome {
 ## Server / Axum Integration (`server` feature)
 
 ```toml
-asx = { version = "0.1", features = ["as2", "as4", "server"] }
+asx-rs = { version = "0.1", features = ["as2", "as4", "server"] }
 ```
 
 The server layer provides axum 0.7 router builders with typed handler traits. It is built on top of the framework-agnostic ingress layer — the same validation logic runs regardless of how the request arrives.
@@ -235,8 +235,8 @@ HandlerOutcome::server_error(msg)                // 500
 ### AS2 server
 
 ```rust
-use asx::transport::server::{as2_router, As2AxumHandler, HandlerOutcome};
-use asx::transport::ingress::As2HttpIngress;
+use asx_rs::transport::server::{as2_router, As2AxumHandler, HandlerOutcome};
+use asx_rs::transport::ingress::As2HttpIngress;
 use std::sync::Arc;
 
 struct MyAs2Handler { /* your state */ }
@@ -264,8 +264,8 @@ let app = as2_router(Arc::new(MyAs2Handler { /* ... */ }), "/as2/receive");
 ### AS4 server
 
 ```rust
-use asx::transport::server::{as4_router, As4AxumHandler, HandlerOutcome};
-use asx::transport::ingress::As4HttpIngress;
+use asx_rs::transport::server::{as4_router, As4AxumHandler, HandlerOutcome};
+use asx_rs::transport::ingress::As4HttpIngress;
 use std::sync::Arc;
 
 struct MyAs4Handler;
@@ -334,8 +334,8 @@ assert_eq!(response.status(), StatusCode::OK);
 AS2 + AS4 dual-protocol axum server:
 
 ```rust
-use asx::transport::server::{as2_router, as4_router, As2AxumHandler, As4AxumHandler, HandlerOutcome};
-use asx::transport::ingress::{As2HttpIngress, As4HttpIngress};
+use asx_rs::transport::server::{as2_router, as4_router, As2AxumHandler, As4AxumHandler, HandlerOutcome};
+use asx_rs::transport::ingress::{As2HttpIngress, As4HttpIngress};
 use std::sync::Arc;
 
 #[tokio::main]

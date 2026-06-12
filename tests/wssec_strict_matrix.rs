@@ -1,7 +1,7 @@
 #![cfg(feature = "as4")]
 
-use asx::core::ErrorCode;
-use asx::crypto::wssec::{
+use asx_rs::core::ErrorCode;
+use asx_rs::crypto::wssec::{
     WsSecCanonicalizationProfile, WsSecVerifyOptions, canonicalize_reference,
     parse_signature_references, verify_enveloped_signature, verify_signature_references_strict,
 };
@@ -60,7 +60,7 @@ fn strict_mode_rejects_whitespace_digest_mismatch() {
         &unsigned,
         "#payload-1",
         WsSecCanonicalizationProfile {
-            kind: asx::crypto::wssec::WsSecCanonicalizationKind::Exclusive,
+            kind: asx_rs::crypto::wssec::WsSecCanonicalizationKind::Exclusive,
             include_comments: false,
             strip_blank_text: false,
             inclusive_ns_prefixes: Vec::new(),
@@ -151,11 +151,11 @@ fn strict_profile_rejects_malformed_signature_value() {
         xml,
         WsSecVerifyOptions::new()
             .with_expected_fingerprint(None)
-            .with_revocation(asx::crypto::wssec::RevocationPolicy {
+            .with_revocation(asx_rs::crypto::wssec::RevocationPolicy {
                 trust_anchor_pems: &[],
                 revocation_crl_pems: &[],
-                ocsp_mode: asx::core::OcspMode::Disabled,
-                ocsp_failure_mode: asx::core::OcspFailureMode::HardFail,
+                ocsp_mode: asx_rs::core::OcspMode::Disabled,
+                ocsp_failure_mode: asx_rs::core::OcspFailureMode::HardFail,
                 stapled_ocsp_responses_der: &[],
                 responder_ocsp_responses_der: &[],
                 ocsp_cache_namespace: "strict-matrix-test",

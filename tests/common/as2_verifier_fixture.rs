@@ -1,10 +1,10 @@
 #[cfg(all(feature = "as2", feature = "testing"))]
-use asx::as2::{As2TrustVerifier, TrustResult, TrustVerifierSeal};
-use asx::core::SessionContext;
+use asx_rs::as2::{As2TrustVerifier, TrustResult, TrustVerifierSeal};
+use asx_rs::core::SessionContext;
 #[cfg(all(feature = "as2", feature = "testing"))]
-use asx::core::{ReceivedBodyHandle, Result};
+use asx_rs::core::{ReceivedBodyHandle, Result};
 #[cfg(all(feature = "as2", feature = "testing"))]
-use asx::lifecycle::TrustEvidence;
+use asx_rs::lifecycle::TrustEvidence;
 
 #[cfg(all(feature = "as2", feature = "testing"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

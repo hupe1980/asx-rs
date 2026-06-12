@@ -1,8 +1,8 @@
 #![cfg_attr(not(feature = "interop-relaxed"), allow(unused_imports, dead_code))]
 #![cfg(all(feature = "as2", feature = "as4"))]
 
-use asx::core::{ErrorCode, InteropMode, SessionContext};
-use asx::interop::{
+use asx_rs::core::{ErrorCode, InteropMode, SessionContext};
+use asx_rs::interop::{
     BaseProfile, CanonicalizationPolicy, EffectivePolicySnapshot, InteropDecision,
     InteropExceptionCode, InteropExceptionPolicy, ProfilePolicyOverrides, ProfileStack,
     RegionalProfilePack, SecurityPolicy, ValidationPolicy, diff_effective_policy_snapshots,
@@ -116,7 +116,7 @@ fn profile_diff_with_no_changes_is_low_risk_and_not_blocking() {
     let after = before.clone();
 
     let report = diff_effective_policy_snapshots(&before, &after);
-    assert_eq!(report.highest_risk, asx::interop::DiffRiskLevel::Low);
+    assert_eq!(report.highest_risk, asx_rs::interop::DiffRiskLevel::Low);
     assert!(report.changes.is_empty());
     assert!(!report.release_blocked);
 }

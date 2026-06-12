@@ -23,7 +23,7 @@ Protocol functions accept `Arc<dyn DedupStorage>`. Pass the same instance across
 ### In-memory dedup
 
 ```rust
-use asx::storage::InMemoryDedupStorage;
+use asx_rs::storage::InMemoryDedupStorage;
 
 let dedup = Arc::new(InMemoryDedupStorage::default());
 ```
@@ -33,7 +33,7 @@ let dedup = Arc::new(InMemoryDedupStorage::default());
 ### TTL-aware dedup
 
 ```rust
-use asx::storage::TtlDedupStorage;
+use asx_rs::storage::TtlDedupStorage;
 use std::time::Duration;
 
 // Expire entries after 48 hours (RFC 4130 §5.2.1 recommended window):
@@ -47,8 +47,8 @@ let dedup = Arc::new(TtlDedupStorage::new(Duration::from_secs(48 * 3600)));
 ### Implementing a custom backend
 
 ```rust
-use asx::storage::DedupStorage;
-use asx::Result;
+use asx_rs::storage::DedupStorage;
+use asx_rs::Result;
 
 struct RedisDedupStorage { /* ... */ }
 
@@ -93,7 +93,7 @@ pub enum ReconciliationReason {
 ### In-memory reconciliation storage
 
 ```rust
-use asx::storage::InMemoryReconciliationStorage;
+use asx_rs::storage::InMemoryReconciliationStorage;
 
 // Unbounded:
 let reconciliation = Arc::new(InMemoryReconciliationStorage::default());
@@ -129,7 +129,7 @@ The library's contract is:
 ### Reference retry loop pattern
 
 ```rust
-use asx::reliability::{DeliveryOutcome, RetryDecision, RetryClass};
+use asx_rs::reliability::{DeliveryOutcome, RetryDecision, RetryClass};
 use std::time::Duration;
 use tokio::time::sleep;
 
@@ -182,8 +182,8 @@ For high-volume partners, wrap the retry loop in a circuit breaker that opens af
 Messages that return `AcceptedPendingVerification` have been accepted by the remote AS2/AS4 endpoint but no synchronous delivery confirmation is available yet. Track them in `ReconciliationStorage`:
 
 ```rust
-use asx::storage::InMemoryReconciliationStorage;
-use asx::reliability::ReconciliationRequest;
+use asx_rs::storage::InMemoryReconciliationStorage;
+use asx_rs::reliability::ReconciliationRequest;
 
 let reconciliation = Arc::new(InMemoryReconciliationStorage::with_capacity(50_000));
 
@@ -197,7 +197,7 @@ reconciliation.resolve(&idempotency_key)?;
 
 // Periodically escalate stale PendingVerification entries:
 // (call from a background task every few minutes)
-asx::reliability::escalate_stale_pending_reconciliation_requests(
+asx_rs::reliability::escalate_stale_pending_reconciliation_requests(
     &*reconciliation,
     Duration::from_secs(300),  // max pending age before escalation to Indeterminate
 )?;

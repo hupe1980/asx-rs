@@ -61,13 +61,13 @@ Add to `Cargo.toml`:
 ```toml
 [dependencies]
 # AS2 client + server with OCSP
-asx = { version = "0.1", features = ["as2", "client", "server", "async-ocsp"] }
+asx-rs = { version = "0.1", features = ["as2", "client", "server", "async-ocsp"] }
 
 # AS4 only
-asx = { version = "0.1", features = ["as4", "client", "server", "async-ocsp"] }
+asx-rs = { version = "0.1", features = ["as4", "client", "server", "async-ocsp"] }
 
 # Both protocols with compression (default)
-asx = { version = "0.1", features = ["as2", "as4", "compression", "client", "server", "async-ocsp"] }
+asx-rs = { version = "0.1", features = ["as2", "as4", "compression", "client", "server", "async-ocsp"] }
 ```
 
 > `as2` and `as4` are **not** enabled by default — add them explicitly.
@@ -79,9 +79,9 @@ asx = { version = "0.1", features = ["as2", "as4", "compression", "client", "ser
 ### AS2 — Send a signed message
 
 ```rust
-use asx::as2::{send_sync, As2SendCredentials, As2SendPolicy, As2SendRequest};
-use asx::core::SessionContext;
-use asx::observability::{BackpressurePolicy, EventBus, EventEmissionMode};
+use asx_rs::as2::{send_sync, As2SendCredentials, As2SendPolicy, As2SendRequest};
+use asx_rs::core::SessionContext;
+use asx_rs::observability::{BackpressurePolicy, EventBus, EventEmissionMode};
 
 let policy = As2SendPolicy {
     sign: true,
@@ -122,8 +122,8 @@ let output = send_sync(
 ### AS2 — Receive and verify
 
 ```rust
-use asx::as2::{receive_sync, CmsSmimeTrustVerifier};
-use asx::core::SessionContext;
+use asx_rs::as2::{receive_sync, CmsSmimeTrustVerifier};
+use asx_rs::core::SessionContext;
 
 let session = SessionContext::new("sess-002", "partner-a", "strict")?;
 let verifier = CmsSmimeTrustVerifier;
@@ -135,9 +135,9 @@ println!("payload bytes: {}", trusted.as_ref().len());
 ### AS4 — Send a push message
 
 ```rust
-use asx::as4::{send_sync, As4SendPolicyBuilder, As4SendRequest};
-use asx::core::SessionContext;
-use asx::observability::{BackpressurePolicy, EventBus, EventEmissionMode};
+use asx_rs::as4::{send_sync, As4SendPolicyBuilder, As4SendRequest};
+use asx_rs::core::SessionContext;
+use asx_rs::observability::{BackpressurePolicy, EventBus, EventEmissionMode};
 
 let (policy, creds) = As4SendPolicyBuilder::new()
     .signing_cert_pem(signing_cert_pem)
@@ -170,15 +170,15 @@ let output = send_sync(
 use std::sync::Arc;
 use axum::Router;
 use async_trait::async_trait;
-use asx::transport::server::{As4AxumHandler, as4_router, HandlerOutcome};
-use asx::transport::As4HttpIngress;
+use asx_rs::transport::server::{As4AxumHandler, as4_router, HandlerOutcome};
+use asx_rs::transport::As4HttpIngress;
 
 struct MyAs4Handler;
 
 #[async_trait]
 impl As4AxumHandler for MyAs4Handler {
     async fn handle(&self, ingress: As4HttpIngress) -> HandlerOutcome {
-        // Feed ingress.body into asx::as4::receive_push_with_dedup_sync(…)
+        // Feed ingress.body into asx_rs::as4::receive_push_with_dedup_sync(…)
         HandlerOutcome::ok()
     }
 }
@@ -196,22 +196,22 @@ async fn main() {
 ```rust
 use std::sync::Arc;
 
-use asx::presets::{
+use asx_rs::presets::{
     DeploymentTopology,
     StrictRuntimeBootstrapToken,
     issue_strict_runtime_bootstrap_token_with_as4_topology,
     strict_production_event_bus,
 };
-use asx::as4::{As4ConversationOrderGate, As4PullStore};
-use asx::storage::{DedupStorage, ReconciliationStorage};
+use asx_rs::as4::{As4ConversationOrderGate, As4PullStore};
+use asx_rs::storage::{DedupStorage, ReconciliationStorage};
 
 fn strict_runtime_bootstrap(
     reconciliation: Arc<dyn ReconciliationStorage>,
     dedup: Arc<dyn DedupStorage>,
-    audit_sink: Arc<dyn asx::observability::audit_sink::DurableAuditSink>,
+    audit_sink: Arc<dyn asx_rs::observability::audit_sink::DurableAuditSink>,
     pull_store: &As4PullStore,
     conversation_gate: &As4ConversationOrderGate,
-) -> asx::Result<asx::observability::EventBus> {
+) -> asx_rs::Result<asx_rs::observability::EventBus> {
     let bus = strict_production_event_bus(1024, audit_sink)?;
 
     // Fail closed before serving traffic if strict invariants are not met.
@@ -231,7 +231,7 @@ fn strict_runtime_bootstrap(
 
 In non-testing builds, strict interop protocol entry points fail closed unless
 startup validation is bound to the session by explicitly applying
-`asx::presets::session_with_strict_runtime_bootstrap_token(...)`.
+`asx_rs::presets::session_with_strict_runtime_bootstrap_token(...)`.
 
 For AS2 HTTP server flows, bind a strict session once with
 `session_with_strict_runtime_bootstrap_token(...)` and then call
@@ -245,7 +245,7 @@ For AS4 HTTP server flows, bind a strict session once with
 ### SBDH — PEPPOL / CEF eDelivery envelope
 
 ```rust
-use asx::sbdh::{StandardBusinessDocument, SbdhHeader, SbdhParty, SbdhDocumentIdentification};
+use asx_rs::sbdh::{StandardBusinessDocument, SbdhHeader, SbdhParty, SbdhDocumentIdentification};
 
 let doc = StandardBusinessDocument {
     header: SbdhHeader {

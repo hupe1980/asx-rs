@@ -1,7 +1,7 @@
 #![cfg(feature = "as4")]
 
-use asx::core::ErrorCode;
-use asx::crypto::wssec::{
+use asx_rs::core::ErrorCode;
+use asx_rs::crypto::wssec::{
     WsSecCanonicalizationProfile, WsSecOutboundKeyInfoProfile, WsSecVerifyOptions,
     canonical_vector_diff, canonicalize_reference,
     generate_xmlsig_signature_with_external_references, parse_signature_references,
@@ -1175,7 +1175,7 @@ fn namespace_declarations_precede_normal_attributes_in_canonical_form() {
 
 #[test]
 fn inclusive_c14n_renders_all_in_scope_namespace_declarations() {
-    use asx::crypto::wssec::WsSecCanonicalizationKind;
+    use asx_rs::crypto::wssec::WsSecCanonicalizationKind;
 
     // An element that uses only `eb:` but has `wsu:` in scope from an ancestor.
     // In Exclusive C14N, only `eb:` would be rendered.
@@ -1224,7 +1224,7 @@ fn inclusive_c14n_renders_all_in_scope_namespace_declarations() {
 
 #[test]
 fn inclusive_c14n_includes_non_utilized_ancestor_namespaces() {
-    use asx::crypto::wssec::WsSecCanonicalizationKind;
+    use asx_rs::crypto::wssec::WsSecCanonicalizationKind;
 
     // An element that only uses `eb:` but has `wsu:` declared on it from the
     // parent. In Inclusive C14N, wsu: MUST be rendered even if not used.
@@ -1260,7 +1260,7 @@ fn inclusive_c14n_includes_non_utilized_ancestor_namespaces() {
 
 #[test]
 fn inclusive_c14n_versus_exclusive_differ_on_non_utilized_namespaces() {
-    use asx::crypto::wssec::WsSecCanonicalizationKind;
+    use asx_rs::crypto::wssec::WsSecCanonicalizationKind;
 
     // Build a document where an element has extra namespaces in scope but
     // only utilizes one of them. Exclusive and Inclusive C14N must produce
@@ -1307,7 +1307,7 @@ fn inclusive_c14n_versus_exclusive_differ_on_non_utilized_namespaces() {
 
 #[test]
 fn parse_signature_references_accepts_inclusive_c14n_transform_uri() {
-    use asx::crypto::wssec::WsSecCanonicalizationKind;
+    use asx_rs::crypto::wssec::WsSecCanonicalizationKind;
 
     // A minimal ds:Signature with an Inclusive C14N Transform URI.
     let xml = r##"<root xmlns:ds="http://www.w3.org/2000/09/xmldsig#"
@@ -1339,7 +1339,7 @@ fn parse_signature_references_accepts_inclusive_c14n_transform_uri() {
 
 #[test]
 fn parse_signature_references_defaults_to_exclusive_c14n_kind() {
-    use asx::crypto::wssec::WsSecCanonicalizationKind;
+    use asx_rs::crypto::wssec::WsSecCanonicalizationKind;
 
     // A ds:Signature using the standard Exclusive C14N Transform URI.
     let xml = r##"<root xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
@@ -1365,7 +1365,7 @@ fn parse_signature_references_defaults_to_exclusive_c14n_kind() {
 
 #[test]
 fn inclusive_c14n_profile_helper_sets_correct_defaults() {
-    use asx::crypto::wssec::WsSecCanonicalizationKind;
+    use asx_rs::crypto::wssec::WsSecCanonicalizationKind;
 
     let profile = WsSecCanonicalizationProfile::inclusive();
     assert_eq!(profile.kind, WsSecCanonicalizationKind::Inclusive);
@@ -1378,7 +1378,7 @@ fn inclusive_c14n_profile_helper_sets_correct_defaults() {
 
 #[test]
 fn wssec_canonicalization_profile_algorithm_uri_is_correct() {
-    use asx::crypto::wssec::WsSecCanonicalizationKind;
+    use asx_rs::crypto::wssec::WsSecCanonicalizationKind;
 
     let exc = WsSecCanonicalizationProfile::default();
     assert_eq!(
