@@ -139,10 +139,11 @@ policy,
 fn wssec_verifier_unsigned_path_requires_signature_when_missing() {
     let session =
         SessionContext::new("sess-registered-pin", "partner-a", "strict").expect("session");
-    let policy = As4PushPolicyBuilder::new()
-        .fail_closed_audit_events(false)
-        .build()
-        .expect("policy");
+    let policy = As4PushPolicy {
+        require_signed_push: true,
+        fail_closed_audit_events: false,
+        ..As4PushPolicy::default()
+    };
     let xml =
         "<s:Envelope xmlns:s='http://www.w3.org/2003/05/soap-envelope'><s:Header/></s:Envelope>";
     let doc = Document::parse(xml).expect("document");

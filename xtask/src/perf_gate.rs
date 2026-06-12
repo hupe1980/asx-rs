@@ -259,7 +259,7 @@ fn run_results(#[allow(unused_variables)] iterations: u64) -> Vec<BenchResult> {
 
     #[cfg(feature = "as2")]
     {
-        let session = SessionContext::new("bench-s-as2", "bench-p", "strict").expect("session");
+        let session = SessionContext::new("bench-s-as2", "bench-p", "strict").expect("session").with_strict_runtime_bootstrap_validated(true);
         let bus = EventBus::new(256).expect("bus");
         let _events = bus.subscribe_scoped_events();
         let payload = vec![b'A'; 2048];
@@ -340,7 +340,7 @@ fn run_results(#[allow(unused_variables)] iterations: u64) -> Vec<BenchResult> {
 
     #[cfg(feature = "as4")]
     {
-        let session = SessionContext::new("bench-s-as4", "bench-p", "strict").expect("session");
+        let session = SessionContext::new("bench-s-as4", "bench-p", "strict").expect("session").with_strict_runtime_bootstrap_validated(true);
         let bus = EventBus::new(256).expect("bus");
         let _events = bus.subscribe_scoped_events();
         let marker_payload =

@@ -210,7 +210,7 @@ fn validate_strict_as4_send_policy_consistency(
     stage: &'static str,
     interop: InteropMode,
     sign: bool,
-    _fail_closed_audit_events: bool,
+    fail_closed_audit_events: bool,
     payload_packaging_mode: PayloadPackagingMode,
 ) -> Result<()> {
     if interop == InteropMode::Strict {
@@ -229,6 +229,17 @@ fn validate_strict_as4_send_policy_consistency(
             ));
         }
     }
+
+    #[cfg(not(feature = "testing"))]
+    if interop == InteropMode::Strict && !fail_closed_audit_events {
+        return Err(AsxError::new(
+            ErrorCode::InvalidInput,
+            "strict AS4 send policy requires fail_closed_audit_events=true in non-testing builds",
+            ErrorContext::new(stage),
+        ));
+    }
+    #[cfg(feature = "testing")]
+    let _ = fail_closed_audit_events;
 
     Ok(())
 }
@@ -410,7 +421,7 @@ fn validate_strict_as4_receive_policy_consistency(
     stage: &'static str,
     interop: InteropMode,
     require_signed_receipt: bool,
-    _fail_closed_audit_events: bool,
+    fail_closed_audit_events: bool,
 ) -> Result<()> {
     if interop == InteropMode::Strict && !require_signed_receipt {
         return Err(AsxError::new(
@@ -419,6 +430,17 @@ fn validate_strict_as4_receive_policy_consistency(
             ErrorContext::new(stage),
         ));
     }
+
+    #[cfg(not(feature = "testing"))]
+    if interop == InteropMode::Strict && !fail_closed_audit_events {
+        return Err(AsxError::new(
+            ErrorCode::InvalidInput,
+            "strict AS4 receive policy requires fail_closed_audit_events=true in non-testing builds",
+            ErrorContext::new(stage),
+        ));
+    }
+    #[cfg(feature = "testing")]
+    let _ = fail_closed_audit_events;
 
     Ok(())
 }
