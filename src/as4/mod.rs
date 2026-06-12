@@ -163,7 +163,9 @@ Content-ID: <{cid}>\r\n\
 
     #[test]
     fn multipart_content_id_matching_accepts_mixed_case_cid_prefix() {
-        let session = SessionContext::new("s-multipart-cid", "p1", "strict").expect("session").with_strict_runtime_bootstrap_validated(true);
+        let session = SessionContext::new("s-multipart-cid", "p1", "strict")
+            .expect("session")
+            .with_strict_runtime_bootstrap_validated(true);
         let multipart = concat!(
             "--boundary123\r\n",
             "Content-Type: application/xop+xml; charset=UTF-8; type=\"application/soap+xml\"\r\n",
@@ -332,7 +334,9 @@ Content-ID: <{cid}>\r\n\
 
     #[test]
     fn receive_push_with_dedup_rejects_empty_payload() {
-        let session = SessionContext::new("s1", "p1", "strict").expect("session").with_strict_runtime_bootstrap_validated(true);
+        let session = SessionContext::new("s1", "p1", "strict")
+            .expect("session")
+            .with_strict_runtime_bootstrap_validated(true);
         let bus = EventBus::new(16).expect("bus");
         let _events = bus.subscribe_scoped_events();
         let dedup = DurableTestDedup(InMemoryDedupBackend::default());
@@ -363,7 +367,9 @@ Content-ID: <{cid}>\r\n\
 
     #[test]
     fn receive_push_with_dedup_rejects_non_xml_payload() {
-        let session = SessionContext::new("s1", "p1", "strict").expect("session").with_strict_runtime_bootstrap_validated(true);
+        let session = SessionContext::new("s1", "p1", "strict")
+            .expect("session")
+            .with_strict_runtime_bootstrap_validated(true);
         let bus = EventBus::new(16).expect("bus");
         let _events = bus.subscribe_scoped_events();
         let dedup = DurableTestDedup(InMemoryDedupBackend::default());
@@ -394,7 +400,9 @@ Content-ID: <{cid}>\r\n\
 
     #[test]
     fn as4_send_rejects_missing_signing_credentials() {
-        let session = SessionContext::new("s1", "p1", "strict").expect("session").with_strict_runtime_bootstrap_validated(true);
+        let session = SessionContext::new("s1", "p1", "strict")
+            .expect("session")
+            .with_strict_runtime_bootstrap_validated(true);
         let bus = EventBus::new(16).expect("bus");
         let _events = bus.subscribe_scoped_events();
         let err = send_sync(
@@ -413,7 +421,9 @@ Content-ID: <{cid}>\r\n\
 
     #[tokio::test]
     async fn as4_send_async_rejects_missing_signing_credentials() {
-        let session = SessionContext::new("s1", "p1", "strict").expect("session").with_strict_runtime_bootstrap_validated(true);
+        let session = SessionContext::new("s1", "p1", "strict")
+            .expect("session")
+            .with_strict_runtime_bootstrap_validated(true);
         let bus = EventBus::new(16).expect("bus");
         let _events = bus.subscribe_scoped_events();
         let err = send_async(
@@ -433,7 +443,9 @@ Content-ID: <{cid}>\r\n\
 
     #[test]
     fn as4_send_mime_mode_emits_multipart_related() {
-        let session = SessionContext::new("s1", "p1", "strict").expect("session").with_strict_runtime_bootstrap_validated(true);
+        let session = SessionContext::new("s1", "p1", "strict")
+            .expect("session")
+            .with_strict_runtime_bootstrap_validated(true);
         let bus = EventBus::new(16).expect("bus");
         let _events = bus.subscribe_scoped_events();
         let policy = As4SendPolicy {
@@ -484,7 +496,9 @@ Content-ID: <{cid}>\r\n\
 
     #[test]
     fn as4_send_wraps_business_payload_with_sbdh_when_configured() {
-        let session = SessionContext::new("s1", "p1", "strict").expect("session").with_strict_runtime_bootstrap_validated(true);
+        let session = SessionContext::new("s1", "p1", "strict")
+            .expect("session")
+            .with_strict_runtime_bootstrap_validated(true);
         let bus = EventBus::new(16).expect("bus");
         let _events = bus.subscribe_scoped_events();
         let policy = As4SendPolicy {
@@ -516,7 +530,9 @@ Content-ID: <{cid}>\r\n\
     #[cfg(feature = "interop-relaxed")]
     #[test]
     fn send_with_custom_action_and_service_appears_in_soap() {
-        let session = SessionContext::new("s1", "p1", "strict").expect("session").with_strict_runtime_bootstrap_validated(true);
+        let session = SessionContext::new("s1", "p1", "strict")
+            .expect("session")
+            .with_strict_runtime_bootstrap_validated(true);
         let bus = EventBus::new(16).expect("bus");
         let _events = bus.subscribe_scoped_events();
         let (mut policy, _) = As4SendPolicyBuilder::new()
@@ -554,7 +570,9 @@ Content-ID: <{cid}>\r\n\
     #[cfg(feature = "interop-relaxed")]
     #[test]
     fn two_way_mep_send_embeds_ref_to_message_id() {
-        let session = SessionContext::new("s1", "p1", "strict").expect("session").with_strict_runtime_bootstrap_validated(true);
+        let session = SessionContext::new("s1", "p1", "strict")
+            .expect("session")
+            .with_strict_runtime_bootstrap_validated(true);
         let bus = EventBus::new(16).expect("bus");
         let _events = bus.subscribe_scoped_events();
         let (mut policy, _) = As4SendPolicyBuilder::new()
@@ -643,7 +661,9 @@ Content-ID: <{cid}>\r\n\
 
     #[test]
     fn as4_send_signed_xmlsig_roundtrip_verifies() {
-        let session = SessionContext::new("s1", "p1", "strict").expect("session").with_strict_runtime_bootstrap_validated(true);
+        let session = SessionContext::new("s1", "p1", "strict")
+            .expect("session")
+            .with_strict_runtime_bootstrap_validated(true);
         let bus = EventBus::new(16).expect("bus");
         let _events = bus.subscribe_scoped_events();
         let out = send_sync(
@@ -689,7 +709,9 @@ Content-ID: <{cid}>\r\n\
 
     #[test]
     fn as4_send_x509data_only_profile_omits_rsa_keyvalue() {
-        let session = SessionContext::new("s1", "p1", "strict").expect("session").with_strict_runtime_bootstrap_validated(true);
+        let session = SessionContext::new("s1", "p1", "strict")
+            .expect("session")
+            .with_strict_runtime_bootstrap_validated(true);
         let bus = EventBus::new(16).expect("bus");
         let _events = bus.subscribe_scoped_events();
         let out = send_sync(
@@ -738,7 +760,9 @@ Content-ID: <{cid}>\r\n\
 
     #[test]
     fn as4_send_encrypt_emits_xmlenc_payload() {
-        let session = SessionContext::new("s1", "p1", "strict").expect("session").with_strict_runtime_bootstrap_validated(true);
+        let session = SessionContext::new("s1", "p1", "strict")
+            .expect("session")
+            .with_strict_runtime_bootstrap_validated(true);
         let bus = EventBus::new(16).expect("bus");
         let _events = bus.subscribe_scoped_events();
         let out = send_sync(
@@ -779,7 +803,9 @@ Content-ID: <{cid}>\r\n\
 
     #[test]
     fn as4_send_encrypts_soap_header_when_requested() {
-        let session = SessionContext::new("s1", "p1", "strict").expect("session").with_strict_runtime_bootstrap_validated(true);
+        let session = SessionContext::new("s1", "p1", "strict")
+            .expect("session")
+            .with_strict_runtime_bootstrap_validated(true);
         let bus = EventBus::new(16).expect("bus");
         let _events = bus.subscribe_scoped_events();
         let out = send_sync(
@@ -1183,7 +1209,9 @@ Content-ID: <{cid}>\r\n\
     #[cfg(feature = "testing")]
     #[tokio::test]
     async fn as4_receive_push_parses_user_message_and_receipt() {
-        let session = SessionContext::new("s1", "p1", "strict").expect("session").with_strict_runtime_bootstrap_validated(true);
+        let session = SessionContext::new("s1", "p1", "strict")
+            .expect("session")
+            .with_strict_runtime_bootstrap_validated(true);
         let bus = EventBus::new(16).expect("bus");
         let _events = bus.subscribe_scoped_events();
         let payload = multipart_user_message_payload(
@@ -1232,7 +1260,9 @@ Content-ID: <{cid}>\r\n\
 
     #[test]
     fn generate_receipt_is_deterministic() {
-        let session = SessionContext::new("s1", "p1", "strict").expect("session").with_strict_runtime_bootstrap_validated(true);
+        let session = SessionContext::new("s1", "p1", "strict")
+            .expect("session")
+            .with_strict_runtime_bootstrap_validated(true);
         let out = generate_receipt(&session, "receipt-msg-1", "msg-1").expect("receipt");
         let xml = match std::str::from_utf8(&out) {
             Ok(xml) => xml,
@@ -1256,21 +1286,27 @@ Content-ID: <{cid}>\r\n\
 
     #[test]
     fn generate_receipt_rejects_empty_message_id() {
-        let session = SessionContext::new("s1", "p1", "strict").expect("session").with_strict_runtime_bootstrap_validated(true);
+        let session = SessionContext::new("s1", "p1", "strict")
+            .expect("session")
+            .with_strict_runtime_bootstrap_validated(true);
         let err = generate_receipt(&session, "", "ref-1").expect_err("must fail");
         assert_eq!(err.code, ErrorCode::InvalidInput);
     }
 
     #[test]
     fn generate_receipt_rejects_empty_ref() {
-        let session = SessionContext::new("s1", "p1", "strict").expect("session").with_strict_runtime_bootstrap_validated(true);
+        let session = SessionContext::new("s1", "p1", "strict")
+            .expect("session")
+            .with_strict_runtime_bootstrap_validated(true);
         let err = generate_receipt(&session, "msg-id", "").expect_err("must fail");
         assert_eq!(err.code, ErrorCode::InvalidInput);
     }
 
     #[test]
     fn generate_receipt_with_nri_embeds_reference_elements() {
-        let session = SessionContext::new("s1", "p1", "strict").expect("session").with_strict_runtime_bootstrap_validated(true);
+        let session = SessionContext::new("s1", "p1", "strict")
+            .expect("session")
+            .with_strict_runtime_bootstrap_validated(true);
         let nri_refs = vec![As4NriReference {
             uri: "#body".to_string(),
             digest_method_uri: "http://www.w3.org/2001/04/xmlenc#sha256".to_string(),
@@ -1303,7 +1339,9 @@ Content-ID: <{cid}>\r\n\
 
     #[test]
     fn generate_receipt_with_nri_empty_refs_matches_generate_receipt() {
-        let session = SessionContext::new("s1", "p1", "strict").expect("session").with_strict_runtime_bootstrap_validated(true);
+        let session = SessionContext::new("s1", "p1", "strict")
+            .expect("session")
+            .with_strict_runtime_bootstrap_validated(true);
         let plain = generate_receipt(&session, "r1", "ref-1").expect("plain");
         let with_nri =
             generate_receipt_with_nri(&session, "r1", "ref-1", &[]).expect("nri with empty refs");
@@ -1326,7 +1364,9 @@ Content-ID: <{cid}>\r\n\
 
     #[test]
     fn generate_receipt_with_nri_xml_injection_is_escaped() {
-        let session = SessionContext::new("s1", "p1", "strict").expect("session").with_strict_runtime_bootstrap_validated(true);
+        let session = SessionContext::new("s1", "p1", "strict")
+            .expect("session")
+            .with_strict_runtime_bootstrap_validated(true);
         let nri_refs = vec![As4NriReference {
             uri: "#body\"><script>attack</script>".to_string(),
             digest_method_uri: "http://example.com/?a=1&b=2".to_string(),
@@ -1340,7 +1380,9 @@ Content-ID: <{cid}>\r\n\
 
     #[test]
     fn strict_mode_rejects_missing_wsse_security_header_even_with_scoped_exception() {
-        let session = SessionContext::new("s1", "p1", "strict").expect("session").with_strict_runtime_bootstrap_validated(true);
+        let session = SessionContext::new("s1", "p1", "strict")
+            .expect("session")
+            .with_strict_runtime_bootstrap_validated(true);
         let bus = EventBus::new(16).expect("bus");
         let _events = bus.subscribe_scoped_events();
         let payload = br#"<S12:Envelope xmlns:S12="http://www.w3.org/2003/05/soap-envelope" xmlns:eb="http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/">
@@ -1385,7 +1427,9 @@ Content-ID: <{cid}>\r\n\
 
     #[test]
     fn strict_mode_rejects_missing_messaging_must_understand() {
-        let session = SessionContext::new("s1", "p1", "strict").expect("session").with_strict_runtime_bootstrap_validated(true);
+        let session = SessionContext::new("s1", "p1", "strict")
+            .expect("session")
+            .with_strict_runtime_bootstrap_validated(true);
         let bus = EventBus::new(16).expect("bus");
         let _events = bus.subscribe_scoped_events();
         let payload = br#"<S12:Envelope xmlns:S12="http://www.w3.org/2003/05/soap-envelope" xmlns:eb="http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/" xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd">
@@ -1427,7 +1471,9 @@ Content-ID: <{cid}>\r\n\
 
     #[test]
     fn strict_mode_surfaces_crypto_failures() {
-        let session = SessionContext::new("s1", "p1", "strict").expect("session").with_strict_runtime_bootstrap_validated(true);
+        let session = SessionContext::new("s1", "p1", "strict")
+            .expect("session")
+            .with_strict_runtime_bootstrap_validated(true);
         let bus = EventBus::new(16).expect("bus");
         let _events = bus.subscribe_scoped_events();
         let payload = multipart_user_message_payload(
@@ -1463,7 +1509,9 @@ Content-ID: <{cid}>\r\n\
 
     #[test]
     fn strict_mode_rejects_interop_exception_overrides_runtime_policy() {
-        let session = SessionContext::new("s1", "p1", "strict").expect("session").with_strict_runtime_bootstrap_validated(true);
+        let session = SessionContext::new("s1", "p1", "strict")
+            .expect("session")
+            .with_strict_runtime_bootstrap_validated(true);
         let bus = EventBus::new(16).expect("bus");
         let _events = bus.subscribe_scoped_events();
         let payload = multipart_user_message_payload(
@@ -1505,7 +1553,9 @@ Content-ID: <{cid}>\r\n\
     #[cfg(not(feature = "testing"))]
     #[test]
     fn strict_mode_rejects_runtime_push_policy_with_unsigned_receipt_requirement() {
-        let session = SessionContext::new("s1", "p1", "strict").expect("session").with_strict_runtime_bootstrap_validated(true);
+        let session = SessionContext::new("s1", "p1", "strict")
+            .expect("session")
+            .with_strict_runtime_bootstrap_validated(true);
         let bus = EventBus::new(16).expect("bus");
         let _events = bus.subscribe_scoped_events();
         let (_, dedup) = durable_reliability();
@@ -1537,8 +1587,9 @@ Content-ID: <{cid}>\r\n\
 
     #[test]
     fn strict_mode_rejects_runtime_send_policy_with_empty_action() {
-        let session =
-            SessionContext::new("s-send-runtime-empty-action", "p1", "strict").expect("session").with_strict_runtime_bootstrap_validated(true);
+        let session = SessionContext::new("s-send-runtime-empty-action", "p1", "strict")
+            .expect("session")
+            .with_strict_runtime_bootstrap_validated(true);
         let bus = EventBus::new(16).expect("bus");
         let _events = bus.subscribe_scoped_events();
         let creds = test_as4_credentials();
@@ -1565,8 +1616,9 @@ Content-ID: <{cid}>\r\n\
 
     #[test]
     fn strict_mode_rejects_runtime_send_policy_with_mismatched_signing_credentials() {
-        let session =
-            SessionContext::new("s-send-runtime-mismatch", "p1", "strict").expect("session").with_strict_runtime_bootstrap_validated(true);
+        let session = SessionContext::new("s-send-runtime-mismatch", "p1", "strict")
+            .expect("session")
+            .with_strict_runtime_bootstrap_validated(true);
         let bus = EventBus::new(16).expect("bus");
         let _events = bus.subscribe_scoped_events();
 
@@ -1599,8 +1651,9 @@ Content-ID: <{cid}>\r\n\
 
     #[test]
     fn strict_mode_rejects_runtime_send_policy_with_empty_service() {
-        let session =
-            SessionContext::new("s-send-runtime-empty-service", "p1", "strict").expect("session").with_strict_runtime_bootstrap_validated(true);
+        let session = SessionContext::new("s-send-runtime-empty-service", "p1", "strict")
+            .expect("session")
+            .with_strict_runtime_bootstrap_validated(true);
         let bus = EventBus::new(16).expect("bus");
         let _events = bus.subscribe_scoped_events();
         let creds = test_as4_credentials();
@@ -1627,8 +1680,9 @@ Content-ID: <{cid}>\r\n\
 
     #[test]
     fn strict_mode_rejects_runtime_send_policy_with_empty_ref_to_message_id() {
-        let session =
-            SessionContext::new("s-send-runtime-empty-ref", "p1", "strict").expect("session").with_strict_runtime_bootstrap_validated(true);
+        let session = SessionContext::new("s-send-runtime-empty-ref", "p1", "strict")
+            .expect("session")
+            .with_strict_runtime_bootstrap_validated(true);
         let bus = EventBus::new(16).expect("bus");
         let _events = bus.subscribe_scoped_events();
         let creds = test_as4_credentials();
@@ -1656,7 +1710,9 @@ Content-ID: <{cid}>\r\n\
     #[cfg(not(feature = "testing"))]
     #[tokio::test]
     async fn strict_mode_rejects_runtime_pull_policy_with_unsigned_receipt_requirement() {
-        let session = SessionContext::new("s-pull-runtime", "p1", "strict").expect("session").with_strict_runtime_bootstrap_validated(true);
+        let session = SessionContext::new("s-pull-runtime", "p1", "strict")
+            .expect("session")
+            .with_strict_runtime_bootstrap_validated(true);
         let bus = EventBus::new(16).expect("bus");
         let _events = bus.subscribe_scoped_events();
         let store = As4PullStore::new();
@@ -1697,7 +1753,9 @@ Content-ID: <{cid}>\r\n\
     #[cfg(feature = "interop-relaxed")]
     #[tokio::test]
     async fn relaxed_missing_security_header_is_security_blocked_and_audited() {
-        let session = SessionContext::new("s-relaxed", "p1", "partner-quirks").expect("session").with_strict_runtime_bootstrap_validated(true);
+        let session = SessionContext::new("s-relaxed", "p1", "partner-quirks")
+            .expect("session")
+            .with_strict_runtime_bootstrap_validated(true);
         let bus = EventBus::new(16).expect("bus");
         let _events = bus.subscribe_scoped_events();
         let mut scoped_rx = bus.subscribe_scoped_events();
@@ -1792,7 +1850,9 @@ Content-ID: <{cid}>\r\n\
     #[cfg(feature = "interop-relaxed")]
     #[tokio::test]
     async fn relaxed_mode_emits_no_wssec_relaxation_audit() {
-        let session = SessionContext::new("s1", "p1", "relaxed").expect("session").with_strict_runtime_bootstrap_validated(true);
+        let session = SessionContext::new("s1", "p1", "relaxed")
+            .expect("session")
+            .with_strict_runtime_bootstrap_validated(true);
         let bus = EventBus::new(16).expect("bus");
         let _events = bus.subscribe_scoped_events();
         let mut scoped_rx = bus.subscribe_scoped_events();
@@ -1841,7 +1901,9 @@ Content-ID: <{cid}>\r\n\
 
     #[test]
     fn missing_security_header_fails_closed_when_audit_emit_fails() {
-        let session = SessionContext::new("s1", "p1", "strict").expect("session").with_strict_runtime_bootstrap_validated(true);
+        let session = SessionContext::new("s1", "p1", "strict")
+            .expect("session")
+            .with_strict_runtime_bootstrap_validated(true);
         let bus = EventBus::new(16).expect("bus");
         let _events = bus.subscribe_scoped_events();
         let payload = br#"<S12:Envelope xmlns:S12="http://www.w3.org/2003/05/soap-envelope" xmlns:eb="http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/">
@@ -1889,7 +1951,9 @@ Content-ID: <{cid}>\r\n\
     #[cfg(feature = "testing")]
     #[tokio::test(flavor = "current_thread")]
     async fn pull_store_queue_limit_rejects_new_message_by_default() {
-        let session = SessionContext::new("s-pull-queue", "p1", "strict").expect("session").with_strict_runtime_bootstrap_validated(true);
+        let session = SessionContext::new("s-pull-queue", "p1", "strict")
+            .expect("session")
+            .with_strict_runtime_bootstrap_validated(true);
         let bus = EventBus::new(16).expect("bus");
         let _events = bus.subscribe_scoped_events();
         let store = As4PullStore::with_limits(As4PullStoreLimits {
@@ -1957,7 +2021,9 @@ Content-ID: <{cid}>\r\n\
     #[cfg(not(feature = "testing"))]
     #[tokio::test(flavor = "current_thread")]
     async fn durable_dedup_receive_pull_rejects_non_durable_backend() {
-        let session = SessionContext::new("s-pull-dedup", "p1", "strict").expect("session").with_strict_runtime_bootstrap_validated(true);
+        let session = SessionContext::new("s-pull-dedup", "p1", "strict")
+            .expect("session")
+            .with_strict_runtime_bootstrap_validated(true);
         let bus = EventBus::new(16).expect("bus");
         let _events = bus.subscribe_scoped_events();
         let store = As4PullStore::default();
@@ -1994,7 +2060,9 @@ Content-ID: <{cid}>\r\n\
     #[cfg(feature = "testing")]
     #[tokio::test(flavor = "current_thread")]
     async fn pull_store_queue_limit_can_evict_oldest_when_configured() {
-        let session = SessionContext::new("s-pull-queue-evict", "p1", "strict").expect("session").with_strict_runtime_bootstrap_validated(true);
+        let session = SessionContext::new("s-pull-queue-evict", "p1", "strict")
+            .expect("session")
+            .with_strict_runtime_bootstrap_validated(true);
         let bus = EventBus::new(16).expect("bus");
         let _events = bus.subscribe_scoped_events();
         let store = As4PullStore::with_limits(As4PullStoreLimits {
@@ -2065,7 +2133,9 @@ Content-ID: <{cid}>\r\n\
 
     #[tokio::test(flavor = "current_thread")]
     async fn enqueue_pull_with_reliability_reject_overflow_queues_reconciliation_and_audit() {
-        let session = SessionContext::new("s-pull-queue-rel", "p1", "strict").expect("session").with_strict_runtime_bootstrap_validated(true);
+        let session = SessionContext::new("s-pull-queue-rel", "p1", "strict")
+            .expect("session")
+            .with_strict_runtime_bootstrap_validated(true);
         let bus = EventBus::new(16).expect("bus");
         let mut scoped_rx = bus.subscribe_scoped_events();
         let store = As4PullStore::with_limits(As4PullStoreLimits {
@@ -2154,8 +2224,9 @@ Content-ID: <{cid}>\r\n\
 
     #[tokio::test(flavor = "current_thread")]
     async fn enqueue_pull_with_reliability_evict_overflow_queues_reconciliation_and_audit() {
-        let session =
-            SessionContext::new("s-pull-queue-rel-evict", "p1", "strict").expect("session").with_strict_runtime_bootstrap_validated(true);
+        let session = SessionContext::new("s-pull-queue-rel-evict", "p1", "strict")
+            .expect("session")
+            .with_strict_runtime_bootstrap_validated(true);
         let bus = EventBus::new(16).expect("bus");
         let mut scoped_rx = bus.subscribe_scoped_events();
         let store = As4PullStore::with_limits(As4PullStoreLimits {
@@ -2247,7 +2318,9 @@ Content-ID: <{cid}>\r\n\
     #[cfg(feature = "testing")]
     #[tokio::test(flavor = "current_thread")]
     async fn pull_store_served_cache_limit_evicts_oldest_pull_id() {
-        let session = SessionContext::new("s-pull-served", "p1", "strict").expect("session").with_strict_runtime_bootstrap_validated(true);
+        let session = SessionContext::new("s-pull-served", "p1", "strict")
+            .expect("session")
+            .with_strict_runtime_bootstrap_validated(true);
         let bus = EventBus::new(16).expect("bus");
         let _events = bus.subscribe_scoped_events();
         let store = As4PullStore::with_limits(As4PullStoreLimits {
@@ -2361,7 +2434,9 @@ Content-ID: <{cid}>\r\n\
     #[cfg(feature = "testing")]
     #[tokio::test(flavor = "current_thread")]
     async fn pull_receive_requeues_message_when_push_processing_fails() {
-        let session = SessionContext::new("s-pull-requeue", "p1", "strict").expect("session").with_strict_runtime_bootstrap_validated(true);
+        let session = SessionContext::new("s-pull-requeue", "p1", "strict")
+            .expect("session")
+            .with_strict_runtime_bootstrap_validated(true);
         let bus = EventBus::new(16).expect("bus");
         let _events = bus.subscribe_scoped_events();
         let store = As4PullStore::new();
@@ -2612,7 +2687,9 @@ Content-ID: <{cid}>\r\n\
 
     #[test]
     fn as4_send_runtime_accepts_strict_only_wssec_profile() {
-        let session = SessionContext::new("s-send-strict", "p1", "strict").expect("session").with_strict_runtime_bootstrap_validated(true);
+        let session = SessionContext::new("s-send-strict", "p1", "strict")
+            .expect("session")
+            .with_strict_runtime_bootstrap_validated(true);
         let bus = EventBus::new(16).expect("bus");
         let _events = bus.subscribe_scoped_events();
         let creds = test_as4_credentials();
