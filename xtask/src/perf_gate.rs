@@ -20,19 +20,17 @@ use asx::reliability::InMemoryDedupBackend;
 #[cfg(all(feature = "as2", feature = "testing"))]
 use asx::reliability::InMemoryReconciliationHook;
 
-#[cfg(feature = "as2")]
-use asx::as2::{
-    As2SendCredentials, As2SendPolicy, generate_mdn as as2_generate_mdn, send_sync as as2_send,
-};
 #[cfg(all(feature = "as2", feature = "testing"))]
 use asx::as2::{
     As2MdnMode, As2ReceiveMdnRequest, As2ReceivePolicy, As2TrustVerifier, TrustResult,
     TrustVerifierSeal, receive_with_mdn_with_reliability,
 };
-#[cfg(feature = "as4")]
-use asx::as4::{
-    generate_receipt as as4_generate_receipt,
+#[cfg(feature = "as2")]
+use asx::as2::{
+    As2SendCredentials, As2SendPolicy, generate_mdn as as2_generate_mdn, send_sync as as2_send,
 };
+#[cfg(feature = "as4")]
+use asx::as4::generate_receipt as as4_generate_receipt;
 #[cfg(all(feature = "as4", feature = "testing"))]
 use asx::as4::{
     As4PushPolicyBuilder, As4ReceivePushRequest, As4ReceivePushSyncRequest,
