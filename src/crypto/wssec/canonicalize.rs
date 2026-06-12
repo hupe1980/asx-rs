@@ -525,17 +525,15 @@ fn serialize_root_node(
                     }
                 }
             }
-            NT::Comment => {
-                if profile.include_comments {
-                    if is_after_doc_elem {
-                        out.push('\n');
-                    }
-                    out.push_str("<!--");
-                    out.push_str(child.text().unwrap_or_default());
-                    out.push_str("-->");
-                    if is_before_doc_elem {
-                        out.push('\n');
-                    }
+            NT::Comment if profile.include_comments => {
+                if is_after_doc_elem {
+                    out.push('\n');
+                }
+                out.push_str("<!--");
+                out.push_str(child.text().unwrap_or_default());
+                out.push_str("-->");
+                if is_before_doc_elem {
+                    out.push('\n');
                 }
             }
             _ => {

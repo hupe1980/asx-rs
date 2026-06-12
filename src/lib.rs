@@ -110,6 +110,7 @@ pub mod as2;
 pub mod as4;
 
 #[cfg(feature = "client")]
+#[cfg(feature = "as4")]
 pub mod smp;
 
 #[cfg(feature = "client")]

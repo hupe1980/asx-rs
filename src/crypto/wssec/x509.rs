@@ -1,3 +1,7 @@
+// Functions below are used exclusively by wssec::verify (as4-only); suppress
+// dead-code warnings when the as4 feature is not enabled.
+#![cfg_attr(not(feature = "as4"), allow(dead_code))]
+
 use openssl::bn::BigNum;
 use openssl::pkey::PKey;
 use openssl::rsa::Rsa;
@@ -96,7 +100,7 @@ pub(crate) fn validate_pkix_chain_and_revocation(
     let fresh_store: Option<openssl::x509::store::X509Store>;
     let store: &openssl::x509::store::X509StoreRef =
         if let Some(ref pre) = revocation_policy.pre_built_x509_store {
-            &**pre
+            pre
         } else {
             let mut builder = X509StoreBuilder::new().map_err(|err| {
                 AsxError::new(

@@ -52,7 +52,7 @@ impl SoapEnvelope {
 /// The default (`RequireAuthenticatedScope`) is the safe choice for production.
 /// `UseSoapSenderId` is provided only for controlled environments where all
 /// senders are fully trusted and mTLS-based authentication is infeasible.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub enum FragmentScopePolicy {
     /// **Secure default.** Fragment groups are scoped by the transport-layer
@@ -63,6 +63,7 @@ pub enum FragmentScopePolicy {
     /// [`ErrorCode::PolicyViolation`] if `authenticated_sender_scope` is `None`.
     /// Typical scope values: mTLS client certificate CN, peer IP, or AP identifier
     /// verified at the transport layer before the request was admitted.
+    #[default]
     RequireAuthenticatedScope,
     /// **Insecure — legacy compatibility only.**
     ///
@@ -74,14 +75,6 @@ pub enum FragmentScopePolicy {
     /// * all senders are on the same trusted internal network, **and**
     /// * upgrading to authenticated scope is not feasible in the short term.
     UseSoapSenderId,
-}
-
-impl Default for FragmentScopePolicy {
-    fn default() -> Self {
-        // Secure by default — callers that cannot supply an authenticated scope
-        // must explicitly opt in to `UseSoapSenderId`.
-        Self::RequireAuthenticatedScope
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

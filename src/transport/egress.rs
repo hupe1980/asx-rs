@@ -64,6 +64,7 @@ use crate::as4::As4SendOutput;
 /// Returns [`ErrorCode::InvalidInput`] for malformed URLs, disallowed schemes,
 /// or private-range IP hosts. Returns [`ErrorCode::PolicyViolation`] when
 /// plain HTTP is attempted.
+#[cfg_attr(not(feature = "as4"), allow(dead_code))]
 pub(crate) async fn validate_egress_url(url: &str, context: &'static str) -> Result<()> {
     let target = validate_egress_target_with_policy(url, context).await?;
     // In client-only builds without AS2/AS4 transport features enabled, this

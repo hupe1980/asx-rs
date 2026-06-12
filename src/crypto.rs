@@ -11,7 +11,7 @@ pub mod ocsp_discovery;
 pub mod signing;
 #[cfg(feature = "as4")]
 pub mod soap_builder;
-#[cfg(feature = "as4")]
+#[cfg(any(feature = "as2", feature = "as4"))]
 pub mod wssec;
 
 #[derive(Debug, Clone, PartialEq, Eq)]

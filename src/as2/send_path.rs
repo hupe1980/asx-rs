@@ -261,6 +261,7 @@ fn send_sync_prepared_ref(
     )?;
 
     let mut payload_to_send = payload;
+    #[cfg(feature = "compression")]
     if policy.compress {
         payload_to_send = compress_payload(&payload_to_send)?;
     }
@@ -489,6 +490,7 @@ fn encrypt_payload(
     )
 }
 
+#[cfg(feature = "compression")]
 fn compress_payload(payload: &[u8]) -> Result<Vec<u8>> {
     crate::crypto::compression::compress_gzip(payload, 6)
 }

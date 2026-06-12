@@ -1,9 +1,8 @@
 use asx::core::{ErrorCode, InteropMode, SessionContext};
 use asx::http::{HttpRequest, PartnerEndpointGovernance};
 use asx::interop::{
-    BaseProfile, CanonicalizationPolicy, CompatibilityPolicy, PartnerProfileOverlay,
-    ProfileExtension, ProfileOverride, ProfilePolicyOverrides, ProfileStack, RegionalProfilePack,
-    SecurityPolicy, ValidationPolicy,
+    BaseProfile, CanonicalizationPolicy, PartnerProfileOverlay, ProfileExtension, ProfileOverride,
+    ProfilePolicyOverrides, ProfileStack, RegionalProfilePack, SecurityPolicy, ValidationPolicy,
 };
 use asx::wire::{
     StreamLimits, WireEnvelope, canonical_transfer_fingerprint,
@@ -310,7 +309,6 @@ fn run_policy_resolver_case(input: &[u8]) -> Result<(), String> {
                 enforce_payload_limits: !b(5),
                 require_as2_mic: !b(6),
             },
-            compatibility: CompatibilityPolicy,
         },
         extensions: vec![ProfileExtension {
             name: "ext-fuzz".to_string(),
@@ -326,7 +324,6 @@ fn run_policy_resolver_case(input: &[u8]) -> Result<(), String> {
         overrides: vec![ProfileOverride {
             name: "ov-fuzz".to_string(),
             overrides: ProfilePolicyOverrides {
-                compatibility: Some(CompatibilityPolicy),
                 ..ProfilePolicyOverrides::default()
             },
         }],
@@ -543,7 +540,6 @@ fn base_stack() -> ProfileStack {
             canonicalization: CanonicalizationPolicy::default(),
             security: SecurityPolicy::default(),
             validation: ValidationPolicy::default(),
-            compatibility: CompatibilityPolicy::default(),
         },
         extensions: vec![],
         overrides: vec![],

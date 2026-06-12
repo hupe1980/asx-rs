@@ -439,7 +439,7 @@ Content-ID: <{cid}>\r\n\
             As4SendRequest {
                 message_id: "msg-send-mime-1".to_string(),
                 payload: b"payload".to_vec(),
-                policy: policy,
+                policy,
                 credentials: test_as4_credentials(),
             },
         )
@@ -491,7 +491,7 @@ Content-ID: <{cid}>\r\n\
             As4SendRequest {
                 message_id: "msg-send-sbdh-1".to_string(),
                 payload: b"<Invoice xmlns=\"urn:test\"><ID>INV-1</ID></Invoice>".to_vec(),
-                policy: policy,
+                policy,
                 credentials: test_as4_credentials(),
             },
         )
@@ -524,7 +524,7 @@ Content-ID: <{cid}>\r\n\
             As4SendRequest {
                 message_id: "msg-custom-action".to_string(),
                 payload: b"data".to_vec(),
-                policy: policy,
+                policy,
                 credentials: test_as4_credentials(),
             },
         )
@@ -560,7 +560,7 @@ Content-ID: <{cid}>\r\n\
             As4SendRequest {
                 message_id: "msg-reply".to_string(),
                 payload: b"response payload".to_vec(),
-                policy: policy,
+                policy,
                 credentials: test_as4_credentials(),
             },
         )
@@ -594,7 +594,7 @@ Content-ID: <{cid}>\r\n\
             As4SendRequest {
                 message_id: "msg-reply-2".to_string(),
                 payload: b"reply payload".to_vec(),
-                policy: policy,
+                policy,
                 credentials: built_creds,
             },
         )
@@ -927,10 +927,12 @@ Content-ID: <{cid}>\r\n\
         let creds = test_as4_credentials();
         let session = session_with_trust("s-sbdh-recv", "p1", &creds);
 
-        let mut policy = As4SendPolicy::default();
-        policy.sign = true;
-        policy.payload_packaging_mode = super::pmode::PayloadPackagingMode::MimeAttachment;
-        policy.sbdh_header = Some(test_sbdh_header("urn:uuid:asx-sbdh-recv"));
+        let policy = As4SendPolicy {
+            sign: true,
+            payload_packaging_mode: super::pmode::PayloadPackagingMode::MimeAttachment,
+            sbdh_header: Some(test_sbdh_header("urn:uuid:asx-sbdh-recv")),
+            ..As4SendPolicy::default()
+        };
 
         let business_payload = b"<Invoice xmlns=\"urn:test\"><ID>INV-2</ID></Invoice>";
         let outbound = send_sync(
@@ -939,7 +941,7 @@ Content-ID: <{cid}>\r\n\
             As4SendRequest {
                 message_id: "msg-sbdh-roundtrip".to_string(),
                 payload: business_payload.to_vec(),
-                policy: policy,
+                policy,
                 credentials: creds,
             },
         )
@@ -2114,19 +2116,17 @@ Content-ID: <{cid}>\r\n\
                     message_id,
                     action,
                     policy,
-                } => {
-                    if message_id.as_ref() == "msg-new"
-                        && *action == "rejected_new"
-                        && *policy == "reject_new"
-                    {
-                        saw_overflow = true;
-                    }
+                } if message_id.as_ref() == "msg-new"
+                    && *action == "rejected_new"
+                    && *policy == "reject_new" =>
+                {
+                    saw_overflow = true;
                 }
-                AsxEvent::ReconciliationQueued { message_id, reason } => {
-                    if message_id.as_ref() == "msg-new" && *reason == "queue_overflow_rejected_new"
-                    {
-                        saw_reconciliation = true;
-                    }
+                AsxEvent::ReconciliationQueued { message_id, reason }
+                    if message_id.as_ref() == "msg-new"
+                        && *reason == "queue_overflow_rejected_new" =>
+                {
+                    saw_reconciliation = true;
                 }
                 _ => {}
             }
@@ -2208,19 +2208,17 @@ Content-ID: <{cid}>\r\n\
                     message_id,
                     action,
                     policy,
-                } => {
-                    if message_id.as_ref() == "msg-old"
-                        && *action == "evicted_oldest"
-                        && *policy == "evict_oldest"
-                    {
-                        saw_overflow = true;
-                    }
+                } if message_id.as_ref() == "msg-old"
+                    && *action == "evicted_oldest"
+                    && *policy == "evict_oldest" =>
+                {
+                    saw_overflow = true;
                 }
-                AsxEvent::ReconciliationQueued { message_id, reason } => {
-                    if message_id.as_ref() == "msg-old" && *reason == "queue_overflow_evict_oldest"
-                    {
-                        saw_reconciliation = true;
-                    }
+                AsxEvent::ReconciliationQueued { message_id, reason }
+                    if message_id.as_ref() == "msg-old"
+                        && *reason == "queue_overflow_evict_oldest" =>
+                {
+                    saw_reconciliation = true;
                 }
                 _ => {}
             }

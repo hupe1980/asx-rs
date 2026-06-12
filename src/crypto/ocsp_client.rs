@@ -9,6 +9,7 @@ use sha2::{Digest, Sha256};
 use std::sync::{Arc, OnceLock};
 #[cfg(any(test, feature = "async-ocsp"))]
 use std::time::Duration;
+#[cfg(any(test, feature = "async-ocsp"))]
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::core::{AsxError, ErrorCode, ErrorContext, Result};

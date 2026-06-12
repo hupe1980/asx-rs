@@ -147,10 +147,10 @@ impl As4FragmentJoiner {
     /// entry is safe: it will simply be re-rejected on the next incoming
     /// fragment via the concurrent-group or per-group-byte limit check.
     fn reject_group(&mut self, scope_key: String) {
-        if self.rejected_groups_set.len() >= MAX_REJECTED_GROUPS {
-            if let Some(oldest) = self.rejected_groups_order.pop_front() {
-                self.rejected_groups_set.remove(&oldest);
-            }
+        if self.rejected_groups_set.len() >= MAX_REJECTED_GROUPS
+            && let Some(oldest) = self.rejected_groups_order.pop_front()
+        {
+            self.rejected_groups_set.remove(&oldest);
         }
         self.rejected_groups_order.push_back(scope_key.clone());
         self.rejected_groups_set.insert(scope_key);
@@ -1156,7 +1156,7 @@ mod tests {
             &event_bus,
             As4SendRequest {
                 message_id: "mid-large-1".to_string(),
-                payload: payload,
+                payload,
                 policy: policy.clone(),
                 credentials: credentials.clone(),
             },
@@ -1209,7 +1209,7 @@ mod tests {
             &event_bus,
             As4SendRequest {
                 message_id: "mid-large-2".to_string(),
-                payload: payload,
+                payload,
                 policy: policy.clone(),
                 credentials: credentials.clone(),
             },
@@ -1253,9 +1253,9 @@ mod tests {
             &event_bus,
             As4SendRequest {
                 message_id: "mid-large-3".to_string(),
-                payload: payload,
+                payload,
                 policy: policy.clone(),
-                credentials: credentials,
+                credentials,
             },
         )
         .expect("source send");

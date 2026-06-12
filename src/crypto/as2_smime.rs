@@ -102,7 +102,7 @@ pub fn verify_smime_signed_payload(
     let fresh_store: Option<openssl::x509::store::X509Store>;
     let store: &openssl::x509::store::X509StoreRef =
         if let Some(ref pre) = options.revocation_policy.pre_built_x509_store {
-            &**pre
+            pre
         } else {
             let mut builder = X509StoreBuilder::new().map_err(|err| {
                 AsxError::new(
@@ -180,7 +180,7 @@ pub fn verify_smime_signed_payload(
     pkcs7
         .verify(
             &certs,
-            &store,
+            store,
             detached_content.as_deref(),
             Some(&mut verified_payload),
             verify_flags,

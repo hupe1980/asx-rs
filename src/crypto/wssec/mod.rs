@@ -8,19 +8,26 @@
 //   ocsp          — OCSP / CRL revocation
 //   xmlenc        — XML Encryption (AES-128/256-GCM + RSA-OAEP)
 
+// These sub-modules depend on roxmltree / quick-xml which are as4-only deps.
+#[cfg(feature = "as4")]
 pub(crate) mod canonicalize;
 pub(crate) mod ocsp;
+#[cfg(feature = "as4")]
 pub(crate) mod sign;
+#[cfg(feature = "as4")]
 pub(crate) mod verify;
 pub(crate) mod x509;
 
+#[cfg(feature = "as4")]
 pub mod xmlenc;
 
 // ---------------------------------------------------------------------------
 // Namespace URI constants (used across all sub-modules)
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "as4")]
 pub(crate) const DS_NS: &str = "http://www.w3.org/2000/09/xmldsig#";
+#[cfg(feature = "as4")]
 pub(crate) const XML_NS: &str = "http://www.w3.org/XML/1998/namespace";
 pub(crate) const XML_EXC_C14N_URI: &str = "http://www.w3.org/2001/10/xml-exc-c14n#";
 /// W3C Canonical XML 1.0 (Inclusive C14N) transform algorithm URI.
@@ -317,6 +324,7 @@ impl WsSecDigestMethod {
     }
 
     /// Output byte length for this digest method.
+    #[cfg(feature = "as4")]
     pub(crate) fn output_len(self) -> usize {
         match self {
             Self::Sha256 => 32,
@@ -364,21 +372,25 @@ pub(crate) struct WsSecSignatureMaterial {
 // Public API re-exports
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "as4")]
 pub use xmlenc::{
     XmlEncPayloadAlgorithm, decrypt_payload_xmlenc, encrypt_payload_xmlenc,
     encrypt_payload_xmlenc_preparsed, encrypt_soap_header_xmlenc_preparsed,
 };
 
+#[cfg(feature = "as4")]
 pub use canonicalize::{
     SameDocumentReferenceIndex, canonical_vector_diff, canonicalize_reference,
     canonicalize_reference_digest_from_doc_with_inclusive_ns_and_index,
     canonicalize_reference_from_doc, canonicalize_reference_from_doc_with_inclusive_ns,
 };
 pub use ocsp::CertOcspOutcome;
+#[cfg(feature = "as4")]
 pub use sign::{
     generate_xmlsig_signature, generate_xmlsig_signature_with_external_references,
     generate_xmlsig_signature_with_external_references_preparsed,
 };
+#[cfg(feature = "as4")]
 pub use verify::{
     WsSecVerifyOptions, parse_signature_references, verify_enveloped_signature,
     verify_signature_references_strict,

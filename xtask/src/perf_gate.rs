@@ -30,8 +30,8 @@ use asx::as2::{
 };
 #[cfg(feature = "as4")]
 use asx::as4::{
-    As4PushPolicyBuilder, As4ReceivePushRequest, generate_receipt as as4_generate_receipt,
-    receive_push_with_dedup_sync,
+    As4PushPolicyBuilder, As4ReceivePushRequest, As4ReceivePushSyncRequest,
+    generate_receipt as as4_generate_receipt, receive_push_with_dedup_sync,
 };
 #[cfg(feature = "as2")]
 use openssl::asn1::Asn1Time;
@@ -258,7 +258,7 @@ fn run_results(#[allow(unused_variables)] iterations: u64) -> Vec<BenchResult> {
     {
         let session = SessionContext::new("bench-s-as2", "bench-p", "strict").expect("session");
         let audit_sink = std::sync::Arc::new(InMemoryAuditSink::new());
-        let bus = EventBus::new_strict_with_durable_audit_sink(256, audit_sink).expect("bus");
+        let bus = EventBus::new_regulated(256, audit_sink).expect("bus");
         let _events = bus.subscribe_scoped_events();
         let payload = vec![b'A'; 2048];
         let credentials = bench_as2_credentials();
@@ -268,16 +268,18 @@ fn run_results(#[allow(unused_variables)] iterations: u64) -> Vec<BenchResult> {
                 let _ = as2_send(
                     &session,
                     &bus,
-                    "msg-bench-1".to_string(),
-                    payload.clone(),
-                    As2SendPolicy {
-                        interop_mode: asx::core::InteropMode::Strict,
-                        sign: true,
-                        encrypt: true,
-                        compress: false,
-                        ..As2SendPolicy::default()
+                    asx::as2::As2SendRequest {
+                        message_id: "msg-bench-1".to_string(),
+                        payload: payload.clone(),
+                        policy: As2SendPolicy {
+                            interop_mode: asx::core::InteropMode::Strict,
+                            sign: true,
+                            encrypt: true,
+                            compress: false,
+                            ..As2SendPolicy::default()
+                        },
+                        credentials: credentials.clone(),
                     },
-                    credentials.clone(),
                 )
                 .expect("as2 send");
             },
@@ -351,13 +353,16 @@ fn run_results(#[allow(unused_variables)] iterations: u64) -> Vec<BenchResult> {
                 let _ = receive_push_with_dedup_sync(
                     &session,
                     &bus,
-                    As4ReceivePushRequest {
-                        http_content_type: "multipart/related".into(),
-                        payload: std::sync::Arc::clone(&payload),
-                        receipt_payload: None,
-                        policy: bench_policy.clone(),
+                    As4ReceivePushSyncRequest {
+                        request: As4ReceivePushRequest {
+                            http_content_type: "multipart/related".into(),
+                            payload: std::sync::Arc::clone(&payload),
+                            receipt_payload: None,
+                            policy: bench_policy.clone(),
+                            authenticated_sender_scope: None,
+                        },
+                        dedup_backend: &dedup,
                     },
-                    &dedup,
                 )
                 .expect("as4 receive");
             },

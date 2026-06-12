@@ -146,7 +146,7 @@ pub(super) fn process_non_fragment_push(
 }
 
 fn enforce_non_fragment_timestamp_freshness(
-    session: &SessionContext,
+    #[cfg_attr(not(feature = "trace"), allow(unused_variables))] session: &SessionContext,
     policy: &As4PushPolicy,
     parsed: &super::super::ParsedAs4UserMessage,
 ) -> Result<()> {

@@ -2,6 +2,11 @@
 
 use crate::core::{Result, SessionContext};
 
+/// Boxed future returned by [`ConversationOrderGate::acquire_ordered_turn`].
+type AcquireOrderedTurnFuture<'a> = std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<Box<dyn ConversationGuardHandle>>> + Send + 'a>,
+>;
+
 /// Capability surface for AS4 ordered-delivery and pull-queue coordination backends.
 ///
 /// Strict-production startup validation uses this trait so clustered deployments
@@ -95,9 +100,7 @@ pub trait ConversationOrderGate: As4TopologyCoordination {
         &'a self,
         conversation_id: &'a str,
         session: &'a SessionContext,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<Box<dyn ConversationGuardHandle>>> + Send + 'a>,
-    >;
+    ) -> AcquireOrderedTurnFuture<'a>;
 
     /// Validate and record the reply-predecessor relationship for ordered
     /// Two-Way MEPs.

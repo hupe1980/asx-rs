@@ -1,17 +1,5 @@
 use asx::core::InteropMode;
 use asx::interop::{ProfileLintFinding, ProfileValidationFailure, ProfileValidationIssue};
-use asx::profiles::bdew::BdewProfile;
-use asx::profiles::bpc::BpcProfile;
-use asx::profiles::cef::CefProfile;
-use asx::profiles::dbnalliance::DbnProfile;
-use asx::profiles::edelivery2::EDelivery2Profile;
-use asx::profiles::eespa::EespaProfile;
-use asx::profiles::entsog::EntsoGProfile;
-use asx::profiles::erds::ErdsProfile;
-use asx::profiles::euctp::EuctpProfile;
-use asx::profiles::eudamed::EudamedProfile;
-use asx::profiles::hredelivery::HrEdeliveryProfile;
-use asx::profiles::peppol::PeppolProfile;
 use serde::Serialize;
 
 pub fn run(args: &[String]) -> Result<(), String> {
@@ -73,7 +61,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
 
     let summary = GateSummary {
         gate: "profile-lint-gate",
-        profiles_checked: 12,
+        profiles_checked: 0,
         failures,
     };
 
@@ -95,57 +83,10 @@ struct NamedProfile {
     base: asx::interop::ProfileStack,
 }
 
-fn profile_catalog() -> [NamedProfile; 12] {
-    [
-        NamedProfile {
-            name: "bdew",
-            base: BdewProfile::profile_stack(),
-        },
-        NamedProfile {
-            name: "bpc",
-            base: BpcProfile::profile_stack(),
-        },
-        NamedProfile {
-            name: "cef",
-            base: CefProfile::profile_stack(),
-        },
-        NamedProfile {
-            name: "dbnalliance",
-            base: DbnProfile::profile_stack(),
-        },
-        NamedProfile {
-            name: "edelivery2",
-            base: EDelivery2Profile::profile_stack(),
-        },
-        NamedProfile {
-            name: "eespa",
-            base: EespaProfile::profile_stack(),
-        },
-        NamedProfile {
-            name: "entsog",
-            base: EntsoGProfile::profile_stack(),
-        },
-        NamedProfile {
-            name: "erds",
-            base: ErdsProfile::profile_stack(),
-        },
-        NamedProfile {
-            name: "euctp",
-            base: EuctpProfile::profile_stack(),
-        },
-        NamedProfile {
-            name: "eudamed",
-            base: EudamedProfile::profile_stack(),
-        },
-        NamedProfile {
-            name: "hredelivery",
-            base: HrEdeliveryProfile::profile_stack(),
-        },
-        NamedProfile {
-            name: "peppol",
-            base: PeppolProfile::profile_stack(),
-        },
-    ]
+fn profile_catalog() -> [NamedProfile; 0] {
+    // asx::profiles sub-crates are not yet published; catalog is empty until
+    // profile crates are implemented and added as xtask dependencies.
+    []
 }
 
 #[derive(Debug, Serialize)]
