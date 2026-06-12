@@ -207,8 +207,8 @@ fn regulated_provider_selection_parses_and_formats() {
 }
 
 #[cfg(feature = "client")]
-#[test]
-fn regulated_http_provider_fetches_key_from_endpoint() {
+#[tokio::test(flavor = "multi_thread")]
+async fn regulated_http_provider_fetches_key_from_endpoint() {
     use std::io::{Read, Write};
     use std::net::TcpListener;
 
@@ -257,8 +257,8 @@ fn regulated_http_provider_fetches_key_from_endpoint() {
 }
 
 #[cfg(feature = "client")]
-#[test]
-fn regulated_http_provider_retries_transient_server_error() {
+#[tokio::test(flavor = "multi_thread")]
+async fn regulated_http_provider_retries_transient_server_error() {
     use std::io::{Read, Write};
     use std::net::TcpListener;
 
@@ -316,8 +316,8 @@ fn regulated_http_provider_retries_transient_server_error() {
 }
 
 #[cfg(feature = "client")]
-#[test]
-fn regulated_http_provider_rejects_invalid_response_hmac() {
+#[tokio::test(flavor = "multi_thread")]
+async fn regulated_http_provider_rejects_invalid_response_hmac() {
     use std::io::{Read, Write};
     use std::net::TcpListener;
 

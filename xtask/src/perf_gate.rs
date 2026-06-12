@@ -25,8 +25,11 @@ use asx::reliability::InMemoryReconciliationHook;
 #[cfg(feature = "as2")]
 use asx::as2::{
     As2MdnMode, As2ReceiveMdnRequest, As2ReceivePolicy, As2SendCredentials, As2SendPolicy,
-    As2TrustVerifier, TrustResult, TrustVerifierSeal, generate_mdn as as2_generate_mdn,
-    receive_with_mdn_with_reliability, send_sync as as2_send,
+    generate_mdn as as2_generate_mdn, send_sync as as2_send,
+};
+#[cfg(all(feature = "as2", feature = "testing"))]
+use asx::as2::{
+    As2TrustVerifier, TrustResult, TrustVerifierSeal, receive_with_mdn_with_reliability,
 };
 #[cfg(feature = "as4")]
 use asx::as4::{
@@ -55,23 +58,23 @@ struct BenchResult {
     ns_per_op: f64,
 }
 
-#[cfg(feature = "as2")]
+#[cfg(all(feature = "as2", feature = "testing"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct DeterministicTrustVerifier {
     trust: TrustEvidence,
 }
 
-#[cfg(feature = "as2")]
+#[cfg(all(feature = "as2", feature = "testing"))]
 impl DeterministicTrustVerifier {
     fn new(trust: TrustEvidence) -> Self {
         Self { trust }
     }
 }
 
-#[cfg(feature = "as2")]
+#[cfg(all(feature = "as2", feature = "testing"))]
 impl TrustVerifierSeal for DeterministicTrustVerifier {}
 
-#[cfg(feature = "as2")]
+#[cfg(all(feature = "as2", feature = "testing"))]
 impl As2TrustVerifier for DeterministicTrustVerifier {
     fn verify_and_decrypt(
         &self,
@@ -144,7 +147,7 @@ fn bench(mut f: impl FnMut(), name: &'static str, iterations: u64) -> BenchResul
     }
 }
 
-#[cfg(feature = "as4")]
+#[cfg(all(feature = "as4", feature = "testing"))]
 fn as4_multipart_payload_from_fixture(soap_xml: &[u8]) -> Vec<u8> {
     let boundary = "asx-perf-boundary";
     let payload_cid = "perf-body@example.com";
@@ -301,34 +304,39 @@ fn run_results(#[allow(unused_variables)] iterations: u64) -> Vec<BenchResult> {
             iterations,
         ));
 
-        let mdn_payload = fs::read("tests/fixtures/as2_mdn_sync_ok.golden").expect("mdn fixture");
-        let verifier = DeterministicTrustVerifier::new(TrustEvidence::verified_and_decryptable());
-        results.push(bench(
-            || {
-                let hook = InMemoryReconciliationHook::default();
-                let dedup = InMemoryDedupBackend::default();
-                let _ = receive_with_mdn_with_reliability(
-                    &session,
-                    &bus,
-                    As2ReceiveMdnRequest {
-                        payload: std::sync::Arc::from([1u8]),
-                        mdn_payload: std::sync::Arc::from(mdn_payload.as_slice()),
-                        mdn_mode: As2MdnMode::Synchronous,
-                        expected_mic: Some(
-                            "KUPgyYBxFU9pqBBAxdTOeAw3hlDAepf6m2Pfoy8VI0g=".to_string(),
-                        ),
-                        policy: As2ReceivePolicy::default(),
-                        original_message_id: None,
-                    },
-                    &hook,
-                    &dedup,
-                    &verifier,
-                )
-                .expect("as2 receive mdn");
-            },
-            "as2_verify_decrypt_mdn",
-            iterations,
-        ));
+        #[cfg(feature = "testing")]
+        {
+            let mdn_payload =
+                fs::read("tests/fixtures/as2_mdn_sync_ok.golden").expect("mdn fixture");
+            let verifier =
+                DeterministicTrustVerifier::new(TrustEvidence::verified_and_decryptable());
+            results.push(bench(
+                || {
+                    let hook = InMemoryReconciliationHook::default();
+                    let dedup = InMemoryDedupBackend::default();
+                    let _ = receive_with_mdn_with_reliability(
+                        &session,
+                        &bus,
+                        As2ReceiveMdnRequest {
+                            payload: std::sync::Arc::from([1u8]),
+                            mdn_payload: std::sync::Arc::from(mdn_payload.as_slice()),
+                            mdn_mode: As2MdnMode::Synchronous,
+                            expected_mic: Some(
+                                "KUPgyYBxFU9pqBBAxdTOeAw3hlDAepf6m2Pfoy8VI0g=".to_string(),
+                            ),
+                            policy: As2ReceivePolicy::default(),
+                            original_message_id: None,
+                        },
+                        &hook,
+                        &dedup,
+                        &verifier,
+                    )
+                    .expect("as2 receive mdn");
+                },
+                "as2_verify_decrypt_mdn",
+                iterations,
+            ));
+        }
     }
 
     #[cfg(feature = "as4")]
@@ -338,37 +346,43 @@ fn run_results(#[allow(unused_variables)] iterations: u64) -> Vec<BenchResult> {
         let _events = bus.subscribe_scoped_events();
         let marker_payload =
             fs::read("tests/fixtures/as4_push_user_message.golden").expect("as4 fixture precheck");
+
+        #[cfg(feature = "testing")]
         let payload =
             std::sync::Arc::<[u8]>::from(as4_multipart_payload_from_fixture(&marker_payload));
-        let bench_policy = As4PushPolicyBuilder::new()
-            .interop(asx::core::InteropMode::Relaxed)
-            .fail_closed_audit_events(false)
-            .allow_unsigned_push(true)
-            .build()
-            .expect("bench policy");
 
-        results.push(bench(
-            || {
-                let dedup = InMemoryDedupBackend::default();
-                let _ = receive_push_with_dedup_sync(
-                    &session,
-                    &bus,
-                    As4ReceivePushSyncRequest {
-                        request: As4ReceivePushRequest {
-                            http_content_type: "multipart/related".into(),
-                            payload: std::sync::Arc::clone(&payload),
-                            receipt_payload: None,
-                            policy: bench_policy.clone(),
-                            authenticated_sender_scope: None,
+        #[cfg(feature = "testing")]
+        {
+            let bench_policy = As4PushPolicyBuilder::new()
+                .interop(asx::core::InteropMode::Strict)
+                .fail_closed_audit_events(false)
+                .allow_unsigned_push(true)
+                .build()
+                .expect("bench policy");
+
+            results.push(bench(
+                || {
+                    let dedup = InMemoryDedupBackend::default();
+                    let _ = receive_push_with_dedup_sync(
+                        &session,
+                        &bus,
+                        As4ReceivePushSyncRequest {
+                            request: As4ReceivePushRequest {
+                                http_content_type: "multipart/related".into(),
+                                payload: std::sync::Arc::clone(&payload),
+                                receipt_payload: None,
+                                policy: bench_policy.clone(),
+                                authenticated_sender_scope: None,
+                            },
+                            dedup_backend: &dedup,
                         },
-                        dedup_backend: &dedup,
-                    },
-                )
-                .expect("as4 receive");
-            },
-            "as4_verify_decrypt",
-            iterations,
-        ));
+                    )
+                    .expect("as4 receive");
+                },
+                "as4_verify_decrypt",
+                iterations,
+            ));
+        }
 
         results.push(bench(
             || {

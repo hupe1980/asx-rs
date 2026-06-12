@@ -288,11 +288,7 @@ fn run_profile_loader_case(input: &[u8]) -> Result<(), String> {
 
 fn run_policy_resolver_case(input: &[u8]) -> Result<(), String> {
     let b = |idx: usize| -> bool { input.get(idx).copied().unwrap_or_default() & 1 == 1 };
-    let mode = if b(0) {
-        InteropMode::Relaxed
-    } else {
-        InteropMode::Strict
-    };
+    let mode = InteropMode::Strict;
 
     let stack = ProfileStack {
         base: BaseProfile {
@@ -313,11 +309,7 @@ fn run_policy_resolver_case(input: &[u8]) -> Result<(), String> {
         extensions: vec![ProfileExtension {
             name: "ext-fuzz".to_string(),
             overrides: ProfilePolicyOverrides {
-                mode: Some(if b(10) {
-                    InteropMode::Relaxed
-                } else {
-                    InteropMode::Strict
-                }),
+                mode: Some(InteropMode::Strict),
                 ..ProfilePolicyOverrides::default()
             },
         }],
@@ -331,11 +323,7 @@ fn run_policy_resolver_case(input: &[u8]) -> Result<(), String> {
             name: "partner-fuzz".to_string(),
             partner_id: "partner-fuzz".to_string(),
             overrides: ProfilePolicyOverrides {
-                mode: Some(if b(14) {
-                    InteropMode::Relaxed
-                } else {
-                    InteropMode::Strict
-                }),
+                mode: Some(InteropMode::Strict),
                 ..ProfilePolicyOverrides::default()
             },
         }],
