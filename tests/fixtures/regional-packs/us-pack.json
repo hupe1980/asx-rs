@@ -1,0 +1,15 @@
+{
+  "pack_id": "us-healthcare",
+  "version": "2.1.0",
+  "applies_to_base_profile": "base",
+  "overrides": {
+    "mode": "Relaxed",
+    "canonicalization": null,
+    "security": null,
+    "validation": {
+      "reject_ambiguous_headers": true,
+      "enforce_payload_limits": true,
+      "require_as2_mic": false
+    }
+  }
+}

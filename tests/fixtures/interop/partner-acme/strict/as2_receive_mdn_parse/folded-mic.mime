@@ -1,0 +1,17 @@
+Content-Type: multipart/report; report-type=disposition-notification; boundary="acme-strict-mdn"
+
+--acme-strict-mdn
+Content-Type: text/plain; charset=us-ascii
+
+Processed successfully.
+
+--acme-strict-mdn
+Content-Type: message/disposition-notification
+
+Final-Recipient: rfc822; partner-acme
+Original-Message-ID: <acme-interop-42@example>
+Disposition: automatic-action/MDN-sent-automatically; processed
+Received-Content-MIC: ZXELZG2MstvZ8CzynjCRhlEuxafCsnlFN6wFAV9r8AA=,
+ sha-256
+
+--acme-strict-mdn--

@@ -1,0 +1,1 @@
+<eb:Payload xmlns:eb="urn:example:eb" xmlns:wsu="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd" wsu:Id="payload-1">ABC</eb:Payload>

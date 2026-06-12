@@ -1,0 +1,13 @@
+MIME-Version: 1.0
+Content-Type: multipart/report; report-type=disposition-notification
+AS2-From: ACME
+AS2-To: HUB
+Message-ID: <mdn-strict-bad-boundary@example>
+
+--broken-boundary
+Content-Type: message/disposition-notification
+
+Final-Recipient: rfc822; HUB
+Disposition: automatic-action/MDN-sent-automatically; processed
+
+--broken-boundary--

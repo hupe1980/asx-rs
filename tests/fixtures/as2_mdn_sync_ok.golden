@@ -1,0 +1,6 @@
+Content-Type: multipart/report; report-type=disposition-notification; boundary="as2-mdn-b"
+
+Final-Recipient: rfc822; partner-a
+Original-Message-ID: <msg-42@example>
+Disposition: automatic-action/MDN-sent-automatically; processed
+Received-content-MIC: ZXELZG2MstvZ8CzynjCRhlEuxafCsnlFN6wFAV9r8AA=, sha-256

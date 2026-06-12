@@ -1,0 +1,5 @@
+content-type: multipart/report; report-type=disposition-notification
+
+final-recipient: rfc822; HUB
+original-message-id: <mdn-relaxed-ok@example>
+disposition: automatic-action/MDN-sent-automatically; processed/warning: boundary-quirk

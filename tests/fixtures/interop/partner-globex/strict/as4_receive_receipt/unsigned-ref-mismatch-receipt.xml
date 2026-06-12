@@ -1,0 +1,21 @@
+<S12:Envelope xmlns:S12="http://www.w3.org/2003/05/soap-envelope"
+    xmlns:eb="http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/"
+    xmlns:ebbpsig="http://docs.oasis-open.org/ebxml-bp/ebbp-signals-2.0">
+  <S12:Header>
+    <eb:Messaging>
+      <eb:SignalMessage>
+        <eb:MessageInfo>
+          <eb:RefToMessageId>msg-push-999</eb:RefToMessageId>
+        </eb:MessageInfo>
+        <eb:Receipt>
+          <ebbpsig:NonRepudiationInformation>
+            <ebbpsig:MessagePartNRInformation>
+              <ebbpsig:MessagePartIdentifier>body</ebbpsig:MessagePartIdentifier>
+            </ebbpsig:MessagePartNRInformation>
+          </ebbpsig:NonRepudiationInformation>
+        </eb:Receipt>
+      </eb:SignalMessage>
+    </eb:Messaging>
+  </S12:Header>
+  <S12:Body/>
+</S12:Envelope>

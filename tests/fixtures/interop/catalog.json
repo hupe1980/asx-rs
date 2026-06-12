@@ -1,0 +1,255 @@
+{
+  "schema_version": "1.0",
+  "fixtures": [
+    {
+      "fixture_id": "as2-strict-malformed-boundary",
+      "protocol": "As2Mime",
+      "mode": "Strict",
+      "grouping": {
+        "partner_id": "partner-acme",
+        "profile_name": "strict",
+        "protocol_stage": "as2_receive_mdn_boundary"
+      },
+      "payload_path": "partner-acme/strict/as2_receive_mdn_boundary/malformed-boundary.mime",
+      "expected_outcome": "InteropViolation",
+      "reason_annotations": [
+        "Strict AS2 MDN parsing requires explicit multipart boundary",
+        "Malformed partner payload must fail at boundary parse stage"
+      ]
+    },
+    {
+      "fixture_id": "as2-relaxed-partner-quirk-boundary",
+      "protocol": "As2Mime",
+      "mode": "Relaxed",
+      "grouping": {
+        "partner_id": "partner-acme",
+        "profile_name": "partner-quirks",
+        "protocol_stage": "as2_receive_mdn_boundary"
+      },
+      "payload_path": "partner-acme/relaxed/as2_receive_mdn_boundary/partner-quirk-boundary.mime",
+      "expected_outcome": "Pass",
+      "reason_annotations": [
+        "Partner-scoped relaxed exception allows known boundary quirk",
+        "Relaxed acceptance must remain profile-scoped and auditable"
+      ]
+    },
+    {
+      "fixture_id": "as2-strict-folded-mic-multipart-report",
+      "protocol": "As2Mime",
+      "mode": "Strict",
+      "grouping": {
+        "partner_id": "partner-acme",
+        "profile_name": "strict",
+        "protocol_stage": "as2_receive_mdn_parse"
+      },
+      "payload_path": "partner-acme/strict/as2_receive_mdn_parse/folded-mic.mime",
+      "expected_outcome": "Pass",
+      "reason_annotations": [
+        "Strict AS2 parser should accept folded Received-Content-MIC continuation lines",
+        "Partner formatting quirks in notification headers must not break compliant multipart/report parsing"
+      ]
+    },
+    {
+      "fixture_id": "as4-strict-missing-security-header",
+      "protocol": "As4Soap",
+      "mode": "Strict",
+      "grouping": {
+        "partner_id": "partner-globex",
+        "profile_name": "strict",
+        "protocol_stage": "as4_parse_user_message"
+      },
+      "payload_path": "partner-globex/strict/as4_parse_user_message/missing-security.xml",
+      "expected_outcome": "ParseFailed",
+      "reason_annotations": [
+        "Missing wsse:Security is security-blocked",
+        "Strict/default paths must reject missing security header via interop guardrail enforcement"
+      ]
+    },
+    {
+      "fixture_id": "as4-strict-duplicate-message-id",
+      "protocol": "As4Soap",
+      "mode": "Strict",
+      "grouping": {
+        "partner_id": "partner-globex",
+        "profile_name": "strict",
+        "protocol_stage": "as4_parse_user_message"
+      },
+      "payload_path": "partner-globex/strict/as4_parse_user_message/duplicate-message-id.xml",
+      "expected_outcome": "InteropViolation",
+      "reason_annotations": [
+        "Duplicate eb:MessageId values must fail closed to prevent header-injection ambiguity",
+        "Strict parser must reject conflicting message identity fields"
+      ]
+    },
+    {
+      "fixture_id": "as4-strict-forged-signed-receipt",
+      "protocol": "As4Soap",
+      "mode": "Strict",
+      "grouping": {
+        "partner_id": "partner-globex",
+        "profile_name": "strict",
+        "protocol_stage": "as4_receive_receipt"
+      },
+      "payload_path": "partner-globex/strict/as4_receive_receipt/push-user-message-multipart.mime",
+      "receipt_payload_path": "partner-globex/strict/as4_receive_receipt/forged-signed-receipt.xml",
+      "expected_outcome": "PolicyViolation",
+      "reason_annotations": [
+        "Forged or stub-signed AS4 receipt must be rejected",
+        "Receipt signature verification failures must be classified explicitly as security verification failures"
+      ]
+    },
+    {
+      "fixture_id": "as4-relaxed-wssec-trimmed-reference",
+      "protocol": "As4Soap",
+      "mode": "Relaxed",
+      "grouping": {
+        "partner_id": "partner-globex",
+        "profile_name": "vendor-relaxed",
+        "protocol_stage": "as4_parse_user_message"
+      },
+      "payload_path": "partner-globex/relaxed/as4_parse_user_message/wssec-trimmed-reference.xml",
+      "expected_outcome": "PolicyViolation",
+      "reason_annotations": [
+        "Relaxed profile currently remains strict for this wsse reference variant",
+        "Trimmed-reference input must still fail closed until explicit compatibility behavior is implemented"
+      ]
+    },
+    {
+      "fixture_id": "as4-relaxed-missing-security-header-security-blocked",
+      "protocol": "As4Soap",
+      "mode": "Relaxed",
+      "grouping": {
+        "partner_id": "partner-globex",
+        "profile_name": "vendor-relaxed",
+        "protocol_stage": "as4_parse_user_message"
+      },
+      "payload_path": "partner-globex/relaxed/as4_parse_user_message/missing-security.xml",
+      "expected_outcome": "PolicyViolation",
+      "reason_annotations": [
+        "Missing wsse:Security remains security-blocked even in relaxed interoperability mode",
+        "Relaxed profiles must not permit security-header omission"
+      ]
+    },
+    {
+      "fixture_id": "as4-relaxed-forged-signed-receipt",
+      "protocol": "As4Soap",
+      "mode": "Relaxed",
+      "grouping": {
+        "partner_id": "partner-globex",
+        "profile_name": "vendor-relaxed",
+        "protocol_stage": "as4_receive_receipt"
+      },
+      "payload_path": "partner-globex/strict/as4_receive_receipt/push-user-message-multipart.mime",
+      "receipt_payload_path": "partner-globex/strict/as4_receive_receipt/forged-signed-receipt.xml",
+      "expected_outcome": "PolicyViolation",
+      "reason_annotations": [
+        "Relaxed compatibility mode must still reject forged AS4 receipt signatures",
+        "Relaxed mode still classifies receipt signature verification failures as security verification failures"
+      ]
+    },
+    {
+      "fixture_id": "as4-strict-unsigned-receipt-valid",
+      "protocol": "As4Soap",
+      "mode": "Strict",
+      "grouping": {
+        "partner_id": "partner-globex",
+        "profile_name": "strict",
+        "protocol_stage": "as4_receive_receipt"
+      },
+      "payload_path": "partner-globex/strict/as4_receive_receipt/push-user-message-multipart.mime",
+      "receipt_payload_path": "partner-globex/strict/as4_receive_receipt/unsigned-valid-receipt.xml",
+      "expected_outcome": "Pass",
+      "reason_annotations": [
+        "With signed-receipt requirement disabled in matrix fixture mode, valid unsigned receipts are accepted",
+        "RefToMessageId correlation and receipt structure remain enforced for this relaxed fixture harness"
+      ]
+    },
+    {
+      "fixture_id": "as4-relaxed-unsigned-receipt-valid",
+      "protocol": "As4Soap",
+      "mode": "Relaxed",
+      "grouping": {
+        "partner_id": "partner-globex",
+        "profile_name": "vendor-relaxed",
+        "protocol_stage": "as4_receive_receipt"
+      },
+      "payload_path": "partner-globex/strict/as4_receive_receipt/push-user-message-multipart.mime",
+      "receipt_payload_path": "partner-globex/strict/as4_receive_receipt/unsigned-valid-receipt.xml",
+      "expected_outcome": "Pass",
+      "reason_annotations": [
+        "With signed-receipt requirement disabled in matrix fixture mode, valid unsigned receipts are accepted",
+        "Receipt structure and correlation checks still run in relaxed profile coverage"
+      ]
+    },
+    {
+      "fixture_id": "as4-strict-unsigned-receipt-ref-mismatch",
+      "protocol": "As4Soap",
+      "mode": "Strict",
+      "grouping": {
+        "partner_id": "partner-globex",
+        "profile_name": "strict",
+        "protocol_stage": "as4_receive_receipt"
+      },
+      "payload_path": "partner-globex/strict/as4_receive_receipt/push-user-message-multipart.mime",
+      "receipt_payload_path": "partner-globex/strict/as4_receive_receipt/unsigned-ref-mismatch-receipt.xml",
+      "expected_outcome": "InteropViolation",
+      "reason_annotations": [
+        "Unsigned receipt semantic mismatch must be evaluated when fixture-mode signed-receipt policy is disabled",
+        "RefToMessageId mismatch remains an interop failure after structural receipt validation"
+      ]
+    },
+    {
+      "fixture_id": "as4-relaxed-unsigned-receipt-ref-mismatch",
+      "protocol": "As4Soap",
+      "mode": "Relaxed",
+      "grouping": {
+        "partner_id": "partner-globex",
+        "profile_name": "vendor-relaxed",
+        "protocol_stage": "as4_receive_receipt"
+      },
+      "payload_path": "partner-globex/strict/as4_receive_receipt/push-user-message-multipart.mime",
+      "receipt_payload_path": "partner-globex/strict/as4_receive_receipt/unsigned-ref-mismatch-receipt.xml",
+      "expected_outcome": "InteropViolation",
+      "reason_annotations": [
+        "Relaxed mode must keep receipt semantic mismatch behavior aligned with strict fixture-mode policy settings",
+        "RefToMessageId mismatch remains an interop failure after structural receipt validation"
+      ]
+    },
+    {
+      "fixture_id": "as4-strict-signed-receipt-ref-mismatch",
+      "protocol": "As4Soap",
+      "mode": "Strict",
+      "grouping": {
+        "partner_id": "partner-globex",
+        "profile_name": "strict",
+        "protocol_stage": "as4_receive_receipt"
+      },
+      "payload_path": "partner-globex/strict/as4_receive_receipt/push-user-message-multipart.mime",
+      "receipt_payload_path": null,
+      "generated_receipt_ref_to_message_id": "msg-push-999",
+      "expected_outcome": "PolicyViolation",
+      "reason_annotations": [
+        "Strict mode must evaluate signed receipt semantic linkage after successful signature verification",
+        "RefToMessageId mismatch after verified signature remains an interop failure"
+      ]
+    },
+    {
+      "fixture_id": "as4-relaxed-signed-receipt-ref-mismatch",
+      "protocol": "As4Soap",
+      "mode": "Relaxed",
+      "grouping": {
+        "partner_id": "partner-globex",
+        "profile_name": "vendor-relaxed",
+        "protocol_stage": "as4_receive_receipt"
+      },
+      "payload_path": "partner-globex/strict/as4_receive_receipt/push-user-message-multipart.mime",
+      "receipt_payload_path": null,
+      "generated_receipt_ref_to_message_id": "msg-push-999",
+      "expected_outcome": "PolicyViolation",
+      "reason_annotations": [
+        "Relaxed mode must not bypass signed-receipt semantic correlation checks",
+        "RefToMessageId mismatch after successful signature verification remains an interop failure"
+      ]
+    }
+  ]
+}

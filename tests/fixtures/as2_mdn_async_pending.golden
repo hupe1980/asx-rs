@@ -1,0 +1,5 @@
+Content-Type: multipart/report; report-type=disposition-notification; boundary="as2-mdn-b"
+
+Final-Recipient: rfc822; partner-a
+Original-Message-ID: <msg-43@example>
+Disposition: automatic-action/MDN-sent-automatically; processed/warning: authentication-failed, processing continued

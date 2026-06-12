@@ -1,0 +1,19 @@
+<S12:Envelope xmlns:S12="http://www.w3.org/2003/05/soap-envelope" xmlns:eb="http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/" xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd">
+  <S12:Header>
+    <eb:Messaging S12:mustUnderstand="true">
+      <eb:UserMessage>
+        <eb:MessageInfo>
+          <eb:MessageId>as4-strict-primary-id</eb:MessageId>
+          <eb:MessageId>as4-strict-injected-id</eb:MessageId>
+        </eb:MessageInfo>
+        <eb:PartyInfo>
+          <eb:From><eb:PartyId>globex</eb:PartyId></eb:From>
+          <eb:To><eb:PartyId>hub</eb:PartyId></eb:To>
+        </eb:PartyInfo>
+        <eb:CollaborationInfo><eb:Action>SubmitInvoice</eb:Action></eb:CollaborationInfo>
+      </eb:UserMessage>
+    </eb:Messaging>
+    <wsse:Security/>
+  </S12:Header>
+  <S12:Body/>
+</S12:Envelope>

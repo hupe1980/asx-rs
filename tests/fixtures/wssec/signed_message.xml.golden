@@ -1,0 +1,19 @@
+<soap:Envelope xmlns:soap="http://www.w3.org/2003/05/soap-envelope"
+               xmlns:wsu="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd"
+               xmlns:ds="http://www.w3.org/2000/09/xmldsig#"
+               xmlns:eb="urn:example:eb">
+  <soap:Header>
+    <ds:Signature>
+      <ds:SignedInfo>
+        <ds:Reference URI="#payload-1">
+          <ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/>
+          <ds:DigestValue>{{DIGEST}}</ds:DigestValue>
+        </ds:Reference>
+      </ds:SignedInfo>
+      <ds:SignatureValue>stub-signature</ds:SignatureValue>
+    </ds:Signature>
+  </soap:Header>
+  <soap:Body>
+    <eb:Payload wsu:Id="payload-1">ABC</eb:Payload>
+  </soap:Body>
+</soap:Envelope>

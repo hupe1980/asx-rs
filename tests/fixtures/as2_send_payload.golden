@@ -1,0 +1,5 @@
+--asx-msg-42
+Content-Type: application/edi-x12
+
+ISA*00*          *00*          *ZZ*SENDER         *ZZ*RECEIVER       *240101*1200*U*00401*000000001*0*T*:~
+--asx-msg-42--

@@ -1,0 +1,167 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check-test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        features:
+          - "as2,client"
+          - "as4,server"
+          - "as2,as4,client,server,trace"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cargo check
+        run: cargo check --no-default-features --features "${{ matrix.features }}"
+      - name: Cargo test
+        run: cargo test --no-default-features --features "${{ matrix.features }}"
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cargo fmt
+        run: cargo fmt --all -- --check
+      - name: Cargo clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+  perf-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Run Performance Gate
+        run: |
+          cargo run --release -p xtask --all-features -- perf-gate \
+            --iterations 2000 \
+            --check-baseline docs/perf-baseline.txt \
+            --max-regression 0.25
+
+  perf-matrix-smoke:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        features:
+          - "as2,client"
+          - "as4,server"
+          - "as2,as4,client,server"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Benchmark Harness Smoke
+        run: |
+          cargo run --release -p xtask --no-default-features --features "${{ matrix.features }}" -- perf-gate --iterations 500
+
+  interop-fixtures-required:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Run Required Interop Fixtures
+        run: |
+          cargo test --all-features --test as2_send_golden
+          cargo test --all-features --test as2_receive_mdn
+          cargo test --all-features --test as4_push_flow
+          cargo test --all-features --test as4_pull_flow
+          cargo test --all-features --test wssec_c14n_vectors
+          cargo test --all-features --test wssec_strict_matrix
+
+  property-and-fuzz-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Run Property Test Suite
+        run: cargo test --all-features --test property_protocol_invariants
+      - name: Run Profile Property Invariants
+        run: cargo test --all-features --test profile_property_invariants
+      - name: Run Fuzz Smoke Suite
+        run: cargo test --all-features --test fuzz_protocol_ingress
+
+  interop-matrix-and-vector-required:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Run Interop Matrix Gate
+        run: bash scripts/run_interop_matrix.sh
+      - name: Run WS-Security Vector Gate
+        run: bash scripts/run_wssec_vector_gate.sh
+
+  fuzz-adversarial-required:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Run Adversarial Fuzz Gate
+        run: bash scripts/run_fuzz_gate.sh 4000 2500 artifacts/fuzz
+      - name: Upload Fuzz Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts
+          path: artifacts/fuzz
+
+  session-isolation-required:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Run Session Isolation Integration Suite
+        run: cargo test --all-features --test session_isolation_concurrency
+
+  coverage-profile-interop:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Enforce Profile/Interop Coverage Threshold
+        run: bash scripts/check_profile_coverage.sh 85 src/interop.rs
+
+  flaky-quarantine-policy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate Quarantine Register
+        run: bash scripts/check_test_quarantine.sh docs/test-quarantine.txt
+
+  release-candidate-gate:
+    runs-on: ubuntu-latest
+    needs:
+      - check-test
+      - lint
+      - perf-gate
+      - perf-matrix-smoke
+      - interop-fixtures-required
+      - property-and-fuzz-smoke
+      - session-isolation-required
+      - coverage-profile-interop
+      - interop-matrix-and-vector-required
+      - fuzz-adversarial-required
+      - flaky-quarantine-policy
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Run Release Candidate Gate
+        run: bash scripts/release_gate.sh

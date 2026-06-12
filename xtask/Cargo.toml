@@ -1,0 +1,28 @@
+[package]
+name = "xtask"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[features]
+default = ["interop-strict", "testing"]
+as2 = ["asx/as2"]
+as4 = ["asx/as4"]
+client = ["asx/client"]
+server = ["asx/server"]
+interop-strict = ["asx/interop-strict"]
+interop-relaxed = ["asx/interop-relaxed"]
+compression = ["asx/compression"]
+trace = ["asx/trace"]
+async-ocsp = ["asx/async-ocsp"]
+testing = ["asx/testing"]
+
+[dependencies]
+asx = { path = "..", default-features = false }
+base64 = "0.22"
+memchr = "2"
+openssl = "0.10"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tokio = { version = "1", features = ["rt"] }
