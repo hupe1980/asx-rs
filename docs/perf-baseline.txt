@@ -1,6 +1,6 @@
 # ns_per_op baseline
 as2_sign_encrypt=986860.062
-as2_mdn_generation=116.938
+as2_mdn_generation=310.000
 as2_verify_decrypt_mdn=1779.438
 as4_verify_decrypt=6477.604
 as4_precheck_markers=261.875

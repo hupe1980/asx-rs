@@ -1,5 +1,3 @@
-use sha2::{Digest, Sha256};
-
 use crate::core::{
     AsxError, ErrorCode, ErrorContext, InteropMode, ReceivedBodyHandle, Result, SessionContext,
     SpoolEncryption, SpoolLifecyclePolicy,
@@ -470,15 +468,15 @@ Content-Type: message/disposition-notification\r\n\
 }
 
 fn mdn_boundary_from_message_id(original_message_id: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(original_message_id.as_bytes());
-    let digest = hasher.finalize();
-    let mut digest_hex = String::with_capacity(digest.len() * 2);
-    for byte in digest {
-        use std::fmt::Write as _;
-        let _ = write!(&mut digest_hex, "{byte:02x}");
+    // FNV-1a: fast non-cryptographic hash sufficient for MIME boundary uniqueness.
+    const OFFSET: u64 = 14_695_981_039_346_656_037;
+    const PRIME: u64 = 1_099_511_628_211;
+    let mut h: u64 = OFFSET;
+    for &b in original_message_id.as_bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(PRIME);
     }
-    format!("asx-mdn-{}", &digest_hex[..24])
+    format!("asx-mdn-{h:016x}")
 }
 
 /// Outcome of [`correlate_async_mdn`].
