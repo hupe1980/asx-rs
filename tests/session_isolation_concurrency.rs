@@ -1,4 +1,4 @@
-#![cfg_attr(not(feature = "interop-relaxed"), allow(unused_imports, dead_code))]
+#![cfg(feature = "interop-relaxed")]
 #![cfg(all(feature = "as2", feature = "as4", feature = "testing"))]
 #[path = "common/as2_verifier.rs"]
 mod common;

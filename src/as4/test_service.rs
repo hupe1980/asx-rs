@@ -8,6 +8,8 @@
 //! ## Usage — sending a test ping
 //!
 //! ```rust
+//! # #[cfg(feature = "interop-relaxed")]
+//! # {
 //! # use asx_rs::as4::test_service::{test_service_send_policy, TEST_SERVICE_URI, TEST_ACTION_URI};
 //! # use asx_rs::core::InteropMode;
 //! let (policy, _creds) = test_service_send_policy()
@@ -17,6 +19,7 @@
 //!     .expect("test policy");
 //! assert_eq!(policy.service, TEST_SERVICE_URI);
 //! assert_eq!(policy.action, TEST_ACTION_URI);
+//! # }
 //! ```
 //!
 //! ## Usage — detecting a test ping on receive
@@ -73,6 +76,8 @@ pub fn is_test_service_message(msg: &ParsedAs4UserMessage) -> bool {
 ///
 /// # Example
 /// ```rust
+/// # #[cfg(feature = "interop-relaxed")]
+/// # {
 /// # use asx_rs::as4::test_service::test_service_send_policy;
 /// # use asx_rs::core::InteropMode;
 /// let (policy, _creds) = test_service_send_policy()
@@ -80,6 +85,7 @@ pub fn is_test_service_message(msg: &ParsedAs4UserMessage) -> bool {
 ///     .sign(false)
 ///     .build()
 ///     .expect("build");
+/// # }
 /// ```
 pub fn test_service_send_policy() -> As4SendPolicyBuilder {
     As4SendPolicyBuilder::new()

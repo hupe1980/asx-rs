@@ -93,7 +93,7 @@ impl DedupStorage for DurableClusterSafeDedup {
     fn first_seen<'a>(
         &'a self,
         _idempotency_key: &'a str,
-    ) -> BoxFuture<'a, crate::core::Result<bool>> {
+    ) -> BoxFuture<'a, asx_rs::core::Result<bool>> {
         Box::pin(async move { Ok(true) })
     }
 }
@@ -128,7 +128,7 @@ impl DedupStorage for NonClusterSafeDedup {
     fn first_seen<'a>(
         &'a self,
         _idempotency_key: &'a str,
-    ) -> BoxFuture<'a, crate::core::Result<bool>> {
+    ) -> BoxFuture<'a, asx_rs::core::Result<bool>> {
         Box::pin(async move { Ok(true) })
     }
 }

@@ -140,7 +140,7 @@ pub(super) fn parse_mdn(
                     )
                 })?;
             }
-            #[cfg_attr(not(feature = "interop-relaxed"), allow(deprecated))]
+            #[cfg(feature = "interop-relaxed")]
             InteropMode::Relaxed => {
                 if verify_result.is_err() {
                     interop_reasons.push("mdn_signature_verification_failed");

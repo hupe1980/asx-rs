@@ -1,5 +1,4 @@
-#![cfg_attr(not(feature = "interop-relaxed"), allow(unused_imports, dead_code))]
-#![cfg_attr(not(feature = "interop-relaxed"), allow(unused_imports))]
+#![cfg(feature = "interop-relaxed")]
 use asx_rs::core::{InteropMode, SessionContext};
 use asx_rs::interop::{
     BaseProfile, CanonicalizationPolicy, PartnerProfileOverlay, ProfileExtension, ProfileOverride,

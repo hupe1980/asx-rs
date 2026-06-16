@@ -407,6 +407,8 @@ impl As2ReceivePolicy {
 ///
 /// # Example
 /// ```
+/// # #[cfg(feature = "interop-relaxed")]
+/// # {
 /// use asx_rs::as2::{As2ReceivePolicyBuilder, As2RegulatedSpoolKeyProvider};
 /// use asx_rs::core::InteropMode;
 ///
@@ -414,6 +416,7 @@ impl As2ReceivePolicy {
 ///     .interop(InteropMode::Relaxed)
 ///     .fail_closed_audit_events(false)
 ///     .build();
+/// # }
 /// ```
 #[derive(Debug, Clone)]
 pub struct As2ReceivePolicyBuilder {

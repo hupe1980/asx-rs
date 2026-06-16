@@ -297,6 +297,7 @@ Content-ID: <{cid}>\r\n\
     /// Create a session that trusts the certificate embedded in `creds`.
     /// Required for tests that receive signed messages — PKIX validation is
     /// fail-closed and rejects signatures when no trust anchor is configured.
+    #[cfg(feature = "interop-relaxed")]
     fn session_with_trust(
         session_id: &str,
         partner_id: &str,
@@ -604,6 +605,7 @@ Content-ID: <{cid}>\r\n\
         assert_eq!(out.ref_to_message_id.as_deref(), Some("original-msg-001"));
     }
 
+    #[cfg(feature = "interop-relaxed")]
     #[test]
     fn two_way_mep_receive_extracts_ref_to_message_id() {
         let bus = EventBus::new(16).expect("bus");
@@ -848,6 +850,7 @@ Content-ID: <{cid}>\r\n\
         assert!(!xml.contains("<ebms:Messaging"));
     }
 
+    #[cfg(feature = "interop-relaxed")]
     #[test]
     fn as4_receive_push_decrypts_outbound_xmlenc_loop() {
         let bus = EventBus::new(16).expect("bus");
@@ -904,6 +907,7 @@ Content-ID: <{cid}>\r\n\
         assert_eq!(received.payload.as_ref().as_ref(), b"payload");
     }
 
+    #[cfg(feature = "interop-relaxed")]
     #[test]
     fn as4_receive_push_accepts_multipart_related_payload() {
         let bus = EventBus::new(16).expect("bus");
@@ -962,6 +966,7 @@ Content-ID: <{cid}>\r\n\
         assert_eq!(received.user_message.message_id, "msg-send-mime-recv");
     }
 
+    #[cfg(feature = "interop-relaxed")]
     #[test]
     fn as4_receive_unwraps_sbdh_payload_when_present() {
         let bus = EventBus::new(16).expect("bus");
@@ -1026,6 +1031,7 @@ Content-ID: <{cid}>\r\n\
         );
     }
 
+    #[cfg(feature = "interop-relaxed")]
     #[tokio::test]
     async fn as4_receive_push_with_dedup_async_accepts_multipart_related_payload() {
         let bus = EventBus::new(16).expect("bus");
@@ -1084,6 +1090,7 @@ Content-ID: <{cid}>\r\n\
         assert_eq!(received.user_message.message_id, "msg-send-mime-recv-async");
     }
 
+    #[cfg(feature = "interop-relaxed")]
     #[test]
     fn as4_receive_push_rejects_multipart_root_part_with_non_xop_content_type() {
         let bus = EventBus::new(16).expect("bus");
@@ -1149,6 +1156,7 @@ Content-ID: <{cid}>\r\n\
         assert_eq!(err.code, ErrorCode::ParseFailed);
     }
 
+    #[cfg(feature = "interop-relaxed")]
     #[test]
     fn as4_receive_push_rejects_tampered_multipart_payload_reference_digest() {
         let bus = EventBus::new(16).expect("bus");
@@ -1909,6 +1917,7 @@ Content-ID: <{cid}>\r\n\
         assert!(!saw_audit);
     }
 
+    #[cfg(feature = "interop-relaxed")]
     #[test]
     fn missing_security_header_fails_closed_when_audit_emit_fails() {
         let session = SessionContext::new("s1", "p1", "strict")

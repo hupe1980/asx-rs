@@ -528,25 +528,16 @@ pub enum InteropMode {
     /// Relaxed interoperability mode — permits deviations from strict AS2/AS4
     /// profile requirements to accommodate legacy or non-conformant partners.
     ///
-    /// # Compile-time gate
+    /// # Feature gate
     ///
-    /// This variant requires the **`interop-relaxed`** Cargo feature.  Without
-    /// the feature, using `InteropMode::Relaxed` emits a `#[deprecated]`
-    /// compiler warning.  Projects that enforce `-D warnings` or
-    /// `RUSTFLAGS='-D deprecated'` will receive a hard compile error, making
-    /// the mode selection robust in monorepo builds where strict-mode
-    /// enforcement is mandatory.
+    /// This variant is only available when the **`interop-relaxed`** Cargo
+    /// feature is enabled:
     ///
     /// ```toml
     /// [dependencies]
     /// asx = { version = "0.2", features = ["interop-relaxed"] }
     /// ```
-    #[cfg_attr(
-        not(feature = "interop-relaxed"),
-        deprecated(note = "InteropMode::Relaxed requires the 'interop-relaxed' Cargo \
-                    feature. Add `features = [\"interop-relaxed\"]` to your \
-                    asx dependency declaration.")
-    )]
+    #[cfg(feature = "interop-relaxed")]
     Relaxed,
 }
 

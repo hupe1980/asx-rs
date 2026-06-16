@@ -631,8 +631,12 @@ fn expected_from_error(code: ErrorCode) -> FixtureExpectedOutcome {
 fn interop_mode_from_fixture(mode: FixtureMode) -> InteropMode {
     match mode {
         FixtureMode::Strict => InteropMode::Strict,
-        #[cfg_attr(not(feature = "interop-relaxed"), allow(deprecated))]
+        #[cfg(feature = "interop-relaxed")]
         FixtureMode::Relaxed => InteropMode::Relaxed,
+        #[cfg(not(feature = "interop-relaxed"))]
+        FixtureMode::Relaxed => {
+            unreachable!("interop-relaxed feature required for relaxed fixtures")
+        }
     }
 }
 
