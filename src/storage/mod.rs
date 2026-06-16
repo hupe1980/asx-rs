@@ -112,13 +112,26 @@ pub trait DedupStorage: Send + Sync {
 /// Trait for distributed reconciliation request queuing.
 /// Implementations must preserve order and prevent duplicate reconciliation attempts.
 ///
-/// **Stability notice — forward declaration only.**
-/// This trait is exported as public API, but no public function in `asx-rs 0.1`
-/// accepts a `dyn ReconciliationStorage` parameter.  It is provided so that
-/// downstream crates can implement it against a future stable integration surface
-/// without a dependency version bump.  The trait shape (method signatures, return
-/// types, error variants) is subject to breaking change while the crate is at
-/// `0.x`.  Pin to an exact `asx-rs` patch version if you implement this trait.
+/// # Stability
+///
+/// `ReconciliationStorage` is part of the public API and is accepted by
+/// several functions in [`crate::presets`] and [`crate::reliability`], but its
+/// **trait shape — method signatures, return types, and error variants — is
+/// subject to breaking change** while this crate is at `0.x`.
+///
+/// If you implement this trait in downstream code, pin to an exact `asx-rs`
+/// version in your `Cargo.toml` to avoid unexpected breakage:
+///
+/// ```toml
+/// [dependencies]
+/// asx-rs = "=0.3.0"  # exact-version pin — ReconciliationStorage is not yet stable
+/// ```
+///
+/// The sealed-trait pattern is intentionally not used here so that downstream
+/// crates can provide production-grade backends (PostgreSQL, Redis, etc.) before
+/// this crate reaches `1.0`.  Once the trait stabilises the exact-pin
+/// requirement will be lifted and a crate-level migration notice will be
+/// published.
 pub trait ReconciliationStorage: Send + Sync {
     /// Return whether this backend persists reconciliation state durably.
     ///

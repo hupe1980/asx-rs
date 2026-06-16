@@ -14,7 +14,15 @@ pub struct As2SendRequest {
     pub message_id: String,
     pub payload: Vec<u8>,
     pub policy: As2SendPolicy,
-    pub credentials: As2SendCredentials,
+    /// Per-request signing / encryption credentials.
+    ///
+    /// - `None` — use the signing cert, signing key, and recipient cert stored
+    ///   in the session's `CertHandle` (set via
+    ///   `SessionContextBuilder::with_signing_cert_pem` /
+    ///   `with_signing_key_pem` / `with_recipient_cert_pem`).
+    /// - `Some(creds)` — use `creds` exactly, ignoring session-level
+    ///   credential material.  Use this for per-message overrides.
+    pub credentials: Option<As2SendCredentials>,
 }
 
 #[derive(Clone)]
@@ -144,8 +152,27 @@ pub fn send_sync(
         message_id,
         payload,
         policy,
-        credentials,
+        credentials: credentials_opt,
     } = request;
+
+    // Resolve effective credentials: per-request `Some(c)` wins; `None` falls
+    // back to the signing material stored in the session's CertHandle.
+    let session_creds;
+    let credentials = match credentials_opt {
+        Some(c) => c,
+        None => {
+            let ch = session.cert_handle();
+            session_creds = As2SendCredentials {
+                signing_cert_pem: ch.signing_cert_pem.as_ref().map(|s| s.as_bytes().to_vec()),
+                signing_key_pem: ch.signing_key_pem.as_ref().map(|s| s.as_bytes().to_vec()),
+                recipient_cert_pem: ch
+                    .recipient_cert_pem
+                    .as_ref()
+                    .map(|s| s.as_bytes().to_vec()),
+            };
+            session_creds
+        }
+    };
 
     let prepared =
         credentials.prepare_for_policy(&policy, "as2_send_validate", ErrorCode::PolicyViolation)?;

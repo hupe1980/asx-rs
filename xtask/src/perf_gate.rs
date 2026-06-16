@@ -283,7 +283,7 @@ fn run_results(#[allow(unused_variables)] iterations: u64) -> Vec<BenchResult> {
                             fail_closed_audit_events: false,
                             ..As2SendPolicy::default()
                         },
-                        credentials: credentials.clone(),
+                        credentials: Some(credentials.clone()),
                     },
                 )
                 .expect("as2 send");

@@ -394,7 +394,7 @@ pub fn send_sync_fragmented(
     message_id: String,
     payload: Vec<u8>,
     policy: As4SendPolicy,
-    credentials: As4SendCredentials,
+    credentials: Option<As4SendCredentials>,
     fragment_size_bytes: usize,
 ) -> Result<Vec<As4SplitFragmentOutput>> {
     if fragment_size_bytes == 0 {
@@ -1158,7 +1158,7 @@ mod tests {
                 message_id: "mid-large-1".to_string(),
                 payload,
                 policy: policy.clone(),
-                credentials: credentials.clone(),
+                credentials: Some(credentials.clone()),
             },
         )
         .expect("source send");
@@ -1211,7 +1211,7 @@ mod tests {
                 message_id: "mid-large-2".to_string(),
                 payload,
                 policy: policy.clone(),
-                credentials: credentials.clone(),
+                credentials: Some(credentials.clone()),
             },
         )
         .expect("source send");
@@ -1255,7 +1255,7 @@ mod tests {
                 message_id: "mid-large-3".to_string(),
                 payload,
                 policy: policy.clone(),
-                credentials,
+                credentials: Some(credentials),
             },
         )
         .expect("source send");
@@ -1322,7 +1322,7 @@ mod tests {
                 message_id: msg_id.to_string(),
                 payload,
                 policy: policy.clone(),
-                credentials,
+                credentials: Some(credentials),
             },
         )
         .expect("source send");

@@ -417,7 +417,7 @@ Content-ID: <{cid}>\r\n\
                 message_id: "msg-send-1".to_string(),
                 payload: b"payload".to_vec(),
                 policy: As4SendPolicy::default(),
-                credentials: As4SendCredentials::default(),
+                credentials: Some(As4SendCredentials::default()),
             },
         )
         .expect_err("missing creds must fail");
@@ -438,7 +438,7 @@ Content-ID: <{cid}>\r\n\
                 message_id: "msg-send-async-1".to_string(),
                 payload: b"payload".to_vec(),
                 policy: As4SendPolicy::default(),
-                credentials: As4SendCredentials::default(),
+                credentials: Some(As4SendCredentials::default()),
             },
         )
         .await
@@ -466,7 +466,7 @@ Content-ID: <{cid}>\r\n\
                 message_id: "msg-send-mime-1".to_string(),
                 payload: b"payload".to_vec(),
                 policy,
-                credentials: test_as4_credentials(),
+                credentials: Some(test_as4_credentials()),
             },
         )
         .expect("send");
@@ -520,7 +520,7 @@ Content-ID: <{cid}>\r\n\
                 message_id: "msg-send-sbdh-1".to_string(),
                 payload: b"<Invoice xmlns=\"urn:test\"><ID>INV-1</ID></Invoice>".to_vec(),
                 policy,
-                credentials: test_as4_credentials(),
+                credentials: Some(test_as4_credentials()),
             },
         )
         .expect("send with sbdh");
@@ -555,7 +555,7 @@ Content-ID: <{cid}>\r\n\
                 message_id: "msg-custom-action".to_string(),
                 payload: b"data".to_vec(),
                 policy,
-                credentials: test_as4_credentials(),
+                credentials: Some(test_as4_credentials()),
             },
         )
         .expect("send");
@@ -593,7 +593,7 @@ Content-ID: <{cid}>\r\n\
                 message_id: "msg-reply".to_string(),
                 payload: b"response payload".to_vec(),
                 policy,
-                credentials: test_as4_credentials(),
+                credentials: Some(test_as4_credentials()),
             },
         )
         .expect("send");
@@ -628,7 +628,7 @@ Content-ID: <{cid}>\r\n\
                 message_id: "msg-reply-2".to_string(),
                 payload: b"reply payload".to_vec(),
                 policy,
-                credentials: built_creds,
+                credentials: Some(built_creds),
             },
         )
         .expect("send");
@@ -688,7 +688,7 @@ Content-ID: <{cid}>\r\n\
                     payload_packaging_mode: super::pmode::PayloadPackagingMode::MimeAttachment,
                     ..As4SendPolicy::default()
                 },
-                credentials: test_as4_credentials(),
+                credentials: Some(test_as4_credentials()),
             },
         )
         .expect("send");
@@ -736,7 +736,7 @@ Content-ID: <{cid}>\r\n\
                     payload_packaging_mode: super::pmode::PayloadPackagingMode::MimeAttachment,
                     ..As4SendPolicy::default()
                 },
-                credentials: test_as4_credentials(),
+                credentials: Some(test_as4_credentials()),
             },
         )
         .expect("send");
@@ -787,7 +787,7 @@ Content-ID: <{cid}>\r\n\
                     payload_packaging_mode: super::pmode::PayloadPackagingMode::MimeAttachment,
                     ..As4SendPolicy::default()
                 },
-                credentials: test_as4_credentials(),
+                credentials: Some(test_as4_credentials()),
             },
         )
         .expect("send encrypt");
@@ -831,7 +831,7 @@ Content-ID: <{cid}>\r\n\
                     payload_packaging_mode: super::pmode::PayloadPackagingMode::MimeAttachment,
                     ..As4SendPolicy::default()
                 },
-                credentials: test_as4_credentials(),
+                credentials: Some(test_as4_credentials()),
             },
         )
         .expect("send header encrypt");
@@ -872,7 +872,7 @@ Content-ID: <{cid}>\r\n\
                     payload_packaging_mode: super::pmode::PayloadPackagingMode::MimeAttachment,
                     ..As4SendPolicy::default()
                 },
-                credentials: creds.clone(),
+                credentials: Some(creds.clone()),
             },
         )
         .expect("send encrypt+sign");
@@ -930,7 +930,7 @@ Content-ID: <{cid}>\r\n\
                     payload_packaging_mode: super::pmode::PayloadPackagingMode::MimeAttachment,
                     ..As4SendPolicy::default()
                 },
-                credentials: creds.clone(),
+                credentials: Some(creds.clone()),
             },
         )
         .expect("send mime");
@@ -989,7 +989,7 @@ Content-ID: <{cid}>\r\n\
                 message_id: "msg-sbdh-roundtrip".to_string(),
                 payload: business_payload.to_vec(),
                 policy,
-                credentials: creds,
+                credentials: Some(creds),
             },
         )
         .expect("send sbdh payload");
@@ -1054,7 +1054,7 @@ Content-ID: <{cid}>\r\n\
                     payload_packaging_mode: super::pmode::PayloadPackagingMode::MimeAttachment,
                     ..As4SendPolicy::default()
                 },
-                credentials: creds.clone(),
+                credentials: Some(creds.clone()),
             },
         )
         .expect("send mime");
@@ -1113,7 +1113,7 @@ Content-ID: <{cid}>\r\n\
                     payload_packaging_mode: super::pmode::PayloadPackagingMode::MimeAttachment,
                     ..As4SendPolicy::default()
                 },
-                credentials: creds.clone(),
+                credentials: Some(creds.clone()),
             },
         )
         .expect("send mime");
@@ -1179,7 +1179,7 @@ Content-ID: <{cid}>\r\n\
                     payload_packaging_mode: super::pmode::PayloadPackagingMode::MimeAttachment,
                     ..As4SendPolicy::default()
                 },
-                credentials: creds.clone(),
+                credentials: Some(creds.clone()),
             },
         )
         .expect("send mime");
@@ -1623,7 +1623,7 @@ Content-ID: <{cid}>\r\n\
                     action: "   ".to_string(),
                     ..As4SendPolicy::default()
                 },
-                credentials: creds,
+                credentials: Some(creds),
             },
         )
         .expect_err("strict runtime send policy must reject empty action");
@@ -1655,7 +1655,7 @@ Content-ID: <{cid}>\r\n\
                 message_id: "msg-send-runtime-mismatch".to_string(),
                 payload: b"payload".to_vec(),
                 policy: As4SendPolicy::default(),
-                credentials: mismatched,
+                credentials: Some(mismatched),
             },
         )
         .expect_err("strict runtime send policy must reject mismatched signing credentials");
@@ -1687,7 +1687,7 @@ Content-ID: <{cid}>\r\n\
                     service: "   ".to_string(),
                     ..As4SendPolicy::default()
                 },
-                credentials: creds,
+                credentials: Some(creds),
             },
         )
         .expect_err("strict runtime send policy must reject empty service");
@@ -1716,7 +1716,7 @@ Content-ID: <{cid}>\r\n\
                     ref_to_message_id: Some("   ".to_string()),
                     ..As4SendPolicy::default()
                 },
-                credentials: creds,
+                credentials: Some(creds),
             },
         )
         .expect_err("strict runtime send policy must reject empty ref_to_message_id");
@@ -2727,7 +2727,7 @@ Content-ID: <{cid}>\r\n\
                     payload_packaging_mode: super::pmode::PayloadPackagingMode::MimeAttachment,
                     ..As4SendPolicy::default()
                 },
-                credentials: creds,
+                credentials: Some(creds),
             },
         )
         .expect("strict send runtime with strict-only profile must succeed");

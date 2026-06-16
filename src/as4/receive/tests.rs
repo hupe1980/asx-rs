@@ -189,7 +189,7 @@ async fn ordered_receive_requires_conversation_id() {
             message_id: "ordered-no-conv-id@test".to_string(),
             payload: b"test payload".to_vec(),
             policy: send_policy,
-            credentials: send_creds,
+            credentials: Some(send_creds),
         },
     )
     .expect("send");
@@ -500,7 +500,7 @@ async fn ordered_fragment_aware_receive_completes_in_conversation_turn_order() {
         "mid-ordered-fragment".to_string(),
         vec![b'o'; 4096],
         send_policy,
-        creds,
+        Some(creds),
         1024,
     )
     .expect("fragment split");
@@ -577,7 +577,7 @@ async fn async_fragment_aware_receive_accepts_typed_request() {
         "mid-async-fragment".to_string(),
         vec![b'a'; 3072],
         send_policy,
-        creds,
+        Some(creds),
         1024,
     )
     .expect("fragment split");
@@ -655,7 +655,7 @@ fn fragment_aware_receive_reassembles_and_processes_message() {
         "mid-fragment-aware".to_string(),
         send_payload,
         send_policy,
-        creds.clone(),
+        Some(creds.clone()),
         1024,
     )
     .expect("fragment split");
@@ -730,7 +730,7 @@ fn non_fragment_aware_receive_rejects_message_fragment_payload() {
         "mid-fragment-reject".to_string(),
         vec![b'r'; 2048],
         send_policy,
-        creds,
+        Some(creds),
         1024,
     )
     .expect("fragment split");

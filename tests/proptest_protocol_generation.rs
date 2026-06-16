@@ -80,7 +80,7 @@ proptest! {
                 message_id: message_id.clone(),
                 payload: payload.clone(),
                 policy: policy.clone(),
-                credentials: As2SendCredentials::default(),
+                credentials: Some(As2SendCredentials::default()),
             },
         );
 
@@ -91,7 +91,7 @@ proptest! {
                 message_id: message_id.clone(),
                 payload,
                 policy,
-                credentials: As2SendCredentials::default(),
+                credentials: Some(As2SendCredentials::default()),
             },
         );
 

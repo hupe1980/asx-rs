@@ -15,7 +15,7 @@
 //!         message_id: msg_id,
 //!         payload,
 //!         policy,
-//!         credentials: creds,
+//!         credentials: Some(creds),
 //!     },
 //! )?;
 //! let outcome = transport.send("https://partner.example/as2", &output).await?;
@@ -31,7 +31,7 @@
 //!         message_id: msg_id,
 //!         payload,
 //!         policy,
-//!         credentials: creds,
+//!         credentials: Some(creds),
 //!     },
 //! )?;
 //! let outcome = transport.send("https://partner.example/as4", &output).await?;

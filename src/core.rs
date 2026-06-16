@@ -535,7 +535,7 @@ pub enum InteropMode {
     ///
     /// ```toml
     /// [dependencies]
-    /// asx = { version = "0.2", features = ["interop-relaxed"] }
+    /// asx = { version = "0.3", features = ["interop-relaxed"] }
     /// ```
     #[cfg(feature = "interop-relaxed")]
     Relaxed,
@@ -691,6 +691,61 @@ impl SessionContextBuilder {
         self
     }
 
+    /// Set the PEM-encoded X.509 certificate used to sign **outbound** messages.
+    ///
+    /// Must be called together with [`with_signing_key_pem`](Self::with_signing_key_pem).
+    /// [`build`](Self::build) will return an error when only one of the signing
+    /// pair is provided, or when the key does not match the certificate.
+    ///
+    /// Once set, `send_sync` / `send_async` use this certificate for every
+    /// message sent on this session — no per-request `As4SendCredentials` /
+    /// `As2SendCredentials` is required.  Per-request credentials remain
+    /// available as an explicit override via `Some(creds)` on the send request.
+    ///
+    /// # Example
+    /// ```rust,ignore
+    /// let session = SessionContextBuilder::new("s1", "partner-a")
+    ///     .with_signing_cert_pem(our_cert_pem)
+    ///     .with_signing_key_pem(our_key_pem)
+    ///     .with_trust_anchor_pem(partner_root_ca_pem)
+    ///     .build()?;
+    /// // All sends on this session are signed automatically.
+    /// asx_rs::as4::send_sync(&session, &bus, As4SendRequest {
+    ///     message_id,
+    ///     payload,
+    ///     policy,
+    ///     credentials: None,  // ← session certificate used
+    /// })?;
+    /// ```
+    pub fn with_signing_cert_pem(mut self, pem: impl Into<String>) -> Self {
+        let cert_handle = self.cert_handle.get_or_insert_with(|| CertHandle::new(""));
+        cert_handle.signing_cert_pem = Some(pem.into());
+        self
+    }
+
+    /// Set the PEM-encoded private key used to sign **outbound** messages.
+    ///
+    /// Must match the certificate supplied via
+    /// [`with_signing_cert_pem`](Self::with_signing_cert_pem).  The raw key
+    /// bytes are **zeroized on drop** via the `CertHandle` destructor.
+    pub fn with_signing_key_pem(mut self, pem: impl Into<String>) -> Self {
+        let cert_handle = self.cert_handle.get_or_insert_with(|| CertHandle::new(""));
+        cert_handle.signing_key_pem = Some(zeroize::Zeroizing::new(pem.into()));
+        self
+    }
+
+    /// Set the PEM-encoded X.509 certificate belonging to **this partner**,
+    /// used to encrypt outbound messages when the send policy has
+    /// `encrypt = true`.
+    ///
+    /// When set, sends with `encrypt = true` do not require a per-request
+    /// `recipient_cert_pem` in `As4SendCredentials` / `As2SendCredentials`.
+    pub fn with_recipient_cert_pem(mut self, pem: impl Into<String>) -> Self {
+        let cert_handle = self.cert_handle.get_or_insert_with(|| CertHandle::new(""));
+        cert_handle.recipient_cert_pem = Some(pem.into());
+        self
+    }
+
     /// Attach a serialized effective policy snapshot JSON string.
     pub fn effective_policy_snapshot_json(mut self, snapshot_json: impl Into<String>) -> Self {
         self.effective_policy_snapshot_json = Some(snapshot_json.into());
@@ -716,6 +771,23 @@ impl SessionContextBuilder {
         let mut session = SessionContext::new(self.session_id, self.partner_id, self.profile_name)?;
 
         if let Some(cert_handle) = self.cert_handle {
+            // Validate that signing_key_pem and signing_cert_pem are both
+            // present or both absent.
+            match (&cert_handle.signing_key_pem, &cert_handle.signing_cert_pem) {
+                (Some(_), None) | (None, Some(_)) => {
+                    return Err(AsxError::new(
+                        ErrorCode::InvalidInput,
+                        "signing_key_pem and signing_cert_pem must both be set or both absent",
+                        ErrorContext::new("session_context_builder"),
+                    ));
+                }
+                _ => {}
+            }
+            // Eagerly parse and validate PEM material when crypto features are
+            // available.  This surfaces key/cert mismatches at session
+            // construction time rather than deep inside the send pipeline.
+            #[cfg(any(feature = "as2", feature = "as4"))]
+            validate_cert_handle_outbound_pem(&cert_handle)?;
             session = session.with_cert_handle(cert_handle)?;
         }
 
@@ -736,6 +808,63 @@ impl SessionContextBuilder {
 
         Ok(session)
     }
+}
+
+/// Validate PEM-encoded outbound signing material stored in a `CertHandle`.
+///
+/// Called from `SessionContextBuilder::build` when `as2` or `as4` features
+/// are active.  Parses the signing cert + key, verifies the key matches the
+/// cert, and optionally parses the recipient cert if present.  All errors are
+/// surfaced at session construction time rather than deep in the send pipeline.
+#[cfg(any(feature = "as2", feature = "as4"))]
+fn validate_cert_handle_outbound_pem(cert_handle: &CertHandle) -> Result<()> {
+    if let (Some(key_pem), Some(cert_pem)) =
+        (&cert_handle.signing_key_pem, &cert_handle.signing_cert_pem)
+    {
+        let cert = openssl::x509::X509::from_pem(cert_pem.as_bytes()).map_err(|_| {
+            AsxError::new(
+                ErrorCode::InvalidInput,
+                "signing_cert_pem is not a valid PEM X.509 certificate",
+                ErrorContext::new("session_context_builder_validate"),
+            )
+        })?;
+
+        let key = openssl::pkey::PKey::private_key_from_pem(key_pem.as_bytes()).map_err(|_| {
+            AsxError::new(
+                ErrorCode::InvalidInput,
+                "signing_key_pem is not a valid PEM private key",
+                ErrorContext::new("session_context_builder_validate"),
+            )
+        })?;
+
+        let cert_pub = cert.public_key().map_err(|_| {
+            AsxError::new(
+                ErrorCode::InvalidInput,
+                "signing_cert_pem does not contain a usable public key",
+                ErrorContext::new("session_context_builder_validate"),
+            )
+        })?;
+
+        if !key.public_eq(&cert_pub) {
+            return Err(AsxError::new(
+                ErrorCode::InvalidInput,
+                "signing_key_pem does not match signing_cert_pem",
+                ErrorContext::new("session_context_builder_validate"),
+            ));
+        }
+    }
+
+    if let Some(pem) = &cert_handle.recipient_cert_pem {
+        openssl::x509::X509::from_pem(pem.as_bytes()).map_err(|_| {
+            AsxError::new(
+                ErrorCode::InvalidInput,
+                "recipient_cert_pem is not a valid PEM X.509 certificate",
+                ErrorContext::new("session_context_builder_validate"),
+            )
+        })?;
+    }
+
+    Ok(())
 }
 
 /// Lazy cache of trust-anchor X.509 certificates parsed from
@@ -802,6 +931,28 @@ pub struct CertHandle {
     pub ocsp_failure_mode: OcspFailureMode,
     pub stapled_ocsp_responses_der: Vec<Vec<u8>>,
     pub responder_ocsp_responses_der: Vec<Vec<u8>>,
+    /// PEM-encoded X.509 certificate used to sign **outbound** messages to
+    /// this partner.  When set via
+    /// [`SessionContextBuilder::with_signing_cert_pem`], `send_sync` /
+    /// `send_async` use this certificate automatically; no per-request
+    /// `As4SendCredentials` / `As2SendCredentials` is required.
+    ///
+    /// Must be paired with [`signing_key_pem`](Self::signing_key_pem).
+    /// [`SessionContextBuilder::build`] validates the pair and checks that
+    /// the key matches the certificate.
+    pub signing_cert_pem: Option<String>,
+    /// PEM-encoded private key matching
+    /// [`signing_cert_pem`](Self::signing_cert_pem).
+    ///
+    /// # Security
+    ///
+    /// The key bytes are **zeroized on drop** via the `Zeroizing` wrapper.
+    /// Do not log or persist a `CertHandle` that contains live key material.
+    pub signing_key_pem: Option<zeroize::Zeroizing<String>>,
+    /// PEM-encoded X.509 certificate belonging to this partner, used to
+    /// encrypt outbound AS4 / AS2 messages when the send policy has
+    /// `encrypt = true` and no per-request credential is provided.
+    pub recipient_cert_pem: Option<String>,
     /// Lazy-parsed trust anchor X.509 certificates — shared across clones.
     /// Populated on first call to [`CertHandle::trust_anchors_x509`].
     #[cfg(any(feature = "as2", feature = "as4"))]
@@ -839,6 +990,9 @@ impl CertHandle {
             ocsp_failure_mode: OcspFailureMode::HardFail,
             stapled_ocsp_responses_der: Vec::new(),
             responder_ocsp_responses_der: Vec::new(),
+            signing_cert_pem: None,
+            signing_key_pem: None,
+            recipient_cert_pem: None,
             #[cfg(any(feature = "as2", feature = "as4"))]
             trust_anchors_cache: TrustAnchorCache::default(),
             #[cfg(any(feature = "as2", feature = "as4"))]

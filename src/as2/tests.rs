@@ -1202,7 +1202,7 @@ async fn strict_send_rejects_empty_payload() {
             message_id: "msg-1".into(),
             payload: vec![],
             policy: As2SendPolicy::default(),
-            credentials: test_as2_credentials(),
+            credentials: Some(test_as2_credentials()),
         },
     )
     .expect_err("strict reject");
@@ -1220,7 +1220,7 @@ async fn strict_send_async_rejects_empty_payload() {
             message_id: "msg-1".into(),
             payload: vec![],
             policy: As2SendPolicy::default(),
-            credentials: test_as2_credentials(),
+            credentials: Some(test_as2_credentials()),
         },
     )
     .await
@@ -1249,7 +1249,7 @@ fn strict_send_rejects_as2_from_header_injection_value() {
                 mic_algorithm: As2MicAlgorithm::Sha256,
                 encryption_cipher: SmimeCipher::Aes256Cbc,
             },
-            credentials: test_as2_credentials(),
+            credentials: Some(test_as2_credentials()),
         },
     )
     .expect_err("strict AS2 send must reject AS2-From header injection attempts");
@@ -1271,11 +1271,11 @@ fn strict_send_rejects_mismatched_signing_cert_and_key() {
             message_id: "msg-1".into(),
             payload: b"payload".to_vec(),
             policy: As2SendPolicy::default(),
-            credentials: As2SendCredentials {
+            credentials: Some(As2SendCredentials {
                 signing_cert_pem: creds_a.signing_cert_pem.clone(),
                 signing_key_pem: creds_b.signing_key_pem.clone(),
                 recipient_cert_pem: creds_a.recipient_cert_pem.clone(),
-            },
+            }),
         },
     )
     .expect_err("strict AS2 send must reject mismatched signing cert/key");
@@ -1316,7 +1316,7 @@ async fn relaxed_send_allows_empty_payload() {
                 mic_algorithm: As2MicAlgorithm::Sha256,
                 encryption_cipher: SmimeCipher::Aes256Cbc,
             },
-            credentials: test_as2_credentials(),
+            credentials: Some(test_as2_credentials()),
         },
     )
     .expect("relaxed send");

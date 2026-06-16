@@ -36,7 +36,7 @@ async fn as2_send_matches_golden_payload_and_mic() {
                 mic_algorithm: As2MicAlgorithm::Sha256,
                 encryption_cipher: SmimeCipher::Aes256Cbc,
             },
-            credentials: As2SendCredentials::default(),
+            credentials: Some(As2SendCredentials::default()),
         },
     )
     .expect("send");
@@ -88,7 +88,7 @@ async fn strict_and_relaxed_policy_differs_only_when_configured() {
                 mic_algorithm: As2MicAlgorithm::Sha256,
                 encryption_cipher: SmimeCipher::Aes256Cbc,
             },
-            credentials: As2SendCredentials::default(),
+            credentials: Some(As2SendCredentials::default()),
         },
     );
     assert!(strict.is_err());
@@ -110,7 +110,7 @@ async fn strict_and_relaxed_policy_differs_only_when_configured() {
                 mic_algorithm: As2MicAlgorithm::Sha256,
                 encryption_cipher: SmimeCipher::Aes256Cbc,
             },
-            credentials: As2SendCredentials::default(),
+            credentials: Some(As2SendCredentials::default()),
         },
     )
     .expect("relaxed ok");
@@ -145,7 +145,7 @@ async fn mic_uses_exact_octet_boundary_without_payload_rewrite() {
                 mic_algorithm: As2MicAlgorithm::Sha256,
                 encryption_cipher: SmimeCipher::Aes256Cbc,
             },
-            credentials: As2SendCredentials::default(),
+            credentials: Some(As2SendCredentials::default()),
         },
     )
     .expect("send");

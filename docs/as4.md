@@ -203,7 +203,7 @@ certificate from the SMP.
 Enable the `smp` module with the `client` feature:
 
 ```toml
-asx-rs = { version = "0.2", features = ["as4", "client", "async-ocsp"] }
+asx-rs = { version = "0.3", features = ["as4", "client", "async-ocsp"] }
 ```
 
 ### Lookup and Register a Runtime P-Mode

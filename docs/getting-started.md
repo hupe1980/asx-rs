@@ -7,22 +7,22 @@ Add `asx-rs` to `Cargo.toml`. Because AS2 and AS4 are feature-gated, you must se
 ```toml
 [dependencies]
 # AS2 only
-asx-rs = { version = "0.2", features = ["as2", "async-ocsp"] }
+asx-rs = { version = "0.3", features = ["as2", "async-ocsp"] }
 
 # AS4 only
-asx-rs = { version = "0.2", features = ["as4", "async-ocsp"] }
+asx-rs = { version = "0.3", features = ["as4", "async-ocsp"] }
 
 # Both protocols
-asx-rs = { version = "0.2", features = ["as2", "as4", "async-ocsp"] }
+asx-rs = { version = "0.3", features = ["as2", "as4", "async-ocsp"] }
 
 # Both protocols with payload compression (RFC 5402)
-asx-rs = { version = "0.2", features = ["as2", "as4", "compression", "async-ocsp"] }
+asx-rs = { version = "0.3", features = ["as2", "as4", "compression", "async-ocsp"] }
 
 # HTTP client (outbound) + server (inbound) with both protocols
-asx-rs = { version = "0.2", features = ["as2", "as4", "client", "server", "async-ocsp"] }
+asx-rs = { version = "0.3", features = ["as2", "as4", "client", "server", "async-ocsp"] }
 
 # Relaxed interop for explicitly scoped partner exceptions
-asx-rs = { version = "0.2", features = ["as2", "as4", "interop-relaxed", "async-ocsp"] }
+asx-rs = { version = "0.3", features = ["as2", "as4", "interop-relaxed", "async-ocsp"] }
 ```
 
 > **Note:** The default feature set is `["interop-strict", "async-ocsp"]`. Adding `asx-rs` without explicit features gives you only the shared infrastructure — no AS2 or AS4 protocol functions are compiled.
