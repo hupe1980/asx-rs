@@ -106,7 +106,7 @@ pub(super) fn process_non_fragment_push(
     receipt_payload: Option<&[u8]>,
     http_content_type: &str,
 ) -> Result<As4ReceivePushProgress> {
-    let (multipart, soap_bytes, parsed, gate) =
+    let (multipart, soap_bytes, parsed, gate, is_duplicate) =
         metadata::parse_verify_and_emit_receive_push_metadata(
             ctx.session,
             ctx.event_bus,
@@ -116,6 +116,12 @@ pub(super) fn process_non_fragment_push(
             ctx.dedup_backend,
             ctx.verifier,
         )?;
+
+    if is_duplicate {
+        return Ok(As4ReceivePushProgress::Duplicate {
+            message_id: parsed.message_id,
+        });
+    }
 
     enforce_non_fragment_timestamp_freshness(ctx.session, ctx.policy, &parsed)?;
 

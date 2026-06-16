@@ -45,7 +45,8 @@ pub use send::{
 };
 pub use send_mime::{inject_xop_include, package_as_mime};
 pub use signals::{
-    generate_error_signal, generate_pull_request, generate_receipt, generate_receipt_with_nri,
+    generate_error_signal, generate_pull_request, generate_receipt, generate_receipt_for_output,
+    generate_receipt_with_nri,
 };
 
 mod parser;
@@ -74,7 +75,7 @@ mod tests {
     use crate::observability::{AsxEvent, EventBus};
     use crate::reliability::{InMemoryDedupBackend, InMemoryReconciliationHook};
     use crate::sbdh::{SBDH_NAMESPACE, SbdhDocumentIdentification, SbdhHeader, SbdhParty};
-    use crate::storage::{DedupStorage, ReconciliationStorage};
+    use crate::storage::{BoxFuture, DedupStorage, ReconciliationStorage};
     use openssl::asn1::Asn1Time;
     use openssl::bn::BigNum;
     use openssl::hash::MessageDigest;
@@ -205,7 +206,10 @@ Content-ID: <{cid}>\r\n\
             true
         }
 
-        fn first_seen(&self, idempotency_key: &str) -> crate::core::Result<bool> {
+        fn first_seen<'a>(
+            &'a self,
+            idempotency_key: &'a str,
+        ) -> BoxFuture<'a, crate::core::Result<bool>> {
             self.0.first_seen(idempotency_key)
         }
     }
@@ -651,7 +655,8 @@ Content-ID: <{cid}>\r\n\
                 dedup_backend: &dedup,
             },
         )
-        .expect("receive");
+        .expect("receive")
+        .unwrap_output();
         assert_eq!(
             received.user_message.ref_to_message_id.as_deref(),
             Some("original-msg-002"),
@@ -893,7 +898,8 @@ Content-ID: <{cid}>\r\n\
                 dedup_backend: &dedup,
             },
         )
-        .expect("receive and decrypt");
+        .expect("receive and decrypt")
+        .unwrap_output();
 
         assert_eq!(received.payload.as_ref().as_ref(), b"payload");
     }
@@ -949,7 +955,8 @@ Content-ID: <{cid}>\r\n\
                 dedup_backend: &dedup,
             },
         )
-        .expect("receive mime");
+        .expect("receive mime")
+        .unwrap_output();
 
         assert_eq!(received.payload.as_ref().as_ref(), b"payload-mime");
         assert_eq!(received.user_message.message_id, "msg-send-mime-recv");
@@ -1006,7 +1013,8 @@ Content-ID: <{cid}>\r\n\
                 dedup_backend: &dedup,
             },
         )
-        .expect("receive sbdh payload");
+        .expect("receive sbdh payload")
+        .unwrap_output();
 
         let sbdh = received.sbdh_header.expect("sbdh header parsed");
         assert_eq!(sbdh.sender.identifier, "0007:1234567890123");
@@ -1069,7 +1077,8 @@ Content-ID: <{cid}>\r\n\
             dedup_backend,
         )
         .await
-        .expect("receive mime");
+        .expect("receive mime")
+        .unwrap_output();
 
         assert_eq!(received.payload.as_ref().as_ref(), b"payload-mime-async");
         assert_eq!(received.user_message.message_id, "msg-send-mime-recv-async");
@@ -1249,7 +1258,8 @@ Content-ID: <{cid}>\r\n\
                 dedup_backend: &dedup,
             },
         )
-        .expect("push receive");
+        .expect("push receive")
+        .unwrap_output();
 
         assert_eq!(out.user_message.message_id, "msg-1");
         assert_eq!(out.user_message.action, "SubmitOrder");

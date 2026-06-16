@@ -1,4 +1,4 @@
-use super::super::types::{As4ReceivePushOutput, As4ReceivePushProgress, As4ReceivePushRequest};
+use super::super::types::{As4ReceiveOutcome, As4ReceivePushProgress, As4ReceivePushRequest};
 use super::{As4Verifier, EventBus, SessionContext, async_completion, sync_core};
 use crate::core::{AsxError, ErrorCode, ErrorContext, Result};
 use crate::storage::DedupStorage;
@@ -10,7 +10,7 @@ pub(super) fn receive_push_with_dedup_sync_with_verifier(
     request: As4ReceivePushRequest,
     dedup_backend: &dyn DedupStorage,
     verifier: &(dyn As4Verifier + Send + Sync),
-) -> Result<As4ReceivePushOutput> {
+) -> Result<As4ReceiveOutcome> {
     match sync_core::receive_push_with_dedup_sync_fragment_aware_with_verifier(
         session,
         event_bus,
@@ -19,7 +19,10 @@ pub(super) fn receive_push_with_dedup_sync_with_verifier(
         verifier,
         None,
     )? {
-        As4ReceivePushProgress::Complete(output) => Ok(*output),
+        As4ReceivePushProgress::Complete(output) => Ok(As4ReceiveOutcome::FirstSeen(output)),
+        As4ReceivePushProgress::Duplicate { message_id } => {
+            Ok(As4ReceiveOutcome::Duplicate { message_id })
+        }
         As4ReceivePushProgress::PendingFragment { .. } => Err(AsxError::new(
             ErrorCode::PolicyViolation,
             "AS4 message contains mf:MessageFragment; use receive_push_with_dedup_sync_fragment_aware",
@@ -34,7 +37,7 @@ pub(super) async fn receive_push_with_dedup_async_with_verifier<V>(
     request: As4ReceivePushRequest,
     dedup_backend: Arc<dyn DedupStorage>,
     verifier: V,
-) -> Result<As4ReceivePushOutput>
+) -> Result<As4ReceiveOutcome>
 where
     V: As4Verifier + Send + Sync + 'static,
 {

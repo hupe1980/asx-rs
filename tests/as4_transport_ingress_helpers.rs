@@ -13,7 +13,7 @@ use asx_rs::presets::{
     strict_production_event_bus,
 };
 use asx_rs::reliability::{InMemoryDedupBackend, ReconciliationRequest};
-use asx_rs::storage::{DedupStorage, ReconciliationStorage};
+use asx_rs::storage::{BoxFuture, DedupStorage, ReconciliationStorage};
 use asx_rs::transport::ingress::As4IngressReceivePushSyncRequest;
 use asx_rs::transport::ingress::as4_ingress_from_http;
 use std::sync::Arc;
@@ -79,8 +79,11 @@ impl DedupStorage for DurableClusterSafeDedup {
         true
     }
 
-    fn first_seen(&self, _idempotency_key: &str) -> asx_rs::core::Result<bool> {
-        Ok(true)
+    fn first_seen<'a>(
+        &'a self,
+        _idempotency_key: &'a str,
+    ) -> BoxFuture<'a, crate::core::Result<bool>> {
+        Box::pin(async move { Ok(true) })
     }
 }
 

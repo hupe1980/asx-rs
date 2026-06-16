@@ -12,7 +12,7 @@ use crate::reliability::{
     DeliveryOutcome, ReconciliationReason, ReconciliationRequest, RetryDecision,
     derive_ingress_idempotency_key,
 };
-use crate::storage::{DedupStorage, ReconciliationStorage};
+use crate::storage::{DedupStorage, ReconciliationStorage, drive_dedup_future};
 use std::sync::Arc;
 
 pub(crate) fn expected_fingerprint_from_session(session: &SessionContext) -> Option<&str> {
@@ -142,17 +142,20 @@ pub(crate) fn enforce_strict_as4_send_runtime_policy_consistency(
     Ok(())
 }
 
-pub(crate) fn emit_duplicate_if_seen(
+/// Returns `Ok(true)` if the message is a **duplicate** (already seen),
+/// `Ok(false)` if it is first-seen.
+/// Emits a `DuplicateDetected` audit event on replays.
+pub(crate) async fn check_duplicate_push(
     session: &SessionContext,
     event_bus: &EventBus,
     dedup_backend: &dyn DedupStorage,
     message_id: &str,
     ingress: AsxIngressStage,
     fail_closed_audit_events: bool,
-) -> crate::core::Result<()> {
+) -> crate::core::Result<bool> {
     let dedup_key =
         derive_ingress_idempotency_key(session.partner_id(), "as4_push_receive", message_id);
-    if !dedup_backend.first_seen(&dedup_key)? {
+    if !dedup_backend.first_seen(&dedup_key).await? {
         emit_audit_event(
             event_bus,
             session,
@@ -164,8 +167,10 @@ pub(crate) fn emit_duplicate_if_seen(
             fail_closed_audit_events,
             "as4_dedup",
         )?;
+        Ok(true)
+    } else {
+        Ok(false)
     }
-    Ok(())
 }
 
 pub(crate) fn emit_receive_push_signed_encrypted(
@@ -240,19 +245,20 @@ pub(crate) fn emit_receive_push_receipt_taxonomy_outcome(
     Ok(())
 }
 
-pub(crate) fn emit_pull_duplicate_if_seen(
+/// Returns `Ok(true)` if the pull message is a **duplicate**, `Ok(false)` if first-seen.
+pub(crate) async fn check_duplicate_pull(
     session: &SessionContext,
     event_bus: &EventBus,
     dedup_backend: &dyn DedupStorage,
     pull_message_id: &Arc<str>,
     fail_closed_audit_events: bool,
-) -> crate::core::Result<()> {
+) -> crate::core::Result<bool> {
     let dedup_key = derive_ingress_idempotency_key(
         session.partner_id(),
         "as4_pull_receive",
         pull_message_id.as_ref(),
     );
-    if !dedup_backend.first_seen(&dedup_key)? {
+    if !dedup_backend.first_seen(&dedup_key).await? {
         emit_audit_event(
             event_bus,
             session,
@@ -264,8 +270,10 @@ pub(crate) fn emit_pull_duplicate_if_seen(
             fail_closed_audit_events,
             "as4_pull_dedup",
         )?;
+        Ok(true)
+    } else {
+        Ok(false)
     }
-    Ok(())
 }
 
 pub(crate) fn handle_empty_pull_partition(
@@ -331,4 +339,27 @@ pub(crate) fn ensure_pull_mpc_matches(
     }
 
     Ok(())
+}
+
+/// Sync wrapper for [`check_duplicate_push`] for use in the blocking receive path.
+///
+/// Drives the async dedup future synchronously.  Only works with in-memory
+/// backends (where the future is immediately ready).  For async-backed stores,
+/// use `check_duplicate_push` from an async context.
+pub(crate) fn check_duplicate_push_sync(
+    session: &SessionContext,
+    event_bus: &EventBus,
+    dedup_backend: &dyn DedupStorage,
+    message_id: &str,
+    ingress: AsxIngressStage,
+    fail_closed_audit_events: bool,
+) -> crate::core::Result<bool> {
+    drive_dedup_future(check_duplicate_push(
+        session,
+        event_bus,
+        dedup_backend,
+        message_id,
+        ingress,
+        fail_closed_audit_events,
+    ))
 }

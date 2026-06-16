@@ -1,5 +1,5 @@
 use super::super::coordination::ConversationOrderGate;
-use super::super::types::{As4ReceivePushOutput, As4ReceivePushProgress};
+use super::super::types::{As4ReceiveOutcome, As4ReceivePushOutput, As4ReceivePushProgress};
 use crate::core::{AsxError, ErrorCode, ErrorContext, Result, SessionContext};
 
 fn ordered_missing_conversation_id_error(session: &SessionContext) -> AsxError {
@@ -23,23 +23,28 @@ fn ordered_gate_key_from_output(
 
 /// Finalize ordered output using the `ConversationOrderGate` trait interface.
 ///
-/// Used by pipeline paths that accept `&dyn ConversationOrderGate` (i.e., when
-/// a custom distributed gate is supplied).
-pub(super) async fn finalize_ordered_output_with_gate_trait(
+/// For duplicates, no gate acquisition is needed — the message was already
+/// serialized on its first pass.
+pub(super) async fn finalize_ordered_outcome_with_gate_trait(
     session: &SessionContext,
     gate: &dyn ConversationOrderGate,
-    output: As4ReceivePushOutput,
-) -> Result<As4ReceivePushOutput> {
-    let gate_key = ordered_gate_key_from_output(session, &output)?;
-    let guard = gate.acquire_ordered_turn(&gate_key, session).await?;
-    gate.record_message_ordering(
-        &gate_key,
-        &output.user_message.message_id,
-        output.user_message.ref_to_message_id.as_deref(),
-    )
-    .await?;
-    guard.release();
-    Ok(output)
+    outcome: As4ReceiveOutcome,
+) -> Result<As4ReceiveOutcome> {
+    match outcome {
+        As4ReceiveOutcome::FirstSeen(output) => {
+            let gate_key = ordered_gate_key_from_output(session, &output)?;
+            let guard = gate.acquire_ordered_turn(&gate_key, session).await?;
+            gate.record_message_ordering(
+                &gate_key,
+                &output.user_message.message_id,
+                output.user_message.ref_to_message_id.as_deref(),
+            )
+            .await?;
+            guard.release();
+            Ok(As4ReceiveOutcome::FirstSeen(output))
+        }
+        duplicate @ As4ReceiveOutcome::Duplicate { .. } => Ok(duplicate),
+    }
 }
 
 pub(super) async fn finalize_fragment_aware_ordered_progress(
@@ -49,9 +54,18 @@ pub(super) async fn finalize_fragment_aware_ordered_progress(
 ) -> Result<As4ReceivePushProgress> {
     match progress {
         As4ReceivePushProgress::Complete(output) => {
-            let output = finalize_ordered_output_with_gate_trait(session, gate, *output).await?;
-            Ok(As4ReceivePushProgress::Complete(Box::new(output)))
+            let gate_key = ordered_gate_key_from_output(session, &output)?;
+            let guard = gate.acquire_ordered_turn(&gate_key, session).await?;
+            gate.record_message_ordering(
+                &gate_key,
+                &output.user_message.message_id,
+                output.user_message.ref_to_message_id.as_deref(),
+            )
+            .await?;
+            guard.release();
+            Ok(As4ReceivePushProgress::Complete(output))
         }
         pending @ As4ReceivePushProgress::PendingFragment { .. } => Ok(pending),
+        duplicate @ As4ReceivePushProgress::Duplicate { .. } => Ok(duplicate),
     }
 }

@@ -9,7 +9,7 @@ use crate::as4::types::{
 };
 use crate::core::{CertHandle, ErrorCode, OcspFailureMode, OcspMode, SessionContext};
 use crate::reliability::InMemoryDedupBackend;
-use crate::storage::DedupStorage;
+use crate::storage::{BoxFuture, DedupStorage};
 use openssl::asn1::Asn1Time;
 use openssl::bn::BigNum;
 use openssl::hash::MessageDigest;
@@ -28,7 +28,7 @@ impl DedupStorage for DurableTestDedup {
         true
     }
 
-    fn first_seen(&self, idempotency_key: &str) -> Result<bool> {
+    fn first_seen<'a>(&'a self, idempotency_key: &'a str) -> BoxFuture<'a, Result<bool>> {
         self.0.first_seen(idempotency_key)
     }
 }
@@ -542,6 +542,7 @@ async fn ordered_fragment_aware_receive_completes_in_conversation_turn_order() {
     match progress {
         As4ReceivePushProgress::PendingFragment { .. } => {}
         As4ReceivePushProgress::Complete(_) => {}
+        As4ReceivePushProgress::Duplicate { .. } => panic!("unexpected duplicate"),
     }
 }
 
@@ -617,6 +618,7 @@ async fn async_fragment_aware_receive_accepts_typed_request() {
     match progress {
         As4ReceivePushProgress::PendingFragment { .. } => {}
         As4ReceivePushProgress::Complete(_) => {}
+        As4ReceivePushProgress::Duplicate { .. } => panic!("unexpected duplicate"),
     }
 }
 

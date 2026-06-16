@@ -1,4 +1,4 @@
-use super::super::types::{As4ReceivePushOutput, As4ReceivePushProgress, As4ReceivePushRequest};
+use super::super::types::{As4ReceiveOutcome, As4ReceivePushProgress, As4ReceivePushRequest};
 use super::{As4Verifier, EventBus, SessionContext, async_bridge};
 use crate::core::{AsxError, ErrorCode, ErrorContext, Result};
 use crate::storage::DedupStorage;
@@ -10,7 +10,7 @@ pub(super) async fn receive_push_with_dedup_async_with_shared_verifier(
     request: As4ReceivePushRequest,
     dedup_backend: Arc<dyn DedupStorage>,
     verifier: Arc<dyn As4Verifier + Send + Sync>,
-) -> Result<As4ReceivePushOutput> {
+) -> Result<As4ReceiveOutcome> {
     match async_bridge::receive_push_with_dedup_async_fragment_aware_with_shared_verifier(
         session,
         event_bus,
@@ -23,7 +23,10 @@ pub(super) async fn receive_push_with_dedup_async_with_shared_verifier(
     )
     .await?
     {
-        As4ReceivePushProgress::Complete(output) => Ok(*output),
+        As4ReceivePushProgress::Complete(output) => Ok(As4ReceiveOutcome::FirstSeen(output)),
+        As4ReceivePushProgress::Duplicate { message_id } => {
+            Ok(As4ReceiveOutcome::Duplicate { message_id })
+        }
         As4ReceivePushProgress::PendingFragment { .. } => Err(AsxError::new(
             ErrorCode::PolicyViolation,
             "AS4 message contains mf:MessageFragment; use receive_push_with_dedup_async_fragment_aware",

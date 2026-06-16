@@ -283,6 +283,16 @@ pub enum ErrorCode {
     ///
     /// HTTP semantics: respond with 413 Content Too Large.
     PayloadTooLarge,
+    /// A storage or infrastructure backend (dedup store, reconciliation queue,
+    /// audit sink) failed with an I/O or connectivity error.
+    ///
+    /// This is distinct from [`ReliabilityFailure`](Self::ReliabilityFailure)
+    /// (protocol-level duplicate/ordering failure) and from
+    /// [`TransportFailure`](Self::TransportFailure) (network/HTTP failure).
+    ///
+    /// HTTP semantics: respond with 503 Service Unavailable — the server is
+    /// temporarily unable to handle the request due to a backend outage.
+    StorageBackendFailure,
 }
 
 impl ErrorCode {
@@ -299,6 +309,7 @@ impl ErrorCode {
             Self::NotFound => "not_found",
             Self::CapacityExhausted => "capacity_exhausted",
             Self::PayloadTooLarge => "payload_too_large",
+            Self::StorageBackendFailure => "storage_backend_failure",
         }
     }
 
@@ -322,6 +333,7 @@ impl ErrorCode {
     /// | `NotFound`                    | 404         |
     /// | `CapacityExhausted`           | 429         |
     /// | `PayloadTooLarge`             | 413         |
+    /// | `StorageBackendFailure`        | 503         |
     pub fn to_http_status(self) -> u16 {
         match self {
             Self::InvalidInput => 400,
@@ -335,6 +347,7 @@ impl ErrorCode {
             Self::NotFound => 404,
             Self::CapacityExhausted => 429,
             Self::PayloadTooLarge => 413,
+            Self::StorageBackendFailure => 503,
         }
     }
 
@@ -371,6 +384,11 @@ impl ErrorCode {
             Self::CapacityExhausted => Some(
                 "Shed load or retry after a backoff delay. \
                  Consider increasing channel capacity or conversation gate limits.",
+            ),
+            Self::StorageBackendFailure => Some(
+                "Check dedup/reconciliation/audit backend connectivity and disk space. \
+                 Inspect backend logs for I/O errors. \
+                 Consider a circuit-breaker or fallback backend for resilience.",
             ),
             _ => None,
         }
@@ -446,6 +464,36 @@ impl AsxError {
         self.context = self.context.with_message_id(message_id);
         self
     }
+
+    /// Returns `true` if this error represents a replay-protection rejection
+    /// (the message was already seen by the dedup store).
+    ///
+    /// Equivalent to `err.code == ErrorCode::ReliabilityFailure && err.message contains "replay"`,
+    /// but stable across message-text changes.  Use this instead of matching on error text.
+    ///
+    /// # Example
+    /// ```rust,ignore
+    /// if let Err(e) = receive_push_with_dedup_async(...).await {
+    ///     if e.is_duplicate() {
+    ///         // idempotent: send receipt without re-processing
+    ///     }
+    /// }
+    /// ```
+    ///
+    /// **Prefer [`asx_rs::as4::As4ReceiveOutcome`] over this method** — the discriminated
+    /// outcome enum is the primary API for duplicate detection on the receive path.
+    /// This method is provided for error-path scenarios (e.g., when a storage backend
+    /// fails-closed and propagates a duplicate as an error rather than an outcome).
+    #[inline]
+    pub fn is_duplicate(&self) -> bool {
+        self.code == ErrorCode::ReliabilityFailure && self.message.contains("replay")
+    }
+
+    /// Returns `true` if this error represents a transient storage or infrastructure failure.
+    #[inline]
+    pub fn is_storage_failure(&self) -> bool {
+        self.code == ErrorCode::StorageBackendFailure
+    }
 }
 
 impl fmt::Display for AsxError {
@@ -491,7 +539,7 @@ pub enum InteropMode {
     ///
     /// ```toml
     /// [dependencies]
-    /// asx = { version = "0.1", features = ["interop-relaxed"] }
+    /// asx = { version = "0.2", features = ["interop-relaxed"] }
     /// ```
     #[cfg_attr(
         not(feature = "interop-relaxed"),
@@ -608,6 +656,47 @@ impl SessionContextBuilder {
     /// Set explicit certificate/trust material for the session.
     pub fn cert_handle(mut self, cert_handle: CertHandle) -> Self {
         self.cert_handle = Some(cert_handle);
+        self
+    }
+
+    /// Append a single PEM-encoded trust anchor to the session's certificate store.
+    ///
+    /// This is a convenience alternative to constructing a [`CertHandle`] manually.
+    /// Can be called multiple times to build up a set of trusted root/intermediate CAs.
+    ///
+    /// # Example
+    /// ```rust,ignore
+    /// let session = SessionContextBuilder::new("s1", "partner-a")
+    ///     .with_trust_anchor_pem(root_ca_pem)
+    ///     .build()?;
+    /// ```
+    pub fn with_trust_anchor_pem(mut self, pem: impl Into<String>) -> Self {
+        let cert_handle = self.cert_handle.get_or_insert_with(|| CertHandle::new(""));
+        cert_handle.trust_anchor_pems.push(pem.into());
+        self
+    }
+
+    /// Append multiple PEM-encoded trust anchors to the session's certificate store.
+    ///
+    /// Equivalent to calling [`with_trust_anchor_pem`][Self::with_trust_anchor_pem]
+    /// in a loop.
+    pub fn with_trust_anchor_pems(
+        mut self,
+        pems: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        let cert_handle = self.cert_handle.get_or_insert_with(|| CertHandle::new(""));
+        cert_handle
+            .trust_anchor_pems
+            .extend(pems.into_iter().map(|p| p.into()));
+        self
+    }
+
+    /// Set the OCSP revocation-check mode for the session.
+    ///
+    /// Defaults to [`OcspMode::default()`] when not specified.
+    pub fn with_ocsp_mode(mut self, mode: OcspMode) -> Self {
+        let cert_handle = self.cert_handle.get_or_insert_with(|| CertHandle::new(""));
+        cert_handle.ocsp_mode = mode;
         self
     }
 

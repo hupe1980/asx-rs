@@ -629,7 +629,7 @@ impl RetryScheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::{DedupStorage, ReconciliationStorage};
+    use crate::storage::{DedupStorage, ReconciliationStorage, drive_dedup_future};
     use std::sync::Arc;
     use std::thread;
 
@@ -797,12 +797,12 @@ mod tests {
         let key = "dedup:critical:msg-1";
 
         // First call succeeds
-        assert!(backend.first_seen(key).unwrap());
+        assert!(drive_dedup_future(backend.first_seen(key)).unwrap());
 
         // Poison the lock by deliberately causing a panic during lock acquisition
         // (We can't directly poison in tests, but we validate the Result-based API allows proper error propagation)
         // In production, if lock poison occurs, first_seen now returns Err instead of silently continuing.
-        let result = backend.first_seen(key);
+        let result = drive_dedup_future(backend.first_seen(key));
         assert!(result.is_ok());
 
         // The critical semantic: any lock poison error would now bubble up as Err(AsxError)
@@ -836,8 +836,8 @@ mod tests {
     fn in_memory_dedup_backend_accepts_first_and_rejects_duplicate() {
         let backend = InMemoryDedupBackend::default();
         let key = "dedup:partner-a:as2:msg-1";
-        assert!(backend.first_seen(key).unwrap());
-        assert!(!backend.first_seen(key).unwrap());
+        assert!(drive_dedup_future(backend.first_seen(key)).unwrap());
+        assert!(!drive_dedup_future(backend.first_seen(key)).unwrap());
     }
 
     #[test]
@@ -848,7 +848,9 @@ mod tests {
         let mut handles = Vec::new();
         for _ in 0..16 {
             let backend = Arc::clone(&backend);
-            handles.push(thread::spawn(move || backend.first_seen(key).unwrap()));
+            handles.push(thread::spawn(move || {
+                drive_dedup_future(backend.first_seen(key)).unwrap()
+            }));
         }
 
         let accepted = handles

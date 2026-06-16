@@ -2,7 +2,7 @@ use super::super::parser::{
     parse_as4_user_message_document, parse_as4_user_message_from_doc,
     precheck_as4_user_message_structure_bytes,
 };
-use super::super::services::emit_duplicate_if_seen;
+use super::super::services::check_duplicate_push_sync;
 use super::super::stream::{MultipartAs4Payload, extract_multipart_related_payload_if_present};
 use super::super::types::As4PushPolicy;
 use super::{As4Verifier, payload};
@@ -40,6 +40,7 @@ fn wssec_external_reference<'a>(
     Some((cid, payload))
 }
 
+#[allow(clippy::type_complexity)]
 pub(super) fn parse_verify_and_emit_receive_push_metadata<'a>(
     session: &SessionContext,
     event_bus: &EventBus,
@@ -53,6 +54,7 @@ pub(super) fn parse_verify_and_emit_receive_push_metadata<'a>(
     &'a [u8],
     super::super::ParsedAs4UserMessage,
     payload::WsSecVerifiedGate,
+    bool, // is_duplicate
 )> {
     let multipart = extract_multipart_related_payload_if_present(
         payload_bytes,
@@ -90,7 +92,7 @@ pub(super) fn parse_verify_and_emit_receive_push_metadata<'a>(
         verifier,
     )?;
 
-    emit_duplicate_if_seen(
+    let is_duplicate = check_duplicate_push_sync(
         session,
         event_bus,
         dedup_backend,
@@ -99,5 +101,5 @@ pub(super) fn parse_verify_and_emit_receive_push_metadata<'a>(
         policy.fail_closed_audit_events,
     )?;
 
-    Ok((multipart, soap_bytes, parsed, gate))
+    Ok((multipart, soap_bytes, parsed, gate, is_duplicate))
 }

@@ -22,7 +22,7 @@ use crate::reliability::{
     derive_ingress_idempotency_key, derive_reconciliation_idempotency_key,
 };
 use crate::send_pipeline as pipeline;
-use crate::storage::{DedupStorage, ReconciliationStorage};
+use crate::storage::{DedupStorage, ReconciliationStorage, drive_dedup_future};
 use crate::wire::{
     DEFAULT_MAX_BODY_BYTES, StreamBodyPolicy, StreamLimits, StreamReadMetrics,
     enforce_payload_limit,
@@ -291,7 +291,7 @@ pub fn receive_with_mdn_with_reliability(
         "as2_mdn_receive",
         &reconciliation_message_id,
     );
-    if !dedup_backend.first_seen(&dedup_key)? {
+    if !drive_dedup_future(dedup_backend.first_seen(&dedup_key))? {
         tracing::warn!(
             session_id = %session.session_id(),
             partner_id = %session.partner_id(),

@@ -1,7 +1,10 @@
 //! AS4 signal generation: Receipt, Error, and PullRequest signals.
 
 use super::stream::normalize_mpc;
-use super::types::{As4ErrorCode, As4ErrorSeverity, As4GeneratePullRequestPolicy, As4NriReference};
+use super::types::{
+    As4ErrorCode, As4ErrorSeverity, As4GeneratePullRequestPolicy, As4NriReference,
+    As4ReceivePushOutput,
+};
 use crate::core::{AsxError, ErrorCode, ErrorContext, Result, SessionContext};
 #[cfg(feature = "as4")]
 use crate::crypto::soap_builder::WsSecurityHeaderBuilder;
@@ -349,4 +352,33 @@ pub fn generate_pull_request(
         let unsigned_envelope = envelope.replace("<!-- wsse-placeholder -->\n    ", "");
         Ok(unsigned_envelope.into_bytes())
     }
+}
+
+/// Convenience wrapper: generate a receipt for a completed receive output.
+///
+/// Equivalent to calling [`generate_receipt_with_nri`] with
+/// `ref_to_message_id = output.user_message.message_id` and an empty NRI
+/// slice.  For NRO-profile receipts (with `<NonRepudiationInformation>`),
+/// use [`generate_receipt_with_nri`] directly with refs extracted from the
+/// raw inbound bytes.
+///
+/// # Example
+/// ```rust,ignore
+/// let outcome = asx_rs::as4::receive_push_with_dedup_async(&session, &bus, req, dedup).await?;
+/// if let As4ReceiveOutcome::FirstSeen(output) = outcome {
+///     let receipt_id = format!("receipt@{}", uuid::Uuid::new_v4());
+///     let receipt_bytes = generate_receipt_for_output(&session, &receipt_id, &output)?;
+/// }
+/// ```
+pub fn generate_receipt_for_output(
+    session: &SessionContext,
+    receipt_message_id: &str,
+    output: &As4ReceivePushOutput,
+) -> Result<Vec<u8>> {
+    generate_receipt_with_nri(
+        session,
+        receipt_message_id,
+        &output.user_message.message_id,
+        &[],
+    )
 }

@@ -1174,6 +1174,76 @@ pub enum As4ReceivePushProgress {
         expected_fragments: Option<usize>,
     },
     Complete(Box<As4ReceivePushOutput>),
+    /// The message was already processed — idempotent replay detected by the
+    /// dedup store.  Return an acknowledgement without re-dispatching to
+    /// business logic.
+    Duplicate {
+        message_id: String,
+    },
+}
+
+/// Outcome of a non-fragment-aware AS4 push receive call.
+///
+/// Unlike `Result<As4ReceivePushOutput, AsxError>`, this enum lets callers
+/// distinguish a **first-seen** message (process normally) from a **replay**
+/// (return an idempotent acknowledgement without re-dispatching) at the call
+/// site — no `EventBus` subscription required.
+///
+/// # Example
+/// ```rust,ignore
+/// match receive_push_with_dedup_async(&session, &bus, req, dedup).await? {
+///     As4ReceiveOutcome::FirstSeen(output) => dispatch_to_workflow(output),
+///     As4ReceiveOutcome::Duplicate { message_id } => {
+///         tracing::info!(%message_id, "replay ignored");
+///         // still send an AS4 receipt — the sender may not have received the first one
+///     }
+/// }
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum As4ReceiveOutcome {
+    /// First occurrence: message verified and ready for business processing.
+    FirstSeen(Box<As4ReceivePushOutput>),
+    /// Replay: already processed.  Use `message_id` to correlate and return
+    /// an idempotent acknowledgement without re-dispatching.
+    Duplicate { message_id: String },
+}
+
+impl As4ReceiveOutcome {
+    /// Returns `true` if this is a first-seen message.
+    #[inline]
+    pub fn is_first_seen(&self) -> bool {
+        matches!(self, Self::FirstSeen(_))
+    }
+
+    /// Returns `true` if this is a duplicate replay.
+    #[inline]
+    pub fn is_duplicate(&self) -> bool {
+        matches!(self, Self::Duplicate { .. })
+    }
+
+    /// Consume the outcome and return the output if first-seen, `None` for duplicates.
+    #[inline]
+    pub fn into_output(self) -> Option<As4ReceivePushOutput> {
+        match self {
+            Self::FirstSeen(output) => Some(*output),
+            Self::Duplicate { .. } => None,
+        }
+    }
+
+    /// Unwrap the output, panicking on duplicates.  Only use after `is_duplicate()` check.
+    ///
+    /// # Panics
+    /// Panics if called on a `Duplicate` variant.
+    #[inline]
+    pub fn unwrap_output(self) -> As4ReceivePushOutput {
+        match self {
+            Self::FirstSeen(output) => *output,
+            Self::Duplicate { ref message_id } => {
+                panic!("called unwrap_output on a Duplicate (message_id={message_id})")
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

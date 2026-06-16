@@ -622,7 +622,8 @@ fn expected_from_error(code: ErrorCode) -> FixtureExpectedOutcome {
         | ErrorCode::ReliabilityFailure
         | ErrorCode::NotFound
         | ErrorCode::CapacityExhausted
-        | ErrorCode::PayloadTooLarge => FixtureExpectedOutcome::ParseFailed,
+        | ErrorCode::PayloadTooLarge
+        | ErrorCode::StorageBackendFailure => FixtureExpectedOutcome::ParseFailed,
     }
 }
 

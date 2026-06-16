@@ -1,6 +1,6 @@
 use super::super::coordination::ConversationOrderGate;
 use super::super::large_message::As4FragmentJoiner;
-use super::super::types::{As4ReceivePushOutput, As4ReceivePushProgress, As4ReceivePushRequest};
+use super::super::types::{As4ReceiveOutcome, As4ReceivePushProgress, As4ReceivePushRequest};
 use super::ordered_async;
 use super::{As4WsSecVerifier, EventBus, SessionContext, sync_core};
 use crate::core::Result;
@@ -47,12 +47,11 @@ pub struct As4ReceivePushSyncFragmentAwareRequest<'a> {
 // Public receive wrappers are isolated here so receive.rs remains focused
 // on guard enforcement and protocol orchestration internals.
 
-#[cfg_attr(feature = "trace", tracing::instrument(skip_all, fields(partner_id = %session.partner_id())))]
 pub fn receive_push_with_dedup_sync(
     session: &SessionContext,
     event_bus: &EventBus,
     request: As4ReceivePushSyncRequest<'_>,
-) -> Result<As4ReceivePushOutput> {
+) -> Result<As4ReceiveOutcome> {
     let As4ReceivePushSyncRequest {
         request,
         dedup_backend,
@@ -95,7 +94,7 @@ pub async fn receive_push_with_dedup_async(
     event_bus: &EventBus,
     request: As4ReceivePushRequest,
     dedup_backend: Arc<dyn DedupStorage>,
-) -> Result<As4ReceivePushOutput> {
+) -> Result<As4ReceiveOutcome> {
     super::receive_push_with_dedup_async_with_verifier(
         session,
         event_bus,
@@ -138,7 +137,7 @@ pub async fn receive_push_ordered(
     session: &SessionContext,
     event_bus: &EventBus,
     request: As4ReceivePushOrderedRequest<'_>,
-) -> crate::core::Result<As4ReceivePushOutput> {
+) -> crate::core::Result<As4ReceiveOutcome> {
     let As4ReceivePushOrderedRequest {
         request,
         dedup_backend,

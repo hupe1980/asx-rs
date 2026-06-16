@@ -109,6 +109,7 @@ fn push(payload: &[u8]) -> asx_rs::core::Result<asx_rs::as4::As4ReceivePushOutpu
             dedup_backend: &dedup(),
         },
     )
+    .map(|o| o.unwrap_output())
 }
 
 fn push_signed_required(payload: &[u8]) -> asx_rs::core::Result<asx_rs::as4::As4ReceivePushOutput> {
@@ -139,6 +140,7 @@ fn push_signed_required(payload: &[u8]) -> asx_rs::core::Result<asx_rs::as4::As4
             dedup_backend: &dedup(),
         },
     )
+    .map(|o| o.unwrap_output())
 }
 
 fn multipart_payload_with_cid(soap_xml: &[u8], payload_cid: &str, payload: &[u8]) -> Vec<u8> {

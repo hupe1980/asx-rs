@@ -61,13 +61,13 @@ Add to `Cargo.toml`:
 ```toml
 [dependencies]
 # AS2 client + server with OCSP
-asx-rs = { version = "0.1", features = ["as2", "client", "server", "async-ocsp"] }
+asx-rs = { version = "0.2", features = ["as2", "client", "server", "async-ocsp"] }
 
 # AS4 only
-asx-rs = { version = "0.1", features = ["as4", "client", "server", "async-ocsp"] }
+asx-rs = { version = "0.2", features = ["as4", "client", "server", "async-ocsp"] }
 
 # Both protocols with compression (default)
-asx-rs = { version = "0.1", features = ["as2", "as4", "compression", "client", "server", "async-ocsp"] }
+asx-rs = { version = "0.2", features = ["as2", "as4", "compression", "client", "server", "async-ocsp"] }
 ```
 
 > `as2` and `as4` are **not** enabled by default — add them explicitly.

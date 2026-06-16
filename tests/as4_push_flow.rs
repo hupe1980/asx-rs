@@ -122,7 +122,8 @@ fn as4_push_valid_without_receipt_when_unsigned_push_is_allowed() {
             dedup_backend: &dedup,
         },
     )
-    .expect("valid push flow");
+    .expect("valid push flow")
+    .unwrap_output();
 
     assert_eq!(out.user_message.message_id, "msg-push-1");
     assert_eq!(out.user_message.action, "SubmitOrder");
@@ -238,7 +239,8 @@ fn cryptographically_signed_receipt_passes_end_to_end() {
             dedup_backend: &dedup,
         },
     )
-    .expect("cryptographically signed receipt must be accepted");
+    .expect("cryptographically signed receipt must be accepted")
+    .unwrap_output();
 
     let receipt = out.receipt.expect("receipt");
     assert!(receipt.is_signed);

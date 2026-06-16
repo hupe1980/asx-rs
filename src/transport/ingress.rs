@@ -333,7 +333,7 @@ impl As4HttpIngress {
     pub fn receive_push_with_dedup_sync(
         &self,
         request: As4IngressReceivePushSyncRequest<'_>,
-    ) -> crate::core::Result<crate::as4::As4ReceivePushOutput> {
+    ) -> crate::core::Result<crate::as4::As4ReceiveOutcome> {
         crate::as4::receive_push_with_dedup_sync(
             request.session,
             request.event_bus,
@@ -459,7 +459,7 @@ mod tests {
     #[cfg(feature = "as4")]
     use crate::reliability::ReconciliationRequest;
     #[cfg(feature = "as4")]
-    use crate::storage::{DedupStorage, ReconciliationStorage};
+    use crate::storage::{BoxFuture, DedupStorage, ReconciliationStorage};
     #[cfg(all(feature = "as4", feature = "testing"))]
     use sha2::{Digest, Sha256};
     #[cfg(feature = "as4")]
@@ -1097,8 +1097,11 @@ mod tests {
             true
         }
 
-        fn first_seen(&self, _idempotency_key: &str) -> Result<bool> {
-            Ok(true)
+        fn first_seen<'a>(
+            &'a self,
+            _idempotency_key: &'a str,
+        ) -> BoxFuture<'a, crate::core::Result<bool>> {
+            Box::pin(async move { Ok(true) })
         }
     }
 
@@ -1254,7 +1257,8 @@ mod tests {
                 dedup_backend: &crate::reliability::InMemoryDedupBackend::default(),
                 receipt_payload: None,
             })
-            .expect("valid multipart push payload must succeed");
+            .expect("valid multipart push payload must succeed")
+            .unwrap_output();
 
         assert_eq!(out.user_message.message_id, "msg-push-1");
         assert_eq!(out.user_message.action, "SubmitOrder");
@@ -1293,7 +1297,8 @@ mod tests {
                 dedup_backend: &crate::reliability::InMemoryDedupBackend::default(),
                 receipt_payload: Some(signed_receipt_fixture("msg-push-1")),
             })
-            .expect("valid multipart push + signed receipt must succeed");
+            .expect("valid multipart push + signed receipt must succeed")
+            .unwrap_output();
 
         let receipt = out.receipt.expect("receipt");
         assert!(receipt.is_signed);

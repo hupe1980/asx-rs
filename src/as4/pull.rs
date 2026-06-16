@@ -4,13 +4,14 @@ use super::pull_store::{As4PullEnqueueOutcome, As4PullStore};
 use super::pull_store::{PullQueueKey, PullRequestKey};
 use super::receive::receive_push_with_dedup_async;
 use super::services::{
-    emit_pull_duplicate_if_seen, enforce_strict_as4_runtime_policy_consistency,
-    ensure_pull_mpc_matches, handle_empty_pull_partition,
+    check_duplicate_pull, enforce_strict_as4_runtime_policy_consistency, ensure_pull_mpc_matches,
+    handle_empty_pull_partition,
 };
 use super::stream::{constant_time_eq, normalize_mpc};
 use super::types::{
-    As4PushPolicy, As4QueuedPullMessage, As4ReceivePullOutput, As4ReceivePullRequest,
-    As4ReceivePushOutput, As4ReceivePushRequest, FragmentScopePolicy as As4FragmentScopePolicy,
+    As4PushPolicy, As4QueuedPullMessage, As4ReceiveOutcome, As4ReceivePullOutput,
+    As4ReceivePullRequest, As4ReceivePushOutput, As4ReceivePushRequest,
+    FragmentScopePolicy as As4FragmentScopePolicy,
 };
 use crate::core::{AsxError, ErrorCode, ErrorContext, Result, SessionContext};
 use crate::observability::{AsxEvent, EventBus, emit_audit_event, emit_protocol_event};
@@ -209,7 +210,17 @@ async fn receive_queued_pull_message(
     )
     .await
     {
-        Ok(push_out) => push_out,
+        Ok(As4ReceiveOutcome::FirstSeen(output)) => *output,
+        Ok(As4ReceiveOutcome::Duplicate { .. }) => {
+            // Pull messages replayed through the same pull store entry are
+            // idempotent by construction — the push was already processed.
+            store.requeue_front(queue_key, queued).await?;
+            return Err(crate::core::AsxError::new(
+                ErrorCode::ReliabilityFailure,
+                "pull message replay: already processed",
+                crate::core::ErrorContext::for_session("as4_pull_receive", session),
+            ));
+        }
         Err(err) => {
             store.requeue_front(queue_key, queued).await?;
             return Err(err);
@@ -350,13 +361,14 @@ pub async fn receive_pull_with_reliability(
         mpc: Arc::clone(&mpc),
     };
 
-    emit_pull_duplicate_if_seen(
+    check_duplicate_pull(
         session,
         event_bus,
         dedup_backend.as_ref(),
         &pull_message_id,
         fail_closed_audit_events,
-    )?;
+    )
+    .await?;
 
     validate_pull_authorization_info(
         session,

@@ -3,6 +3,7 @@ use crate::core::{AsxError, ErrorContext};
 use crate::observability::audit_sink::{InMemoryAuditSink, ReplayCursor};
 use crate::observability::{BackpressurePolicy, EventBus, EventEmissionMode};
 use crate::reliability::{InMemoryDedupBackend, InMemoryReconciliationHook};
+use crate::storage::BoxFuture;
 use openssl::asn1::Asn1Time;
 use openssl::bn::BigNum;
 use openssl::nid::Nid;
@@ -67,7 +68,10 @@ impl DedupStorage for DurableTestDedup {
         true
     }
 
-    fn first_seen(&self, idempotency_key: &str) -> crate::core::Result<bool> {
+    fn first_seen<'a>(
+        &'a self,
+        idempotency_key: &'a str,
+    ) -> BoxFuture<'a, crate::core::Result<bool>> {
         self.0.first_seen(idempotency_key)
     }
 }

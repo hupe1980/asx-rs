@@ -258,7 +258,7 @@ pub struct TransportConfig {
     /// Timeout for the full request round-trip (from send to last byte of
     /// response body). Default: 60 s.
     pub request_timeout: Duration,
-    /// `User-Agent` header value. Default: `"asx/0.1"`.
+    /// `User-Agent` header value. Default: `"asx/0.2"`.
     pub user_agent: String,
     /// Maximum idle connections per host kept in the pool. Default: 4.
     pub pool_max_idle_per_host: usize,
@@ -271,7 +271,7 @@ impl Default for TransportConfig {
         Self {
             connect_timeout: Duration::from_secs(10),
             request_timeout: Duration::from_secs(60),
-            user_agent: "asx/0.1".to_string(),
+            user_agent: "asx/0.2".to_string(),
             pool_max_idle_per_host: 4,
             pool_idle_timeout: Duration::from_secs(90),
         }

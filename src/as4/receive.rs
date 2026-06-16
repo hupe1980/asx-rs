@@ -46,6 +46,7 @@
 use super::large_message::As4FragmentJoiner;
 mod async_bridge;
 mod async_completion;
+#[doc(hidden)]
 mod entrypoints;
 mod metadata;
 mod ordered;

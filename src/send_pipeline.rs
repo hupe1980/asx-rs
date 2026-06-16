@@ -141,6 +141,7 @@ pub fn classify_send_retry(err: &AsxError) -> RetryDecision {
         | ErrorCode::SecurityVerificationFailed
         | ErrorCode::NotFound
         | ErrorCode::PayloadTooLarge => RetryClass::Permanent,
+        ErrorCode::StorageBackendFailure => RetryClass::Transient,
     };
 
     RetryDecision {

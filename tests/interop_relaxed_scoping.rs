@@ -193,7 +193,7 @@ async fn as4_missing_non_repudiation_info_is_security_blocked_and_audited() {
         .build()
         .expect("policy");
 
-    let (_, dedup) = reliability();
+    let (_, dedup_scoped) = reliability();
     let multipart_payload = multipart_payload_with_xop(payload);
     let multipart_content_type =
         "multipart/related; boundary=\"asx-interop-boundary\"; type=\"application/soap+xml\"";
@@ -209,12 +209,16 @@ async fn as4_missing_non_repudiation_info_is_security_blocked_and_audited() {
                 policy: policy.clone(),
                 authenticated_sender_scope: None,
             },
-            dedup_backend: &dedup,
+            dedup_backend: &dedup_scoped,
         },
     )
     .expect_err("security-blocked exception must not be overridable (scoped)");
     assert_eq!(scoped_err.code, ErrorCode::PolicyViolation);
 
+    // Use a fresh dedup backend: the first call recorded the message ID as "seen"
+    // (even though it failed), so reusing the same backend would make the second
+    // call return Duplicate instead of reaching the policy check.
+    let (_, dedup_unscoped) = reliability();
     let unscoped_err = receive_push_with_dedup_sync(
         &blocked_unscoped,
         &bus,
@@ -226,7 +230,7 @@ async fn as4_missing_non_repudiation_info_is_security_blocked_and_audited() {
                 policy,
                 authenticated_sender_scope: None,
             },
-            dedup_backend: &dedup,
+            dedup_backend: &dedup_unscoped,
         },
     )
     .expect_err("security-blocked exception must not be overridable (unscoped)");

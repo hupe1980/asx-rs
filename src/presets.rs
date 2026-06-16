@@ -398,6 +398,7 @@ mod tests {
     use crate::observability::audit_sink::{
         AuditEvent, AuditSinkDurability, DurableAuditSink, ReplayCursor,
     };
+    use crate::storage::BoxFuture;
 
     struct DurableTestAuditSink;
 
@@ -453,8 +454,11 @@ mod tests {
             false
         }
 
-        fn first_seen(&self, _idempotency_key: &str) -> Result<bool> {
-            Ok(true)
+        fn first_seen<'a>(
+            &'a self,
+            _idempotency_key: &'a str,
+        ) -> BoxFuture<'a, crate::core::Result<bool>> {
+            Box::pin(async move { Ok(true) })
         }
     }
 
@@ -467,8 +471,11 @@ mod tests {
             true
         }
 
-        fn first_seen(&self, _idempotency_key: &str) -> Result<bool> {
-            Ok(true)
+        fn first_seen<'a>(
+            &'a self,
+            _idempotency_key: &'a str,
+        ) -> BoxFuture<'a, crate::core::Result<bool>> {
+            Box::pin(async move { Ok(true) })
         }
     }
 
@@ -576,8 +583,11 @@ mod tests {
             true
         }
 
-        fn first_seen(&self, _idempotency_key: &str) -> Result<bool> {
-            Ok(true)
+        fn first_seen<'a>(
+            &'a self,
+            _idempotency_key: &'a str,
+        ) -> BoxFuture<'a, crate::core::Result<bool>> {
+            Box::pin(async move { Ok(true) })
         }
     }
 

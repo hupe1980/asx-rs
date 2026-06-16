@@ -12,7 +12,7 @@ use asx_rs::observability::{BackpressurePolicy, EventBus, EventEmissionMode};
 #[cfg(feature = "as4")]
 use asx_rs::presets::{DeploymentTopology, validate_strict_production_as4_topology_readiness};
 use asx_rs::presets::{strict_production_event_bus, validate_strict_production_startup_readiness};
-use asx_rs::storage::{DedupStorage, ReconciliationStorage};
+use asx_rs::storage::{BoxFuture, DedupStorage, ReconciliationStorage};
 
 struct DurableTestAuditSink;
 
@@ -90,8 +90,11 @@ impl DedupStorage for DurableClusterSafeDedup {
         true
     }
 
-    fn first_seen(&self, _idempotency_key: &str) -> Result<bool> {
-        Ok(true)
+    fn first_seen<'a>(
+        &'a self,
+        _idempotency_key: &'a str,
+    ) -> BoxFuture<'a, crate::core::Result<bool>> {
+        Box::pin(async move { Ok(true) })
     }
 }
 
@@ -122,8 +125,11 @@ impl DedupStorage for NonClusterSafeDedup {
         true
     }
 
-    fn first_seen(&self, _idempotency_key: &str) -> Result<bool> {
-        Ok(true)
+    fn first_seen<'a>(
+        &'a self,
+        _idempotency_key: &'a str,
+    ) -> BoxFuture<'a, crate::core::Result<bool>> {
+        Box::pin(async move { Ok(true) })
     }
 }
 

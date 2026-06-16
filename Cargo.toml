@@ -1,6 +1,6 @@
 [package]
 name = "asx-rs"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 authors = ["hupe1980"]
 description = "AS2 and AS4 B2B messaging library for Rust — signing, encryption, MDN, and ebMS3/AS4 profile support"
@@ -45,7 +45,7 @@ openssl = { version = "0.10", optional = true }
 aes-gcm = { version = "0.10", optional = true }
 flate2 = { version = "1", optional = true }
 reqwest = { version = ">=0.12, <0.13", default-features = false, features = ["json", "rustls-tls", "http2"], optional = true }
-axum = { version = ">=0.7, <0.8", optional = true }
+axum = { version = ">=0.7, <0.9", optional = true }
 uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 dashmap = "6"
