@@ -4,4 +4,4 @@ as2_mdn_generation=500.000
 as2_verify_decrypt_mdn=1779.438
 as4_verify_decrypt=6477.604
 as4_precheck_markers=640.000
-as4_receipt_generation=420.000
+as4_receipt_generation=550.000
