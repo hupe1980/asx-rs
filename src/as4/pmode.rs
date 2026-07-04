@@ -33,6 +33,7 @@
 //!         sign: true, encrypt: true, encrypt_soap_headers: false, compress: false
 //!     },
 //!     payload_packaging: PayloadPackagingMode::MimeAttachment,
+//!     endpoint_url: Some("https://partner-a.example.com/as4".into()),
 //! });
 //!
 //! let pm = registry.resolve("partner-a", "urn:service:invoicing", "urn:action:submit");
@@ -68,7 +69,7 @@ use crate::core::{AsxError, ErrorCode, ErrorContext, InteropMode, Result};
 /// [`ErrorCode::InteropViolation`]: crate::core::ErrorCode::InteropViolation
 /// [`MimeAttachment`]: PayloadPackagingMode::MimeAttachment
 #[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum PayloadPackagingMode {
     /// Use MIME multipart/related attachments (PEPPOL/CEF).
     ///
@@ -80,7 +81,7 @@ pub enum PayloadPackagingMode {
 }
 
 /// ebMS3 Message Exchange Pattern.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 #[non_exhaustive]
 pub enum MepType {
     /// ebMS3 One-Way/Push — sender pushes; no response UserMessage on this P-Mode.
@@ -95,7 +96,7 @@ pub enum MepType {
 /// Security policy within a P-Mode.
 ///
 /// Maps to the `PMode[].Security` parameter set defined in ebMS3 Core §6.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PModeSecurity {
     /// Whether outbound messages on this P-Mode must be signed.
     pub sign: bool,
@@ -126,7 +127,7 @@ impl Default for PModeSecurity {
 /// service/action combination.
 ///
 /// P-Modes are stored in a [`PModeRegistry`] and resolved at send-time.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PMode {
     /// Globally unique P-Mode identifier (e.g., `"pm-001"` or a URN).
     pub id: String,
@@ -144,6 +145,19 @@ pub struct PMode {
     pub security: PModeSecurity,
     /// Payload packaging mode (strict MIME attachment packaging).
     pub payload_packaging: PayloadPackagingMode,
+    /// ebMS3 `PMode[1].Protocol.Address` — outbound endpoint URL for this P-Mode.
+    ///
+    /// When `Some`, send pipelines can retrieve the endpoint directly from the
+    /// P-Mode registration, eliminating the need for a separate partner-address
+    /// registry.  Startup validation
+    /// (`presets::validate_strict_production_topology`) will assert that all
+    /// outbound P-Modes have a non-`None` endpoint URL when present.
+    ///
+    /// `None` preserves the existing behaviour where the endpoint URL is
+    /// supplied by the caller at send-time (e.g. from a separate
+    /// `PartnerDirectory` lookup).  Keeping this field `None` is safe for
+    /// deployments that resolve endpoints through other means.
+    pub endpoint_url: Option<String>,
 }
 
 impl PMode {
@@ -163,6 +177,27 @@ impl PMode {
         require_non_empty(&self.partner_id, "partner_id", stage)?;
         require_non_empty(&self.service, "service", stage)?;
         require_non_empty(&self.action, "action", stage)?;
+
+        if let Some(url) = &self.endpoint_url {
+            if url.trim().is_empty() {
+                return Err(AsxError::new(
+                    ErrorCode::InvalidInput,
+                    "P-Mode endpoint_url must not be empty when Some; use None to omit",
+                    ErrorContext::new(stage),
+                ));
+            }
+            #[cfg(not(feature = "testing"))]
+            if !url.starts_with("https://") {
+                return Err(AsxError::new(
+                    ErrorCode::PolicyViolation,
+                    format!(
+                        "P-Mode endpoint_url must use the HTTPS scheme (eDelivery AS4 §4.1); \
+                         got: {url}"
+                    ),
+                    ErrorContext::new(stage),
+                ));
+            }
+        }
 
         #[cfg(not(feature = "testing"))]
         if !self.security.sign {
@@ -193,6 +228,7 @@ impl PMode {
     ///         sign: false, encrypt: false, encrypt_soap_headers: false, compress: false
     ///     },
     ///     payload_packaging: PayloadPackagingMode::MimeAttachment,
+    ///     endpoint_url: None,
     /// };
     /// let _policy_builder = pm.to_send_policy_builder();
     /// // Caller would then add credentials and call .build()
@@ -256,7 +292,7 @@ impl PMode {
 ///
 /// Thread safety: [`PModeRegistry`] is immutable after construction.  Build
 /// it once at startup, then share via `Arc<PModeRegistry>`.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct PModeRegistry {
     modes: Vec<PMode>,
 }
@@ -331,6 +367,7 @@ mod tests {
             mep,
             security: PModeSecurity::default(),
             payload_packaging: PayloadPackagingMode::default(),
+            endpoint_url: None,
         }
     }
 

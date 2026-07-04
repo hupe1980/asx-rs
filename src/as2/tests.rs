@@ -87,15 +87,18 @@ impl ReconciliationStorage for DurableTestReconciliationWrapper {
         true
     }
 
-    fn enqueue(&self, request: ReconciliationRequest) -> crate::core::Result<bool> {
+    fn enqueue<'a>(
+        &'a self,
+        request: ReconciliationRequest,
+    ) -> BoxFuture<'a, crate::core::Result<bool>> {
         self.0.enqueue(request)
     }
 
-    fn queued_requests(&self) -> crate::core::Result<Vec<ReconciliationRequest>> {
+    fn queued_requests(&self) -> BoxFuture<'_, crate::core::Result<Vec<ReconciliationRequest>>> {
         self.0.queued_requests()
     }
 
-    fn resolve(&self, idempotency_key: &str) -> crate::core::Result<bool> {
+    fn resolve<'a>(&'a self, idempotency_key: &'a str) -> BoxFuture<'a, crate::core::Result<bool>> {
         self.0.resolve(idempotency_key)
     }
 }
@@ -133,15 +136,18 @@ impl ReconciliationStorage for DurableTestReconciliation {
         true
     }
 
-    fn enqueue(&self, request: ReconciliationRequest) -> crate::core::Result<bool> {
+    fn enqueue<'a>(
+        &'a self,
+        request: ReconciliationRequest,
+    ) -> BoxFuture<'a, crate::core::Result<bool>> {
         self.0.enqueue(request)
     }
 
-    fn queued_requests(&self) -> crate::core::Result<Vec<ReconciliationRequest>> {
+    fn queued_requests(&self) -> BoxFuture<'_, crate::core::Result<Vec<ReconciliationRequest>>> {
         self.0.queued_requests()
     }
 
-    fn resolve(&self, idempotency_key: &str) -> crate::core::Result<bool> {
+    fn resolve<'a>(&'a self, idempotency_key: &'a str) -> BoxFuture<'a, crate::core::Result<bool>> {
         self.0.resolve(idempotency_key)
     }
 }
@@ -155,20 +161,28 @@ impl ReconciliationStorage for AlwaysFailReconciliation {
         true
     }
 
-    fn enqueue(&self, _request: ReconciliationRequest) -> crate::core::Result<bool> {
-        Err(AsxError::new(
-            ErrorCode::ReliabilityFailure,
-            "simulated reconciliation backend outage",
-            ErrorContext::new("as2_test_reconciliation_fail"),
-        ))
+    fn enqueue<'a>(
+        &'a self,
+        _request: ReconciliationRequest,
+    ) -> BoxFuture<'a, crate::core::Result<bool>> {
+        Box::pin(async move {
+            Err(AsxError::new(
+                ErrorCode::ReliabilityFailure,
+                "simulated reconciliation backend outage",
+                ErrorContext::new("as2_test_reconciliation_fail"),
+            ))
+        })
     }
 
-    fn queued_requests(&self) -> crate::core::Result<Vec<ReconciliationRequest>> {
-        Ok(Vec::new())
+    fn queued_requests(&self) -> BoxFuture<'_, crate::core::Result<Vec<ReconciliationRequest>>> {
+        Box::pin(async move { Ok(Vec::new()) })
     }
 
-    fn resolve(&self, _idempotency_key: &str) -> crate::core::Result<bool> {
-        Ok(false)
+    fn resolve<'a>(
+        &'a self,
+        _idempotency_key: &'a str,
+    ) -> BoxFuture<'a, crate::core::Result<bool>> {
+        Box::pin(async move { Ok(false) })
     }
 }
 
@@ -203,9 +217,9 @@ fn test_as2_credentials() -> As2SendCredentials {
     let cert = builder.build();
 
     As2SendCredentials {
-        signing_cert_pem: Some(cert.to_pem().expect("cert pem")),
+        signing_cert_pem: Some(cert.to_pem().expect("cert pem").into()),
         signing_key_pem: Some(pkey.private_key_to_pem_pkcs8().expect("private key pem")),
-        recipient_cert_pem: Some(cert.to_pem().expect("recipient cert pem")),
+        recipient_cert_pem: Some(cert.to_pem().expect("recipient cert pem").into()),
     }
 }
 
@@ -1484,7 +1498,11 @@ fn receive_from_ingress_signed_receipt_requires_mdn_signing_credentials() {
 fn receive_from_ingress_generates_signed_sync_mdn_when_requested() {
     let creds = test_as2_credentials();
     let mdn_signing = As2MdnSigningCredentials {
-        signing_cert_pem: creds.signing_cert_pem.clone().expect("test signing cert"),
+        signing_cert_pem: creds
+            .signing_cert_pem
+            .as_deref()
+            .expect("test signing cert")
+            .to_vec(),
         signing_key_pem: creds.signing_key_pem.clone().expect("test signing key"),
     };
     let payload =
@@ -1935,16 +1953,18 @@ Disposition: automatic-action/MDN-sent-automatically; processed\r\n\
 #[test]
 fn correlate_async_mdn_resolves_pending_indeterminate_entry() {
     let reconciliation = InMemoryReconciliationHook::default();
-    reconciliation
-        .enqueue(
+    use crate::storage::drive_dedup_future;
+    drive_dedup_future(
+        reconciliation.enqueue(
             crate::reliability::ReconciliationRequest::for_outcome(
                 "<mdn-test-001@example.com>",
                 "partner-a",
                 crate::reliability::DeliveryOutcome::Indeterminate,
             )
             .expect("request"),
-        )
-        .expect("enqueue");
+        ),
+    )
+    .expect("enqueue");
 
     let mdn = build_minimal_async_mdn("<mdn-test-001@example.com>");
     let outcome =

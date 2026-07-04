@@ -185,7 +185,6 @@ fn build_http_client(
     pinned_resolution: Option<(&str, &[SocketAddr])>,
 ) -> Result<reqwest::Client> {
     let mut builder = reqwest::Client::builder()
-        .use_rustls_tls()
         .https_only(true)
         .connect_timeout(config.connect_timeout)
         .timeout(config.request_timeout)

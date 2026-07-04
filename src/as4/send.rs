@@ -1,5 +1,7 @@
 //! AS4 outbound send pipeline.
 
+use std::sync::Arc;
+
 use super::send_mime::{inject_xop_include, package_as_mime};
 use super::services::enforce_strict_as4_send_runtime_policy_consistency;
 use super::types::{
@@ -18,7 +20,6 @@ use crate::reliability::{RetryConfig, RetryScheduler};
 use crate::sbdh::StandardBusinessDocument;
 use crate::send_pipeline as pipeline;
 use crate::transport::trace_context::generate_traceparent;
-use std::sync::Arc;
 
 const SOAP12_NAMESPACE: &str = "http://www.w3.org/2003/05/soap-envelope";
 const SOAP12_HTTP_CONTENT_TYPE: &str = "application/soap+xml";
@@ -127,12 +128,15 @@ pub fn send_sync(
         None => {
             let ch = session.cert_handle();
             session_creds = As4SendCredentials {
-                signing_cert_pem: ch.signing_cert_pem.as_ref().map(|s| s.as_bytes().to_vec()),
+                signing_cert_pem: ch
+                    .signing_cert_pem
+                    .as_ref()
+                    .map(|s| Arc::from(s.as_bytes())),
                 signing_key_pem: ch.signing_key_pem.as_ref().map(|s| s.as_bytes().to_vec()),
                 recipient_cert_pem: ch
                     .recipient_cert_pem
                     .as_ref()
-                    .map(|s| s.as_bytes().to_vec()),
+                    .map(|s| Arc::from(s.as_bytes())),
             };
             session_creds
         }

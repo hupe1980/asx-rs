@@ -18,28 +18,61 @@ use std::task::Poll;
 /// box their async body with `Box::pin(async move { ... })`.
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
-/// Drive a `BoxFuture` to completion synchronously.
+/// Core implementation of the synchronous-poll drive pattern.
 ///
-/// This is provided for the **sync receive path** (`receive_push_with_dedup_sync`),
-/// which runs inside `tokio::task::spawn_blocking` and cannot `.await` a future.
-/// All in-memory [`DedupStorage`] implementations return a `Poll::Ready` future
-/// immediately and this function resolves them in O(1).
-///
-/// # Panics
-/// Panics with a clear message if the future returns `Poll::Pending`, which
-/// indicates an async backend being called from the sync path.  In that case,
-/// switch to `receive_push_with_dedup_async` which properly `.await`s the dedup call.
+/// Both [`drive_dedup_future`] and [`drive_reconciliation_future`] delegate here.
+/// Having one code path ensures the noop-waker poll logic is maintained in a
+/// single place while preserving the distinct diagnostic messages.
 #[inline]
-pub(crate) fn drive_dedup_future<T>(future: impl Future<Output = T>) -> T {
+fn drive_sync_future<T>(future: impl Future<Output = T>, context: &'static str) -> T {
     let waker = std::task::Waker::noop();
     let mut cx = std::task::Context::from_waker(waker);
     match std::pin::pin!(future).poll(&mut cx) {
         Poll::Ready(val) => val,
-        Poll::Pending => panic!(
-            "DedupStorage::first_seen returned Poll::Pending from a sync receive context. \
-             Use `receive_push_with_dedup_async` for async-backed dedup stores."
-        ),
+        Poll::Pending => panic!("{context}"),
     }
+}
+
+/// Drive a `BoxFuture` to completion synchronously.
+///
+/// This is provided for **sync receive paths** that cannot `.await` a future:
+/// - `receive_push_with_dedup_sync` (dedup)
+/// - `receive_with_mdn_with_reliability` and internal AS4 helpers (reconciliation)
+///
+/// All in-memory storage implementations return a `Poll::Ready` future immediately
+/// and this function resolves them in O(1).
+///
+/// # Panics
+/// Panics with a clear message if the future returns `Poll::Pending`, which
+/// indicates an async backend being called from the sync path.  For dedup, switch
+/// to `receive_push_with_dedup_async`.  For reconciliation sync callers, ensure
+/// only in-memory backends are used on sync paths.
+#[cfg(any(feature = "as2", feature = "as4"))]
+#[inline]
+pub(crate) fn drive_dedup_future<T>(future: impl Future<Output = T>) -> T {
+    drive_sync_future(
+        future,
+        "DedupStorage::first_seen returned Poll::Pending from a sync receive context. \
+         Use `receive_push_with_dedup_async` for async-backed dedup stores.",
+    )
+}
+
+/// Drive a [`ReconciliationStorage`] `BoxFuture` to completion synchronously.
+///
+/// Provided for sync receive paths (`receive_with_mdn_with_reliability`, internal
+/// AS4 pull/push helpers) that hold a `&dyn ReconciliationStorage` and cannot `.await`.
+/// In-memory backends resolve immediately (`Poll::Ready`); network-backed backends must
+/// not be used from sync paths — this function will panic with a diagnostic if they do.
+///
+/// # Panics
+/// Panics if the future returns `Poll::Pending` (async backend on a sync path).
+#[inline]
+pub(crate) fn drive_reconciliation_future<T>(future: impl Future<Output = T>) -> T {
+    drive_sync_future(
+        future,
+        "ReconciliationStorage method returned Poll::Pending from a sync receive context. \
+         Only in-memory ReconciliationStorage backends can be used from sync paths.",
+    )
 }
 
 /// Trait for distributed dedup state storage.
@@ -152,23 +185,36 @@ pub trait ReconciliationStorage: Send + Sync {
     }
 
     /// Enqueue a reconciliation request.
-    /// Returns Ok(true) if enqueued (not previously seen by idempotency key).
-    /// Returns Ok(false) if duplicate (already in queue).
-    /// Returns Err if storage backend fails (fail-closed for correctness).
-    fn enqueue(&self, request: ReconciliationRequest) -> crate::core::Result<bool>;
+    ///
+    /// Returns a future that resolves to:
+    /// - `Ok(true)` — enqueued successfully (not a duplicate).
+    /// - `Ok(false)` — duplicate (already in queue by idempotency key).
+    /// - `Err(_)` — storage backend failure (fail-closed for correctness).
+    ///
+    /// The future is `Send` so it can be driven from async tasks on any executor.
+    /// In-memory implementations resolve immediately (`Poll::Ready`).
+    fn enqueue<'a>(
+        &'a self,
+        request: ReconciliationRequest,
+    ) -> BoxFuture<'a, crate::core::Result<bool>>;
 
     /// Retrieve all queued reconciliation requests.
     ///
-    /// Returns a snapshot of the current queue.  Callers should process the
+    /// Returns a snapshot of the current queue. Callers should process the
     /// returned `Vec` outside the storage lock; do not call back into this
     /// storage from within any callback derived from the snapshot.
-    fn queued_requests(&self) -> crate::core::Result<Vec<ReconciliationRequest>>;
+    ///
+    /// The future is `Send` and resolves immediately for in-memory backends.
+    fn queued_requests(&self) -> BoxFuture<'_, crate::core::Result<Vec<ReconciliationRequest>>>;
 
     /// Mark a reconciliation request as resolved and remove it from the queue.
+    ///
     /// `idempotency_key` must match the key used during `enqueue`.
-    /// Returns Ok(true) if the request was found and removed, Ok(false) if not found.
-    /// Returns Err if storage backend fails (fail-closed).
-    fn resolve(&self, idempotency_key: &str) -> crate::core::Result<bool>;
+    /// Returns `Ok(true)` if the request was found and removed, `Ok(false)` if not found.
+    /// Returns `Err` if storage backend fails (fail-closed).
+    ///
+    /// The future is `Send` and resolves immediately for in-memory backends.
+    fn resolve<'a>(&'a self, idempotency_key: &'a str) -> BoxFuture<'a, crate::core::Result<bool>>;
 }
 
 pub use memory::{

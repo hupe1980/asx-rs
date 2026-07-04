@@ -157,6 +157,11 @@ pub(super) fn event_code(event: &AsxEvent) -> &'static str {
         AsxEvent::CertOcspUnknown { .. } => "cert_ocsp_unknown",
         AsxEvent::CertNearExpiry { .. } => "cert_near_expiry",
         AsxEvent::As2AsyncMdnRequested { .. } => "as2_async_mdn_requested",
+        AsxEvent::MessageSent { .. } => "message_sent",
+        AsxEvent::MessageSendFailed { .. } => "message_send_failed",
+        AsxEvent::FragmentIngested { .. } => "fragment_ingested",
+        AsxEvent::FragmentGroupComplete { .. } => "fragment_group_complete",
+        AsxEvent::FragmentGroupEvicted { .. } => "fragment_group_evicted",
     }
 }
 
@@ -190,5 +195,10 @@ pub(super) fn event_message(event: &AsxEvent) -> &'static str {
         AsxEvent::CertOcspUnknown { .. } => "Certificate OCSP status unknown",
         AsxEvent::CertNearExpiry { .. } => "Certificate approaching expiry",
         AsxEvent::As2AsyncMdnRequested { .. } => "Async MDN delivery requested via mailto:",
+        AsxEvent::MessageSent { .. } => "Outbound message sent successfully",
+        AsxEvent::MessageSendFailed { .. } => "Outbound message delivery failed permanently",
+        AsxEvent::FragmentIngested { .. } => "Large-message fragment ingested",
+        AsxEvent::FragmentGroupComplete { .. } => "Large-message fragment group complete",
+        AsxEvent::FragmentGroupEvicted { .. } => "Large-message fragment group evicted",
     }
 }

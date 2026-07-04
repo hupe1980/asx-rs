@@ -1,6 +1,6 @@
 [package]
 name = "asx-rs"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 authors = ["hupe1980"]
 description = "AS2 and AS4 B2B messaging library for Rust — signing, encryption, MDN, and ebMS3/AS4 profile support"
@@ -34,38 +34,37 @@ testing = []
 tracing = "0.1"
 tokio = { version = "1", features = ["sync", "rt", "rt-multi-thread", "macros", "time", "io-util"] }
 tokio-stream = "0.1"
-sha2 = { version = "0.10", features = ["oid"] }
-hmac = "0.12"
+sha2 = { version = "0.11", features = ["oid"] }
+hmac = "0.13"
 base64 = "0.22"
-mailparse = "0.15"
-serde = { version = "1", features = ["derive"] }
+mailparse = "0.16"
+serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
-x509-parser = "0.16"
+x509-parser = "0.18"
 openssl = { version = "0.10", optional = true }
-aes-gcm = { version = "0.10", optional = true }
+aes-gcm = { version = "0.11", optional = true }
 flate2 = { version = "1", optional = true }
-reqwest = { version = ">=0.12, <0.13", default-features = false, features = ["json", "rustls-tls", "http2"], optional = true }
-axum = { version = ">=0.7, <0.9", optional = true }
+reqwest = { version = ">=0.13, <0.14", default-features = false, features = ["json", "rustls", "rustls-native-certs", "http2"], optional = true }
+axum = { version = ">=0.8, <0.9", optional = true }
 uuid = { version = "1", features = ["v4", "serde"] }
-chrono = { version = "0.4", features = ["serde"] }
 dashmap = "6"
 parking_lot = "0.12"
-lru = "0.12"
+lru = "0.18"
 memchr = "2"
 libc = "0.2"
 getrandom = "0.3"
 zeroize = "1"
 subtle = "2"
 bytes = "1"
-quick-xml = { version = "0.40", optional = true }
-roxmltree = { version = "0.20", optional = true }
+quick-xml = { version = "0.41", optional = true }
+roxmltree = { version = "0.21", optional = true }
 opentelemetry-api = { package = "opentelemetry", version = "0.32", default-features = false, features = ["metrics"], optional = true }
 smallvec = "1"
-rustix = { version = "0.38", features = ["fs"] }
+rustix = { version = "1", features = ["fs"] }
 
 [dev-dependencies]
 proptest = "1"
-tower = { version = "0.4", features = ["util"] }
+tower = { version = "0.5", features = ["util"] }
 criterion = { version = "0.5", features = ["html_reports"] }
 opentelemetry-sdk = { package = "opentelemetry_sdk", version = "0.32", default-features = false, features = ["metrics"] }
 

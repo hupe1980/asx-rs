@@ -90,6 +90,78 @@ impl PartialEq for ReconciliationRequest {
 impl Eq for ReconciliationRequest {}
 
 impl ReconciliationRequest {
+    /// Create a new `Indeterminate` request with validated IDs.
+    ///
+    /// Returns `Err` with [`ErrorCode::InvalidInput`] if either ID is empty.
+    pub fn new_indeterminate(
+        message_id: impl Into<String>,
+        partner_id: impl Into<String>,
+    ) -> crate::core::Result<Self> {
+        let message_id = message_id.into();
+        let partner_id = partner_id.into();
+        if message_id.is_empty() {
+            return Err(crate::core::AsxError::new(
+                crate::core::ErrorCode::InvalidInput,
+                "ReconciliationRequest message_id must not be empty",
+                crate::core::ErrorContext::new("reconciliation_new_indeterminate"),
+            ));
+        }
+        if partner_id.is_empty() {
+            return Err(crate::core::AsxError::new(
+                crate::core::ErrorCode::InvalidInput,
+                "ReconciliationRequest partner_id must not be empty",
+                crate::core::ErrorContext::new("reconciliation_new_indeterminate"),
+            ));
+        }
+        let reason = ReconciliationReason::Indeterminate;
+        let idempotency_key =
+            derive_reconciliation_idempotency_key(&partner_id, &message_id, reason);
+        Ok(Self {
+            idempotency_key,
+            message_id,
+            partner_id,
+            reason,
+            created_instant: Instant::now(),
+        })
+    }
+
+    /// Create a new `PendingVerification` request with validated IDs.
+    ///
+    /// Returns `Err` with [`ErrorCode::InvalidInput`] if either ID is empty.
+    pub fn new_pending_verification(
+        message_id: impl Into<String>,
+        partner_id: impl Into<String>,
+    ) -> crate::core::Result<Self> {
+        let message_id = message_id.into();
+        let partner_id = partner_id.into();
+        if message_id.is_empty() {
+            return Err(crate::core::AsxError::new(
+                crate::core::ErrorCode::InvalidInput,
+                "ReconciliationRequest message_id must not be empty",
+                crate::core::ErrorContext::new("reconciliation_new_pending_verification"),
+            ));
+        }
+        if partner_id.is_empty() {
+            return Err(crate::core::AsxError::new(
+                crate::core::ErrorCode::InvalidInput,
+                "ReconciliationRequest partner_id must not be empty",
+                crate::core::ErrorContext::new("reconciliation_new_pending_verification"),
+            ));
+        }
+        let reason = ReconciliationReason::PendingVerification;
+        let idempotency_key =
+            derive_reconciliation_idempotency_key(&partner_id, &message_id, reason);
+        Ok(Self {
+            idempotency_key,
+            message_id,
+            partner_id,
+            reason,
+            created_instant: Instant::now(),
+        })
+    }
+
+    /// Convenience wrapper: map a [`DeliveryOutcome`] to the appropriate
+    /// constructor, or `None` for outcomes that require no reconciliation.
     pub fn for_outcome(
         message_id: impl Into<String>,
         partner_id: impl Into<String>,
@@ -139,7 +211,8 @@ pub fn escalate_stale_pending_reconciliation_requests(
     reconciliation: &dyn crate::storage::ReconciliationStorage,
     max_pending_age: Duration,
 ) -> crate::core::Result<Vec<ReconciliationRequest>> {
-    let queued = reconciliation.queued_requests()?;
+    use crate::storage::drive_reconciliation_future;
+    let queued = drive_reconciliation_future(reconciliation.queued_requests())?;
     let mut escalated = Vec::new();
 
     for request in queued {
@@ -152,7 +225,7 @@ pub fn escalate_stale_pending_reconciliation_requests(
         }
 
         // If another worker already resolved it, skip silently.
-        if !reconciliation.resolve(&request.idempotency_key)? {
+        if !drive_reconciliation_future(reconciliation.resolve(&request.idempotency_key))? {
             continue;
         }
 
@@ -164,7 +237,7 @@ pub fn escalate_stale_pending_reconciliation_requests(
             continue;
         };
 
-        if reconciliation.enqueue(indeterminate.clone())? {
+        if drive_reconciliation_future(reconciliation.enqueue(indeterminate.clone()))? {
             escalated.push(indeterminate);
         }
     }
@@ -697,9 +770,9 @@ mod tests {
             .expect("request");
         let duplicate = first.clone();
 
-        assert!(hook.enqueue(first).unwrap());
-        assert!(!hook.enqueue(duplicate).unwrap());
-        assert_eq!(hook.queued_requests().unwrap().len(), 1);
+        assert!(drive_dedup_future(hook.enqueue(first)).unwrap());
+        assert!(!drive_dedup_future(hook.enqueue(duplicate)).unwrap());
+        assert_eq!(drive_dedup_future(hook.queued_requests()).unwrap().len(), 1);
     }
 
     #[test]
@@ -711,7 +784,7 @@ mod tests {
             DeliveryOutcome::AcceptedPendingVerification,
         )
         .expect("pending request");
-        assert!(hook.enqueue(pending).expect("enqueue pending"));
+        assert!(drive_dedup_future(hook.enqueue(pending)).expect("enqueue pending"));
 
         // Use a zero threshold so the just-created request is immediately stale.
         // The monotonic `age()` is always >= 0, so Duration::ZERO triggers escalation.
@@ -723,7 +796,7 @@ mod tests {
         assert_eq!(escalated[0].partner_id, "partner-a");
         assert_eq!(escalated[0].reason, ReconciliationReason::Indeterminate);
 
-        let queued = hook.queued_requests().expect("queue snapshot");
+        let queued = drive_dedup_future(hook.queued_requests()).expect("queue snapshot");
         assert_eq!(queued.len(), 1);
         assert_eq!(queued[0].reason, ReconciliationReason::Indeterminate);
     }
@@ -737,7 +810,7 @@ mod tests {
             DeliveryOutcome::AcceptedPendingVerification,
         )
         .expect("pending request");
-        assert!(hook.enqueue(pending).expect("enqueue pending"));
+        assert!(drive_dedup_future(hook.enqueue(pending)).expect("enqueue pending"));
 
         // Use a 1-hour threshold; a just-created request should never be that old.
         let escalated =
@@ -745,7 +818,7 @@ mod tests {
                 .expect("escalation sweep");
 
         assert!(escalated.is_empty());
-        let queued = hook.queued_requests().expect("queue snapshot");
+        let queued = drive_dedup_future(hook.queued_requests()).expect("queue snapshot");
         assert_eq!(queued.len(), 1);
         assert_eq!(queued[0].reason, ReconciliationReason::PendingVerification);
     }
@@ -817,7 +890,7 @@ mod tests {
                 .expect("request");
 
         // Enqueue succeeds normally
-        assert!(hook.enqueue(request).unwrap());
+        assert!(drive_dedup_future(hook.enqueue(request)).unwrap());
 
         // If lock poison were to occur, enqueue now returns Err instead of panicking silently.
         // This validates the infrastructure failure is propagated to the caller.

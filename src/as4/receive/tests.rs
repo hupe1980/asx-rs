@@ -64,9 +64,9 @@ fn test_as4_credentials() -> As4SendCredentials {
     let cert = builder.build();
 
     As4SendCredentials {
-        signing_cert_pem: Some(cert.to_pem().expect("cert pem")),
+        signing_cert_pem: Some(cert.to_pem().expect("cert pem").into()),
         signing_key_pem: Some(pkey.private_key_to_pem_pkcs8().expect("private key pem")),
-        recipient_cert_pem: Some(cert.to_pem().expect("recipient cert pem")),
+        recipient_cert_pem: Some(cert.to_pem().expect("recipient cert pem").into()),
     }
 }
 
@@ -79,7 +79,7 @@ fn session_with_trust(
         .signing_cert_pem
         .as_ref()
         .expect("test creds must have signing cert");
-    let cert_pem_str = String::from_utf8(cert_pem.clone()).expect("cert pem utf8");
+    let cert_pem_str = String::from_utf8(cert_pem.to_vec()).expect("cert pem utf8");
     let cert = X509::from_pem(cert_pem).expect("cert parse");
     let cert_digest = cert
         .digest(MessageDigest::sha256())

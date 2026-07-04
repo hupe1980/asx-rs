@@ -467,7 +467,7 @@ async fn retry_side_effects_are_not_duplicated_for_same_message() {
     assert_eq!(first.outcome, DeliveryOutcome::AcceptedPendingVerification);
     assert_eq!(second.outcome, DeliveryOutcome::AcceptedPendingVerification);
 
-    let queued = hook.queued_requests().expect("queued requests");
+    let queued = hook.queued_requests().await.expect("queued requests");
     assert_eq!(queued.len(), 1);
     assert_eq!(queued[0].reason, ReconciliationReason::PendingVerification);
 }

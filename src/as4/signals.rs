@@ -71,7 +71,7 @@ pub fn generate_receipt_with_nri(
         ));
     }
 
-    let timestamp = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let timestamp = crate::time_utils::format_rfc3339_secs(std::time::SystemTime::now());
     // SECURITY: Escape caller-supplied values to prevent XML injection.
     let message_id_escaped = crate::wire::escape_xml(message_id);
     let ref_to_message_id_escaped = crate::wire::escape_xml(ref_to_message_id);
@@ -161,7 +161,7 @@ pub fn generate_error_signal(
         ));
     }
 
-    let timestamp = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let timestamp = crate::time_utils::format_rfc3339_secs(std::time::SystemTime::now());
     let message_id_escaped = crate::wire::escape_xml(message_id);
     let ref_id_escaped = crate::wire::escape_xml(ref_to_message_id);
     let description_escaped = crate::wire::escape_xml(description);
@@ -270,7 +270,7 @@ pub fn generate_pull_request(
         }
     }
 
-    let timestamp = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let timestamp = crate::time_utils::format_rfc3339_secs(std::time::SystemTime::now());
     let mpc_escaped = crate::wire::escape_xml(mpc);
     let message_id_escaped = crate::wire::escape_xml(&policy.message_id);
 

@@ -22,7 +22,7 @@ use quick_xml::reader::NsReader;
 // OpenSSL is retained only for asymmetric operations (RSA-OAEP key wrap/unwrap).
 use aes_gcm::{
     Aes128Gcm, Aes256Gcm, KeyInit,
-    aead::{Aead, AeadInPlace, Tag},
+    aead::Aead,
 };
 
 use crate::core::{AsxError, ErrorCode, ErrorContext, Result};
@@ -189,14 +189,14 @@ fn encrypt_xmlenc_preparsed(
 
     // Pure-Rust AES-GCM encryption (aes-gcm crate).
     // encrypt() returns ciphertext || 16-byte tag concatenated.
-    let nonce = aes_gcm::Nonce::from_slice(&nonce_bytes);
+    let nonce = aes_gcm::Nonce::from(nonce_bytes);
     let gcm_output = match aes_key.len() {
         16 => aes_gcm::Aes128Gcm::new_from_slice(&aes_key)
             .expect("key length validated above")
-            .encrypt(nonce, payload.as_ref()),
+            .encrypt(&nonce, payload.as_ref()),
         32 => aes_gcm::Aes256Gcm::new_from_slice(&aes_key)
             .expect("key length validated above")
-            .encrypt(nonce, payload.as_ref()),
+            .encrypt(&nonce, payload.as_ref()),
         _ => unreachable!("XmlEncPayloadAlgorithm::key_len() returns 16 or 32"),
     }
     .map_err(|_| {
@@ -592,7 +592,7 @@ pub fn decrypt_payload_xmlenc(
     }
 
     let wrapped_key = decode_cipher_value("wrapped XML Encryption key", &wrapped_key_text)?;
-    let mut cipher_blob = decode_cipher_value("XML Encryption ciphertext", &payload_cipher_text)?;
+    let cipher_blob = decode_cipher_value("XML Encryption ciphertext", &payload_cipher_text)?;
 
     let pkey = PKey::private_key_from_pem(recipient_key_pem).map_err(|err| {
         AsxError::new(
@@ -670,16 +670,10 @@ pub fn decrypt_payload_xmlenc(
                 ));
             }
 
-            // In-place decryption reuses `cipher_blob` as the output buffer,
-            // avoiding one Vec<u8> allocation compared to the allocating `decrypt()` path.
-            // Layout: cipher_blob = nonce(12) || ciphertext || tag(16)
+            // Extract the 12-byte nonce; cipher_blob[12..] = ciphertext || tag,
+            // which is exactly the format Aead::decrypt expects.
             let nonce_bytes: [u8; 12] = cipher_blob[..12].try_into().expect("12 bytes");
-            let nonce = aes_gcm::Nonce::from_slice(&nonce_bytes);
-            let tag_start = cipher_blob.len() - 16;
-            let tag_bytes: [u8; 16] = cipher_blob[tag_start..].try_into().expect("16 bytes");
-            // Strip the nonce prefix and tag suffix, keeping only the ciphertext in-place.
-            cipher_blob.copy_within(12..tag_start, 0);
-            cipher_blob.truncate(tag_start - 12);
+            let nonce = aes_gcm::Nonce::from(nonce_bytes);
 
             let aead_err = |_| {
                 AsxError::new(
@@ -688,21 +682,13 @@ pub fn decrypt_payload_xmlenc(
                     ErrorContext::new("wssec_decrypt_payload"),
                 )
             };
-            match aes_key.len() {
-                16 => {
-                    let tag = Tag::<Aes128Gcm>::from_slice(&tag_bytes);
-                    Aes128Gcm::new_from_slice(&aes_key)
-                        .expect("key length pre-validated")
-                        .decrypt_in_place_detached(nonce, b"", &mut cipher_blob, tag)
-                        .map_err(aead_err)?;
-                }
-                32 => {
-                    let tag = Tag::<Aes256Gcm>::from_slice(&tag_bytes);
-                    Aes256Gcm::new_from_slice(&aes_key)
-                        .expect("key length pre-validated")
-                        .decrypt_in_place_detached(nonce, b"", &mut cipher_blob, tag)
-                        .map_err(aead_err)?;
-                }
+            let plaintext = match aes_key.len() {
+                16 => Aes128Gcm::new_from_slice(&aes_key)
+                    .expect("key length pre-validated")
+                    .decrypt(&nonce, &cipher_blob[12..]),
+                32 => Aes256Gcm::new_from_slice(&aes_key)
+                    .expect("key length pre-validated")
+                    .decrypt(&nonce, &cipher_blob[12..]),
                 other => {
                     return Err(AsxError::new(
                         ErrorCode::DecryptionFailed,
@@ -713,7 +699,8 @@ pub fn decrypt_payload_xmlenc(
                     ));
                 }
             }
-            Ok(cipher_blob)
+            .map_err(aead_err)?;
+            Ok(plaintext)
         }
     }
 }

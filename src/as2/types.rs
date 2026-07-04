@@ -195,12 +195,12 @@ impl As2SendPolicy {
 #[derive(Debug, Clone, Default)]
 pub struct As2SendCredentials {
     /// PEM-encoded signing certificate (required if policy.sign = true)
-    pub signing_cert_pem: Option<Vec<u8>>,
+    pub signing_cert_pem: Option<Arc<[u8]>>,
     /// PEM-encoded signing private key (required if policy.sign = true)
     pub signing_key_pem: Option<Vec<u8>>,
     /// PEM-encoded recipient certificate for encryption (required if
     /// policy.encrypt = true)
-    pub recipient_cert_pem: Option<Vec<u8>>,
+    pub recipient_cert_pem: Option<Arc<[u8]>>,
 }
 
 impl Drop for As2SendCredentials {

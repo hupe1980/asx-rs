@@ -5,7 +5,7 @@ use std::sync::Arc;
 /// Using a typed enum rather than a raw `&'static str` prevents typos and
 /// enables exhaustive matching in monitoring dashboards that pattern-match on
 /// protocol names.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
 #[non_exhaustive]
 pub enum AsxProtocol {
     /// EDIINT AS2 (RFC 4130).
@@ -36,7 +36,7 @@ impl std::fmt::Display for AsxProtocol {
 ///
 /// Identifies which receive path detected the duplicate, enabling monitoring
 /// dashboards to partition dedup counters by inbound channel.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
 #[non_exhaustive]
 pub enum AsxIngressStage {
     /// AS2 `receive_with_mdn` path (MDN correlation dedup).
@@ -72,7 +72,7 @@ impl std::fmt::Display for AsxIngressStage {
 /// Each variant carries only the fields that are *unique to that event type*.
 /// Fields common to all events — `session_id`, `partner_id`, and `timestamp_ms` —
 /// are hoisted to [`ScopedAsxEvent`] to eliminate redundant allocations.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 #[non_exhaustive]
 pub enum AsxEvent {
     OutboundPrepared {
@@ -244,6 +244,82 @@ pub enum AsxEvent {
         /// The `mailto:` address extracted from `Disposition-Notification-To`.
         mailto_address: Arc<str>,
     },
+    // ── Outbound delivery result events ────────────────────────────────────────
+    //
+    // These events complete the outbound observability story.  Monitoring systems
+    // can subscribe to `MessageSent` / `MessageSendFailed` to build end-to-end
+    // delivery dashboards without adding custom instrumentation in every embedder.
+    /// Outbound message was sent successfully and the receipt/MDN was acknowledged.
+    ///
+    /// Emitted after the HTTP response with a positive receipt signal is received.
+    MessageSent {
+        message_id: Arc<str>,
+        /// Endpoint URL the message was delivered to.
+        endpoint_url: Arc<str>,
+        /// Total round-trip time in milliseconds (send + receipt processing).
+        duration_ms: u64,
+    },
+    /// All retry attempts exhausted — outbound delivery failed permanently.
+    ///
+    /// Emitted when the retry scheduler gives up after exhausting the configured
+    /// retry budget.  The `total_attempts` count includes the initial attempt.
+    MessageSendFailed {
+        message_id: Arc<str>,
+        /// Human-readable reason for the final failure.
+        reason: &'static str,
+        /// Total number of delivery attempts made (initial + retries).
+        total_attempts: u32,
+    },
+    // ── Large-message fragment progress events ─────────────────────────────────
+    //
+    // These events allow monitoring systems to track reassembly progress and
+    // detect stuck or abandoned large-message transfers without requiring
+    // embedder-side instrumentation.
+    /// A fragment was successfully ingested into the joiner.
+    ///
+    /// Emitted by `As4FragmentJoiner::ingest_fragment` for every accepted
+    /// fragment.  `expected_total` is `None` until a fragment carrying the
+    /// fragment count is received.
+    FragmentIngested {
+        /// AS4 large-message `GroupId` (sender-scope-qualified).
+        group_id: Arc<str>,
+        /// Zero-based fragment number of the ingested fragment.
+        fragment_num: usize,
+        /// Number of distinct fragments received so far (including this one).
+        received_so_far: usize,
+        /// Expected total fragment count, if known.
+        expected_total: Option<usize>,
+    },
+    /// All fragments received — reassembly is complete.
+    ///
+    /// Emitted by `As4FragmentJoiner::ingest_fragment` when the last expected
+    /// fragment arrives and the full message has been reconstructed.
+    FragmentGroupComplete {
+        /// AS4 large-message `GroupId`.
+        group_id: Arc<str>,
+        /// Total number of fragments that made up the message.
+        total_fragments: usize,
+        /// Total reconstructed payload size in bytes.
+        total_bytes: usize,
+    },
+    /// A fragment group was evicted before all fragments arrived.
+    ///
+    /// Emitted by `As4FragmentJoiner` when a group is evicted due to:
+    /// - Count limit (`max_concurrent_groups`) exhausted.
+    /// - Byte limit (`max_bytes_per_group`) exceeded.
+    /// - Age limit (`max_group_age`) exceeded via `prune_stale_groups`.
+    /// - Protocol violation (duplicate fragment, count mismatch, etc.).
+    ///
+    /// The `reason` field distinguishes between limit types and protocol errors.
+    FragmentGroupEvicted {
+        /// AS4 large-message `GroupId`.
+        group_id: Arc<str>,
+        /// Machine-readable eviction reason.
+        ///
+        /// Stable values: `"count_limit"`, `"byte_limit"`, `"age_limit"`,
+        /// `"duplicate_fragment"`, `"count_mismatch"`, `"protocol_violation"`.
+        reason: &'static str,
+    },
 }
 
 impl AsxEvent {
@@ -277,6 +353,11 @@ impl AsxEvent {
             Self::CertOcspUnknown { .. } => "cert_ocsp_unknown",
             Self::CertNearExpiry { .. } => "cert_near_expiry",
             Self::As2AsyncMdnRequested { .. } => "as2_async_mdn_requested",
+            Self::MessageSent { .. } => "message_sent",
+            Self::MessageSendFailed { .. } => "message_send_failed",
+            Self::FragmentIngested { .. } => "fragment_ingested",
+            Self::FragmentGroupComplete { .. } => "fragment_group_complete",
+            Self::FragmentGroupEvicted { .. } => "fragment_group_evicted",
         }
     }
 }
@@ -287,7 +368,7 @@ pub type SharedAsxEvent = Arc<AsxEvent>;
 ///
 /// The `session_id`, `partner_id`, and `timestamp_ms` fields are common across
 /// all events and are stored here once rather than in every [`AsxEvent`] variant.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct ScopedAsxEvent {
     pub session_id: String,
     /// AS2/AS4 partner identifier, always equal to `session.partner_id()`.
