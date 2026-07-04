@@ -47,7 +47,7 @@ fn drive_sync_future<T>(future: impl Future<Output = T>, context: &'static str) 
 /// indicates an async backend being called from the sync path.  For dedup, switch
 /// to `receive_push_with_dedup_async`.  For reconciliation sync callers, ensure
 /// only in-memory backends are used on sync paths.
-#[cfg(any(feature = "as2", feature = "as4"))]
+#[allow(dead_code)]
 #[inline]
 pub(crate) fn drive_dedup_future<T>(future: impl Future<Output = T>) -> T {
     drive_sync_future(
