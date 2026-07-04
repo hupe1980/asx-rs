@@ -22,7 +22,9 @@ use crate::reliability::{
     derive_ingress_idempotency_key, derive_reconciliation_idempotency_key,
 };
 use crate::send_pipeline as pipeline;
-use crate::storage::{DedupStorage, ReconciliationStorage, drive_dedup_future};
+use crate::storage::{
+    DedupStorage, ReconciliationStorage, drive_dedup_future, drive_reconciliation_future,
+};
 use crate::wire::{
     DEFAULT_MAX_BODY_BYTES, StreamBodyPolicy, StreamLimits, StreamReadMetrics,
     enforce_payload_limit,
@@ -261,7 +263,7 @@ pub fn receive_with_mdn_with_reliability(
                     session.partner_id().to_string(),
                     DeliveryOutcome::Indeterminate,
                 ) {
-                    reconciliation_hook.enqueue(req).map_err(|enqueue_err| {
+                    drive_reconciliation_future(reconciliation_hook.enqueue(req)).map_err(|enqueue_err| {
                         AsxError::new(
                             ErrorCode::ReliabilityFailure,
                             format!(
@@ -368,7 +370,7 @@ pub fn receive_with_mdn_with_reliability(
             ReconciliationReason::Indeterminate => "indeterminate",
             ReconciliationReason::PendingVerification => "pending_verification",
         };
-        if reconciliation_hook.enqueue(recon_req)? {
+        if drive_reconciliation_future(reconciliation_hook.enqueue(recon_req))? {
             emit_protocol_event(
                 event_bus,
                 session,
@@ -524,7 +526,7 @@ pub fn correlate_async_mdn(
         ReconciliationReason::PendingVerification,
     ] {
         let key = derive_reconciliation_idempotency_key(partner_id, &original_message_id, reason);
-        if reconciliation.resolve(&key)? {
+        if drive_reconciliation_future(reconciliation.resolve(&key))? {
             return Ok(AsyncMdnCorrelationOutcome::Resolved {
                 original_message_id,
             });

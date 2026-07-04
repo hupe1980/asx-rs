@@ -96,12 +96,16 @@ pub(super) fn fetch_spool_key_hex_over_http(
             }
 
             if !trust_anchor_pems.is_empty() {
-                client_builder = client_builder.tls_built_in_root_certs(false);
-                for trust_anchor_pem in trust_anchor_pems {
-                    let trust_anchor = reqwest::Certificate::from_pem(&trust_anchor_pem)
-                        .map_err(|err| format!("invalid trust-anchor certificate PEM: {err}"))?;
-                    client_builder = client_builder.add_root_certificate(trust_anchor);
+                let mut anchors: Vec<reqwest::Certificate> =
+                    Vec::with_capacity(trust_anchor_pems.len());
+                for pem in &trust_anchor_pems {
+                    anchors.push(
+                        reqwest::Certificate::from_pem(pem).map_err(|err| {
+                            format!("invalid trust-anchor certificate PEM: {err}")
+                        })?,
+                    );
                 }
+                client_builder = client_builder.tls_certs_only(anchors);
             }
 
             let client = client_builder

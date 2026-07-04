@@ -4,7 +4,6 @@
 /// for AS4 push/pull message construction.
 use crate::core::Result;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use chrono::Utc;
 
 const SOAP12_NAMESPACE: &str = "http://www.w3.org/2003/05/soap-envelope";
 const EBMS_NAMESPACE: &str = "http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/";
@@ -278,7 +277,7 @@ impl SoapEnvelopeBuilder {
         xml.push_str("        <ebms:MessageInfo>\n");
         xml.push_str(&format!(
             "          <ebms:Timestamp>{}</ebms:Timestamp>\n",
-            chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+            crate::time_utils::format_rfc3339_secs(std::time::SystemTime::now())
         ));
         xml.push_str(&format!(
             "          <ebms:MessageId wsu:Id=\"{}\">{}</ebms:MessageId>\n",
@@ -455,11 +454,10 @@ impl WsSecurityHeaderBuilder {
     /// Includes a `wsu:Timestamp` (5-minute window) as required by WS-Security 1.1.1 and
     /// the eDelivery AS4 profile.
     pub fn build(self) -> Result<Vec<u8>> {
-        let now = Utc::now();
-        let created = now.format("%Y-%m-%dT%H:%M:%SZ").to_string();
-        let expires = (now + chrono::Duration::minutes(5))
-            .format("%Y-%m-%dT%H:%M:%SZ")
-            .to_string();
+        let now = std::time::SystemTime::now();
+        let created = crate::time_utils::format_rfc3339_secs(now);
+        let expires =
+            crate::time_utils::format_rfc3339_secs(now + std::time::Duration::from_secs(300));
 
         let mut xml = String::new();
 

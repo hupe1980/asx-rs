@@ -5,6 +5,7 @@
 //! `As4SendCredentials`) or prepared directly against protocol policies.
 
 use crate::core::{ErrorCode, Result};
+use std::sync::Arc;
 use zeroize::Zeroize;
 
 #[cfg(feature = "as2")]
@@ -19,11 +20,11 @@ use crate::as4::{As4PreparedSendCredentials, As4SendCredentials, As4SendPolicy};
 #[derive(Debug, Clone, Default)]
 pub struct PartnerCredentials {
     /// PEM-encoded signing certificate.
-    pub signing_cert_pem: Option<Vec<u8>>,
+    pub signing_cert_pem: Option<Arc<[u8]>>,
     /// PEM-encoded signing private key.
     pub signing_key_pem: Option<Vec<u8>>,
     /// PEM-encoded recipient certificate used for encryption.
-    pub recipient_cert_pem: Option<Vec<u8>>,
+    pub recipient_cert_pem: Option<Arc<[u8]>>,
 }
 
 impl Drop for PartnerCredentials {
@@ -127,13 +128,15 @@ impl PartnerCredentials {
             .cert
             .as_ref()
             .map(|cert| {
-                cert.to_pem().map_err(|e| {
-                    AsxError::new(
-                        ErrorCode::InvalidInput,
-                        format!("PKCS#12 certificate to PEM conversion failed: {e}"),
-                        ErrorContext::new("credentials_from_pkcs12"),
-                    )
-                })
+                cert.to_pem()
+                    .map_err(|e| {
+                        AsxError::new(
+                            ErrorCode::InvalidInput,
+                            format!("PKCS#12 certificate to PEM conversion failed: {e}"),
+                            ErrorContext::new("credentials_from_pkcs12"),
+                        )
+                    })
+                    .map(Arc::from)
             })
             .transpose()?;
 
@@ -218,14 +221,15 @@ impl From<PartnerCredentials> for As4SendCredentials {
 #[cfg(test)]
 mod tests {
     use super::PartnerCredentials;
+    use std::sync::Arc;
 
     #[cfg(feature = "as2")]
     #[test]
     fn partner_credentials_roundtrip_as2_projection() {
         let src = PartnerCredentials {
-            signing_cert_pem: Some(b"cert".to_vec()),
+            signing_cert_pem: Some(Arc::from(b"cert" as &[u8])),
             signing_key_pem: Some(b"key".to_vec()),
-            recipient_cert_pem: Some(b"recipient".to_vec()),
+            recipient_cert_pem: Some(Arc::from(b"recipient" as &[u8])),
         };
 
         let as2 = src.to_as2_send_credentials();
@@ -241,9 +245,9 @@ mod tests {
     #[test]
     fn partner_credentials_roundtrip_as4_projection() {
         let src = PartnerCredentials {
-            signing_cert_pem: Some(b"cert".to_vec()),
+            signing_cert_pem: Some(Arc::from(b"cert" as &[u8])),
             signing_key_pem: Some(b"key".to_vec()),
-            recipient_cert_pem: Some(b"recipient".to_vec()),
+            recipient_cert_pem: Some(Arc::from(b"recipient" as &[u8])),
         };
 
         let as4 = src.to_as4_send_credentials();

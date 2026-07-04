@@ -131,7 +131,9 @@ pub fn emit_message_encrypted(
 /// send orchestration.
 pub fn classify_send_retry(err: &AsxError) -> RetryDecision {
     let class = match err.code {
-        ErrorCode::TransportFailure | ErrorCode::CapacityExhausted => RetryClass::Transient,
+        ErrorCode::TransportFailure | ErrorCode::CapacityExhausted | ErrorCode::Timeout => {
+            RetryClass::Transient
+        }
         ErrorCode::ReliabilityFailure => RetryClass::Indeterminate,
         ErrorCode::InvalidInput
         | ErrorCode::PolicyViolation
@@ -140,7 +142,9 @@ pub fn classify_send_retry(err: &AsxError) -> RetryDecision {
         | ErrorCode::ParseFailed
         | ErrorCode::SecurityVerificationFailed
         | ErrorCode::NotFound
-        | ErrorCode::PayloadTooLarge => RetryClass::Permanent,
+        | ErrorCode::PayloadTooLarge
+        | ErrorCode::CertificateRevoked
+        | ErrorCode::CertificateExpired => RetryClass::Permanent,
         ErrorCode::StorageBackendFailure => RetryClass::Transient,
     };
 

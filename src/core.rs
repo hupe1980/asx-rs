@@ -293,6 +293,30 @@ pub enum ErrorCode {
     /// HTTP semantics: respond with 503 Service Unavailable — the server is
     /// temporarily unable to handle the request due to a backend outage.
     StorageBackendFailure,
+    /// The partner's certificate has been revoked by its issuing CA.
+    ///
+    /// Distinct from [`SecurityVerificationFailed`](Self::SecurityVerificationFailed)
+    /// (which covers signature/chain errors) so that monitoring can page on revocation
+    /// separately from transient verification failures.
+    ///
+    /// HTTP semantics: 403 Forbidden — the certificate is permanently invalid.
+    CertificateRevoked,
+    /// The partner's certificate has passed its `notAfter` validity date.
+    ///
+    /// Distinct from [`SecurityVerificationFailed`](Self::SecurityVerificationFailed)
+    /// so that operations teams receive a targeted remediation hint (rotate the
+    /// partner cert) rather than a generic security failure alert.
+    ///
+    /// HTTP semantics: 403 Forbidden.
+    CertificateExpired,
+    /// A network or I/O operation timed out before completing.
+    ///
+    /// Distinct from [`TransportFailure`](Self::TransportFailure) (which covers
+    /// protocol/TLS errors) so that callers can apply timeout-specific retry
+    /// policies (e.g., exponential back-off with jitter rather than immediate retry).
+    ///
+    /// HTTP semantics: 504 Gateway Timeout when acting as a proxy/client.
+    Timeout,
 }
 
 impl ErrorCode {
@@ -310,6 +334,9 @@ impl ErrorCode {
             Self::CapacityExhausted => "capacity_exhausted",
             Self::PayloadTooLarge => "payload_too_large",
             Self::StorageBackendFailure => "storage_backend_failure",
+            Self::CertificateRevoked => "certificate_revoked",
+            Self::CertificateExpired => "certificate_expired",
+            Self::Timeout => "timeout",
         }
     }
 
@@ -334,6 +361,9 @@ impl ErrorCode {
     /// | `CapacityExhausted`           | 429         |
     /// | `PayloadTooLarge`             | 413         |
     /// | `StorageBackendFailure`        | 503         |
+    /// | `CertificateRevoked`          | 403         |
+    /// | `CertificateExpired`          | 403         |
+    /// | `Timeout`                     | 504         |
     pub fn to_http_status(self) -> u16 {
         match self {
             Self::InvalidInput => 400,
@@ -348,6 +378,9 @@ impl ErrorCode {
             Self::CapacityExhausted => 429,
             Self::PayloadTooLarge => 413,
             Self::StorageBackendFailure => 503,
+            Self::CertificateRevoked => 403,
+            Self::CertificateExpired => 403,
+            Self::Timeout => 504,
         }
     }
 
@@ -389,6 +422,21 @@ impl ErrorCode {
                 "Check dedup/reconciliation/audit backend connectivity and disk space. \
                  Inspect backend logs for I/O errors. \
                  Consider a circuit-breaker or fallback backend for resilience.",
+            ),
+            Self::CertificateRevoked => Some(
+                "The partner's signing certificate has been revoked by its issuing CA. \
+                 Contact the trading partner to obtain a replacement certificate. \
+                 Update the trust anchor and retry.",
+            ),
+            Self::CertificateExpired => Some(
+                "The partner's signing certificate has passed its notAfter validity date. \
+                 Request a renewed certificate from the trading partner. \
+                 Do not extend trust to expired certificates.",
+            ),
+            Self::Timeout => Some(
+                "The remote endpoint did not respond within the configured timeout. \
+                 Verify network connectivity and DNS resolution. \
+                 Apply exponential back-off before retrying.",
             ),
             _ => None,
         }

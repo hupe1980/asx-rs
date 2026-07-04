@@ -71,6 +71,8 @@ pub mod interop;
 pub mod lifecycle;
 pub mod observability;
 pub mod presets;
+#[cfg(feature = "as4")]
+pub(crate) mod time_utils;
 
 // Compile-time guards for invalid feature combinations.
 #[cfg(all(feature = "server", not(any(feature = "as2", feature = "as4"))))]

@@ -97,50 +97,64 @@ impl ReconciliationStorage for InMemoryReconciliationStorage {
         false
     }
 
-    fn enqueue(&self, request: ReconciliationRequest) -> crate::core::Result<bool> {
-        // Hold the `seen` lock while acquiring `queued` to eliminate the TOCTOU window
-        // where seen.insert succeeds but queued acquisition fails, leaving the key
-        // permanently stuck in `seen` without a corresponding queued entry.
-        let mut seen = self.seen.lock();
-        if seen.contains(&request.idempotency_key) {
-            return Ok(false);
-        }
-        let mut queued = self.queued.lock();
-        if queued.len() >= self.max_queued {
-            return Err(crate::core::AsxError::new(
-                crate::core::ErrorCode::PolicyViolation,
-                format!(
-                    "reconciliation queue at capacity ({} entries); resolve pending requests before enqueuing more",
-                    self.max_queued
-                ),
-                crate::core::ErrorContext::new("reconciliation_storage_enqueue"),
-            ));
-        }
-        seen.insert(request.idempotency_key.clone());
-        queued.push(request);
-        Ok(true)
+    fn enqueue<'a>(
+        &'a self,
+        request: ReconciliationRequest,
+    ) -> super::BoxFuture<'a, crate::core::Result<bool>> {
+        Box::pin(async move {
+            // Hold the `seen` lock while acquiring `queued` to eliminate the TOCTOU window
+            // where seen.insert succeeds but queued acquisition fails, leaving the key
+            // permanently stuck in `seen` without a corresponding queued entry.
+            let mut seen = self.seen.lock();
+            if seen.contains(&request.idempotency_key) {
+                return Ok(false);
+            }
+            let mut queued = self.queued.lock();
+            if queued.len() >= self.max_queued {
+                return Err(crate::core::AsxError::new(
+                    crate::core::ErrorCode::PolicyViolation,
+                    format!(
+                        "reconciliation queue at capacity ({} entries); resolve pending requests before enqueuing more",
+                        self.max_queued
+                    ),
+                    crate::core::ErrorContext::new("reconciliation_storage_enqueue"),
+                ));
+            }
+            seen.insert(request.idempotency_key.clone());
+            queued.push(request);
+            Ok(true)
+        })
     }
 
-    fn queued_requests(&self) -> crate::core::Result<Vec<ReconciliationRequest>> {
-        let queued = self.queued.lock();
-        Ok(queued.clone())
+    fn queued_requests(
+        &self,
+    ) -> super::BoxFuture<'_, crate::core::Result<Vec<ReconciliationRequest>>> {
+        Box::pin(async move {
+            let queued = self.queued.lock();
+            Ok(queued.clone())
+        })
     }
 
-    fn resolve(&self, idempotency_key: &str) -> crate::core::Result<bool> {
-        // Acquire in the same `seen → queued` order used by `enqueue` to prevent
-        // lock-order inversion deadlocks when both locks are held simultaneously.
-        let mut seen = self.seen.lock();
-        let mut queued = self.queued.lock();
-        let before = queued.len();
-        queued.retain(|r| r.idempotency_key != idempotency_key);
-        let removed = queued.len() < before;
-        if removed {
-            // Remove from `seen` so the key can be re-enqueued after resolution.
-            // Without this, a resolved key would remain permanently stuck in `seen`
-            // for the lifetime of the process, preventing re-delivery on retry.
-            seen.remove(idempotency_key);
-        }
-        Ok(removed)
+    fn resolve<'a>(
+        &'a self,
+        idempotency_key: &'a str,
+    ) -> super::BoxFuture<'a, crate::core::Result<bool>> {
+        Box::pin(async move {
+            // Acquire in the same `seen → queued` order used by `enqueue` to prevent
+            // lock-order inversion deadlocks when both locks are held simultaneously.
+            let mut seen = self.seen.lock();
+            let mut queued = self.queued.lock();
+            let before = queued.len();
+            queued.retain(|r| r.idempotency_key != idempotency_key);
+            let removed = queued.len() < before;
+            if removed {
+                // Remove from `seen` so the key can be re-enqueued after resolution.
+                // Without this, a resolved key would remain permanently stuck in `seen`
+                // for the lifetime of the process, preventing re-delivery on retry.
+                seen.remove(idempotency_key);
+            }
+            Ok(removed)
+        })
     }
 }
 
@@ -390,9 +404,12 @@ mod tests {
             .expect("request");
         let duplicate = first.clone();
 
-        assert!(storage.enqueue(first).unwrap());
-        assert!(!storage.enqueue(duplicate).unwrap());
-        assert_eq!(storage.queued_requests().unwrap().len(), 1);
+        assert!(drive_dedup_future(storage.enqueue(first)).unwrap());
+        assert!(!drive_dedup_future(storage.enqueue(duplicate)).unwrap());
+        assert_eq!(
+            drive_dedup_future(storage.queued_requests()).unwrap().len(),
+            1
+        );
     }
 
     #[test]
@@ -402,17 +419,23 @@ mod tests {
             ReconciliationRequest::for_outcome("msg-resolve", "p1", DeliveryOutcome::Indeterminate)
                 .expect("request");
         let key = req.idempotency_key.clone();
-        assert!(storage.enqueue(req).unwrap());
-        assert_eq!(storage.queued_requests().unwrap().len(), 1);
+        assert!(drive_dedup_future(storage.enqueue(req)).unwrap());
+        assert_eq!(
+            drive_dedup_future(storage.queued_requests()).unwrap().len(),
+            1
+        );
 
         assert!(
-            storage.resolve(&key).unwrap(),
+            drive_dedup_future(storage.resolve(&key)).unwrap(),
             "resolve should return true when found"
         );
-        assert_eq!(storage.queued_requests().unwrap().len(), 0);
+        assert_eq!(
+            drive_dedup_future(storage.queued_requests()).unwrap().len(),
+            0
+        );
 
         // resolving again returns false (already removed)
-        assert!(!storage.resolve(&key).unwrap());
+        assert!(!drive_dedup_future(storage.resolve(&key)).unwrap());
     }
 
     #[test]
@@ -456,9 +479,12 @@ mod tests {
             ReconciliationRequest::for_outcome("msg-cap-3", "p1", DeliveryOutcome::Indeterminate)
                 .unwrap();
 
-        assert!(storage.enqueue(r1).unwrap());
-        assert!(storage.enqueue(r2).unwrap());
-        assert!(storage.enqueue(r3).is_err(), "should fail at capacity");
+        assert!(drive_dedup_future(storage.enqueue(r1)).unwrap());
+        assert!(drive_dedup_future(storage.enqueue(r2)).unwrap());
+        assert!(
+            drive_dedup_future(storage.enqueue(r3)).is_err(),
+            "should fail at capacity"
+        );
     }
 
     #[test]
@@ -472,34 +498,39 @@ mod tests {
                 .unwrap();
         let key1 = r1.idempotency_key.clone();
 
-        assert!(storage.enqueue(r1).unwrap());
-        assert!(storage.enqueue(r2).is_err(), "should fail at capacity");
+        assert!(drive_dedup_future(storage.enqueue(r1)).unwrap());
+        assert!(
+            drive_dedup_future(storage.enqueue(r2)).is_err(),
+            "should fail at capacity"
+        );
 
         // After resolving, the dedup key is also removed from `seen`, so the
         // same idempotency key can be re-enqueued for a retry.
-        assert!(storage.resolve(&key1).unwrap());
+        assert!(drive_dedup_future(storage.resolve(&key1)).unwrap());
         let r3 =
             ReconciliationRequest::for_outcome("msg-room-3", "p1", DeliveryOutcome::Indeterminate)
                 .unwrap();
         assert!(
-            storage.enqueue(r3).unwrap(),
+            drive_dedup_future(storage.enqueue(r3)).unwrap(),
             "new request should be accepted after resolve"
         );
     }
 
     #[test]
     fn in_memory_reconciliation_resolve_allows_reenqueue_of_same_key() {
-        use crate::storage::ReconciliationStorage;
         let storage = InMemoryReconciliationStorage::default();
         let r1 =
             ReconciliationRequest::for_outcome("msg-retry", "p1", DeliveryOutcome::Indeterminate)
                 .unwrap();
         let key = r1.idempotency_key.clone();
         // Enqueue, then resolve; the same key must be re-enqueueable (retry scenario).
-        assert!(storage.enqueue(r1).unwrap(), "initial enqueue");
         assert!(
-            !storage
-                .enqueue(
+            drive_dedup_future(storage.enqueue(r1)).unwrap(),
+            "initial enqueue"
+        );
+        assert!(
+            !drive_dedup_future(
+                storage.enqueue(
                     ReconciliationRequest::for_outcome(
                         "msg-retry",
                         "p1",
@@ -507,16 +538,20 @@ mod tests {
                     )
                     .unwrap()
                 )
-                .unwrap(),
+            )
+            .unwrap(),
             "duplicate enqueue before resolve must be rejected"
         );
-        assert!(storage.resolve(&key).unwrap(), "resolve returns true");
+        assert!(
+            drive_dedup_future(storage.resolve(&key)).unwrap(),
+            "resolve returns true"
+        );
         // Re-enqueue the same idempotency key — must succeed after resolution.
         let r2 =
             ReconciliationRequest::for_outcome("msg-retry", "p1", DeliveryOutcome::Indeterminate)
                 .unwrap();
         assert!(
-            storage.enqueue(r2).unwrap(),
+            drive_dedup_future(storage.enqueue(r2)).unwrap(),
             "re-enqueue after resolve must succeed (retry path)"
         );
     }
@@ -590,7 +625,6 @@ mod tests {
 
     #[test]
     fn queued_requests_returns_all_items() {
-        use crate::storage::ReconciliationStorage;
         let storage = InMemoryReconciliationStorage::default();
         let r1 =
             ReconciliationRequest::for_outcome("m-each-1", "p1", DeliveryOutcome::Indeterminate)
@@ -598,11 +632,10 @@ mod tests {
         let r2 =
             ReconciliationRequest::for_outcome("m-each-2", "p1", DeliveryOutcome::Indeterminate)
                 .unwrap();
-        storage.enqueue(r1).unwrap();
-        storage.enqueue(r2).unwrap();
+        drive_dedup_future(storage.enqueue(r1)).unwrap();
+        drive_dedup_future(storage.enqueue(r2)).unwrap();
 
-        let mut collected: Vec<String> = storage
-            .queued_requests()
+        let mut collected: Vec<String> = drive_dedup_future(storage.queued_requests())
             .unwrap()
             .into_iter()
             .map(|r| r.message_id)

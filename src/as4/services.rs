@@ -12,7 +12,9 @@ use crate::reliability::{
     DeliveryOutcome, ReconciliationReason, ReconciliationRequest, RetryDecision,
     derive_ingress_idempotency_key,
 };
-use crate::storage::{DedupStorage, ReconciliationStorage, drive_dedup_future};
+use crate::storage::{
+    DedupStorage, ReconciliationStorage, drive_dedup_future, drive_reconciliation_future,
+};
 use std::sync::Arc;
 
 pub(crate) fn expected_fingerprint_from_session(session: &SessionContext) -> Option<&str> {
@@ -295,7 +297,7 @@ pub(crate) fn handle_empty_pull_partition(
             ReconciliationReason::Indeterminate => "indeterminate",
             ReconciliationReason::PendingVerification => "pending_verification",
         };
-        if reconciliation_hook.enqueue(reconciliation_request)? {
+        if drive_reconciliation_future(reconciliation_hook.enqueue(reconciliation_request))? {
             emit_protocol_event(
                 event_bus,
                 session,

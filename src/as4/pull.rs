@@ -16,7 +16,7 @@ use super::types::{
 use crate::core::{AsxError, ErrorCode, ErrorContext, Result, SessionContext};
 use crate::observability::{AsxEvent, EventBus, emit_audit_event, emit_protocol_event};
 use crate::reliability::{DeliveryOutcome, ReconciliationRequest, RetryDecision};
-use crate::storage::{DedupStorage, ReconciliationStorage};
+use crate::storage::{DedupStorage, ReconciliationStorage, drive_reconciliation_future};
 use std::sync::Arc;
 
 /// Default MPC used when none is specified in the queued message.
@@ -69,7 +69,7 @@ fn emit_pull_overflow_with_reconciliation(
         message_id.to_string(),
         session.partner_id().to_string(),
         DeliveryOutcome::Indeterminate,
-    ) && reconciliation_hook.enqueue(reconciliation_request)?
+    ) && drive_reconciliation_future(reconciliation_hook.enqueue(reconciliation_request))?
     {
         emit_protocol_event(
             event_bus,

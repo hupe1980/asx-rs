@@ -873,8 +873,8 @@ impl As4SendPolicyBuilder {
         self
     }
 
-    pub fn signing_cert_pem(mut self, pem: Vec<u8>) -> Self {
-        self.credentials.signing_cert_pem = Some(pem);
+    pub fn signing_cert_pem(mut self, pem: impl Into<Arc<[u8]>>) -> Self {
+        self.credentials.signing_cert_pem = Some(pem.into());
         self
     }
 
@@ -883,8 +883,8 @@ impl As4SendPolicyBuilder {
         self
     }
 
-    pub fn recipient_cert_pem(mut self, pem: Vec<u8>) -> Self {
-        self.credentials.recipient_cert_pem = Some(pem);
+    pub fn recipient_cert_pem(mut self, pem: impl Into<Arc<[u8]>>) -> Self {
+        self.credentials.recipient_cert_pem = Some(pem.into());
         self
     }
 
@@ -936,11 +936,11 @@ impl As4SendPolicyBuilder {
 #[derive(Debug, Clone, Default)]
 pub struct As4SendCredentials {
     /// PEM-encoded signing certificate
-    pub signing_cert_pem: Option<Vec<u8>>,
+    pub signing_cert_pem: Option<Arc<[u8]>>,
     /// PEM-encoded signing private key
     pub signing_key_pem: Option<Vec<u8>>,
     /// PEM-encoded recipient certificate for encryption
-    pub recipient_cert_pem: Option<Vec<u8>>,
+    pub recipient_cert_pem: Option<Arc<[u8]>>,
 }
 
 impl Drop for As4SendCredentials {
@@ -1117,7 +1117,7 @@ impl ParsedAs4UserMessage {
             None => return Ok(()),
         };
 
-        let ts = chrono::DateTime::parse_from_rfc3339(ts_str).map_err(|_| {
+        let ts_secs = crate::time_utils::parse_rfc3339_to_unix_secs(ts_str).ok_or_else(|| {
             AsxError::new(
                 ErrorCode::ParseFailed,
                 format!("eb:Timestamp value '{ts_str}' is not a valid RFC 3339 timestamp"),
@@ -1125,20 +1125,20 @@ impl ParsedAs4UserMessage {
             )
         })?;
 
-        let now = chrono::Utc::now();
-        let ts_utc: chrono::DateTime<chrono::Utc> = ts.into();
-        let delta = (now - ts_utc).abs();
-        let window_chrono =
-            chrono::Duration::from_std(window).unwrap_or(chrono::Duration::seconds(300));
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or(std::time::Duration::ZERO)
+            .as_secs() as i64;
+        let delta_secs = (now_secs - ts_secs).unsigned_abs();
+        let window_secs = window.as_secs();
 
-        if delta > window_chrono {
+        if delta_secs > window_secs {
             return Err(AsxError::new(
                 ErrorCode::SecurityVerificationFailed,
                 format!(
-                    "eb:Timestamp is outside the freshness window (delta={:.0}s, allowed={}s); \
+                    "eb:Timestamp is outside the freshness window (delta={}s, allowed={}s); \
                      message rejected to prevent replay",
-                    delta.num_milliseconds() as f64 / 1000.0,
-                    window.as_secs(),
+                    delta_secs, window_secs,
                 ),
                 ErrorContext::new("as4_timestamp_freshness")
                     .with_message_id(self.message_id.clone()),

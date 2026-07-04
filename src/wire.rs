@@ -301,7 +301,8 @@ pub fn canonical_transfer_fingerprint(request: &HttpRequest) -> Result<String> {
 
     hasher.update(&request.body);
     let digest = hasher.finalize();
-    Ok(format!("{:x}", digest))
+    let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+    Ok(hex)
 }
 
 pub(crate) fn parse_content_type(raw: &str) -> Result<ContentType> {

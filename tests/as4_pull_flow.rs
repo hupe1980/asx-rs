@@ -380,7 +380,7 @@ async fn as4_pull_indeterminate_reconciliation_is_not_duplicated_for_same_pull_r
     assert_eq!(first.outcome, DeliveryOutcome::Indeterminate);
     assert_eq!(second.outcome, DeliveryOutcome::Indeterminate);
 
-    let queued = hook.queued_requests().expect("queued requests");
+    let queued = hook.queued_requests().await.expect("queued requests");
     assert_eq!(queued.len(), 1);
     assert_eq!(queued[0].reason, ReconciliationReason::Indeterminate);
 }

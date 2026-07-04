@@ -24,8 +24,8 @@ pub use coordination::{As4TopologyCoordination, ConversationGuardHandle, Convers
 // Free-function API — the former `*` associated functions are now
 // top-level functions in the `as4` module (the module itself is the namespace).
 pub use large_message::{
-    As4FragmentJoiner, As4JoinProgress, As4JoinedLargeMessage, As4SplitFragmentOutput,
-    send_sync_fragmented,
+    As4FragmentJoiner, As4FragmentJoinerLimits, As4JoinProgress, As4JoinedLargeMessage,
+    As4SplitFragmentOutput, send_sync_fragmented,
 };
 pub use pull::{
     As4EnqueuePullWithReliabilityRequest, As4ReceivePullWithReliabilityRequest,
@@ -232,20 +232,24 @@ Content-ID: <{cid}>\r\n\
             true
         }
 
-        fn enqueue(
-            &self,
+        fn enqueue<'a>(
+            &'a self,
             request: crate::reliability::ReconciliationRequest,
-        ) -> crate::core::Result<bool> {
+        ) -> BoxFuture<'a, crate::core::Result<bool>> {
             self.0.enqueue(request)
         }
 
         fn queued_requests(
             &self,
-        ) -> crate::core::Result<Vec<crate::reliability::ReconciliationRequest>> {
+        ) -> BoxFuture<'_, crate::core::Result<Vec<crate::reliability::ReconciliationRequest>>>
+        {
             self.0.queued_requests()
         }
 
-        fn resolve(&self, idempotency_key: &str) -> crate::core::Result<bool> {
+        fn resolve<'a>(
+            &'a self,
+            idempotency_key: &'a str,
+        ) -> BoxFuture<'a, crate::core::Result<bool>> {
             self.0.resolve(idempotency_key)
         }
     }
@@ -288,9 +292,9 @@ Content-ID: <{cid}>\r\n\
         let cert = builder.build();
 
         As4SendCredentials {
-            signing_cert_pem: Some(cert.to_pem().expect("cert pem")),
+            signing_cert_pem: Some(cert.to_pem().expect("cert pem").into()),
             signing_key_pem: Some(pkey.private_key_to_pem_pkcs8().expect("private key pem")),
-            recipient_cert_pem: Some(cert.to_pem().expect("recipient cert pem")),
+            recipient_cert_pem: Some(cert.to_pem().expect("recipient cert pem").into()),
         }
     }
 
@@ -308,7 +312,7 @@ Content-ID: <{cid}>\r\n\
             .as_ref()
             .expect("test creds must have signing cert");
         let cert_pem_str =
-            String::from_utf8(cert_pem.clone()).expect("cert pem must be valid utf8");
+            String::from_utf8(cert_pem.to_vec()).expect("cert pem must be valid utf8");
 
         // Compute SHA-256 fingerprint of the cert DER so the verifier can pin it.
         let cert = openssl::x509::X509::from_pem(cert_pem).expect("valid certificate PEM");
@@ -2203,7 +2207,8 @@ Content-ID: <{cid}>\r\n\
         .expect_err("overflow must reject new message");
         assert_eq!(err.code, ErrorCode::CapacityExhausted);
 
-        let queued = hook.queued_requests().expect("queued requests");
+        let queued =
+            crate::storage::drive_dedup_future(hook.queued_requests()).expect("queued requests");
         assert_eq!(queued.len(), 1);
         assert_eq!(queued[0].message_id, "msg-new");
 
@@ -2296,7 +2301,8 @@ Content-ID: <{cid}>\r\n\
             As4PullEnqueueOutcome::EvictedOldestAndEnqueued { .. }
         ));
 
-        let queued = hook.queued_requests().expect("queued requests");
+        let queued =
+            crate::storage::drive_dedup_future(hook.queued_requests()).expect("queued requests");
         assert_eq!(queued.len(), 1);
         assert_eq!(queued[0].message_id, "msg-old");
 
@@ -2919,7 +2925,7 @@ Content-ID: <{cid}>\r\n\
         let creds_raw = test_as4_credentials();
         let creds = As4PullRequestCredentials {
             signing_key_pem: creds_raw.signing_key_pem.clone().unwrap(),
-            signing_cert_pem: creds_raw.signing_cert_pem.clone().unwrap(),
+            signing_cert_pem: creds_raw.signing_cert_pem.as_deref().unwrap().to_vec(),
             key_info_profile: WsSecOutboundKeyInfoProfile::default(),
         };
         let policy = As4GeneratePullRequestPolicy {
@@ -2974,7 +2980,7 @@ Content-ID: <{cid}>\r\n\
         let creds_raw = test_as4_credentials();
         let creds = As4PullRequestCredentials {
             signing_key_pem: b"not-a-private-key".to_vec(),
-            signing_cert_pem: creds_raw.signing_cert_pem.clone().unwrap(),
+            signing_cert_pem: creds_raw.signing_cert_pem.as_deref().unwrap().to_vec(),
             key_info_profile: WsSecOutboundKeyInfoProfile::default(),
         };
         let policy = As4GeneratePullRequestPolicy {
@@ -2997,7 +3003,7 @@ Content-ID: <{cid}>\r\n\
         let creds_b = test_as4_credentials();
         let creds = As4PullRequestCredentials {
             signing_key_pem: creds_b.signing_key_pem.clone().unwrap(),
-            signing_cert_pem: creds_a.signing_cert_pem.clone().unwrap(),
+            signing_cert_pem: creds_a.signing_cert_pem.as_deref().unwrap().to_vec(),
             key_info_profile: WsSecOutboundKeyInfoProfile::default(),
         };
         let policy = As4GeneratePullRequestPolicy {

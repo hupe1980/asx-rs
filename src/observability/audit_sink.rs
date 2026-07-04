@@ -5,7 +5,7 @@
 /// Enables future integration of external audit systems beyond in-memory broadcast.
 use crate::core::{AsxError, ErrorCode, ErrorContext, Result};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fmt;

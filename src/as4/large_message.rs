@@ -77,13 +77,17 @@ struct JoinState {
     action: Option<String>,
     message_header: Option<MessageHeaderMeta>,
     parts: BTreeMap<usize, Vec<u8>>,
+    /// Wall-clock instant when the first fragment of this group was ingested.
+    /// Used by [`As4FragmentJoiner::prune_stale_groups`] for time-based eviction.
+    created_at: std::time::Instant,
 }
 
 /// Resource-limit configuration for [`As4FragmentJoiner`].
 ///
 /// Unbounded joiners are a DoS vector: a malicious sender can open thousands of
 /// fragment groups or stream multi-GB fragments that are never completed.
-/// These limits bound both the group count and the per-group byte budget.
+/// These limits bound the group count, the per-group byte budget, and optionally
+/// the maximum age of an in-progress group.
 #[derive(Debug, Clone)]
 pub struct As4FragmentJoinerLimits {
     /// Maximum number of concurrently in-flight fragment groups.
@@ -102,6 +106,22 @@ pub struct As4FragmentJoinerLimits {
     ///
     /// Default: 128 MiB (`128 * 1024 * 1024`).
     pub max_bytes_per_group: usize,
+
+    /// Maximum age of an in-progress fragment group before it is eligible for
+    /// time-based eviction via [`As4FragmentJoiner::prune_stale_groups`].
+    ///
+    /// When `Some(duration)`, any group whose first fragment was ingested more
+    /// than `duration` ago is evicted (and permanently rejected) the next time
+    /// `prune_stale_groups` is called.  When `None` (the default), time-based
+    /// eviction is disabled and incomplete groups are only removed when the
+    /// count or byte limits are hit.
+    ///
+    /// Recommended value for production BDEW MaKo deployments: `Some(Duration::from_secs(3600))`
+    /// (1 hour), which is sufficient for any reasonable large-message transfer
+    /// while protecting against memory exhaustion from abandoned groups.
+    ///
+    /// Default: `None` (disabled — preserves existing behaviour).
+    pub max_group_age: Option<std::time::Duration>,
 }
 
 impl Default for As4FragmentJoinerLimits {
@@ -109,6 +129,11 @@ impl Default for As4FragmentJoinerLimits {
         Self {
             max_concurrent_groups: 256,
             max_bytes_per_group: 128 * 1024 * 1024,
+            // 1-hour TTL: matches the recommended BDEW MaKo production value.
+            // Abandoned fragment groups are evicted the next time
+            // `prune_stale_groups` is called, bounding memory consumption.
+            // Override with `None` to disable time-based eviction (not recommended).
+            max_group_age: Some(std::time::Duration::from_secs(3600)),
         }
     }
 }
@@ -279,6 +304,7 @@ impl As4FragmentJoiner {
                 action: None,
                 message_header: None,
                 parts: BTreeMap::new(),
+                created_at: std::time::Instant::now(),
             });
 
         if state.parts.contains_key(&fragment_num) {
@@ -378,6 +404,48 @@ impl As4FragmentJoiner {
             received_fragments: received,
             expected_fragments: expected,
         })
+    }
+
+    /// Evict all fragment groups whose first fragment was ingested more than
+    /// `limits.max_group_age` ago.
+    ///
+    /// Returns the number of groups evicted.  Each evicted group is added to
+    /// the permanent reject-list so that late-arriving fragments for the same
+    /// group are rejected immediately rather than starting a new (also stale)
+    /// accumulation window.
+    ///
+    /// Call this periodically \u2014 for example from a `tokio::time::interval` task
+    /// \u2014 to reclaim memory held by abandoned or crashed senders.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use asx_rs::as4::{As4FragmentJoiner, As4FragmentJoinerLimits};
+    /// # use std::time::{Duration, Instant};
+    /// let limits = As4FragmentJoinerLimits {
+    ///     max_group_age: Some(Duration::from_secs(3600)),
+    ///     ..Default::default()
+    /// };
+    /// let mut joiner = As4FragmentJoiner::with_limits(limits);
+    /// // Call periodically:
+    /// let evicted = joiner.prune_stale_groups(Instant::now());
+    /// assert_eq!(evicted, 0); // nothing in-flight yet
+    /// ```
+    pub fn prune_stale_groups(&mut self, now: std::time::Instant) -> usize {
+        let Some(max_age) = self.limits.max_group_age else {
+            return 0;
+        };
+        let stale_keys: Vec<String> = self
+            .groups
+            .iter()
+            .filter(|(_, s)| now.saturating_duration_since(s.created_at) > max_age)
+            .map(|(k, _)| k.clone())
+            .collect();
+        let evicted = stale_keys.len();
+        for key in stale_keys {
+            self.evict_and_reject_group(key);
+        }
+        evicted
     }
 }
 
@@ -1346,6 +1414,7 @@ mod tests {
         let limits = As4FragmentJoinerLimits {
             max_concurrent_groups: 2,
             max_bytes_per_group: 128 * 1024 * 1024,
+            max_group_age: None,
         };
         let mut joiner = As4FragmentJoiner::with_limits(limits);
 
@@ -1388,6 +1457,7 @@ mod tests {
         let limits = As4FragmentJoinerLimits {
             max_concurrent_groups: 256,
             max_bytes_per_group: 1,
+            max_group_age: None,
         };
         let mut joiner = As4FragmentJoiner::with_limits(limits);
 

@@ -806,12 +806,16 @@ mod tests {
 
         thread::sleep(Duration::from_millis(20));
 
-        let fill_deadline = Instant::now() + Duration::from_millis(200);
+        // Each failed attempt under FailClosed increments capacity_exhausted_total,
+        // so track retries here and add them to the expected final count.
+        let mut fill_retries: u64 = 0;
+        let fill_deadline = Instant::now() + Duration::from_millis(500);
         loop {
             let second_result = channel.send_incident(&as2_incident("as2:test:burst:2"));
             if second_result.is_ok() {
                 break;
             }
+            fill_retries += 1;
             if Instant::now() >= fill_deadline {
                 panic!("failed to enqueue second incident before deadline");
             }
@@ -826,7 +830,8 @@ mod tests {
         let metrics = channel.metrics_snapshot();
         assert_eq!(metrics.queue_capacity, 1);
         assert_eq!(metrics.accepted_total, 2);
-        assert_eq!(metrics.capacity_exhausted_total, 1);
+        // fill_retries failed FailClosed attempts + the one burst:3 rejection
+        assert_eq!(metrics.capacity_exhausted_total, fill_retries + 1);
         assert_eq!(metrics.dropped_total, 0);
 
         let _ = server.join();
@@ -861,16 +866,24 @@ mod tests {
 
         thread::sleep(Duration::from_millis(20));
 
-        let fill_deadline = Instant::now() + Duration::from_millis(200);
+        // BestEffortDrop always returns Ok even when dropping, so we cannot rely on
+        // the return value to detect a successful enqueue. Poll accepted_total instead,
+        // and track how many attempts were silently dropped in the loop.
+        let mut drop2_extra_drops: u64 = 0;
+        let fill_deadline = Instant::now() + Duration::from_millis(500);
         loop {
-            let second_result = channel.send_incident(&as2_incident("as2:test:drop:2"));
-            if second_result.is_ok() {
-                break;
+            let before = channel.metrics_snapshot().accepted_total;
+            channel
+                .send_incident(&as2_incident("as2:test:drop:2"))
+                .expect("no error on drop policy");
+            if channel.metrics_snapshot().accepted_total > before {
+                break; // drop:2 was actually enqueued
             }
+            drop2_extra_drops += 1;
             if Instant::now() >= fill_deadline {
-                panic!("failed to enqueue second incident before deadline");
+                panic!("drop:2 was never accepted before deadline");
             }
-            thread::sleep(Duration::from_millis(1));
+            thread::sleep(Duration::from_millis(5));
         }
 
         channel
@@ -880,7 +893,8 @@ mod tests {
         let metrics = channel.metrics_snapshot();
         assert_eq!(metrics.queue_capacity, 1);
         assert_eq!(metrics.accepted_total, 2);
-        assert_eq!(metrics.dropped_total, 1);
+        // drop2_extra_drops silent drops in the loop + the one drop:3 rejection
+        assert_eq!(metrics.dropped_total, drop2_extra_drops + 1);
         assert_eq!(metrics.capacity_exhausted_total, 0);
 
         let _ = server.join();

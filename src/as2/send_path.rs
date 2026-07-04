@@ -163,12 +163,15 @@ pub fn send_sync(
         None => {
             let ch = session.cert_handle();
             session_creds = As2SendCredentials {
-                signing_cert_pem: ch.signing_cert_pem.as_ref().map(|s| s.as_bytes().to_vec()),
+                signing_cert_pem: ch
+                    .signing_cert_pem
+                    .as_ref()
+                    .map(|s| Arc::from(s.as_bytes())),
                 signing_key_pem: ch.signing_key_pem.as_ref().map(|s| s.as_bytes().to_vec()),
                 recipient_cert_pem: ch
                     .recipient_cert_pem
                     .as_ref()
-                    .map(|s| s.as_bytes().to_vec()),
+                    .map(|s| Arc::from(s.as_bytes())),
             };
             session_creds
         }

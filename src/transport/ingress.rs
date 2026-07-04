@@ -1118,16 +1118,16 @@ mod tests {
             true
         }
 
-        fn enqueue(&self, _request: ReconciliationRequest) -> Result<bool> {
-            Ok(false)
+        fn enqueue<'a>(&'a self, _request: ReconciliationRequest) -> BoxFuture<'a, Result<bool>> {
+            Box::pin(async move { Ok(false) })
         }
 
-        fn queued_requests(&self) -> Result<Vec<ReconciliationRequest>> {
-            Ok(Vec::new())
+        fn queued_requests(&self) -> BoxFuture<'_, Result<Vec<ReconciliationRequest>>> {
+            Box::pin(async move { Ok(Vec::new()) })
         }
 
-        fn resolve(&self, _idempotency_key: &str) -> Result<bool> {
-            Ok(false)
+        fn resolve<'a>(&'a self, _idempotency_key: &'a str) -> BoxFuture<'a, Result<bool>> {
+            Box::pin(async move { Ok(false) })
         }
     }
 

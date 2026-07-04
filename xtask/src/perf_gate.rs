@@ -121,9 +121,9 @@ fn bench_as2_credentials() -> As2SendCredentials {
     let cert = builder.build();
 
     As2SendCredentials {
-        signing_cert_pem: Some(cert.to_pem().expect("cert pem")),
+        signing_cert_pem: Some(cert.to_pem().expect("cert pem").into()),
         signing_key_pem: Some(pkey.private_key_to_pem_pkcs8().expect("private key pem")),
-        recipient_cert_pem: Some(cert.to_pem().expect("recipient cert pem")),
+        recipient_cert_pem: Some(cert.to_pem().expect("recipient cert pem").into()),
     }
 }
 

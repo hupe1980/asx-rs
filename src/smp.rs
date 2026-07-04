@@ -180,7 +180,6 @@ impl SmpClient {
     /// Panics if the HTTP client cannot be built.
     pub fn with_config(config: SmpConfig) -> Self {
         let http = reqwest::Client::builder()
-            .use_rustls_tls()
             .timeout(std::time::Duration::from_secs(10))
             .build()
             .expect("failed to build SMP reqwest client");
