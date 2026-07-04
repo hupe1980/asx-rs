@@ -66,16 +66,21 @@ impl ReconciliationStorage for DurableClusterSafeReconciliation {
         true
     }
 
-    fn enqueue(&self, _request: asx_rs::reliability::ReconciliationRequest) -> Result<bool> {
-        Ok(false)
+    fn enqueue(
+        &self,
+        _request: asx_rs::reliability::ReconciliationRequest,
+    ) -> BoxFuture<'_, Result<bool>> {
+        Box::pin(async { Ok(false) })
     }
 
-    fn queued_requests(&self) -> Result<Vec<asx_rs::reliability::ReconciliationRequest>> {
-        Ok(Vec::new())
+    fn queued_requests(
+        &self,
+    ) -> BoxFuture<'_, Result<Vec<asx_rs::reliability::ReconciliationRequest>>> {
+        Box::pin(async { Ok(Vec::new()) })
     }
 
-    fn resolve(&self, _idempotency_key: &str) -> Result<bool> {
-        Ok(false)
+    fn resolve<'a>(&'a self, _idempotency_key: &'a str) -> BoxFuture<'a, Result<bool>> {
+        Box::pin(async { Ok(false) })
     }
 }
 
@@ -105,16 +110,21 @@ impl ReconciliationStorage for NonDurableReconciliation {
         false
     }
 
-    fn enqueue(&self, _request: asx_rs::reliability::ReconciliationRequest) -> Result<bool> {
-        Ok(false)
+    fn enqueue(
+        &self,
+        _request: asx_rs::reliability::ReconciliationRequest,
+    ) -> BoxFuture<'_, Result<bool>> {
+        Box::pin(async { Ok(false) })
     }
 
-    fn queued_requests(&self) -> Result<Vec<asx_rs::reliability::ReconciliationRequest>> {
-        Ok(Vec::new())
+    fn queued_requests(
+        &self,
+    ) -> BoxFuture<'_, Result<Vec<asx_rs::reliability::ReconciliationRequest>>> {
+        Box::pin(async { Ok(Vec::new()) })
     }
 
-    fn resolve(&self, _idempotency_key: &str) -> Result<bool> {
-        Ok(false)
+    fn resolve<'a>(&'a self, _idempotency_key: &'a str) -> BoxFuture<'a, Result<bool>> {
+        Box::pin(async { Ok(false) })
     }
 }
 

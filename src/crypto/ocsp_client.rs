@@ -364,6 +364,7 @@ fn fetch_from_cache_or_responder(
 }
 
 #[cfg(any(test, feature = "async-ocsp"))]
+#[allow(dead_code)]
 fn build_ocsp_request_der(cert: &X509Ref, issuer: &X509Ref) -> Result<Vec<u8>> {
     let cert_id = OcspCertId::from_cert(MessageDigest::sha1(), cert, issuer).map_err(|err| {
         AsxError::new(
@@ -398,6 +399,7 @@ fn build_ocsp_request_der(cert: &X509Ref, issuer: &X509Ref) -> Result<Vec<u8>> {
 }
 
 #[cfg(any(test, feature = "async-ocsp"))]
+#[allow(dead_code)]
 fn build_cache_key(
     cert: &X509Ref,
     issuer: &X509Ref,
@@ -433,6 +435,7 @@ fn build_cache_key(
 }
 
 #[cfg(any(test, feature = "async-ocsp"))]
+#[allow(dead_code)]
 fn current_unix_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -441,6 +444,7 @@ fn current_unix_secs() -> u64 {
 }
 
 #[cfg(any(test, feature = "async-ocsp"))]
+#[allow(dead_code)]
 fn hex_lower(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len() * 2);

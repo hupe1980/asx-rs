@@ -20,10 +20,7 @@ use quick_xml::reader::NsReader;
 
 // Pure-Rust symmetric crypto: AES-GCM (aes-gcm crate).
 // OpenSSL is retained only for asymmetric operations (RSA-OAEP key wrap/unwrap).
-use aes_gcm::{
-    Aes128Gcm, Aes256Gcm, KeyInit,
-    aead::Aead,
-};
+use aes_gcm::{Aes128Gcm, Aes256Gcm, KeyInit, aead::Aead};
 
 use crate::core::{AsxError, ErrorCode, ErrorContext, Result};
 

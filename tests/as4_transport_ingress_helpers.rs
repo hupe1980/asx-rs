@@ -112,16 +112,22 @@ impl ReconciliationStorage for DurableClusterSafeReconciliation {
         true
     }
 
-    fn enqueue(&self, _request: ReconciliationRequest) -> asx_rs::core::Result<bool> {
-        Ok(false)
+    fn enqueue(
+        &self,
+        _request: ReconciliationRequest,
+    ) -> BoxFuture<'_, asx_rs::core::Result<bool>> {
+        Box::pin(async { Ok(false) })
     }
 
-    fn queued_requests(&self) -> asx_rs::core::Result<Vec<ReconciliationRequest>> {
-        Ok(Vec::new())
+    fn queued_requests(&self) -> BoxFuture<'_, asx_rs::core::Result<Vec<ReconciliationRequest>>> {
+        Box::pin(async { Ok(Vec::new()) })
     }
 
-    fn resolve(&self, _idempotency_key: &str) -> asx_rs::core::Result<bool> {
-        Ok(false)
+    fn resolve<'a>(
+        &'a self,
+        _idempotency_key: &'a str,
+    ) -> BoxFuture<'a, asx_rs::core::Result<bool>> {
+        Box::pin(async { Ok(false) })
     }
 }
 
