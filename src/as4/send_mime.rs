@@ -6,7 +6,7 @@
 //! When `PayloadPackagingMode::MimeAttachment` is selected, AS4 messages are transmitted
 //! as MIME multipart/related instead of embedded in SOAP `<asx:Base64>` elements.
 
-use crate::as4::mime_packaging::{MimeAttachment, MimePackageBuilder};
+use crate::as4::mime_packaging::{MimeAttachment, MimePackageBuilder, PayloadFilename};
 use crate::core::{AsxError, ErrorCode, ErrorContext, Result};
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::{Reader, Writer};
@@ -47,11 +47,19 @@ pub fn package_as_mime(
     payload_content_id: &str,
     payload_content_type: &str,
     soap_content_type: &str,
+    payload_filename: Option<&PayloadFilename>,
 ) -> Result<(Vec<u8>, String)> {
-    // Create payload attachment. Content-Disposition is intentionally omitted
-    // for strict-profile interoperability.
+    // Build the Content-Disposition value. BDEW §AF §2.12 requires a filename
+    // on every payload part. When no filename is supplied we still emit
+    // `Content-Disposition: attachment` for PEPPOL AS4 profile conformance
+    // (receivers validate the header's presence; omitting it is incorrect).
+    let disposition = match payload_filename {
+        Some(name) => format!("attachment; filename=\"{}\"", name.as_str()),
+        None => "attachment".to_string(),
+    };
     let payload_attachment =
-        MimeAttachment::new(payload_content_id, payload_content_type, payload, "binary");
+        MimeAttachment::new(payload_content_id, payload_content_type, payload, "binary")
+            .with_disposition(disposition);
 
     // Build MIME package
     let builder = MimePackageBuilder::new()

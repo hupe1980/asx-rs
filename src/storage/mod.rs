@@ -157,7 +157,7 @@ pub trait DedupStorage: Send + Sync {
 ///
 /// ```toml
 /// [dependencies]
-/// asx-rs = "=0.3.0"  # exact-version pin — ReconciliationStorage is not yet stable
+/// asx-rs = "=0.5.0"  # exact-version pin — ReconciliationStorage is not yet stable
 /// ```
 ///
 /// The sealed-trait pattern is intentionally not used here so that downstream

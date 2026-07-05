@@ -56,7 +56,7 @@ pub trait ReconciliationStorage: Send + Sync {
 Enable feature `postgres-storage` to use first-party durable, cluster-safe storage:
 
 ```toml
-asx-rs = { version = "0.3", features = ["as2", "as4", "postgres-storage"] }
+asx-rs = { version = "0.5", features = ["as2", "as4", "postgres-storage"] }
 ```
 
 Available implementations:
