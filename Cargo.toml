@@ -1,6 +1,6 @@
 [package]
 name = "asx-rs"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 authors = ["hupe1980"]
 description = "AS2 and AS4 B2B messaging library for Rust — signing, encryption, MDN, and ebMS3/AS4 profile support"

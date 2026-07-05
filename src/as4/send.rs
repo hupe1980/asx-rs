@@ -8,7 +8,7 @@ use super::types::{
     As4PreparedSendCredentials, As4SendCredentials, As4SendOutput, As4SendPolicy, SoapEnvelope,
     validate_as4_send_policy_and_credentials_consistency,
 };
-use crate::as4::mime_packaging::MimeAttachment;
+use crate::as4::mime_packaging::{MimeAttachment, PayloadFilename};
 use crate::core::{AsxError, ErrorCode, ErrorContext, Result, SessionContext};
 #[cfg(feature = "as4")]
 use crate::crypto::soap_builder::{SoapEnvelopeBuilder, WsSecurityHeaderBuilder};
@@ -40,6 +40,20 @@ pub struct As4SendRequest {
     ///   credential material.  Use this for per-message credential overrides
     ///   (e.g. partner-specific encryption certs in a hub/spoke topology).
     pub credentials: Option<As4SendCredentials>,
+    /// A pre-validated filename emitted as `Content-Disposition: attachment;
+    /// filename="..."` on the MIME payload part.
+    ///
+    /// Required for BDEW *Allgemeine Festlegungen* §AF §2.12 compliance.
+    /// When `None`, the part still carries `Content-Disposition: attachment`
+    /// for PEPPOL AS4 profile conformance.
+    ///
+    /// Build the filename for your profile, then parse it:
+    ///
+    /// ```ignore
+    /// let name = format!("MSCONS_{}_{}_{}_{}_REF.txt", sender, receiver, date, time);
+    /// let req = As4SendRequest { payload_filename: Some(name.parse()?), .. };
+    /// ```
+    pub payload_filename: Option<PayloadFilename>,
 }
 
 #[derive(Clone)]
@@ -48,6 +62,8 @@ pub struct As4SendPreparedRequest {
     pub payload: Vec<u8>,
     pub policy: As4SendPolicy,
     pub prepared: As4PreparedSendCredentials,
+    /// See [`As4SendRequest::payload_filename`].
+    pub payload_filename: Option<PayloadFilename>,
 }
 
 #[inline]
@@ -118,6 +134,7 @@ pub fn send_sync(
         payload,
         policy,
         credentials: credentials_opt,
+        payload_filename,
     } = request;
 
     // Resolve effective credentials: per-request `Some(c)` wins; `None` falls
@@ -186,6 +203,7 @@ pub fn send_sync(
             payload,
             policy,
             prepared,
+            payload_filename,
         },
     )
 }
@@ -202,8 +220,17 @@ pub fn send_sync_prepared(
         payload,
         policy,
         prepared,
+        payload_filename,
     } = request;
-    send_sync_prepared_ref(session, event_bus, message_id, payload, policy, &prepared)
+    send_sync_prepared_ref(
+        session,
+        event_bus,
+        message_id,
+        payload,
+        policy,
+        &prepared,
+        payload_filename,
+    )
 }
 
 fn send_sync_prepared_ref(
@@ -213,6 +240,7 @@ fn send_sync_prepared_ref(
     payload: Vec<u8>,
     policy: As4SendPolicy,
     prepared: &As4PreparedSendCredentials,
+    payload_filename: Option<PayloadFilename>,
 ) -> Result<As4SendOutput> {
     pipeline::validate_message_id(&message_id, "as4_send_validate", session)?;
 
@@ -464,6 +492,7 @@ fn send_sync_prepared_ref(
         &payload_content_id,
         payload_mime_type,
         SOAP12_HTTP_CONTENT_TYPE,
+        payload_filename.as_ref(),
     )?;
 
     if policy.sign {
@@ -567,6 +596,7 @@ pub async fn send_async_prepared(
                             request.payload.clone(),
                             request.policy.clone(),
                             &request.prepared,
+                            request.payload_filename.clone(),
                         )
                     })
                     .await

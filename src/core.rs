@@ -583,7 +583,7 @@ pub enum InteropMode {
     ///
     /// ```toml
     /// [dependencies]
-    /// asx = { version = "0.3", features = ["interop-relaxed"] }
+    /// asx = { version = "0.5", features = ["interop-relaxed"] }
     /// ```
     #[cfg(feature = "interop-relaxed")]
     Relaxed,
@@ -763,6 +763,7 @@ impl SessionContextBuilder {
     ///     payload,
     ///     policy,
     ///     credentials: None,  // ← session certificate used
+    ///     payload_filename: None,
     /// })?;
     /// ```
     pub fn with_signing_cert_pem(mut self, pem: impl Into<String>) -> Self {

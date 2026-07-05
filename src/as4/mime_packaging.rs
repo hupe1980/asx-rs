@@ -34,7 +34,7 @@
 //! Content-Type: application/octet-stream
 //! Content-Transfer-Encoding: binary
 //! Content-ID: <payload-001@example.com>
-//! Content-Disposition: attachment; name="payload"
+//! Content-Disposition: attachment; filename="MSCONS_..._260705_1230_REF.txt"
 //!
 //! [binary payload data]
 //! ------boundary123--
@@ -48,7 +48,155 @@
 //! - Helpers for generating stable Content-ID values from payloads
 
 use crate::core::{AsxError, ErrorCode, ErrorContext, Result};
+use std::fmt;
 use std::io::Write;
+
+// ──────────────────────────────────────────────────────────────────────────────
+// PayloadFilename newtype
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// A validated MIME `Content-Disposition` filename safe for embedding in
+/// AS4 payload part headers.
+///
+/// ## Invariants (enforced once, at construction)
+///
+/// * 1–255 printable US-ASCII bytes (range `0x20`–`0x7E`)
+/// * No double-quote (`"`) or backslash (`\`) — RFC 2183 `quoted-string` specials
+/// * No control characters including CR/LF — header-injection hardening
+///
+/// Using a newtype instead of a raw `String` moves validation to the API
+/// boundary ("parse, don't validate"): once a `PayloadFilename` exists, the
+/// send pipeline can embed it in a MIME header without any further checks.
+///
+/// ## Examples
+///
+/// ```rust
+/// use asx_rs::as4::mime_packaging::PayloadFilename;
+///
+/// let name = PayloadFilename::new("invoice.xml").unwrap();
+///
+/// // BDEW Allgemeine Festlegungen §AF §2.12 — build the filename string in
+/// // your application, then wrap it:
+/// let bdew = format!(
+///     "MSCONS_4011234000000_4011234000001_{}_{}_{}.txt",
+///     "260705", "1230", "REF123"
+/// );
+/// let name = PayloadFilename::new(&bdew).unwrap();
+/// ```
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct PayloadFilename(String);
+
+/// Error returned when a string violates [`PayloadFilename`] invariants.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PayloadFilenameError(String);
+
+impl fmt::Display for PayloadFilenameError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for PayloadFilenameError {}
+
+impl PayloadFilename {
+    const MAX_LEN: usize = 255;
+
+    /// Create a `PayloadFilename` from a string slice.
+    ///
+    /// Validates first, then allocates — the `&str` is only copied into an
+    /// owned `String` when the value is known to be valid.
+    ///
+    /// For callers that already own a `String`, use `TryFrom<String>` to
+    /// avoid a redundant allocation:
+    ///
+    /// ```rust
+    /// use asx_rs::as4::mime_packaging::PayloadFilename;
+    /// let s = "invoice.xml".to_owned();
+    /// let name: PayloadFilename = s.try_into().unwrap();
+    /// ```
+    ///
+    /// Returns `Err` when the string is empty, exceeds 255 bytes, or contains
+    /// any character outside `0x20`–`0x7E` or the forbidden `"` and `\`.
+    pub fn new(s: &str) -> std::result::Result<Self, PayloadFilenameError> {
+        Self::validate_bytes(s.as_bytes())?;
+        Ok(Self(s.to_owned()))
+    }
+
+    /// Return the filename as a string slice.
+    #[inline]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    fn validate_bytes(bytes: &[u8]) -> std::result::Result<(), PayloadFilenameError> {
+        if bytes.is_empty() {
+            return Err(PayloadFilenameError(
+                "payload filename must not be empty \
+                 (use None to omit the Content-Disposition filename parameter)"
+                    .into(),
+            ));
+        }
+        if bytes.len() > Self::MAX_LEN {
+            return Err(PayloadFilenameError(format!(
+                "payload filename exceeds maximum length ({} bytes, limit is {})",
+                bytes.len(),
+                Self::MAX_LEN,
+            )));
+        }
+        if let Some(bad) = bytes
+            .iter()
+            .copied()
+            .find(|&b| b < 0x20 || b > 0x7E || b == b'"' || b == b'\\')
+        {
+            return Err(PayloadFilenameError(format!(
+                "payload filename contains character 0x{bad:02X} not allowed in a \
+                 Content-Disposition header value (must be printable ASCII, \
+                 no double-quote or backslash)"
+            )));
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Display for PayloadFilename {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl AsRef<str> for PayloadFilename {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::str::FromStr for PayloadFilename {
+    type Err = PayloadFilenameError;
+    /// Parse a `PayloadFilename` from a string slice. Enables the `.parse()` idiom:
+    /// ```rust
+    /// use asx_rs::as4::mime_packaging::PayloadFilename;
+    /// let name: PayloadFilename = "invoice.xml".parse().unwrap();
+    /// ```
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        Self::new(s)
+    }
+}
+
+impl TryFrom<String> for PayloadFilename {
+    type Error = PayloadFilenameError;
+    /// Validate and wrap an owned `String` without re-allocating.
+    fn try_from(s: String) -> std::result::Result<Self, Self::Error> {
+        Self::validate_bytes(s.as_bytes())?;
+        Ok(Self(s))
+    }
+}
+
+impl TryFrom<&str> for PayloadFilename {
+    type Error = PayloadFilenameError;
+    fn try_from(s: &str) -> std::result::Result<Self, Self::Error> {
+        Self::new(s)
+    }
+}
 
 /// MIME boundary marker for multipart/related messages.
 ///
@@ -429,5 +577,69 @@ mod tests {
         assert!(String::from_utf8_lossy(&mime_body).contains("--"));
         // Should contain Content-ID headers
         assert!(String::from_utf8_lossy(&mime_body).contains("Content-ID:"));
+    }
+
+    // ── PayloadFilename tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn payload_filename_accepts_printable_ascii() {
+        assert!(PayloadFilename::new("invoice.xml").is_ok());
+        assert!(
+            PayloadFilename::new("MSCONS_4011234000000_4011234000001_260705_1230_REF.txt").is_ok()
+        );
+        assert!(PayloadFilename::new("file with spaces.txt").is_ok());
+        // full printable range: 0x20 and 0x7E
+        assert!(PayloadFilename::new(" ~").is_ok());
+    }
+
+    #[test]
+    fn payload_filename_rejects_empty() {
+        let err = PayloadFilename::new("").unwrap_err();
+        assert!(err.to_string().contains("empty"), "{err}");
+    }
+
+    #[test]
+    fn payload_filename_rejects_over_length() {
+        let long = "a".repeat(256);
+        let err = PayloadFilename::new(&long).unwrap_err();
+        assert!(err.to_string().contains("maximum length"), "{err}");
+    }
+
+    #[test]
+    fn payload_filename_rejects_control_characters() {
+        // Header-injection: CR, LF
+        assert!(PayloadFilename::new("evil\r\nX-Injected: hdr").is_err());
+        assert!(PayloadFilename::new("evil\n").is_err());
+        // Null byte
+        assert!(PayloadFilename::new("evil\x00null").is_err());
+        // DEL (0x7F is outside the 0x20–0x7E printable range)
+        assert!(PayloadFilename::new("evil\x7f").is_err());
+        // Non-ASCII: U+00E9 é (UTF-8: 0xC3 0xA9 — both bytes > 0x7E)
+        assert!(PayloadFilename::new("caf\u{00e9}").is_err());
+    }
+
+    #[test]
+    fn payload_filename_rejects_quoted_string_specials() {
+        // Double-quote would break `filename="..."` encoding
+        assert!(PayloadFilename::new("evil\"quote").is_err());
+        // Backslash is the RFC 2183 escape character in quoted-string
+        assert!(PayloadFilename::new("evil\\backslash").is_err());
+    }
+
+    #[test]
+    fn payload_filename_tryfrom_conversions_work() {
+        let from_str: PayloadFilename = "invoice.xml".try_into().unwrap();
+        let from_string: PayloadFilename = "invoice.xml".to_string().try_into().unwrap();
+        let from_parse: PayloadFilename = "invoice.xml".parse().unwrap();
+        assert_eq!(from_str, from_string);
+        assert_eq!(from_str, from_parse);
+        assert_eq!(from_str.as_str(), "invoice.xml");
+    }
+
+    #[test]
+    fn payload_filename_display_and_asref() {
+        let name = PayloadFilename::new("report.pdf").unwrap();
+        assert_eq!(name.to_string(), "report.pdf");
+        assert_eq!(AsRef::<str>::as_ref(&name), "report.pdf");
     }
 }

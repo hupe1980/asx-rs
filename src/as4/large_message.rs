@@ -481,6 +481,7 @@ pub fn send_sync_fragmented(
             payload,
             policy: policy.clone(),
             credentials,
+            payload_filename: None,
         },
     )?;
 
@@ -540,6 +541,7 @@ fn split_send_output_into_fragments(
             data_content_id.as_str(),
             "application/octet-stream",
             SOAP12_HTTP_CONTENT_TYPE,
+            None,
         )?;
 
         fragments.push(As4SplitFragmentOutput {
@@ -1227,6 +1229,7 @@ mod tests {
                 payload,
                 policy: policy.clone(),
                 credentials: Some(credentials.clone()),
+                payload_filename: None,
             },
         )
         .expect("source send");
@@ -1280,6 +1283,7 @@ mod tests {
                 payload,
                 policy: policy.clone(),
                 credentials: Some(credentials.clone()),
+                payload_filename: None,
             },
         )
         .expect("source send");
@@ -1324,6 +1328,7 @@ mod tests {
                 payload,
                 policy: policy.clone(),
                 credentials: Some(credentials),
+                payload_filename: None,
             },
         )
         .expect("source send");
@@ -1391,6 +1396,7 @@ mod tests {
                 payload,
                 policy: policy.clone(),
                 credentials: Some(credentials),
+                payload_filename: None,
             },
         )
         .expect("source send");

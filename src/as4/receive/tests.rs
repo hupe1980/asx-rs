@@ -190,6 +190,7 @@ async fn ordered_receive_requires_conversation_id() {
             payload: b"test payload".to_vec(),
             policy: send_policy,
             credentials: Some(send_creds),
+            payload_filename: None,
         },
     )
     .expect("send");

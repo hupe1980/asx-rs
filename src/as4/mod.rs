@@ -52,7 +52,9 @@ pub use signals::{
 mod parser;
 
 pub mod mime_packaging;
-pub use mime_packaging::{MimeAttachment, MimePackageBuilder};
+pub use mime_packaging::{
+    MimeAttachment, MimePackageBuilder, PayloadFilename, PayloadFilenameError,
+};
 
 pub mod pmode;
 #[cfg(feature = "testing")]
@@ -422,6 +424,7 @@ Content-ID: <{cid}>\r\n\
                 payload: b"payload".to_vec(),
                 policy: As4SendPolicy::default(),
                 credentials: Some(As4SendCredentials::default()),
+                payload_filename: None,
             },
         )
         .expect_err("missing creds must fail");
@@ -443,6 +446,7 @@ Content-ID: <{cid}>\r\n\
                 payload: b"payload".to_vec(),
                 policy: As4SendPolicy::default(),
                 credentials: Some(As4SendCredentials::default()),
+                payload_filename: None,
             },
         )
         .await
@@ -471,6 +475,7 @@ Content-ID: <{cid}>\r\n\
                 payload: b"payload".to_vec(),
                 policy,
                 credentials: Some(test_as4_credentials()),
+                payload_filename: None,
             },
         )
         .expect("send");
@@ -503,6 +508,95 @@ Content-ID: <{cid}>\r\n\
         );
     }
 
+    // --- FR-001 / BUG-001: Content-Disposition on payload attachment ----------
+
+    #[test]
+    fn as4_send_emits_content_disposition_attachment_when_no_filename() {
+        // PEPPOL AS4 profile requires Content-Disposition on every payload
+        // part even when no explicit filename is set.
+        let session = SessionContext::new("s1", "p1", "strict")
+            .expect("session")
+            .with_strict_runtime_bootstrap_validated(true);
+        let bus = EventBus::new(16).expect("bus");
+        let _events = bus.subscribe_scoped_events();
+        let policy = As4SendPolicy {
+            sign: true,
+            payload_packaging_mode: super::pmode::PayloadPackagingMode::MimeAttachment,
+            ..Default::default()
+        };
+
+        let out = send_sync(
+            &session,
+            &bus,
+            As4SendRequest {
+                message_id: "msg-cd-none-1".to_string(),
+                payload: b"EDIFACT".to_vec(),
+                policy,
+                credentials: Some(test_as4_credentials()),
+                payload_filename: None,
+            },
+        )
+        .expect("send");
+
+        let mime_body = std::str::from_utf8(&out.soap_envelope.body).expect("utf8");
+        // Baseline Content-Disposition must always be present.
+        assert!(
+            mime_body.contains("Content-Disposition: attachment"),
+            "Content-Disposition: attachment must always be emitted for PEPPOL conformance"
+        );
+        // No filename= parameter when none was supplied.
+        assert!(
+            !mime_body.contains("filename="),
+            "filename= must not appear when payload_filename is None"
+        );
+    }
+
+    #[test]
+    fn as4_send_emits_content_disposition_with_filename_when_set() {
+        // BDEW §AF §2.12 mandates filename in Content-Disposition.
+        // The caller builds the filename string however their profile requires,
+        // then wraps it in `PayloadFilename` for safe embedding.
+        let session = SessionContext::new("s1", "p1", "strict")
+            .expect("session")
+            .with_strict_runtime_bootstrap_validated(true);
+        let bus = EventBus::new(16).expect("bus");
+        let _events = bus.subscribe_scoped_events();
+        let policy = As4SendPolicy {
+            sign: true,
+            payload_packaging_mode: super::pmode::PayloadPackagingMode::MimeAttachment,
+            ..Default::default()
+        };
+
+        let filename = "MSCONS_4011234000000_4011234000001_260101_1230_REF123.txt";
+        let out = send_sync(
+            &session,
+            &bus,
+            As4SendRequest {
+                message_id: "msg-cd-fname-1".to_string(),
+                payload: b"EDIFACT".to_vec(),
+                policy,
+                credentials: Some(test_as4_credentials()),
+                payload_filename: Some(
+                    super::mime_packaging::PayloadFilename::new(filename).unwrap(),
+                ),
+            },
+        )
+        .expect("send");
+
+        let mime_body = std::str::from_utf8(&out.soap_envelope.body).expect("utf8");
+        let expected = format!("Content-Disposition: attachment; filename=\"{filename}\"");
+        assert!(
+            mime_body.contains(&expected),
+            "expected '{expected}' in MIME body"
+        );
+    }
+
+    // --- End FR-001 / BUG-001 -------------------------------------------------
+    // Note: PayloadFilename validation tests (header injection, empty string,
+    // over-length) live in `mime_packaging::tests` — that is the type boundary
+    // where invariants are enforced. The send pipeline never receives an
+    // already-invalid PayloadFilename; the type system prevents it.
+
     #[test]
     fn as4_send_wraps_business_payload_with_sbdh_when_configured() {
         let session = SessionContext::new("s1", "p1", "strict")
@@ -525,6 +619,7 @@ Content-ID: <{cid}>\r\n\
                 payload: b"<Invoice xmlns=\"urn:test\"><ID>INV-1</ID></Invoice>".to_vec(),
                 policy,
                 credentials: Some(test_as4_credentials()),
+                payload_filename: None,
             },
         )
         .expect("send with sbdh");
@@ -560,6 +655,7 @@ Content-ID: <{cid}>\r\n\
                 payload: b"data".to_vec(),
                 policy,
                 credentials: Some(test_as4_credentials()),
+                payload_filename: None,
             },
         )
         .expect("send");
@@ -598,6 +694,7 @@ Content-ID: <{cid}>\r\n\
                 payload: b"response payload".to_vec(),
                 policy,
                 credentials: Some(test_as4_credentials()),
+                payload_filename: None,
             },
         )
         .expect("send");
@@ -633,6 +730,7 @@ Content-ID: <{cid}>\r\n\
                 payload: b"reply payload".to_vec(),
                 policy,
                 credentials: Some(built_creds),
+                payload_filename: None,
             },
         )
         .expect("send");
@@ -693,6 +791,7 @@ Content-ID: <{cid}>\r\n\
                     ..As4SendPolicy::default()
                 },
                 credentials: Some(test_as4_credentials()),
+                payload_filename: None,
             },
         )
         .expect("send");
@@ -741,6 +840,7 @@ Content-ID: <{cid}>\r\n\
                     ..As4SendPolicy::default()
                 },
                 credentials: Some(test_as4_credentials()),
+                payload_filename: None,
             },
         )
         .expect("send");
@@ -792,6 +892,7 @@ Content-ID: <{cid}>\r\n\
                     ..As4SendPolicy::default()
                 },
                 credentials: Some(test_as4_credentials()),
+                payload_filename: None,
             },
         )
         .expect("send encrypt");
@@ -836,6 +937,7 @@ Content-ID: <{cid}>\r\n\
                     ..As4SendPolicy::default()
                 },
                 credentials: Some(test_as4_credentials()),
+                payload_filename: None,
             },
         )
         .expect("send header encrypt");
@@ -877,6 +979,7 @@ Content-ID: <{cid}>\r\n\
                     ..As4SendPolicy::default()
                 },
                 credentials: Some(creds.clone()),
+                payload_filename: None,
             },
         )
         .expect("send encrypt+sign");
@@ -935,6 +1038,7 @@ Content-ID: <{cid}>\r\n\
                     ..As4SendPolicy::default()
                 },
                 credentials: Some(creds.clone()),
+                payload_filename: None,
             },
         )
         .expect("send mime");
@@ -994,6 +1098,7 @@ Content-ID: <{cid}>\r\n\
                 payload: business_payload.to_vec(),
                 policy,
                 credentials: Some(creds),
+                payload_filename: None,
             },
         )
         .expect("send sbdh payload");
@@ -1059,6 +1164,7 @@ Content-ID: <{cid}>\r\n\
                     ..As4SendPolicy::default()
                 },
                 credentials: Some(creds.clone()),
+                payload_filename: None,
             },
         )
         .expect("send mime");
@@ -1118,6 +1224,7 @@ Content-ID: <{cid}>\r\n\
                     ..As4SendPolicy::default()
                 },
                 credentials: Some(creds.clone()),
+                payload_filename: None,
             },
         )
         .expect("send mime");
@@ -1184,6 +1291,7 @@ Content-ID: <{cid}>\r\n\
                     ..As4SendPolicy::default()
                 },
                 credentials: Some(creds.clone()),
+                payload_filename: None,
             },
         )
         .expect("send mime");
@@ -1628,6 +1736,7 @@ Content-ID: <{cid}>\r\n\
                     ..As4SendPolicy::default()
                 },
                 credentials: Some(creds),
+                payload_filename: None,
             },
         )
         .expect_err("strict runtime send policy must reject empty action");
@@ -1660,6 +1769,7 @@ Content-ID: <{cid}>\r\n\
                 payload: b"payload".to_vec(),
                 policy: As4SendPolicy::default(),
                 credentials: Some(mismatched),
+                payload_filename: None,
             },
         )
         .expect_err("strict runtime send policy must reject mismatched signing credentials");
@@ -1692,6 +1802,7 @@ Content-ID: <{cid}>\r\n\
                     ..As4SendPolicy::default()
                 },
                 credentials: Some(creds),
+                payload_filename: None,
             },
         )
         .expect_err("strict runtime send policy must reject empty service");
@@ -1721,6 +1832,7 @@ Content-ID: <{cid}>\r\n\
                     ..As4SendPolicy::default()
                 },
                 credentials: Some(creds),
+                payload_filename: None,
             },
         )
         .expect_err("strict runtime send policy must reject empty ref_to_message_id");
@@ -2734,6 +2846,7 @@ Content-ID: <{cid}>\r\n\
                     ..As4SendPolicy::default()
                 },
                 credentials: Some(creds),
+                payload_filename: None,
             },
         )
         .expect("strict send runtime with strict-only profile must succeed");

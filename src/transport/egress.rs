@@ -32,6 +32,7 @@
 //!         payload,
 //!         policy,
 //!         credentials: Some(creds),
+//!         payload_filename: None,
 //!     },
 //! )?;
 //! let outcome = transport.send("https://partner.example/as4", &output).await?;
