@@ -146,7 +146,7 @@ impl PayloadFilename {
         if let Some(bad) = bytes
             .iter()
             .copied()
-            .find(|&b| b < 0x20 || b > 0x7E || b == b'"' || b == b'\\')
+            .find(|&b| !(0x20..=0x7E).contains(&b) || b == b'"' || b == b'\\')
         {
             return Err(PayloadFilenameError(format!(
                 "payload filename contains character 0x{bad:02X} not allowed in a \
