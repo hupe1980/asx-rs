@@ -70,8 +70,17 @@ pub use entrypoints::{
     receive_push_with_dedup_async, receive_push_with_dedup_async_fragment_aware,
     receive_push_with_dedup_sync, receive_push_with_dedup_sync_fragment_aware,
 };
-#[cfg(test)]
+#[cfg(feature = "testing")]
+pub use entrypoints::{
+    receive_push_with_dedup_async_with_custom_verifier,
+    receive_push_with_dedup_sync_with_custom_verifier,
+};
+#[cfg(feature = "testing")]
+pub use verifier::InsecureBypassAs4Verifier;
+#[cfg(all(test, not(feature = "testing")))]
 pub(crate) use verifier::private;
+#[cfg(feature = "testing")]
+pub use verifier::private;
 pub use verifier::{As4Verifier, As4WsSecVerifier};
 use verifier_wrappers::{
     receive_push_with_dedup_async_with_verifier, receive_push_with_dedup_sync_with_verifier,

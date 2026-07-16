@@ -89,7 +89,7 @@ pub fn generate_xmlsig_signature_with_external_references_preparsed(
                 ErrorCode::SecurityVerificationFailed,
                 format!(
                     "XMLDSig signing key type {:?} is not supported; \
-                     use an RSA or EC (P-256/P-384/P-521) key",
+                     use an RSA or any ECDSA-capable EC key (P-256, P-384, P-521, BrainpoolP256r1, etc.)",
                     other
                 ),
                 ErrorContext::new("wssec_generate_signature"),
@@ -321,6 +321,19 @@ fn generate_xmlsig_signature_core(
             "<ds:KeyInfo><ds:X509Data><ds:X509Certificate>{}</ds:X509Certificate></ds:X509Data></ds:KeyInfo>",
             cert_der_b64
         ),
+        WsSecOutboundKeyInfoProfile::X509PKIPathv1 => {
+            // SecurityTokenReference pointing to the wsse:BinarySecurityToken
+            // with wsu:Id="X509PKIPathToken" that the caller must place in the
+            // wsse:Security header via WsSecurityHeaderBuilder::with_signing_cert_pkipath_der.
+            const WSSE_NS_URI: &str =
+                "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd";
+            const PKIPATH_VALUE_TYPE: &str = "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-x509-token-profile-1.0#X509PKIPathv1";
+            format!(
+                "<ds:KeyInfo><wsse:SecurityTokenReference xmlns:wsse=\"{WSSE_NS_URI}\">\
+                 <wsse:Reference URI=\"#X509PKIPathToken\" ValueType=\"{PKIPATH_VALUE_TYPE}\"/>\
+                 </wsse:SecurityTokenReference></ds:KeyInfo>"
+            )
+        }
     };
 
     Ok(format!(

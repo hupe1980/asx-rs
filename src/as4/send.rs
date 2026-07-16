@@ -445,17 +445,33 @@ fn send_sync_prepared_ref(
             policy.outbound_key_info_profile,
         )?;
 
-        let wsse_header = WsSecurityHeaderBuilder::new()
-            .with_signing_cert(signing_cert_pem_bytes)
-            .with_signature_xml(signature_xml)
-            .build()
-            .map_err(|err| {
+        // Build the WS-Security header, choosing BST token type based on the
+        // outbound key-info profile.  X509PKIPathv1 requires a PKIPath-encoded
+        // BST (DER SEQUENCE { Certificate }) referenced by SecurityTokenReference;
+        // all other profiles embed the leaf certificate as X509v3.
+        let use_pkipath = policy.outbound_key_info_profile
+            == crate::crypto::wssec::WsSecOutboundKeyInfoProfile::X509PKIPathv1;
+        let mut header_builder = WsSecurityHeaderBuilder::new().with_signature_xml(signature_xml);
+        header_builder = if use_pkipath {
+            let cert_der = signing_cert_ref.to_der().map_err(|_err| {
                 AsxError::new(
                     ErrorCode::ParseFailed,
-                    format!("failed to build WS-Security header: {err:?}"),
+                    "failed to DER-encode AS4 signing certificate for PKIPath BST",
                     ErrorContext::for_session("as4_send_sign", session),
                 )
             })?;
+            let pkipath = crate::crypto::soap_builder::build_pkipath_der(&cert_der);
+            header_builder.with_signing_cert_pkipath_der(pkipath)
+        } else {
+            header_builder.with_signing_cert(signing_cert_pem_bytes)
+        };
+        let wsse_header = header_builder.build().map_err(|err| {
+            AsxError::new(
+                ErrorCode::ParseFailed,
+                format!("failed to build WS-Security header: {err:?}"),
+                ErrorContext::for_session("as4_send_sign", session),
+            )
+        })?;
         let wsse_header = generated_xml_bytes_to_string(wsse_header);
 
         // Rebuild the SOAP envelope with the structured WS-Security header,

@@ -31,6 +31,23 @@ pub use pull::{
     As4EnqueuePullWithReliabilityRequest, As4ReceivePullWithReliabilityRequest,
     enqueue_pull_with_reliability, receive_pull_with_reliability,
 };
+/// Re-export of the `As4Verifier` sealing trait — available only under
+/// `testing` so external crates can implement their own custom verifiers.
+///
+/// ```toml
+/// # Enable in dev-dependencies only
+/// asx-rs = { version = "0.6", features = ["as4", "testing"] }
+/// ```
+///
+/// ```rust,ignore
+/// use asx_rs::as4::{As4Verifier, verifier_seal};
+///
+/// struct RecordingVerifier { ... }
+/// impl verifier_seal::Sealed for RecordingVerifier {}
+/// impl As4Verifier for RecordingVerifier { ... }
+/// ```
+#[cfg(feature = "testing")]
+pub use receive::private as verifier_seal;
 pub use receive::{
     As4ReceivePushAsyncFragmentAwareRequest, As4ReceivePushOrderedFragmentAwareRequest,
     As4ReceivePushOrderedRequest, As4ReceivePushSyncFragmentAwareRequest,
@@ -38,6 +55,11 @@ pub use receive::{
     receive_push_ordered_fragment_aware, receive_push_with_dedup_async,
     receive_push_with_dedup_async_fragment_aware, receive_push_with_dedup_sync,
     receive_push_with_dedup_sync_fragment_aware,
+};
+#[cfg(feature = "testing")]
+pub use receive::{
+    InsecureBypassAs4Verifier, receive_push_with_dedup_async_with_custom_verifier,
+    receive_push_with_dedup_sync_with_custom_verifier,
 };
 pub use send::{
     As4SendPreparedRequest, As4SendRequest, send_async, send_async_prepared, send_sync,
@@ -59,6 +81,13 @@ pub use mime_packaging::{
 pub mod pmode;
 #[cfg(feature = "testing")]
 pub mod test_service;
+
+/// In-process AS4 mock endpoint for integration testing.
+///
+/// Available under `as4 + testing + server` features.
+/// See [`mock_endpoint::MockAs4Endpoint`] for details.
+#[cfg(all(feature = "testing", feature = "server"))]
+pub mod mock_endpoint;
 
 #[cfg(test)]
 const DEFAULT_MPC: &str =
@@ -751,6 +780,7 @@ Content-ID: <{cid}>\r\n\
                         require_signed_push: true,
                         fail_closed_audit_events: false,
                         inbound_decryption_key_pem: None,
+                        require_encrypted_inbound: false,
                         timestamp_freshness_window: None,
                         fragment_scope_policy: FragmentScopePolicy::UseSoapSenderId,
                     },
@@ -1000,6 +1030,7 @@ Content-ID: <{cid}>\r\n\
                         require_signed_push: true,
                         fail_closed_audit_events: false,
                         inbound_decryption_key_pem: creds.signing_key_pem.clone().map(Arc::from),
+                        require_encrypted_inbound: false,
                         timestamp_freshness_window: None,
                         fragment_scope_policy: FragmentScopePolicy::UseSoapSenderId,
                     },
@@ -1059,6 +1090,7 @@ Content-ID: <{cid}>\r\n\
                         require_signed_push: true,
                         fail_closed_audit_events: false,
                         inbound_decryption_key_pem: None,
+                        require_encrypted_inbound: false,
                         timestamp_freshness_window: None,
                         fragment_scope_policy: FragmentScopePolicy::UseSoapSenderId,
                     },
@@ -1119,6 +1151,7 @@ Content-ID: <{cid}>\r\n\
                         require_signed_push: true,
                         fail_closed_audit_events: false,
                         inbound_decryption_key_pem: None,
+                        require_encrypted_inbound: false,
                         timestamp_freshness_window: None,
                         fragment_scope_policy: FragmentScopePolicy::UseSoapSenderId,
                     },
@@ -1185,6 +1218,7 @@ Content-ID: <{cid}>\r\n\
                     require_signed_push: true,
                     fail_closed_audit_events: false,
                     inbound_decryption_key_pem: None,
+                    require_encrypted_inbound: false,
                     timestamp_freshness_window: None,
                     fragment_scope_policy: FragmentScopePolicy::UseSoapSenderId,
                 },
@@ -1254,6 +1288,7 @@ Content-ID: <{cid}>\r\n\
                         require_signed_push: true,
                         fail_closed_audit_events: false,
                         inbound_decryption_key_pem: None,
+                        require_encrypted_inbound: false,
                         timestamp_freshness_window: None,
                         fragment_scope_policy: FragmentScopePolicy::UseSoapSenderId,
                     },
@@ -1322,6 +1357,7 @@ Content-ID: <{cid}>\r\n\
                         require_signed_push: true,
                         fail_closed_audit_events: false,
                         inbound_decryption_key_pem: None,
+                        require_encrypted_inbound: false,
                         timestamp_freshness_window: None,
                         fragment_scope_policy: FragmentScopePolicy::UseSoapSenderId,
                     },
@@ -1370,6 +1406,7 @@ Content-ID: <{cid}>\r\n\
                         require_signed_push: false,
                         fail_closed_audit_events: false,
                         inbound_decryption_key_pem: None,
+                        require_encrypted_inbound: false,
                         timestamp_freshness_window: None,
                         fragment_scope_policy: FragmentScopePolicy::UseSoapSenderId,
                     },
@@ -1922,6 +1959,7 @@ Content-ID: <{cid}>\r\n\
                         require_signed_push: false,
                         fail_closed_audit_events: false,
                         inbound_decryption_key_pem: None,
+                        require_encrypted_inbound: false,
                         timestamp_freshness_window: None,
                         fragment_scope_policy: FragmentScopePolicy::UseSoapSenderId,
                     },
@@ -1948,6 +1986,7 @@ Content-ID: <{cid}>\r\n\
                         require_signed_push: false,
                         fail_closed_audit_events: false,
                         inbound_decryption_key_pem: None,
+                        require_encrypted_inbound: false,
                         timestamp_freshness_window: None,
                         fragment_scope_policy: FragmentScopePolicy::UseSoapSenderId,
                     },
@@ -2009,6 +2048,7 @@ Content-ID: <{cid}>\r\n\
                         require_signed_push: false,
                         fail_closed_audit_events: false,
                         inbound_decryption_key_pem: None,
+                        require_encrypted_inbound: false,
                         timestamp_freshness_window: None,
                         fragment_scope_policy: FragmentScopePolicy::UseSoapSenderId,
                     },
@@ -2070,6 +2110,7 @@ Content-ID: <{cid}>\r\n\
                         require_signed_push: true,
                         fail_closed_audit_events: true,
                         inbound_decryption_key_pem: None,
+                        require_encrypted_inbound: false,
                         timestamp_freshness_window: None,
                         fragment_scope_policy: FragmentScopePolicy::UseSoapSenderId,
                     },

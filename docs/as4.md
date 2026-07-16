@@ -8,7 +8,7 @@ AS4 (ebMS3 + eDelivery) support in `asx-rs` is exposed through free functions in
 
 Primary flows:
 
-1. Outbound AS4 UserMessage send.
+1. Outbound AS4 UserMessage send (signed, optionally encrypted).
 2. Inbound push receive with dedup, WS-Security verification, and optional XML decryption.
 3. Ordered push receive with conversation gate.
 4. Pull receive with reliability integration.
@@ -16,11 +16,191 @@ Primary flows:
 
 ## Important Packaging Rule
 
-Outbound payload packaging is MIME-only (`multipart/related`) with detached payload attachments and cid references.
+Outbound payload packaging is MIME-only (`multipart/related`) with detached payload
+attachments and cid references.  Embedded SOAP payload mode is unsupported for receive
+and rejected on send.
 
-Embedded SOAP payload mode is unsupported for receive and removed from send behavior.
+---
 
-## Public Entry Points
+## Signing: RSA-SHA256 and ECDSA-SHA256
+
+`asx-rs` selects the XMLDSig signature algorithm automatically from the private key type:
+
+| Key type | Algorithm URI | Profiles |
+|---|---|---|
+| RSA | `http://www.w3.org/2001/04/xmldsig-more#rsa-sha256` | PEPPOL, CEF eDelivery |
+| EC (any curve) | `http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha256` | BDEW AS4-Profil §2.2.6.2.1, BSI TR-03116-3 §9.1 |
+
+No policy knob is required — pass the signing cert+key PEM and the library detects the
+type.  BrainpoolP256r1 (BSI) and NIST P-256/P-384/P-521 are all supported.
+
+### X509PKIPathv1 outbound token type
+
+BDEW AS4-Profil §2.2.6.2.1 requires the `wsse:BinarySecurityToken` to use
+`ValueType="...#X509PKIPathv1"` (a DER-encoded PKI path).  Enable it on the send policy:
+
+```rust
+use asx_rs::crypto::wssec::WsSecOutboundKeyInfoProfile;
+
+let (policy, creds) = As4SendPolicyBuilder::new()
+    .outbound_key_info_profile(WsSecOutboundKeyInfoProfile::X509PKIPathv1)
+    // ... signing_cert_pem, signing_key_pem, action, service
+    .build()?;
+```
+
+When `X509PKIPathv1` is set, the send path automatically:
+1. Builds a `wsse:BinarySecurityToken` with `ValueType="...#X509PKIPathv1"` in the
+   Security header (DER SEQUENCE { leaf certificate })
+2. Emits `<wsse:SecurityTokenReference>` in `ds:KeyInfo` pointing to that token by
+   `wsu:Id="X509PKIPathToken"`
+
+---
+
+## XML Encryption: automatic key transport selection
+
+`asx-rs` selects the XML Encryption key transport algorithm from the recipient
+certificate's public key type at call time.  No configuration is needed.
+
+| Recipient cert key | Key transport | Key reference | Profiles |
+|---|---|---|---|
+| RSA | RSA-OAEP (SHA-256/MGF1-SHA-256) | `BinarySecurityToken` | PEPPOL, CEF eDelivery |
+| EC (NIST P-256/P-384/P-521, BrainpoolP256r1/P384r1) | ECDH-ES ephemeral + ConcatKDF (NIST SP 800-56A §5.8.1) + AES-128 Key Wrap (RFC 3394) | `X509SKI` | BDEW AS4-Profil §2.2.6.2.2, BSI TR-03116-3 §9.2 |
+
+### EC encryption XML structure
+
+When the recipient has an EC key the outbound `<xenc:EncryptedKey>` uses:
+
+```xml
+<xenc:EncryptedKey>
+  <xenc:EncryptionMethod Algorithm="http://www.w3.org/2001/04/xmlenc#kw-aes128"/>
+  <ds:KeyInfo>
+    <xenc:AgreementMethod Algorithm="http://www.w3.org/2009/xmlenc11#ECDH-ES">
+      <xenc11:KeyDerivationMethod Algorithm="http://www.w3.org/2009/xmlenc11#ConcatKDF">
+        <xenc11:ConcatKDFParams AlgorithmID="" PartyUInfo="" PartyVInfo="">
+          <ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/>
+        </xenc11:ConcatKDFParams>
+      </xenc11:KeyDerivationMethod>
+      <xenc:OriginatorKeyInfo>
+        <ds:KeyValue>
+          <dsig11:ECKeyValue>
+            <dsig11:NamedCurve URI="urn:oid:1.3.36.3.3.2.8.1.1.7"/>  <!-- BrainpoolP256r1 -->
+            <dsig11:PublicKey>BASE64_EPHEMERAL_PUBLIC_KEY</dsig11:PublicKey>
+          </dsig11:ECKeyValue>
+        </ds:KeyValue>
+      </xenc:OriginatorKeyInfo>
+      <xenc:RecipientKeyInfo>
+        <ds:X509Data><ds:X509SKI>BASE64_SKI</ds:X509SKI></ds:X509Data>
+      </xenc:RecipientKeyInfo>
+    </xenc:AgreementMethod>
+  </ds:KeyInfo>
+  <xenc:CipherData><xenc:CipherValue>WRAPPED_CEK</xenc:CipherValue></xenc:CipherData>
+</xenc:EncryptedKey>
+```
+
+`AlgorithmID`, `PartyUInfo`, and `PartyVInfo` are empty strings per BDEW AS4-Profil
+(BSI TR-03116-3 §9.2 with the referenced default ConcatKDF parameters).
+
+### ConcatKDF parameters
+
+| Parameter | Value | Source |
+|---|---|---|
+| Hash | SHA-256 | XMLenc11 |
+| Counter | 1 (single round, keydatalen ≤ 256 bits) | NIST SP 800-56A §5.8.1 |
+| keydatalen | 128 bits (for kw-aes128) | Derived from key-wrap algorithm |
+| AlgorithmID | `""` (empty) | BDEW AS4-Profil / BSI TR-03116-3 |
+| PartyUInfo | `""` | BDEW AS4-Profil |
+| PartyVInfo | `""` | BDEW AS4-Profil |
+
+---
+
+## `As4PushPolicy` — inbound receive policy
+
+```rust
+pub struct As4PushPolicy {
+    /// Interop mode (Strict is default and required for production).
+    pub interop: InteropMode,
+
+    /// Reject inbound messages without a valid WS-Security signature.
+    /// Default: `true` (fail-closed). Set `false` only for legacy partners.
+    pub require_signed_push: bool,
+
+    /// Reject inbound messages that are NOT XML-encrypted.
+    ///
+    /// Default: `false` (backward-compatible). Set `true` when encryption is
+    /// mandatory (e.g. BDEW AS4-Profil §2.2.6.2.2).  The builder fails at
+    /// construction if this is `true` but `inbound_decryption_key_pem` is unset.
+    pub require_encrypted_inbound: bool,
+
+    /// Private key PEM for decrypting inbound XML-encrypted payloads.
+    /// Accepts both RSA and EC keys:
+    ///   - RSA → RSA-OAEP (PEPPOL/CEF)
+    ///   - EC  → ECDH-ES + ConcatKDF + AES-128 Key Wrap (BDEW)
+    pub inbound_decryption_key_pem: Option<Arc<[u8]>>,
+
+    /// Whether receipt verification failures close the operation.
+    pub require_signed_receipt: bool,
+
+    /// Timestamp freshness window (default: 5 minutes per eDelivery AS4 v1.15 §5.1.3).
+    pub timestamp_freshness_window: Option<std::time::Duration>,
+
+    /// Fail-closed audit event emission.
+    pub fail_closed_audit_events: bool,
+
+    /// Fragment group sender-scope policy.
+    pub fragment_scope_policy: FragmentScopePolicy,
+}
+```
+
+### Builder example — regulated deployment with mandatory encryption
+
+```rust
+let policy = As4PushPolicyBuilder::new()
+    .inbound_decryption_key_pem(my_ec_private_key_pem)
+    .require_encrypted_inbound(true)  // ← reject unencrypted messages fail-closed
+    .build()?;
+```
+
+### Builder example — testing without PKI
+
+```rust
+// Only available with `testing` feature:
+let policy = As4PushPolicyBuilder::new()
+    .allow_unsigned_push(true)
+    .fail_closed_audit_events(false)
+    .timestamp_freshness_window(None)
+    .build()?;
+```
+
+---
+
+## `As4SendPolicy` — outbound send policy
+
+Key fields:
+
+| Field | Default | Notes |
+|---|---|---|
+| `sign` | `true` | Require signing in strict mode |
+| `encrypt` | `false` | Set `true` + `recipient_cert_pem` for encrypted send |
+| `outbound_key_info_profile` | `X509DataAndRsaKeyValue` | Use `X509PKIPathv1` for BDEW |
+| `outbound_xmlenc_payload_algorithm` | `Aes128Gcm` | AES-128-GCM (eDelivery v1.15 default) |
+| `payload_packaging_mode` | `MimeAttachment` | MIME-only (strict default) |
+
+---
+
+## Error Codes
+
+| Code | Scenario | Notes |
+|---|---|---|
+| `ParseFailed` | Malformed SOAP/MIME/XML | Retry unlikely |
+| `DecryptionFailed` | Wrong key, corrupt ciphertext, bad AES-KW integrity | Reject + audit |
+| `SecurityVerificationFailed` | Bad signature, untrusted cert, timestamp out of window | Reject + audit |
+| `PolicyViolation` | Unsigned but signing required; unencrypted but encryption required | Reject + signal error |
+| `InteropViolation` | Missing required ebMS3 element (strict mode) | Reject |
+| `ReliabilityFailure` | Non-durable dedup backend in strict mode | Fix configuration |
+
+---
+
+
 
 ### Send
 

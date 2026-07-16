@@ -222,6 +222,16 @@ pub enum WsSecOutboundKeyInfoProfile {
     #[default]
     X509DataAndRsaKeyValue,
     X509DataOnly,
+    /// WS-Security X.509 PKI path token (`wsse:BinarySecurityToken` with
+    /// `ValueType="...#X509PKIPathv1"`).  The `ds:KeyInfo` inside the signature
+    /// element contains a `<wsse:SecurityTokenReference>` pointing to the BST
+    /// by `wsu:Id` instead of an inline `ds:X509Certificate`.
+    ///
+    /// Required by BDEW AS4-Profil §2.2.6.2.1 and some German energy market
+    /// profiles.  When this profile is selected, the caller must also use
+    /// [`WsSecurityHeaderBuilder::with_signing_cert_pkipath_der`] so that the
+    /// BST element and `ds:KeyInfo` reference are consistent.
+    X509PKIPathv1,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]

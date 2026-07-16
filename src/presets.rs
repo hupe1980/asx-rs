@@ -1004,7 +1004,7 @@ mod tests {
         assert!(preset.send_policy.fail_closed_audit_events);
         assert!(preset.push_policy.fail_closed_audit_events);
         assert!(preset.pull_policy.fail_closed_audit_events);
-        assert!(preset.push_policy.require_signed_push());
-        assert!(preset.pull_policy.require_signed_push());
+        assert!(preset.push_policy.require_signed_push);
+        assert!(preset.pull_policy.require_signed_push);
     }
 }

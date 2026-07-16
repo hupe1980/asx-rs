@@ -40,8 +40,7 @@ fn cert_subject_cn(cert: &X509Ref) -> String {
     cert.subject_name()
         .entries_by_nid(openssl::nid::Nid::COMMONNAME)
         .next()
-        .and_then(|e| e.data().as_utf8().ok())
-        .map(|s| s.to_string())
+        .and_then(|e| e.data().to_string().ok())
         .unwrap_or_default()
 }
 

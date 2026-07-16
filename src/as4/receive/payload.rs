@@ -135,6 +135,17 @@ pub(super) fn resolve_verified_payload<'a>(
         return Ok(ResolvedVerifiedPayload::Owned(decrypted));
     }
 
+    // Fail closed if the policy requires encryption: the payload was not
+    // encrypted (decrypt_xmlenc_payload_if_present returned None, meaning no
+    // xenc:EncryptedData marker was found in the payload bytes).
+    if policy.require_encrypted_inbound {
+        return Err(AsxError::new(
+            ErrorCode::PolicyViolation,
+            "inbound AS4 payload is not XML-encrypted but require_encrypted_inbound = true",
+            ErrorContext::for_session_with_message("as4_receive_push", session, message_id),
+        ));
+    }
+
     if memmem::find(soap_bytes, b"<asx:Base64>").is_some() {
         return Err(AsxError::new(
             ErrorCode::PolicyViolation,

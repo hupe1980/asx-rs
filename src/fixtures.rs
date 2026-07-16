@@ -448,6 +448,227 @@ fn resolve_payload_path(base_dir: &Path, payload_path: &str) -> PathBuf {
     }
 }
 
+// ── Test key-pair generation ─────────────────────────────────────────────────
+
+/// EC curve selector for [`generate_self_signed_ec_keypair`].
+///
+/// Covers the curves used by the major AS4 profiles:
+/// - PEPPOL/CEF eDelivery: `P256` (NIST P-256)
+/// - BDEW AS4-Profil (BSI TR-03116-3): `BrainpoolP256r1`
+///
+/// All variants are tested with OpenSSL EC key generation.
+#[cfg(feature = "crypto")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EcCurve {
+    /// NIST P-256 (`prime256v1`), used by PEPPOL and general AS4 profiles.
+    P256,
+    /// NIST P-384 (`secp384r1`).
+    P384,
+    /// NIST P-521 (`secp521r1`).
+    P521,
+    /// BSI BrainpoolP256r1, mandated by BDEW AS4-Profil §2.2.6.2.1/2.2.6.2.2.
+    BrainpoolP256r1,
+    /// BSI BrainpoolP384r1.
+    BrainpoolP384r1,
+}
+
+#[cfg(feature = "crypto")]
+impl EcCurve {
+    fn to_nid(self) -> openssl::nid::Nid {
+        use openssl::nid::Nid;
+        match self {
+            Self::P256 => Nid::X9_62_PRIME256V1,
+            Self::P384 => Nid::SECP384R1,
+            Self::P521 => Nid::SECP521R1,
+            // BrainpoolP256r1: NID 927 in OpenSSL 1.1+
+            Self::BrainpoolP256r1 => Nid::from_raw(927),
+            Self::BrainpoolP384r1 => Nid::from_raw(931),
+        }
+    }
+}
+
+/// Generate a minimal self-signed **EC** X.509 certificate and private key.
+///
+/// Returns `(cert_pem, key_pem)`.  Both are PEM-encoded and suitable for
+/// passing to [`As4SendPolicyBuilder`][crate::as4::As4SendPolicyBuilder]
+/// (`signing_cert_pem` / `signing_key_pem` / `recipient_cert_pem`) in tests.
+///
+/// The certificate has:
+/// - Subject/Issuer: `CN=subject_cn`
+/// - Validity: 10 years from now
+/// - `KeyUsage`: `digitalSignature` + `keyAgreement` (covers both signing and
+///   ECDH-ES encryption without issuing separate certs for tests)
+/// - `BasicConstraints`: `CA:FALSE`
+///
+/// # Panics
+///
+/// Panics if key generation or certificate building fails (this should never
+/// happen for well-known NIST/Brainpool curves).
+///
+/// # Example
+///
+/// ```rust,no_run
+/// # #[cfg(all(feature = "testing", feature = "as4", feature = "crypto"))]
+/// # {
+/// use asx_rs::fixtures::{EcCurve, generate_self_signed_ec_keypair};
+/// use asx_rs::as4::As4SendPolicyBuilder;
+///
+/// let (cert_pem, key_pem) = generate_self_signed_ec_keypair("test-ap", EcCurve::BrainpoolP256r1);
+/// let (policy, creds) = As4SendPolicyBuilder::new()
+///     .signing_cert_pem(cert_pem)
+///     .signing_key_pem(key_pem)
+///     .action("urn:test:action")
+///     .service("urn:test:svc", "")
+///     .build()
+///     .expect("policy");
+/// # }
+/// ```
+#[cfg(feature = "crypto")]
+pub fn generate_self_signed_ec_keypair(subject_cn: &str, curve: EcCurve) -> (Vec<u8>, Vec<u8>) {
+    use openssl::asn1::Asn1Time;
+    use openssl::bn::BigNum;
+    use openssl::ec::{EcGroup, EcKey};
+    use openssl::hash::MessageDigest;
+    use openssl::pkey::PKey;
+    use openssl::x509::{X509, X509NameBuilder, extension::BasicConstraints, extension::KeyUsage};
+
+    let group = EcGroup::from_curve_name(curve.to_nid())
+        .unwrap_or_else(|e| panic!("EcGroup::from_curve_name failed: {e}"));
+    let ec_key = EcKey::generate(&group).unwrap_or_else(|e| panic!("EcKey::generate failed: {e}"));
+    let pkey =
+        PKey::from_ec_key(ec_key).unwrap_or_else(|e| panic!("PKey::from_ec_key failed: {e}"));
+
+    let mut name = X509NameBuilder::new().expect("X509NameBuilder");
+    name.append_entry_by_text("CN", subject_cn)
+        .expect("CN entry");
+    let name = name.build();
+
+    let mut serial = BigNum::new().expect("BigNum");
+    serial
+        .pseudo_rand(64, openssl::bn::MsbOption::MAYBE_ZERO, false)
+        .expect("serial rand");
+    let serial = serial.to_asn1_integer().expect("to_asn1_integer");
+
+    let mut builder = X509::builder().expect("X509::builder");
+    builder.set_version(2).expect("set_version");
+    builder.set_serial_number(&serial).expect("set_serial");
+    builder.set_subject_name(&name).expect("set_subject");
+    builder.set_issuer_name(&name).expect("set_issuer");
+    builder
+        .set_not_before(&Asn1Time::days_from_now(0).expect("not_before"))
+        .expect("set_not_before");
+    builder
+        .set_not_after(&Asn1Time::days_from_now(3650).expect("not_after"))
+        .expect("set_not_after");
+    builder.set_pubkey(&pkey).expect("set_pubkey");
+
+    // KeyUsage: digitalSignature (for signing) + keyAgreement (for ECDH-ES key agreement).
+    // Marked critical per RFC 5280 §4.2.1.3 and BSI TR-03116-3 requirement.
+    // NOT keyEncipherment — that is for RSA-OAEP; ECDH-ES uses keyAgreement.
+    let ku = KeyUsage::new()
+        .critical()
+        .digital_signature()
+        .key_agreement()
+        .build()
+        .expect("KeyUsage");
+    builder.append_extension(ku).expect("append KeyUsage");
+
+    let bc = BasicConstraints::new()
+        .critical()
+        .build()
+        .expect("BasicConstraints");
+    builder
+        .append_extension(bc)
+        .expect("append BasicConstraints");
+
+    builder.sign(&pkey, MessageDigest::sha256()).expect("sign");
+
+    let cert = builder.build();
+    let cert_pem = cert.to_pem().expect("cert to_pem");
+    let key_pem = pkey.private_key_to_pem_pkcs8().expect("key to_pem");
+    (cert_pem, key_pem)
+}
+
+/// Generate a minimal self-signed **RSA** X.509 certificate and private key.
+///
+/// Returns `(cert_pem, key_pem)`.  Both are PEM-encoded and suitable for
+/// PEPPOL/CEF eDelivery AS4 testing where RSA-SHA256 signing and RSA-OAEP
+/// encryption are used.
+///
+/// The certificate has:
+/// - Subject/Issuer: `CN=subject_cn`
+/// - Validity: 10 years from now
+/// - `KeyUsage`: `digitalSignature` + `keyEncipherment`
+/// - `BasicConstraints`: `CA:FALSE`
+///
+/// Use `bits = 2048` for normal testing; `bits = 4096` for stronger keys.
+///
+/// # Panics
+///
+/// Panics if key generation fails.
+#[cfg(feature = "crypto")]
+pub fn generate_self_signed_rsa_keypair(subject_cn: &str, bits: u32) -> (Vec<u8>, Vec<u8>) {
+    use openssl::asn1::Asn1Time;
+    use openssl::bn::BigNum;
+    use openssl::hash::MessageDigest;
+    use openssl::pkey::PKey;
+    use openssl::rsa::Rsa;
+    use openssl::x509::{X509, X509NameBuilder, extension::BasicConstraints, extension::KeyUsage};
+
+    let rsa = Rsa::generate(bits).unwrap_or_else(|e| panic!("Rsa::generate({bits}) failed: {e}"));
+    let pkey = PKey::from_rsa(rsa).unwrap_or_else(|e| panic!("PKey::from_rsa failed: {e}"));
+
+    let mut name = X509NameBuilder::new().expect("X509NameBuilder");
+    name.append_entry_by_text("CN", subject_cn)
+        .expect("CN entry");
+    let name = name.build();
+
+    let mut serial = BigNum::new().expect("BigNum");
+    serial
+        .pseudo_rand(64, openssl::bn::MsbOption::MAYBE_ZERO, false)
+        .expect("serial rand");
+    let serial = serial.to_asn1_integer().expect("to_asn1_integer");
+
+    let mut builder = X509::builder().expect("X509::builder");
+    builder.set_version(2).expect("set_version");
+    builder.set_serial_number(&serial).expect("set_serial");
+    builder.set_subject_name(&name).expect("set_subject");
+    builder.set_issuer_name(&name).expect("set_issuer");
+    builder
+        .set_not_before(&Asn1Time::days_from_now(0).expect("not_before"))
+        .expect("set_not_before");
+    builder
+        .set_not_after(&Asn1Time::days_from_now(3650).expect("not_after"))
+        .expect("set_not_after");
+    builder.set_pubkey(&pkey).expect("set_pubkey");
+
+    // KeyUsage: digitalSignature (for signing) + keyEncipherment (for RSA-OAEP key wrap).
+    // Marked critical per RFC 5280 §4.2.1.3.
+    // NOT keyAgreement — that is for ECDH-ES; RSA-OAEP uses keyEncipherment.
+    let ku = KeyUsage::new()
+        .critical()
+        .digital_signature()
+        .key_encipherment()
+        .build()
+        .expect("KeyUsage");
+    builder.append_extension(ku).expect("append KeyUsage");
+
+    let bc = BasicConstraints::new()
+        .critical()
+        .build()
+        .expect("BasicConstraints");
+    builder
+        .append_extension(bc)
+        .expect("append BasicConstraints");
+
+    builder.sign(&pkey, MessageDigest::sha256()).expect("sign");
+
+    let cert = builder.build();
+    let cert_pem = cert.to_pem().expect("cert to_pem");
+    let key_pem = pkey.private_key_to_pem_pkcs8().expect("key to_pem");
+    (cert_pem, key_pem)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

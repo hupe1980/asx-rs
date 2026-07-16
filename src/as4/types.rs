@@ -82,12 +82,25 @@ pub struct As4PushPolicy {
     pub interop: InteropMode,
     pub interop_exceptions: InteropExceptionPolicy,
     pub require_signed_receipt: bool,
-    #[doc(hidden)]
-    pub(crate) require_signed_push: bool,
+    /// Whether inbound push messages must carry a valid WS-Security signature.
+    ///
+    /// Defaults to `true`.  Setting to `false` disables signature enforcement
+    /// and should only be used in controlled test environments.
+    pub require_signed_push: bool,
     /// When `true` (the default), protocol event emission failures fail the
     /// receive operation (fail-closed audit semantics).
     pub fail_closed_audit_events: bool,
     pub inbound_decryption_key_pem: Option<Arc<[u8]>>,
+    /// When `true`, inbound push messages that are **not** XML-encrypted are
+    /// rejected with [`ErrorCode::PolicyViolation`].
+    ///
+    /// Requires `inbound_decryption_key_pem` to be set — the builder returns an
+    /// error if `require_encrypted_inbound` is `true` but no decryption key is
+    /// configured.
+    ///
+    /// Defaults to `false` for backward compatibility; set to `true` in any
+    /// deployment where encryption is mandatory (e.g. BDEW AS4-Profil §2.2.6.2.2).
+    pub require_encrypted_inbound: bool,
     /// Replay-window enforcement for inbound `<eb:Timestamp>`.
     ///
     /// When `Some(window)`, inbound messages whose `<eb:Timestamp>` is more than
@@ -120,6 +133,7 @@ impl Default for As4PushPolicy {
             require_signed_push: true,
             fail_closed_audit_events: true,
             inbound_decryption_key_pem: None,
+            require_encrypted_inbound: false,
             timestamp_freshness_window: Some(std::time::Duration::from_secs(300)),
             fragment_scope_policy: FragmentScopePolicy::RequireAuthenticatedScope,
         }
@@ -157,14 +171,10 @@ impl As4PushPolicy {
             require_signed_push: true,
             fail_closed_audit_events: true,
             inbound_decryption_key_pem: None,
+            require_encrypted_inbound: false,
             timestamp_freshness_window: Some(std::time::Duration::from_secs(300)),
             fragment_scope_policy: FragmentScopePolicy::RequireAuthenticatedScope,
         }
-    }
-
-    /// Return whether inbound push messages must carry a valid signature.
-    pub fn require_signed_push(&self) -> bool {
-        self.require_signed_push
     }
 
     /// Return a relaxed push receive policy for use in integration tests.
@@ -495,12 +505,30 @@ impl As4PushPolicyBuilder {
         self
     }
 
-    /// Set the PEM-encoded RSA private key used to decrypt inbound XML-Enc payloads.
+    /// Set the PEM-encoded private key used to decrypt inbound XML-Enc payloads.
+    ///
+    /// Accepts both RSA and EC private keys.  The EC path uses ECDH-ES + ConcatKDF
+    /// + AES-128 Key Wrap as required by BSI TR-03116-3 §9.2; the RSA path uses
+    ///   RSA-OAEP (SHA-256/MGF1-SHA-256) as required by PEPPOL/CEF AS4 profiles.
     ///
     /// The key is validated immediately so that callers discover misconfiguration
     /// at startup rather than on the first decryption attempt.
     pub fn inbound_decryption_key_pem(mut self, pem: Vec<u8>) -> Self {
         self.0.inbound_decryption_key_pem = Some(Arc::from(pem));
+        self
+    }
+
+    /// Require that every inbound push message is XML-encrypted.
+    ///
+    /// When `true`, unencrypted inbound messages are rejected with
+    /// [`ErrorCode::PolicyViolation`] before their payload reaches
+    /// application handlers.
+    ///
+    /// [`build`](Self::build) returns an error if this is set to `true` but
+    /// `inbound_decryption_key_pem` is not configured — an operator cannot
+    /// meaningfully require encryption while providing no key to decrypt it.
+    pub fn require_encrypted_inbound(mut self, require: bool) -> Self {
+        self.0.require_encrypted_inbound = require;
         self
     }
 
@@ -548,6 +576,14 @@ impl As4PushPolicyBuilder {
             self.0.require_signed_receipt,
             self.0.fail_closed_audit_events,
         )?;
+
+        if self.0.require_encrypted_inbound && self.0.inbound_decryption_key_pem.is_none() {
+            return Err(AsxError::new(
+                ErrorCode::InvalidInput,
+                "require_encrypted_inbound = true requires inbound_decryption_key_pem to be set",
+                ErrorContext::new(stage),
+            ));
+        }
 
         if let Some(ref pem) = self.0.inbound_decryption_key_pem {
             openssl::pkey::PKey::private_key_from_pem(pem.as_ref()).map_err(|_err| {

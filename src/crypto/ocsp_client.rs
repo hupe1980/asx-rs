@@ -692,6 +692,17 @@ fn clear_ocsp_response_cache_for_tests() {
     process_local_cache().lock().clear();
 }
 
+/// Serializes all tests that touch the process-global OCSP response cache.
+///
+/// `cargo test` runs tests in parallel by default. Tests that call
+/// `clear_ocsp_response_cache_for_tests()` share a single in-process LRU cache, so
+/// without a serialization guard a concurrent `clear()` from another test can evict
+/// an entry between the two `fetch_from_cache_or_responder` calls in the same test,
+/// producing a spurious second transport call. Each cache-touching test must acquire
+/// this guard before touching the cache.
+#[cfg(test)]
+static CACHE_TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -788,6 +799,7 @@ mod tests {
 
     #[test]
     fn cache_hit_avoids_second_transport_call() {
+        let _guard = CACHE_TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         clear_ocsp_response_cache_for_tests();
         let transport = FakeTransport::new(vec![1, 2, 3]);
         let cache_provider = ProcessLocalOcspResponseCache;
@@ -823,6 +835,7 @@ mod tests {
 
     #[test]
     fn expired_cache_refetches_transport() {
+        let _guard = CACHE_TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         clear_ocsp_response_cache_for_tests();
         let transport = FakeTransport::new(vec![4, 5, 6]);
         let cache_provider = ProcessLocalOcspResponseCache;
@@ -856,6 +869,7 @@ mod tests {
 
     #[test]
     fn empty_responder_bodies_are_not_cached() {
+        let _guard = CACHE_TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         clear_ocsp_response_cache_for_tests();
         let transport = FakeTransport::new(Vec::new());
         let cache_provider = ProcessLocalOcspResponseCache;

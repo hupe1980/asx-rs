@@ -24,7 +24,7 @@ pub(super) fn enforce_receive_push_runtime_guards(
         "as4_receive_push",
         policy.interop,
         &policy.interop_exceptions,
-        policy.require_signed_push(),
+        policy.require_signed_push,
         policy.require_signed_receipt,
         policy.fail_closed_audit_events,
     )?;

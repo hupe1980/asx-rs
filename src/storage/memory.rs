@@ -359,6 +359,49 @@ impl DedupStorage for TtlDedupStorage {
     }
 }
 
+/// Test-only wrapper that marks an [`TtlDedupStorage`] as durable.
+///
+/// In production, dedup backends must implement `is_durable() -> true` only
+/// when backed by a persistent store.  This wrapper is intentionally available
+/// only under the `testing` feature so it cannot accidentally be used in
+/// production code.
+///
+/// Use this in integration tests that need to exercise the receive pipeline
+/// without configuring a real durable backend:
+///
+/// ```rust,ignore
+/// # #[cfg(feature = "testing")]
+/// let dedup = DurableInMemoryDedupBackend::default();
+/// ```
+#[cfg(feature = "testing")]
+#[derive(Debug, Default)]
+pub struct DurableInMemoryDedupBackend(TtlDedupStorage);
+
+#[cfg(feature = "testing")]
+impl DurableInMemoryDedupBackend {
+    /// Create a new durable-flagged in-memory dedup store with the given TTL.
+    pub fn new(ttl: std::time::Duration) -> Self {
+        Self(TtlDedupStorage::new(ttl))
+    }
+}
+
+#[cfg(feature = "testing")]
+impl DedupStorage for DurableInMemoryDedupBackend {
+    /// Returns `true` — this wrapper claims durability for test use only.
+    ///
+    /// **Never use in production.** Entries are lost on process restart.
+    fn is_durable(&self) -> bool {
+        true
+    }
+
+    fn first_seen<'a>(
+        &'a self,
+        idempotency_key: &'a str,
+    ) -> BoxFuture<'a, crate::core::Result<bool>> {
+        self.0.first_seen(idempotency_key)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -23,13 +23,13 @@ ASX has a multi-layer test strategy:
 cargo test --all-features
 ```
 
-Runs all 224+ unit and integration tests. Zero failures expected.
+Runs all 887+ unit and integration tests across all test suites. Zero failures expected.
 
 Run specific feature combinations:
 ```bash
-cargo test --features "as2,client"
-cargo test --features "as4,server"
-cargo test --features "as2,as4,client,server"
+cargo test --features "as2,testing"
+cargo test --features "as4,testing,server"
+cargo test --features "as2,as4,testing,server"
 ```
 
 ---
@@ -43,8 +43,6 @@ cargo test --all-features as2_send_golden
 cargo test --all-features as2_receive_mdn
 ```
 
-Covers: MIME packaging, MIC computation (RFC 4130 §7.3.1), MDN generation/parsing, MDN signature verification, sync/async MDN modes, `As2MdnMode::None`.
-
 ### AS4 flows
 
 ```bash
@@ -52,11 +50,178 @@ cargo test --all-features as4_push_flow
 cargo test --all-features as4_pull_flow
 ```
 
-Covers: SOAP envelope construction, WS-Security signing and verification, AES-128-GCM encrypt/decrypt, RSA-OAEP/MGF1-SHA256 key wrap, pull store enqueue/dequeue, signed pull request generation, Two-Way MEP correlation, Test Service detection.
+Covers: SOAP envelope construction, WS-Security signing (RSA + ECDSA) and verification,
+AES-128-GCM encrypt/decrypt (RSA-OAEP **and** ECDH-ES + ConcatKDF + AES-128-KW), pull
+store enqueue/dequeue, Two-Way MEP correlation, Test Service detection.
+
+---
+
+## Testing Helpers (`testing` feature)
+
+The `testing` feature enables a set of utilities that make it possible to write AS4
+integration tests **without** real X.509 PKI material (BDEW WIRK certificates, PEPPOL
+production PKI, etc.).
+
+> **Security:** The `testing` feature is blocked by `compile_error!` in release profile
+> builds. It must never appear in production binaries.
+
+### `InsecureBypassAs4Verifier`
+
+Skips all WS-Security checks on inbound AS4 push messages. Parity with
+`InsecureBypassTrustVerifier` on the AS2 side.
+
+```toml
+[dev-dependencies]
+asx-rs = { version = "0.6", features = ["as4", "testing"] }
+```
+
+```rust
+use asx_rs::as4::{
+    InsecureBypassAs4Verifier,
+    receive_push_with_dedup_async_with_custom_verifier,
+    As4ReceivePushRequest,
+};
+use std::sync::Arc;
+
+let outcome = receive_push_with_dedup_async_with_custom_verifier(
+    &session, &bus, request, dedup_backend,
+    InsecureBypassAs4Verifier,  // ← bypasses ALL WS-Security verification
+).await?;
+```
+
+When active, a `tracing::warn!` is emitted so test logs are auditable and production
+log scraping can detect accidental non-test usage.
+
+### `MockAs4Endpoint`
+
+An in-process HTTP AS4 server that accepts any push message (signed or unsigned,
+encrypted or plain), records received messages in an async channel, and returns a
+synchronous AS4 receipt. Requires `testing + server` features.
+
+```toml
+[dev-dependencies]
+asx-rs = { version = "0.6", features = ["as4", "testing", "server"] }
+```
+
+```rust
+use asx_rs::as4::mock_endpoint::MockAs4Endpoint;
+use tokio::time::{timeout, Duration};
+
+// Bind to a random OS-assigned port — no PKI certificates needed.
+let endpoint = MockAs4Endpoint::bind("127.0.0.1:0").await.expect("bind");
+let url = endpoint.local_url(); // "http://127.0.0.1:PORT/as4/inbox"
+
+// Send an AS4 message to `url` using any AS4 client...
+
+// Wait for the first message (returns None if the endpoint is dropped).
+let msg = timeout(Duration::from_secs(5), endpoint.next_received())
+    .await
+    .expect("timed out")
+    .expect("endpoint closed");
+
+assert_eq!(msg.action, "urn:bdew:as4:service:UTILMD");
+assert_eq!(msg.from_party_ids, &["9900000000001"]);
+assert!(!msg.payload.is_empty());
+
+// Alias for ergonomics (matching feedback API):
+let msg = endpoint.next_message().await;
+
+// Drain all messages already received without waiting:
+let all = endpoint.drain_received().await;
+```
+
+`MockReceivedMessage` fields:
+- `action` — `<eb:Action>` value
+- `service` — `<eb:Service>` value, if present
+- `message_id` — `<eb:MessageId>`
+- `from_party_ids` — all `<eb:From/eb:PartyId>` values
+- `to_party_ids` — all `<eb:To/eb:PartyId>` values
+- `conversation_id` — `<eb:ConversationId>`, if present
+- `ref_to_message_id` — `<eb:RefToMessageId>` (Two-Way MEP correlation)
+- `payload` — decrypted, de-SBDH-stripped business payload bytes
+
+### `DurableInMemoryDedupBackend`
+
+An in-memory `TtlDedupStorage` wrapper that advertises `is_durable() = true`, allowing
+it to pass the strict durable-backend guard that fires at production receive entry points.
+
+```rust
+use asx_rs::storage::DurableInMemoryDedupBackend;
+use std::sync::Arc;
+
+let dedup: Arc<dyn asx_rs::storage::DedupStorage> = Arc::new(
+    DurableInMemoryDedupBackend::new(std::time::Duration::from_secs(3600)),
+);
+```
+
+### Self-signed keypair generators
+
+Generate minimal self-signed X.509 certificates for test use. Eliminates the need for
+downstream crates to add `openssl` or `rcgen` as dev-dependencies.
+
+```rust
+use asx_rs::fixtures::{EcCurve, generate_self_signed_ec_keypair, generate_self_signed_rsa_keypair};
+
+// EC keypairs — for ECDSA signing and/or ECDH-ES encryption:
+let (cert_pem, key_pem) = generate_self_signed_ec_keypair("test-ap", EcCurve::BrainpoolP256r1);
+let (cert_pem, key_pem) = generate_self_signed_ec_keypair("peppol-ap", EcCurve::P256);
+let (cert_pem, key_pem) = generate_self_signed_ec_keypair("p384-ap",  EcCurve::P384);
+
+// RSA keypair — for RSA-SHA256 signing and/or RSA-OAEP encryption:
+let (cert_pem, key_pem) = generate_self_signed_rsa_keypair("rsa-ap", 2048);
+```
+
+Supported `EcCurve` variants:
+
+| Variant | OID | Profiles |
+|---|---|---|
+| `P256` | 1.2.840.10045.3.1.7 | PEPPOL, general AS4 |
+| `P384` | 1.3.132.0.34 | Higher-assurance |
+| `P521` | 1.3.132.0.35 | Higher-assurance |
+| `BrainpoolP256r1` | 1.3.36.3.3.2.8.1.1.7 | BDEW AS4-Profil / BSI TR-03116-3 |
+| `BrainpoolP384r1` | 1.3.36.3.3.2.8.1.1.11 | BSI |
+
+Generated certificates have:
+- `KeyUsage` (critical): `digitalSignature` + `keyAgreement` (EC) or `keyEncipherment` (RSA)
+- `BasicConstraints` (critical): `CA:FALSE`
+- Validity: 10 years
+- Self-signed with SHA-256
+
+### Custom `As4Verifier` implementations
+
+Under `testing`, the `As4Verifier` sealed trait becomes implementable by external crates
+via the `verifier_seal` re-export:
+
+```rust
+use asx_rs::as4::{As4Verifier, verifier_seal, types::As4PushPolicy};
+use asx_rs::core::{Result, SessionContext};
+
+struct RecordingVerifier {
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+impl verifier_seal::Sealed for RecordingVerifier {}
+
+impl As4Verifier for RecordingVerifier {
+    fn verify_security(
+        &self,
+        _session: &SessionContext,
+        _policy: &As4PushPolicy,
+        _soap_xml: &str,
+        _soap_doc: &roxmltree::Document<'_>,
+        _message_id: &str,
+        _external_reference: Option<(&str, &[u8])>,
+    ) -> Result<()> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+}
+```
 
 ---
 
 ## Interop Fixture Repository
+
 
 The interop fixture corpus governs AS2 MIME and AS4 SOAP strict/relaxed flows with declared expected outcomes.
 

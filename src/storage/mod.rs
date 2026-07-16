@@ -220,3 +220,6 @@ pub trait ReconciliationStorage: Send + Sync {
 pub use memory::{
     BoundedFifoDedupStorage, InMemoryDedupStorage, InMemoryReconciliationStorage, TtlDedupStorage,
 };
+
+#[cfg(feature = "testing")]
+pub use memory::DurableInMemoryDedupBackend;

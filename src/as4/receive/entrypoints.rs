@@ -179,3 +179,56 @@ pub async fn receive_push_ordered_fragment_aware(
     )
     .await
 }
+
+/// Synchronous receive with a caller-supplied verifier — available under the
+/// `testing` feature only.
+///
+/// Allows integration tests and [`crate::as4::mock_endpoint::MockAs4Endpoint`]
+/// to inject a custom [`super::As4Verifier`] (e.g.
+/// [`super::verifier::InsecureBypassAs4Verifier`]) without real PKI material.
+///
+/// # ⚠ Security
+///
+/// Never enable the `testing` feature in production builds.  The custom-verifier
+/// entrypoint bypasses the production-hardened default verifier path.
+#[cfg(feature = "testing")]
+pub fn receive_push_with_dedup_sync_with_custom_verifier(
+    session: &SessionContext,
+    event_bus: &EventBus,
+    request: As4ReceivePushSyncRequest<'_>,
+    verifier: &(dyn super::As4Verifier + Send + Sync),
+) -> Result<As4ReceiveOutcome> {
+    super::receive_push_with_dedup_sync_with_verifier(
+        session,
+        event_bus,
+        request.request,
+        request.dedup_backend,
+        verifier,
+    )
+}
+
+/// Async receive with a caller-supplied verifier — available under the
+/// `testing` feature only.
+///
+/// See [`receive_push_with_dedup_sync_with_custom_verifier`] for the sync
+/// equivalent and a security note on this family of entrypoints.
+#[cfg(feature = "testing")]
+pub async fn receive_push_with_dedup_async_with_custom_verifier<V>(
+    session: &SessionContext,
+    event_bus: &EventBus,
+    request: As4ReceivePushRequest,
+    dedup_backend: Arc<dyn DedupStorage>,
+    verifier: V,
+) -> Result<As4ReceiveOutcome>
+where
+    V: super::As4Verifier + Send + Sync + 'static,
+{
+    super::receive_push_with_dedup_async_with_verifier(
+        session,
+        event_bus,
+        request,
+        dedup_backend,
+        verifier,
+    )
+    .await
+}

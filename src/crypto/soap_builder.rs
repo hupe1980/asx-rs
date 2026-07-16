@@ -412,10 +412,36 @@ fn escape_xml(s: &str) -> String {
         .collect()
 }
 
+/// Encode `cert_der` as a minimal DER `SEQUENCE { Certificate }` suitable for
+/// embedding in a `wsse:BinarySecurityToken` with `ValueType="...#X509PKIPathv1"`.
+///
+/// RFC 3820 defines PKIPath as `SEQUENCE SIZE (1..MAX) OF Certificate`.  For
+/// single-certificate chains — the typical case for asx-rs — this is a SEQUENCE
+/// wrapping exactly one DER-encoded certificate.
+pub fn build_pkipath_der(cert_der: &[u8]) -> Vec<u8> {
+    let len = cert_der.len();
+    let mut result = vec![0x30u8]; // SEQUENCE tag
+    if len < 128 {
+        result.push(len as u8);
+    } else if len < 0x100 {
+        result.extend_from_slice(&[0x81, len as u8]);
+    } else if len < 0x1_0000 {
+        result.extend_from_slice(&[0x82, (len >> 8) as u8, len as u8]);
+    } else {
+        result.extend_from_slice(&[0x83, (len >> 16) as u8, (len >> 8) as u8, len as u8]);
+    }
+    result.extend_from_slice(cert_der);
+    result
+}
+
 /// WS-Security header builder for X.509 certificate-based signing
 #[derive(Debug, Clone)]
 pub struct WsSecurityHeaderBuilder {
     signing_cert_pem: Option<Vec<u8>>,
+    /// When `Some`, emits a `wsse:BinarySecurityToken` with
+    /// `ValueType="...#X509PKIPathv1"` instead of `#X509v3`.
+    /// The value is the base64-encoded DER-encoded PKIPath (SEQUENCE OF Certificate).
+    signing_cert_pkipath_der: Option<Vec<u8>>,
     include_signature_placeholder: bool,
     signature_xml: Option<String>,
 }
@@ -430,6 +456,7 @@ impl WsSecurityHeaderBuilder {
     pub fn new() -> Self {
         Self {
             signing_cert_pem: None,
+            signing_cert_pkipath_der: None,
             include_signature_placeholder: false,
             signature_xml: None,
         }
@@ -437,6 +464,25 @@ impl WsSecurityHeaderBuilder {
 
     pub fn with_signing_cert(mut self, cert_pem: Vec<u8>) -> Self {
         self.signing_cert_pem = Some(cert_pem);
+        self
+    }
+
+    /// Emit a `wsse:BinarySecurityToken` with
+    /// `ValueType="...#X509PKIPathv1"` carrying a DER-encoded PKIPath
+    /// (`SEQUENCE { Certificate }`).
+    ///
+    /// Used together with [`WsSecOutboundKeyInfoProfile::X509PKIPathv1`] so
+    /// that the `ds:KeyInfo` `<wsse:SecurityTokenReference>` in the signature
+    /// references this BST by `wsu:Id="X509PKIPathToken"`.
+    ///
+    /// Build the PKIPath bytes from a single DER certificate:
+    /// ```ignore
+    /// let cert_der = signing_cert_ref.to_der()?;
+    /// let pkipath = build_pkipath_der(&cert_der);
+    /// builder = builder.with_signing_cert_pkipath_der(pkipath);
+    /// ```
+    pub fn with_signing_cert_pkipath_der(mut self, pkipath_der: Vec<u8>) -> Self {
+        self.signing_cert_pkipath_der = Some(pkipath_der);
         self
     }
 
@@ -472,6 +518,16 @@ impl WsSecurityHeaderBuilder {
             xml.push_str("      <wsse:BinarySecurityToken wsu:Id=\"X509Token\" EncodingType=\"http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-soap-message-security-1.0#Base64Binary\" ValueType=\"http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-x509-token-profile-1.0#X509v3\">\n");
             xml.push_str("        ");
             xml.push_str(&STANDARD.encode(cert_pem));
+            xml.push('\n');
+            xml.push_str("      </wsse:BinarySecurityToken>\n");
+        }
+
+        if let Some(pkipath_der) = self.signing_cert_pkipath_der {
+            xml.push_str("      <wsse:BinarySecurityToken wsu:Id=\"X509PKIPathToken\" \
+                EncodingType=\"http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-soap-message-security-1.0#Base64Binary\" \
+                ValueType=\"http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-x509-token-profile-1.0#X509PKIPathv1\">\n");
+            xml.push_str("        ");
+            xml.push_str(&STANDARD.encode(pkipath_der));
             xml.push('\n');
             xml.push_str("      </wsse:BinarySecurityToken>\n");
         }

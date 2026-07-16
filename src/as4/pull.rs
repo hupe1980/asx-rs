@@ -165,6 +165,7 @@ fn build_pull_push_policy(
         require_signed_push,
         fail_closed_audit_events,
         inbound_decryption_key_pem: None,
+        require_encrypted_inbound: false,
         timestamp_freshness_window: Some(std::time::Duration::from_secs(300)),
         fragment_scope_policy: As4FragmentScopePolicy::RequireAuthenticatedScope,
     }
