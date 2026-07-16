@@ -82,14 +82,14 @@ EDI trading partner connections worldwide.
 ```toml
 [dependencies]
 # AS4 — PEPPOL / CEF eDelivery (RSA) or BDEW (EC/ECDH-ES) — same code, key type decides
-asx-rs = { version = "0.6", features = ["as4", "client", "server", "async-ocsp"] }
+asx-rs = { version = "0.7", features = ["as4", "client", "server", "async-ocsp"] }
 
 # AS2 + AS4 with compression
-asx-rs = { version = "0.6", features = ["as2", "as4", "compression", "client", "server", "async-ocsp"] }
+asx-rs = { version = "0.7", features = ["as2", "as4", "compression", "client", "server", "async-ocsp"] }
 
 [dev-dependencies]
 # Testing without PKI certificates (MockAs4Endpoint, bypass verifier, keypair generators)
-asx-rs = { version = "0.6", features = ["as4", "testing", "server"] }
+asx-rs = { version = "0.7", features = ["as4", "testing", "server"] }
 ```
 
 > `as2` and `as4` are **not** in the default feature set — add them explicitly.
@@ -445,7 +445,7 @@ at your option.
 - Reconciliation hooks for async delivery confirmation
 
 ### 🌐 HTTP Transport
-- Axum 0.7 server integration (`server` feature) — drop-in `Router` for AS2 and AS4 ingress
+- Axum server integration (`server` feature) — drop-in `Router` for AS2 and AS4 ingress
 - Async HTTP egress via `reqwest` (`client` feature)
 - Inbound endpoint governance (`HttpEndpointPolicy`) against unexpected sources
 
@@ -471,13 +471,13 @@ Add to `Cargo.toml`:
 ```toml
 [dependencies]
 # AS2 client + server with OCSP
-asx-rs = { version = "0.5", features = ["as2", "client", "server", "async-ocsp"] }
+asx-rs = { version = "0.7", features = ["as2", "client", "server", "async-ocsp"] }
 
 # AS4 only
-asx-rs = { version = "0.5", features = ["as4", "client", "server", "async-ocsp"] }
+asx-rs = { version = "0.7", features = ["as4", "client", "server", "async-ocsp"] }
 
 # Both protocols with compression (default)
-asx-rs = { version = "0.5", features = ["as2", "as4", "compression", "client", "server", "async-ocsp"] }
+asx-rs = { version = "0.7", features = ["as2", "as4", "compression", "client", "server", "async-ocsp"] }
 ```
 
 > `as2` and `as4` are **not** enabled by default — add them explicitly.
@@ -688,7 +688,7 @@ let wrapped = doc.wrap()?;
 | `as2` | AS2 send/receive free functions (`as2::send_sync`, `as2::receive_sync`) | ❌ |
 | `as4` | AS4 send/receive free functions (`as4::send_sync`, `as4::receive_push_with_dedup_sync`) and `As4PullStore` | ❌ |
 | `client` | HTTP egress via `reqwest` (`As2HttpTransport`, `As4HttpTransport`) | ❌ |
-| `server` | Axum 0.7 router integration (`as2_router`, `as4_router`) | ❌ |
+| `server` | Axum router integration (`as2_router`, `as4_router`) | ❌ |
 | `compression` | Zlib/GZIP compression via `flate2` | ✅ |
 | `async-ocsp` | Async OCSP responder fetching via `reqwest` | ✅ |
 | `interop-strict` | Strict interop mode as default | ✅ |

@@ -8,7 +8,7 @@ The `transport` module provides three independent layers for HTTP integration. E
 |---|---|---|---|
 | Ingress | `transport::ingress` | *(always available)* | Framework-agnostic header validation |
 | Egress | `transport::egress` | `client` | Async HTTP send via reqwest |
-| Server | `transport::server` | `server` | Axum 0.7 router builders |
+| Server | `transport::server` | `server` | Axum router builders |
 
 ---
 
@@ -130,7 +130,7 @@ pub struct As4HttpIngress {
 ## Egress / HTTP Client (`client` feature)
 
 ```toml
-asx-rs = { version = "0.5", features = ["as2", "as4", "client"] }
+asx-rs = { version = "0.7", features = ["as2", "as4", "client"] }
 ```
 
 ### AS2 send
@@ -201,7 +201,7 @@ impl HttpSendOutcome {
 ## Server / Axum Integration (`server` feature)
 
 ```toml
-asx-rs = { version = "0.5", features = ["as2", "as4", "server"] }
+asx-rs = { version = "0.7", features = ["as2", "as4", "server"] }
 ```
 
 The server layer provides axum 0.7 router builders with typed handler traits. It is built on top of the framework-agnostic ingress layer — the same validation logic runs regardless of how the request arrives.
@@ -301,7 +301,7 @@ Test handlers without a network using `tower::ServiceExt::oneshot`:
 
 ```toml
 [dev-dependencies]
-tower = { version = "0.4", features = ["util"] }
+tower = { version = "0.5", features = ["util"] }
 ```
 
 ```rust

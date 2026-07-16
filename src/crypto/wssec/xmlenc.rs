@@ -1704,4 +1704,48 @@ mod tests {
         builder.sign(pkey, MessageDigest::sha256()).expect("sign");
         builder.build()
     }
+
+    /// BDEW mandatory curve — BrainpoolP256r1 (NID 927).
+    #[test]
+    fn ecdh_es_roundtrip_brainpool_p256r1() {
+        // BrainpoolP256r1 NID is 927 in OpenSSL 1.1+.
+        let nid = openssl::nid::Nid::from_raw(927);
+        let group = openssl::ec::EcGroup::from_curve_name(nid).expect("BrainpoolP256r1 group");
+        let ec_key = openssl::ec::EcKey::generate(&group).expect("ec key");
+        let pkey = openssl::pkey::PKey::from_ec_key(ec_key).expect("pkey");
+        let cert = build_test_ec_cert(&pkey);
+        let cert_pem = cert.to_pem().expect("cert pem");
+        let key_pem = pkey.private_key_to_pem_pkcs8().expect("key pem");
+
+        let plaintext = b"BDEW BrainpoolP256r1 ECDH-ES roundtrip";
+        let ciphertext =
+            encrypt_payload_xmlenc(plaintext, &cert_pem, XmlEncPayloadAlgorithm::Aes128Gcm)
+                .expect("encrypt with BrainpoolP256r1");
+
+        let xml = String::from_utf8(ciphertext.clone()).expect("utf8");
+        // Verify the correct OID is emitted in the NamedCurve element.
+        assert!(
+            xml.contains("1.3.36.3.3.2.8.1.1.7"),
+            "BrainpoolP256r1 OID must appear in NamedCurve URI"
+        );
+        assert!(xml.contains("ECDH-ES"), "must use ECDH-ES");
+        assert!(xml.contains("kw-aes128"), "must use AES-128 Key Wrap");
+
+        let decrypted =
+            decrypt_payload_xmlenc(&ciphertext, &key_pem).expect("decrypt with BrainpoolP256r1");
+        assert_eq!(
+            decrypted, plaintext,
+            "BrainpoolP256r1 ECDH-ES roundtrip must recover plaintext"
+        );
+    }
+
+    #[test]
+    fn aes_128_key_wrap_roundtrip_brainpool_sanity() {
+        // Duplicate-free alias used for context — the real AES-KW tests are above.
+        let kek = [0xBBu8; 16];
+        let cek = [0xCCu8; 16];
+        let wrapped = aes_128_key_wrap(&kek, &cek).expect("wrap");
+        let unwrapped = aes_128_key_unwrap(&kek, &wrapped).expect("unwrap");
+        assert_eq!(unwrapped, cek.as_slice());
+    }
 }

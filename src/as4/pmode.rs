@@ -107,6 +107,20 @@ pub struct PModeSecurity {
     pub encrypt_soap_headers: bool,
     /// Whether payloads should be compressed before signing (RFC 5402).
     pub compress: bool,
+    /// WS-Security outbound `ds:KeyInfo` token profile.
+    ///
+    /// Controls the form of the signing certificate reference emitted in the
+    /// outbound WS-Security `<ds:KeyInfo>` element:
+    ///
+    /// | Variant | Token type | Networks |
+    /// |---|---|---|
+    /// | `X509DataAndRsaKeyValue` | `<ds:X509Data>` + `<ds:RSAKeyValue>` (default) | PEPPOL (RSA) |
+    /// | `X509DataOnly` | `<ds:X509Data>` only | General AS4, EC keys |
+    /// | `X509PKIPathv1` | `wsse:BinarySecurityToken` + `SecurityTokenReference` | BDEW AS4-Profil §2.2.6.2.1 |
+    ///
+    /// For BDEW / BSI TR-03116-3 deployments set this to
+    /// [`WsSecOutboundKeyInfoProfile::X509PKIPathv1`].
+    pub outbound_key_info_profile: crate::crypto::wssec::WsSecOutboundKeyInfoProfile,
 }
 
 impl Default for PModeSecurity {
@@ -116,6 +130,7 @@ impl Default for PModeSecurity {
             encrypt: false,
             encrypt_soap_headers: false,
             compress: false,
+            outbound_key_info_profile: crate::crypto::wssec::WsSecOutboundKeyInfoProfile::default(),
         }
     }
 }
@@ -241,6 +256,7 @@ impl PMode {
             .encrypt_soap_headers(self.security.encrypt_soap_headers)
             .compress(self.security.compress)
             .payload_packaging_mode(self.payload_packaging)
+            .outbound_key_info_profile(self.security.outbound_key_info_profile)
             .action(&self.action)
             .service(&self.service, &self.service_type)
     }
@@ -261,6 +277,7 @@ impl PMode {
             service: self.service.clone(),
             service_type: self.service_type.clone(),
             payload_packaging_mode: self.payload_packaging,
+            outbound_key_info_profile: self.security.outbound_key_info_profile,
             ..As4SendPolicy::default()
         })
     }
@@ -280,6 +297,7 @@ impl PMode {
             service: self.service,
             service_type: self.service_type,
             payload_packaging_mode: self.payload_packaging,
+            outbound_key_info_profile: self.security.outbound_key_info_profile,
             ..As4SendPolicy::default()
         })
     }
@@ -560,5 +578,82 @@ mod tests {
 
         assert_eq!(err.code, ErrorCode::InvalidInput);
         assert!(err.message.contains("sign=false"));
+    }
+
+    #[test]
+    fn outbound_key_info_profile_propagated_through_to_send_policy() {
+        use crate::crypto::wssec::WsSecOutboundKeyInfoProfile;
+
+        let mut pm = pmode("pm-kip", "p1", "urn:svc", "urn:act", MepType::OneWayPush);
+        pm.security.outbound_key_info_profile = WsSecOutboundKeyInfoProfile::X509PKIPathv1;
+
+        let policy = pm
+            .to_send_policy()
+            .expect("P-Mode with X509PKIPathv1 must materialise");
+
+        assert_eq!(
+            policy.outbound_key_info_profile,
+            WsSecOutboundKeyInfoProfile::X509PKIPathv1,
+            "X509PKIPathv1 must be forwarded from PModeSecurity to As4SendPolicy"
+        );
+    }
+
+    #[test]
+    fn outbound_key_info_profile_propagated_through_into_send_policy() {
+        use crate::crypto::wssec::WsSecOutboundKeyInfoProfile;
+
+        let mut pm = pmode("pm-kip2", "p1", "urn:svc", "urn:act", MepType::OneWayPush);
+        pm.security.outbound_key_info_profile = WsSecOutboundKeyInfoProfile::X509DataOnly;
+
+        let policy = pm
+            .into_send_policy()
+            .expect("P-Mode with X509DataOnly must materialise");
+
+        assert_eq!(
+            policy.outbound_key_info_profile,
+            WsSecOutboundKeyInfoProfile::X509DataOnly,
+        );
+    }
+
+    #[test]
+    fn outbound_key_info_profile_propagated_through_to_send_policy_builder() {
+        use crate::crypto::wssec::WsSecOutboundKeyInfoProfile;
+
+        let mut pm = pmode("pm-kip3", "p1", "urn:svc", "urn:act", MepType::OneWayPush);
+        pm.security.outbound_key_info_profile = WsSecOutboundKeyInfoProfile::X509PKIPathv1;
+
+        // Build manually since we don't have credentials here.
+        let builder = pm.to_send_policy_builder();
+
+        // Verify the builder was initialised with the correct profile by building a relaxed policy.
+        #[cfg(feature = "testing")]
+        {
+            use crate::core::InteropMode;
+            let policy = builder
+                .interop(InteropMode::Relaxed)
+                .sign(false)
+                .fail_closed_audit_events(false)
+                .action("urn:act")
+                .service("urn:svc", "")
+                .build()
+                .expect("relaxed build must succeed");
+
+            assert_eq!(
+                policy.0.outbound_key_info_profile,
+                WsSecOutboundKeyInfoProfile::X509PKIPathv1,
+                "builder must carry X509PKIPathv1 from PModeSecurity"
+            );
+        }
+    }
+
+    #[test]
+    fn pmode_security_default_uses_x509_data_and_rsa_key_value() {
+        use crate::crypto::wssec::WsSecOutboundKeyInfoProfile;
+        let sec = PModeSecurity::default();
+        assert_eq!(
+            sec.outbound_key_info_profile,
+            WsSecOutboundKeyInfoProfile::X509DataAndRsaKeyValue,
+            "default profile must be X509DataAndRsaKeyValue for backward compat"
+        );
     }
 }
