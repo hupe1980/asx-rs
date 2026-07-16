@@ -30,7 +30,8 @@
 //!     action: "urn:action:submit".into(),
 //!     mep: MepType::OneWayPush,
 //!     security: PModeSecurity {
-//!         sign: true, encrypt: true, encrypt_soap_headers: false, compress: false
+//!         sign: true, encrypt: true, encrypt_soap_headers: false, compress: false,
+//!         ..Default::default()
 //!     },
 //!     payload_packaging: PayloadPackagingMode::MimeAttachment,
 //!     endpoint_url: Some("https://partner-a.example.com/as4".into()),
@@ -240,7 +241,8 @@ impl PMode {
     ///     service: "urn:svc".into(), service_type: "".into(),
     ///     action: "urn:act".into(), mep: MepType::OneWayPush,
     ///     security: PModeSecurity {
-    ///         sign: false, encrypt: false, encrypt_soap_headers: false, compress: false
+    ///         sign: false, encrypt: false, encrypt_soap_headers: false, compress: false,
+    ///         ..Default::default()
     ///     },
     ///     payload_packaging: PayloadPackagingMode::MimeAttachment,
     ///     endpoint_url: None,
