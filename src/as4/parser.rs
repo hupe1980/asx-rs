@@ -235,38 +235,34 @@ fn next_opening_tag_local_name(raw: &[u8], mut pos: usize) -> Option<(usize, &[u
 
             // Comment: <!-- ... -->
             if after_lt.starts_with(b"!--") {
-                if let Some(end_rel) = memmem::find(after_lt, b"-->") {
+                {
+                    let end_rel = memmem::find(after_lt, b"-->")?;
                     pos = pos + 1 + end_rel + 3;
-                } else {
-                    return None;
                 }
                 continue;
             }
 
             // CDATA: <![CDATA[ ... ]]>
             if after_lt.starts_with(b"![CDATA[") {
-                if let Some(end_rel) = memmem::find(after_lt, b"]]>") {
+                {
+                    let end_rel = memmem::find(after_lt, b"]]>")?;
                     pos = pos + 1 + end_rel + 3;
-                } else {
-                    return None;
                 }
                 continue;
             }
 
             // Doctype/declaration subset: skip to the next '>' as fail-fast precheck behavior.
-            if let Some(end_rel) = memchr(b'>', after_lt) {
+            {
+                let end_rel = memchr(b'>', after_lt)?;
                 pos = pos + 1 + end_rel + 1;
-            } else {
-                return None;
             }
             continue;
         }
         if *next == b'?' {
             let after_lt = &raw[pos + 1..];
-            if let Some(end_rel) = memmem::find(after_lt, b"?>") {
+            {
+                let end_rel = memmem::find(after_lt, b"?>")?;
                 pos = pos + 1 + end_rel + 2;
-            } else {
-                return None;
             }
             continue;
         }
