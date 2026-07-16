@@ -33,7 +33,7 @@ proptest! {
     fn as4_generated_receipt_contains_ref_to_message_id(
         message_id in "[A-Za-z0-9._:-]{1,48}",
     ) {
-        let receipt_id = format!("receipt-{}", &message_id);
+        let receipt_id = format!("receipt-{}", message_id);
         let receipt = generate_receipt(&session(), &receipt_id, &message_id).expect("receipt");
         let xml = String::from_utf8(receipt).expect("utf8");
 
