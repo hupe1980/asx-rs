@@ -393,6 +393,7 @@ fn execute_as2_fixture(
             payload: b"matrix-payload".to_vec().into(),
             mdn_payload: payload.into(),
             mdn_mode: As2MdnMode::Synchronous,
+            require_signed_mdn: false,
             expected_mic: None,
             policy,
             original_message_id: None,

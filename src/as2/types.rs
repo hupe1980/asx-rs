@@ -622,6 +622,16 @@ pub struct As2ReceiveMdnRequest {
     /// Raw MDN bytes to parse and classify.
     pub mdn_payload: Arc<[u8]>,
     pub mdn_mode: As2MdnMode,
+    /// Whether the original outbound message requested a **signed** receipt
+    /// (i.e. it carried `Disposition-Notification-Options` with a
+    /// `signed-receipt-protocol`, RFC 4130 §7.3).
+    ///
+    /// When `true`, an inbound MDN that is not `multipart/signed` with a
+    /// verifiable signature is rejected (strict) or flagged
+    /// (`mdn_signature_required_but_absent`, relaxed). This closes a
+    /// non-repudiation downgrade: without it, a MITM could strip the signature
+    /// from a receipt and still have it classified as `SuccessConfirmed`.
+    pub require_signed_mdn: bool,
     pub expected_mic: Option<String>,
     pub policy: As2ReceivePolicy,
     /// Original outbound message ID, if known by the caller.

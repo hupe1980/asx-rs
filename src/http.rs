@@ -79,7 +79,7 @@ impl HttpEndpointPolicy {
                 && self
                     .allowed_absolute_path_prefixes
                     .iter()
-                    .any(|prefix| uri.starts_with(prefix));
+                    .any(|prefix| path_target_matches_prefix(uri, prefix));
         }
 
         let Some((scheme, authority)) = parse_absolute_uri_target(uri) else {
@@ -99,6 +99,19 @@ impl HttpEndpointPolicy {
             .iter()
             .any(|configured| configured.eq_ignore_ascii_case(authority))
     }
+}
+
+/// Match an absolute-path request target against an allowed prefix on a path
+/// **segment boundary**.
+///
+/// A plain `uri.starts_with(prefix)` would let the prefix `/as2` match
+/// `/as2evil` or `/as2../admin`. Require that the prefix is either the whole
+/// path or is followed by `/` or the query separator `?`.
+fn path_target_matches_prefix(uri: &str, prefix: &str) -> bool {
+    let Some(rest) = uri.strip_prefix(prefix) else {
+        return false;
+    };
+    rest.is_empty() || rest.starts_with('/') || rest.starts_with('?')
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

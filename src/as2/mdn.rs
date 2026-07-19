@@ -99,6 +99,7 @@ fn mic_values_match(actual: &str, expected: &str) -> bool {
 pub(super) fn parse_mdn(
     raw: &[u8],
     policy: As2ReceivePolicy,
+    require_signed_mdn: bool,
     session: &SessionContext,
     event_bus: &EventBus,
     verifier: &dyn As2TrustVerifier,
@@ -126,6 +127,24 @@ pub(super) fn parse_mdn(
 
     let boundary = parsed_mail.ctype.params.get("boundary");
     let has_signed_content_type = is_signed_mdn(&parsed_mail);
+
+    // RFC 4130 §7.3: if a signed receipt was requested, an unsigned MDN is a
+    // non-repudiation downgrade and must not be silently accepted.
+    if require_signed_mdn && !has_signed_content_type {
+        match policy.interop_mode {
+            InteropMode::Strict => {
+                return Err(AsxError::new(
+                    ErrorCode::SecurityVerificationFailed,
+                    "a signed MDN was requested but the received MDN is not multipart/signed",
+                    super::ErrorContext::for_session("as2_receive_mdn_verify", session),
+                ));
+            }
+            #[cfg(feature = "interop-relaxed")]
+            InteropMode::Relaxed => {
+                interop_reasons.push("mdn_signature_required_but_absent");
+            }
+        }
+    }
 
     if has_signed_content_type {
         let mdn_body = ReceivedBodyHandle::InMemory(Arc::from(raw));

@@ -283,7 +283,10 @@ impl DurableAuditSink for InMemoryAuditSink {
                 .map(|idx| idx + 1)
                 .unwrap_or(0) // ID compacted away → replay from start (safe)
         };
-        let end_pos = (start_pos + limit).min(events.len());
+        // `saturating_add`: a caller-supplied `limit` near `usize::MAX` would
+        // overflow `start_pos + limit` and panic in debug builds on adversarial
+        // pagination input.
+        let end_pos = start_pos.saturating_add(limit).min(events.len());
         Ok(events[start_pos..end_pos].to_vec())
     }
 

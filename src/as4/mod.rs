@@ -36,7 +36,7 @@ pub use pull::{
 ///
 /// ```toml
 /// # Enable in dev-dependencies only
-/// asx-rs = { version = "0.6", features = ["as4", "testing"] }
+/// asx-rs = { version = "0.9", features = ["as4", "testing"] }
 /// ```
 ///
 /// ```rust,ignore

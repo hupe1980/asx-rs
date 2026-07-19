@@ -578,6 +578,58 @@ fn as2_cms_smime_verifier_rejects_unsigned_payload() {
     assert_eq!(err.code, ErrorCode::SecurityVerificationFailed);
 }
 
+/// `CmsSmimeTrustVerifier::requiring_signature()` must reject an
+/// encrypted-only (unsigned) message, while the default verifier accepts it.
+/// The unsigned-encrypted message is produced via relaxed-mode send (strict
+/// send mandates signing).
+#[cfg(feature = "interop-relaxed")]
+#[test]
+fn require_signed_rejects_encrypted_only_message() {
+    let creds = test_as2_credentials();
+    let bus = EventBus::new(16).expect("bus");
+    let out = send_sync(
+        &session(),
+        &bus,
+        As2SendRequest {
+            message_id: "enc-only-1".into(),
+            payload: b"<Invoice/>".to_vec(),
+            policy: As2SendPolicy {
+                interop_mode: InteropMode::Relaxed,
+                fail_closed_audit_events: false,
+                sign: false,
+                encrypt: true,
+                compress: false,
+                payload_content_type: None,
+                as2_from_id: String::new(),
+                mic_algorithm: As2MicAlgorithm::Sha256,
+                encryption_cipher: SmimeCipher::Aes256Cbc,
+            },
+            credentials: Some(creds.clone()),
+        },
+    )
+    .expect("encrypted-only send");
+
+    let key_pem = creds.signing_key_pem.clone().expect("key pem");
+    let cert_pem = creds
+        .recipient_cert_pem
+        .clone()
+        .expect("recipient cert")
+        .to_vec();
+
+    // With require_signed set, the unsigned-encrypted message is rejected.
+    let strict_verifier =
+        CmsSmimeTrustVerifier::with_decryption_credentials(key_pem.clone(), cert_pem.clone())
+            .requiring_signature();
+    let err = receive_sync(&session(), out.mime.body.to_vec(), &strict_verifier)
+        .expect_err("require_signed must reject an unsigned encrypted message");
+    assert_eq!(err.code, ErrorCode::SecurityVerificationFailed);
+
+    // Default (require_signed = false) still accepts and decrypts it.
+    let lenient_verifier = CmsSmimeTrustVerifier::with_decryption_credentials(key_pem, cert_pem);
+    receive_sync(&session(), out.mime.body.to_vec(), &lenient_verifier)
+        .expect("default verifier accepts encrypted-only message");
+}
+
 #[test]
 fn as2_receive_rejects_missing_key() {
     let err = receive_sync(
@@ -1377,6 +1429,7 @@ fn generated_mdn_parses_in_strict_mode() {
     let (parsed, reasons) = parse_mdn(
         &mdn,
         As2ReceivePolicy::default(),
+        false,
         &session(),
         &bus,
         &InsecureBypassTrustVerifier::new(TrustEvidence::verified_and_decryptable()),
@@ -1393,6 +1446,44 @@ fn generated_mdn_parses_in_strict_mode() {
         "automatic-action/MDN-sent-automatically; processed"
     );
     assert!(parsed.received_content_mic.is_some());
+}
+
+/// C-4: when a signed receipt was requested, an unsigned MDN must be rejected
+/// in strict mode (non-repudiation downgrade defence, RFC 4130 §7.3).
+#[test]
+fn unsigned_mdn_rejected_when_signed_receipt_required() {
+    let bus = strict_bus();
+    let _events = bus.subscribe_scoped_events();
+    let mdn = generate_mdn(
+        &session(),
+        "<msg-require-signed@example.com>",
+        "automatic-action/MDN-sent-automatically; processed",
+        Some("ZXELZG2MstvZ8CzynjCRhlEuxafCsnlFN6wFAV9r8AA=, sha-256"),
+    )
+    .expect("mdn generation");
+
+    // require_signed_mdn = true + unsigned MDN → rejected.
+    let err = parse_mdn(
+        &mdn,
+        As2ReceivePolicy::default(),
+        true,
+        &session(),
+        &bus,
+        &InsecureBypassTrustVerifier::new(TrustEvidence::verified_and_decryptable()),
+    )
+    .expect_err("unsigned MDN must be rejected when a signed receipt was required");
+    assert_eq!(err.code, ErrorCode::SecurityVerificationFailed);
+
+    // require_signed_mdn = false → same MDN parses fine.
+    parse_mdn(
+        &mdn,
+        As2ReceivePolicy::default(),
+        false,
+        &session(),
+        &bus,
+        &InsecureBypassTrustVerifier::new(TrustEvidence::verified_and_decryptable()),
+    )
+    .expect("unsigned MDN accepted when no signed receipt was required");
 }
 
 #[test]
@@ -1577,6 +1668,7 @@ Received-content-MIC: ZXELZG2MstvZ8CzynjCRhlEuxafCsnlFN6wFAV9r8AA=, sha-256\r\n"
             payload: vec![1].into(),
             mdn_payload: mdn.to_vec().into(),
             mdn_mode: As2MdnMode::Synchronous,
+            require_signed_mdn: false,
             expected_mic: Some("ZXELZG2MstvZ8CzynjCRhlEuxafCsnlFN6wFAV9r8AA=, sha-256".to_string()),
             policy: As2ReceivePolicy {
                 fail_closed_audit_events: false,
@@ -1610,6 +1702,7 @@ Disposition: automatic-action/MDN-sent-automatically; failed/failure: unsupporte
             payload: vec![1].into(),
             mdn_payload: mdn.to_vec().into(),
             mdn_mode: As2MdnMode::Synchronous,
+            require_signed_mdn: false,
             expected_mic: None,
             policy: As2ReceivePolicy {
                 fail_closed_audit_events: false,
@@ -1642,6 +1735,7 @@ Disposition: automatic-action/MDN-sent-automatically; processed/warning: authent
             payload: vec![1].into(),
             mdn_payload: mdn.to_vec().into(),
             mdn_mode: As2MdnMode::Asynchronous,
+            require_signed_mdn: false,
             expected_mic: Some("ZXELZG2MstvZ8CzynjCRhlEuxafCsnlFN6wFAV9r8AA=, sha-256".to_string()),
             policy: As2ReceivePolicy {
                 fail_closed_audit_events: false,
@@ -1675,6 +1769,7 @@ Disposition: automatic-action/MDN-sent-automatically; partner-custom\r\n";
             payload: vec![1].into(),
             mdn_payload: mdn.to_vec().into(),
             mdn_mode: As2MdnMode::Synchronous,
+            require_signed_mdn: false,
             expected_mic: Some("ZXELZG2MstvZ8CzynjCRhlEuxafCsnlFN6wFAV9r8AA=, sha-256".to_string()),
             policy: As2ReceivePolicy {
                 fail_closed_audit_events: false,
@@ -1707,6 +1802,7 @@ Disposition: automatic-action/MDN-sent-automatically; processed\r\n";
             payload: vec![1].into(),
             mdn_payload: mdn.to_vec().into(),
             mdn_mode: As2MdnMode::Synchronous,
+            require_signed_mdn: false,
             expected_mic: None,
             policy: As2ReceivePolicy {
                 fail_closed_audit_events: false,
@@ -1750,6 +1846,7 @@ Disposition: automatic-action/MDN-sent-automatically; processed\r\n\
             payload: vec![1].into(),
             mdn_payload: mdn.to_vec().into(),
             mdn_mode: As2MdnMode::Synchronous,
+            require_signed_mdn: false,
             expected_mic: None,
             policy: As2ReceivePolicy {
                 interop_mode: InteropMode::Strict,
@@ -1800,6 +1897,7 @@ Disposition: automatic-action/MDN-sent-automatically; processed\r\n\
             payload: vec![1].into(),
             mdn_payload: mdn.to_vec().into(),
             mdn_mode: As2MdnMode::Synchronous,
+            require_signed_mdn: false,
             expected_mic: None,
             policy: As2ReceivePolicy::default(),
             original_message_id: Some("orig-1".to_string()),
@@ -1832,6 +1930,7 @@ fn receive_with_mdn_rejects_invalid_utf8_payload() {
             payload: vec![1].into(),
             mdn_payload: mdn.into(),
             mdn_mode: As2MdnMode::Synchronous,
+            require_signed_mdn: false,
             expected_mic: None,
             policy: As2ReceivePolicy {
                 fail_closed_audit_events: false,
@@ -1871,6 +1970,7 @@ Disposition: automatic-action/MDN-sent-automatically; processed\r\n";
             payload: vec![1].into(),
             mdn_payload: mdn.to_vec().into(),
             mdn_mode: As2MdnMode::Synchronous,
+            require_signed_mdn: false,
             expected_mic: None,
             policy: As2ReceivePolicy {
                 interop_mode: InteropMode::Strict,
@@ -1903,6 +2003,7 @@ fn parse_mdn_failure_with_original_id_fails_closed_when_reconciliation_enqueue_f
             payload: vec![1].into(),
             mdn_payload: mdn.into(),
             mdn_mode: As2MdnMode::Synchronous,
+            require_signed_mdn: false,
             expected_mic: None,
             policy: As2ReceivePolicy {
                 fail_closed_audit_events: false,

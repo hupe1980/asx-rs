@@ -88,6 +88,11 @@ pub struct SoapEnvelopeBuilder {
 
 pub(crate) const MESSAGE_ID_WSU_ID: &str = "as4-message-id";
 pub(crate) const SOAP_BODY_WSU_ID: &str = "as4-body";
+/// `wsu:Id` placed on the `<ebms:Messaging>` header block so the **entire**
+/// ebMS3 UserMessage (party info, service/action, message properties, payload
+/// info) is covered by the WS-Security signature — not just the MessageId.
+/// Signing only MessageId leaves the routing/authorization metadata tamperable.
+pub(crate) const MESSAGING_WSU_ID: &str = "as4-messaging";
 
 impl SoapEnvelopeBuilder {
     /// Create a new builder.
@@ -263,7 +268,11 @@ impl SoapEnvelopeBuilder {
         }
 
         // ebMS3 Messaging/UserMessage is expected under SOAP Header.
-        xml.push_str("    <ebms:Messaging soap:mustUnderstand=\"true\">\n");
+        // The wsu:Id makes the whole block referenceable so the signature covers
+        // all UserMessage routing/authorization metadata (eDelivery AS4 profile).
+        xml.push_str(&format!(
+            "    <ebms:Messaging soap:mustUnderstand=\"true\" wsu:Id=\"{MESSAGING_WSU_ID}\">\n"
+        ));
         if let Some(mpc) = &self.mpc {
             xml.push_str(&format!(
                 "      <ebms:UserMessage mpc=\"{}\">\n",

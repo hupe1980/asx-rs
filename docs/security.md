@@ -121,13 +121,29 @@ WS-Security signature computation uses XML Exclusive C14N (W3C `exc-c14n`). The 
 
 Validated against W3C C14N test vectors (namespace propagation, attribute ordering, text/attribute escaping, PI forwarding, comment stripping, comment preservation).
 
+### Signed scope and XML Signature Wrapping defence
+
+The AS4 push signature covers **three** references: the entire `eb:Messaging`
+header block (`wsu:Id="as4-messaging"` — all `UserMessage` routing/authorization
+metadata: From, To, Service, Action, MPC, MessageProperties, PartInfo), the SOAP
+Body, and a detached `cid:` reference for the MIME payload attachment. (Earlier
+revisions signed only `ebms:MessageId`, leaving the routing metadata tamperable.)
+
+On receive, verification returns the set of verified same-document `wsu:Id`s and
+the AS4 layer requires that the document contains **exactly one** `eb:Messaging`
+block whose `wsu:Id` is in that set. This binds the block the pipeline routes on
+to the block the signature actually covered, defeating XML Signature Wrapping
+(relocating the signed element and injecting an unsigned replacement).
+
 ### Signature verification
 
 Signature verification uses:
 1. Digest verification over C14N-serialized referenced elements.
-2. RSA signature verification using `secure_eq` (constant-time comparison) for digest values.
-3. PKIX chain validation of the signing certificate.
-4. OCSP status check (if configured).
+2. RSA/ECDSA signature verification using `secure_eq` (constant-time comparison) for digest values.
+3. Minimum signing-key strength enforcement (RSA `< 2048` bits is rejected).
+4. PKIX chain validation of the signing certificate.
+5. OCSP status check (if configured).
+6. Binding of the consumed `eb:Messaging` block to the verified signature (above).
 
 Verification is fail-closed: any error at any step propagates immediately via `?`. The caller cannot ignore a failed verification.
 

@@ -7,22 +7,22 @@ Add `asx-rs` to `Cargo.toml`. Because AS2 and AS4 are feature-gated, you must se
 ```toml
 [dependencies]
 # AS2 only
-asx-rs = { version = "0.8", features = ["as2", "async-ocsp"] }
+asx-rs = { version = "0.9", features = ["as2", "async-ocsp"] }
 
 # AS4 only
-asx-rs = { version = "0.8", features = ["as4", "async-ocsp"] }
+asx-rs = { version = "0.9", features = ["as4", "async-ocsp"] }
 
 # Both protocols
-asx-rs = { version = "0.8", features = ["as2", "as4", "async-ocsp"] }
+asx-rs = { version = "0.9", features = ["as2", "as4", "async-ocsp"] }
 
 # Both protocols with payload compression (RFC 5402)
-asx-rs = { version = "0.8", features = ["as2", "as4", "compression", "async-ocsp"] }
+asx-rs = { version = "0.9", features = ["as2", "as4", "compression", "async-ocsp"] }
 
 # HTTP client (outbound) + server (inbound) with both protocols
-asx-rs = { version = "0.8", features = ["as2", "as4", "client", "server", "async-ocsp"] }
+asx-rs = { version = "0.9", features = ["as2", "as4", "client", "server", "async-ocsp"] }
 
 # Relaxed interop for explicitly scoped partner exceptions
-asx-rs = { version = "0.8", features = ["as2", "as4", "interop-relaxed", "async-ocsp"] }
+asx-rs = { version = "0.9", features = ["as2", "as4", "interop-relaxed", "async-ocsp"] }
 ```
 
 > **Note:** The default feature set is `["interop-strict", "async-ocsp"]`. Adding `asx-rs` without explicit features gives you only the shared infrastructure — no AS2 or AS4 protocol functions are compiled.
@@ -33,14 +33,15 @@ asx-rs = { version = "0.8", features = ["as2", "as4", "interop-relaxed", "async-
 |---|---|---|
 | `as2` | `as2::send_sync` / `as2::receive_sync`, async wrappers, MDN generation/parsing, MIC computation | No |
 | `as4` | `as4::send_sync` / `as4::receive_push_with_dedup_sync`, pull APIs, P-Mode registry, Test Service, SBDH | No |
-| `compression` | Zlib/GZIP payload compression via `flate2` | No |
+| `compression` | Zlib/GZIP payload compression via `flate2` | **Yes** |
 | `async-ocsp` | Async OCSP responder fetching via reqwest | **Yes** |
 | `interop-strict` | Strict interop mode as the default profile | **Yes** |
 | `interop-relaxed` | Relaxed-mode controls for explicitly scoped partner exception policies | No |
 | `client` | Async HTTP egress (`As2HttpTransport`, `As4HttpTransport` via reqwest) | No |
 | `server` | Axum HTTP server routers (`as2_router`, `as4_router`) | No |
-| `trace` | `tracing` instrumentation on send/receive paths | No |
-| `postgres-storage` | PostgreSQL-backed durable, cluster-safe dedup/reconciliation backends | No |
+| `trace` | `tracing` instrumentation on send/receive paths | **Yes** |
+| `prometheus` | Built-in Prometheus/OpenMetrics `MetricsSink` adapter | No |
+| `opentelemetry` | OpenTelemetry metrics `MetricsSink` adapter | No |
 | `testing` | `InsecureBypassAs4Verifier`, `MockAs4Endpoint` (with `builder().with_decryption_key_pem()`), `EventBus::new_for_testing()`, `As4HttpTransport::new_for_localhost_testing()`, keypair generators, interop matrix executor | No |
 
 ## Tokio Runtime

@@ -187,6 +187,12 @@ fn build_http_client(
 ) -> Result<reqwest::Client> {
     let mut builder = reqwest::Client::builder()
         .https_only(true)
+        // Never follow HTTP redirects: the SSRF/private-range validation and the
+        // pinned DNS resolution (`resolve_to_addrs`) only cover the *initial*
+        // target. A `3xx Location` to a different host would be resolved and
+        // connected unchecked, defeating the SSRF control. B2B/OCSP/SMP
+        // endpoints are fixed URLs and never legitimately redirect.
+        .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(config.connect_timeout)
         .timeout(config.request_timeout)
         .user_agent(&config.user_agent)
@@ -206,25 +212,47 @@ fn build_http_client(
     })
 }
 
-/// Returns `true` when `addr` is a private/loopback/link-local address.
+/// Returns `true` when `addr` is a private/loopback/link-local/otherwise
+/// non-globally-routable address that an egress transport must never contact
+/// (SSRF defence).
+///
+/// IPv6 addresses are first mapped to their canonical form via
+/// [`std::net::IpAddr::to_canonical`], so an IPv4-mapped address such as
+/// `::ffff:127.0.0.1` or `::ffff:169.254.169.254` is evaluated under the IPv4
+/// rules rather than slipping through as an ordinary public v6 address.
 pub(crate) fn is_private_ip(addr: std::net::IpAddr) -> bool {
-    match addr {
-        std::net::IpAddr::V4(ip) => {
-            let [a, b, ..] = ip.octets();
-            matches!(
-                (a, b),
-                (127, _) | (10, _) | (172, 16..=31) | (192, 168) | (169, 254)
-            )
-        }
-        std::net::IpAddr::V6(ip) => {
-            ip.is_loopback()
-                || ip.is_unspecified()
-                // unique-local fc00::/7
-                || (ip.segments()[0] & 0xfe00) == 0xfc00
-                // link-local fe80::/10
-                || (ip.segments()[0] & 0xffc0) == 0xfe80
-        }
+    // Collapse IPv4-mapped/compatible v6 addresses (e.g. `::ffff:127.0.0.1`)
+    // down to their embedded IPv4 form before classification.
+    match addr.to_canonical() {
+        std::net::IpAddr::V4(ip) => is_private_ipv4(ip),
+        std::net::IpAddr::V6(ip) => is_private_ipv6(ip),
     }
+}
+
+/// IPv4 ranges that must not be reachable from egress.
+fn is_private_ipv4(ip: std::net::Ipv4Addr) -> bool {
+    let [a, b, ..] = ip.octets();
+    ip.is_loopback()            // 127.0.0.0/8
+        || ip.is_private()      // 10/8, 172.16/12, 192.168/16
+        || ip.is_link_local()   // 169.254.0.0/16 (incl. cloud metadata 169.254.169.254)
+        || ip.is_broadcast()    // 255.255.255.255
+        || ip.is_documentation()// 192.0.2/24, 198.51.100/24, 203.0.113/24
+        || ip.is_multicast()    // 224.0.0.0/4
+        || a == 0               // 0.0.0.0/8 ("this host"; 0.0.0.0 routes to localhost)
+        || (a == 100 && (64..=127).contains(&b)) // 100.64.0.0/10 carrier-grade NAT
+        || (a == 192 && b == 0) // 192.0.0.0/24 IETF protocol assignments
+        || a >= 240 // 240.0.0.0/4 reserved (incl. 255/8)
+}
+
+/// IPv6 ranges that must not be reachable from egress.
+fn is_private_ipv6(ip: std::net::Ipv6Addr) -> bool {
+    ip.is_loopback()
+        || ip.is_unspecified()
+        || ip.is_multicast()
+        // unique-local fc00::/7
+        || (ip.segments()[0] & 0xfe00) == 0xfc00
+        // link-local fe80::/10
+        || (ip.segments()[0] & 0xffc0) == 0xfe80
 }
 
 /// Returns `true` when `host` is a private/loopback/link-local address or
@@ -891,6 +919,29 @@ ok\r\n\
     }
 
     #[tokio::test]
+    async fn validate_egress_url_rejects_ipv4_mapped_ipv6_and_reserved_v4() {
+        // Regression: IPv4-mapped IPv6 addresses must be canonicalized and
+        // classified under the v4 rules, and additional reserved v4 ranges
+        // (0.0.0.0/8, CGNAT, documentation) must be blocked — otherwise these
+        // are SSRF bypasses to loopback / link-local / internal targets.
+        for url in &[
+            "https://[::ffff:127.0.0.1]/as4",       // mapped loopback
+            "https://[::ffff:169.254.169.254]/as4", // mapped cloud metadata
+            "https://[::ffff:10.0.0.1]/as4",        // mapped RFC-1918
+            "https://0.0.0.0/as4",                  // 0.0.0.0/8 (routes to localhost)
+            "https://100.64.0.1/as4",               // carrier-grade NAT
+            "https://203.0.113.9/as4",              // TEST-NET-3 documentation
+        ] {
+            let err = validate_egress_url(url, "ctx").await.unwrap_err();
+            assert_eq!(
+                err.code,
+                ErrorCode::InvalidInput,
+                "expected rejection for {url}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn validate_egress_url_rejects_private_ipv6_ranges() {
         for url in &[
             "https://[::1]/as4",
@@ -909,15 +960,17 @@ ok\r\n\
 
     #[tokio::test]
     async fn validate_egress_url_accepts_public_https() {
-        // 203.0.113.1 is in TEST-NET-3 (RFC 5737) — public, non-private, no DNS needed.
-        validate_egress_url("https://203.0.113.1/as2/receive", "ctx")
+        // 8.8.8.8 is a globally-routable public address (IP literal → no DNS
+        // needed). RFC 5737 TEST-NET ranges are intentionally *not* used here:
+        // they are reserved/unroutable and are now rejected as non-global.
+        validate_egress_url("https://8.8.8.8/as2/receive", "ctx")
             .await
             .expect("public HTTPS should be accepted");
     }
 
     #[tokio::test]
     async fn validate_egress_url_rejects_public_http_by_default() {
-        let err = validate_egress_url("http://203.0.113.1/as4/receive", "ctx")
+        let err = validate_egress_url("http://8.8.8.8/as4/receive", "ctx")
             .await
             .unwrap_err();
         assert_eq!(err.code, ErrorCode::PolicyViolation);
@@ -925,7 +978,7 @@ ok\r\n\
 
     #[tokio::test]
     async fn validate_egress_target_for_ip_literal_requires_no_dns_pinning() {
-        let target = validate_egress_target_with_policy("https://203.0.113.1/as2/receive", "ctx")
+        let target = validate_egress_target_with_policy("https://8.8.8.8/as2/receive", "ctx")
             .await
             .expect("public ip literal should validate");
 

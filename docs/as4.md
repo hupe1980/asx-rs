@@ -106,10 +106,17 @@ When the recipient has an EC key the outbound `<xenc:EncryptedKey>` uses:
 |---|---|---|
 | Hash | SHA-256 | XMLenc11 |
 | Counter | 1 (single round, keydatalen ≤ 256 bits) | NIST SP 800-56A §5.8.1 |
-| keydatalen | 128 bits (for kw-aes128) | Derived from key-wrap algorithm |
+| keydatalen | 128 bits (for kw-aes128) — output truncation only | Derived from key-wrap algorithm |
 | AlgorithmID | `""` (empty) | BDEW AS4-Profil / BSI TR-03116-3 |
 | PartyUInfo | `""` | BDEW AS4-Profil |
 | PartyVInfo | `""` | BDEW AS4-Profil |
+
+The derived key material is `SHA-256(counter ‖ Z ‖ OtherInfo)` with
+`OtherInfo = AlgorithmID ‖ PartyUInfo ‖ PartyVInfo` (a **raw** concatenation per
+SP 800-56A §5.8.1 — no embedded `keydatalen`, no per-field length prefixes; the
+length-prefixed form belongs to the JOSE Concat KDF, RFC 7518, and is *not* used
+here). With the empty default parameters this reduces to `SHA-256(counter ‖ Z)`,
+and the KEK is the leftmost `keydatalen/8` bytes.
 
 ---
 
@@ -226,7 +233,13 @@ Behavior notes:
 
 1. SOAP envelope is generated and adapted for XOP/cid references.
 2. MIME package is emitted as `multipart/related` output.
-3. WS-Security signatures include detached payload reference for MIME attachment.
+3. The WS-Security signature covers three references: the whole `eb:Messaging`
+   header block (`wsu:Id="as4-messaging"` — all UserMessage routing/authorization
+   metadata), the SOAP Body, and a detached `cid:` reference for the MIME
+   attachment. On receive, the `eb:Messaging` block that the pipeline routes on is
+   bound to the verified signature (there must be exactly one such block and its
+   `wsu:Id` must be in the verified reference set) — an XML-Signature-Wrapping
+   defence.
 4. Optional XML encryption is applied before outbound packaging.
 
 ### Receive push (owned)
@@ -383,7 +396,7 @@ certificate from the SMP.
 Enable the `smp` module with the `client` feature:
 
 ```toml
-asx-rs = { version = "0.8", features = ["as4", "client", "async-ocsp"] }
+asx-rs = { version = "0.9", features = ["as4", "client", "async-ocsp"] }
 ```
 
 ### Lookup and Register a Runtime P-Mode

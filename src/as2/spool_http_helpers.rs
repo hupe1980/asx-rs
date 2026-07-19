@@ -83,6 +83,8 @@ pub(super) fn fetch_spool_key_hex_over_http(
         tokio::runtime::Handle::current().block_on(async move {
             let mut client_builder = reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(5))
+                // Fixed key-server endpoint; never follow redirects (SSRF hardening).
+                .redirect(reqwest::redirect::Policy::none())
                 .user_agent(concat!(
                     env!("CARGO_PKG_NAME"),
                     "/",

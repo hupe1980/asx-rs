@@ -494,7 +494,17 @@ pub mod async_transport {
         }
 
         fn get_client(&self) -> reqwest::Client {
-            self.client.clone().unwrap_or_default()
+            self.client.clone().unwrap_or_else(|| {
+                // The OCSP responder URL is taken from the certificate's AIA
+                // extension and is therefore attacker-influenced for an
+                // attacker-supplied cert. Never follow redirects: a `3xx` could
+                // steer the request to an internal host (SSRF). A responder URL
+                // is a fixed endpoint that has no legitimate reason to redirect.
+                reqwest::Client::builder()
+                    .redirect(reqwest::redirect::Policy::none())
+                    .build()
+                    .unwrap_or_default()
+            })
         }
     }
 

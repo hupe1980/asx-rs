@@ -228,6 +228,42 @@ impl EventBusMetrics {
         // above so this thread sees the zeroed counter before incrementing.
         counter.fetch_add(n, Ordering::AcqRel) + n
     }
+
+    /// Reset the window counters if the current window has expired.
+    ///
+    /// Shared by the increment path and the read path so that a stale count
+    /// from a past window cannot survive into the next one.
+    fn reset_window_if_expired(&self) {
+        let now_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let epoch = self.window_epoch.load(Ordering::Acquire);
+        if epoch != 0
+            && now_secs >= epoch + self.window_secs
+            && self
+                .window_epoch
+                .compare_exchange(epoch, now_secs, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        {
+            self.window_dropped.store(0, Ordering::Release);
+            self.window_lagged.store(0, Ordering::Release);
+        }
+    }
+
+    /// Current per-window `lagged` count, **advancing the window on read**.
+    ///
+    /// A bare `window_lagged.load()` is not enough for the backpressure read
+    /// path: the window is otherwise only reset inside `window_count_add`, which
+    /// runs solely on drop/lag events. After a transient burst pushed the count
+    /// to the `FailClosed` threshold, if no further lag occurred the counter
+    /// would never reset and every subsequent emit would fail closed forever.
+    /// Resetting here when the wall clock has passed the window boundary keeps
+    /// `FailClosed` self-healing once the burst subsides.
+    pub(super) fn current_window_lagged(&self) -> u64 {
+        self.reset_window_if_expired();
+        self.window_lagged.load(Ordering::Acquire)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

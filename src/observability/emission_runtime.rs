@@ -39,6 +39,23 @@ fn persist_via_audit_fallback(
 impl EventBus {
     #[cfg_attr(feature = "trace", tracing::instrument(skip_all, fields(session_id = %session.session_id())))]
     pub fn emit(&self, session: &SessionContext, event: AsxEvent) -> Result<()> {
+        // Public emits own their audit-fallback persistence.
+        self.emit_internal(session, event, true)
+    }
+
+    /// Core emit. `persist_audit_fallback` controls whether the no-subscriber
+    /// path writes the event to the durable audit sink.
+    ///
+    /// [`emit_audit_event`] persists the event itself *before* emitting (so the
+    /// audit record survives regardless of subscriber liveness), then calls
+    /// this with `persist_audit_fallback = false` — otherwise the same event
+    /// would be written to the compliance log twice under two `event_id`s.
+    fn emit_internal(
+        &self,
+        session: &SessionContext,
+        event: AsxEvent,
+        persist_audit_fallback: bool,
+    ) -> Result<()> {
         let shared_event = Arc::new(event);
         self.metrics
             .observe_event(shared_event.as_ref(), self.metrics_sink.as_ref());
@@ -73,12 +90,18 @@ impl EventBus {
             // Persist to audit sink if available; write failures are fail-closed
             // in fallback mode because the sink is the compliance record.
             if self.audit_sink.is_some() {
-                persist_via_audit_fallback(
-                    self,
-                    session,
-                    shared_event.as_ref(),
-                    "event_bus_audit_fallback",
-                )?;
+                if persist_audit_fallback {
+                    persist_via_audit_fallback(
+                        self,
+                        session,
+                        shared_event.as_ref(),
+                        "event_bus_audit_fallback",
+                    )?;
+                } else {
+                    // Caller already persisted this event; just account for it.
+                    self.metrics.emitted.fetch_add(1, Ordering::Relaxed);
+                    validate_lagged_backpressure(self, session)?;
+                }
                 return Ok(());
             }
             self.metrics.inc_dropped();
@@ -183,12 +206,17 @@ impl EventBus {
                     EventEmissionMode::StrictWithAuditFallback
                 ) && self.audit_sink.is_some()
                 {
-                    persist_via_audit_fallback(
-                        self,
-                        session,
-                        shared_event.as_ref(),
-                        "event_bus_audit_fallback",
-                    )?;
+                    if persist_audit_fallback {
+                        persist_via_audit_fallback(
+                            self,
+                            session,
+                            shared_event.as_ref(),
+                            "event_bus_audit_fallback",
+                        )?;
+                    } else {
+                        self.metrics.emitted.fetch_add(1, Ordering::Relaxed);
+                        validate_lagged_backpressure(self, session)?;
+                    }
                     return Ok(());
                 }
 
@@ -221,7 +249,10 @@ pub fn emit_audit_event(
         Err(err) => return Err(err),
     }
 
-    match bus.emit(session, event) {
+    // We already persisted the event above, so tell `emit` not to persist again
+    // in its no-subscriber audit-fallback path — otherwise the same event lands
+    // in the durable compliance log twice under two distinct `event_id`s.
+    match bus.emit_internal(session, event, false) {
         Ok(()) => Ok(()),
         Err(_) if !fail_closed => Ok(()),
         Err(_) => Err(AsxError::new(

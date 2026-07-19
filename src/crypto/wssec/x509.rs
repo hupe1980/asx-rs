@@ -208,6 +208,27 @@ pub(crate) fn validate_pkix_chain_and_revocation(
 }
 
 /// Validate an end-entity certificate DER for validity period, CA flag, KeyUsage, and EKU.
+/// Minimum accepted RSA modulus size in bits.
+///
+/// 2048 bits is the floor mandated by NIST SP 800-131A / BSI TR-02102-2 for
+/// signatures valid beyond 2030; 1024-bit RSA is broken for long-lived B2B
+/// non-repudiation and is rejected.
+const MIN_RSA_MODULUS_BITS: usize = 2048;
+
+/// Effective bit length of a big-endian unsigned modulus (leading zero bytes and
+/// the high zero bits of the top non-zero byte do not count).
+fn unsigned_bigint_bits(bytes: &[u8]) -> usize {
+    let first_nonzero = bytes.iter().position(|&b| b != 0);
+    match first_nonzero {
+        None => 0,
+        Some(idx) => {
+            let remaining = &bytes[idx..];
+            let top = remaining[0];
+            (remaining.len() - 1) * 8 + (8 - top.leading_zeros() as usize)
+        }
+    }
+}
+
 pub(crate) fn validate_x509_certificate(cert_der: &[u8]) -> Result<()> {
     let cert = parse_x509_certificate(cert_der)?;
 
@@ -217,6 +238,22 @@ pub(crate) fn validate_x509_certificate(cert_der: &[u8]) -> Result<()> {
             "X509 certificate is outside validity period",
             ErrorContext::new("wssec_verify_signature_value"),
         ));
+    }
+
+    // Reject cryptographically weak signing keys. Only RSA has a realistic weak
+    // variant in this profile (1024-bit); all supported EC curves are ≥ 256-bit.
+    if let Ok(PublicKey::RSA(rsa)) = cert.public_key().parsed() {
+        let bits = unsigned_bigint_bits(rsa.modulus);
+        if bits < MIN_RSA_MODULUS_BITS {
+            return Err(AsxError::new(
+                ErrorCode::SecurityVerificationFailed,
+                format!(
+                    "X509 signing certificate RSA key is too weak: {bits}-bit modulus \
+                     (minimum {MIN_RSA_MODULUS_BITS}-bit required)"
+                ),
+                ErrorContext::new("wssec_verify_signature_value"),
+            ));
+        }
     }
 
     if let Some(basic_constraints) = cert.basic_constraints().map_err(|err| {
@@ -444,4 +481,26 @@ fn secure_eq(a: &[u8], b: &[u8]) -> bool {
         diff |= lhs ^ rhs;
     }
     diff == 0
+}
+
+#[cfg(test)]
+mod key_strength_tests {
+    use super::{MIN_RSA_MODULUS_BITS, unsigned_bigint_bits};
+
+    #[test]
+    fn unsigned_bigint_bits_counts_effective_length() {
+        assert_eq!(unsigned_bigint_bits(&[]), 0);
+        assert_eq!(unsigned_bigint_bits(&[0x00, 0x00]), 0);
+        assert_eq!(unsigned_bigint_bits(&[0x01]), 1);
+        assert_eq!(unsigned_bigint_bits(&[0xFF]), 8);
+        assert_eq!(unsigned_bigint_bits(&[0x00, 0x80]), 8);
+        // 2048-bit modulus: 256 bytes with a high bit set in the top byte.
+        let mut m2048 = vec![0u8; 256];
+        m2048[0] = 0x80;
+        assert_eq!(unsigned_bigint_bits(&m2048), 2048);
+        // 1024-bit modulus is below the floor.
+        let mut m1024 = vec![0u8; 128];
+        m1024[0] = 0x80;
+        assert!(unsigned_bigint_bits(&m1024) < MIN_RSA_MODULUS_BITS);
+    }
 }

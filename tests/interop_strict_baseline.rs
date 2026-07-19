@@ -41,6 +41,7 @@ fn as2_strict_mode_rejects_malformed_boundary_with_stage_context() {
             payload: vec![1].into(),
             mdn_payload: mdn.into(),
             mdn_mode: As2MdnMode::Synchronous,
+            require_signed_mdn: false,
             expected_mic: None,
             policy: As2ReceivePolicy {
                 fail_closed_audit_events: false,

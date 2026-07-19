@@ -218,7 +218,9 @@ impl As2TrustVerifier for InsecureBypassTrustVerifier {
 ///    the signature is verified with the configured trust anchors.
 /// 2. **Encrypted-only** (`smime-type=enveloped-data`) — the `EnvelopedData`
 ///    layer is decrypted using [`Self::decryption_key_pem`] /
-///    [`Self::decryption_cert_pem`].  No signature is required.
+///    [`Self::decryption_cert_pem`].  No signature is required *unless*
+///    [`Self::require_signed`] is set, in which case unsigned messages are
+///    rejected.
 /// 3. **Signed-then-encrypted** (the AS2 interop recommendation per
 ///    RFC 4130 §7.5) — the outer `EnvelopedData` is decrypted first, then
 ///    the inner signed structure is verified.
@@ -233,6 +235,20 @@ pub struct CmsSmimeTrustVerifier {
     /// PEM-encoded X.509 recipient certificate matching `decryption_key_pem`.
     /// Required when inbound AS2 messages are encrypted.
     pub decryption_cert_pem: Option<Vec<u8>>,
+    /// Reject inbound messages that carry no verifiable S/MIME signature.
+    ///
+    /// AS2 recipient encryption certificates are exchanged with partners and
+    /// are effectively semi-public, so an *encrypted-only, unsigned* message
+    /// authenticates nothing about the sender. With `require_signed = true`, a
+    /// payload that is encrypted (or plain) but not signed is rejected with
+    /// [`ErrorCode::SecurityVerificationFailed`] instead of being surfaced as
+    /// verified — giving sender authentication / non-repudiation an
+    /// enforceable policy switch.
+    ///
+    /// Default: `false` (encrypted-only messages are accepted), preserving the
+    /// RFC 4130 §7.5 "encryption without signing is legal" behaviour. Set to
+    /// `true` for deployments that require every message to be signed.
+    pub require_signed: bool,
 }
 
 impl Drop for CmsSmimeTrustVerifier {
@@ -249,7 +265,22 @@ impl CmsSmimeTrustVerifier {
         Self {
             decryption_key_pem: Some(key_pem),
             decryption_cert_pem: Some(cert_pem),
+            require_signed: false,
         }
+    }
+
+    /// Require every inbound message to carry a verifiable S/MIME signature.
+    ///
+    /// See [`Self::require_signed`]. Chainable:
+    ///
+    /// ```rust,ignore
+    /// let verifier = CmsSmimeTrustVerifier::with_decryption_credentials(key, cert)
+    ///     .requiring_signature();
+    /// ```
+    #[must_use]
+    pub fn requiring_signature(mut self) -> Self {
+        self.require_signed = true;
+        self
     }
 
     fn build_revocation_policy<'a>(
@@ -330,7 +361,19 @@ impl As2TrustVerifier for CmsSmimeTrustVerifier {
                                 )
                             })?;
                         }
-                        _ => {} // unsigned encrypted payload — no inner signature to verify
+                        _ => {
+                            // Unsigned encrypted payload — no inner signature to
+                            // verify. The recipient encryption cert is semi-public,
+                            // so this authenticates nothing about the sender.
+                            if self.require_signed {
+                                return Err(AsxError::new(
+                                    ErrorCode::SecurityVerificationFailed,
+                                    "AS2 message is encrypted but not signed, and \
+                                     require_signed is set on CmsSmimeTrustVerifier",
+                                    ErrorContext::for_session("as2_smime_require_signed", session),
+                                ));
+                            }
+                        }
                     }
                     let plaintext: Arc<[u8]> = decrypted.into();
                     Ok(TrustResult::decrypted(plaintext))

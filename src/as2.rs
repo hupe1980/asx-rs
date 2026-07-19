@@ -241,6 +241,7 @@ pub fn receive_with_mdn_with_reliability(
     let (mdn, interop_reason_codes) = match parse_mdn(
         request.mdn_payload.as_ref(),
         request.policy,
+        request.require_signed_mdn,
         session,
         event_bus,
         verifier,
@@ -515,6 +516,16 @@ pub fn correlate_async_mdn(
     partner_id: &str,
     reconciliation: &dyn ReconciliationStorage,
 ) -> Result<AsyncMdnCorrelationOutcome> {
+    // This is a public entry point for the async-MDN callback endpoint and runs
+    // on an unauthenticated request body. Bound it before the MIME parse so a
+    // large or deeply-nested body cannot drive unbounded allocation/recursion,
+    // matching the cap `parse_mdn` already enforces.
+    enforce_payload_limit(
+        "as2_correlate_async_mdn",
+        mdn_bytes.len(),
+        MAX_AS2_MDN_BYTES,
+    )?;
+
     let original_message_id = match mdn::extract_original_message_id(mdn_bytes) {
         Some(id) => id,
         None => return Ok(AsyncMdnCorrelationOutcome::NoOriginalMessageId),

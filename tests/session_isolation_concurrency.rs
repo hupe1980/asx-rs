@@ -59,6 +59,7 @@ disposition: automatic-action/MDN-sent-automatically; processed/warning: boundar
         payload: b"payload".to_vec().into(),
         mdn_payload: mdn_boundary_quirk.to_vec().into(),
         mdn_mode: As2MdnMode::Synchronous,
+        require_signed_mdn: false,
         expected_mic: None,
         policy: As2ReceivePolicy {
             fail_closed_audit_events: false,
@@ -71,6 +72,7 @@ disposition: automatic-action/MDN-sent-automatically; processed/warning: boundar
         payload: b"payload".to_vec().into(),
         mdn_payload: mdn_boundary_quirk.to_vec().into(),
         mdn_mode: As2MdnMode::Synchronous,
+        require_signed_mdn: false,
         expected_mic: None,
         policy: As2ReceivePolicy {
             interop_mode: InteropMode::Relaxed,

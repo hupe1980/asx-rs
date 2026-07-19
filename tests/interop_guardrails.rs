@@ -45,6 +45,7 @@ async fn guardrail_outcomes_include_allowed_and_denied_for_as2() {
             payload: vec![1].into(),
             mdn_payload: mdn.clone().into(),
             mdn_mode: As2MdnMode::Synchronous,
+            require_signed_mdn: false,
             expected_mic: None,
             policy: As2ReceivePolicy {
                 interop_mode: InteropMode::Relaxed,
@@ -73,6 +74,7 @@ async fn guardrail_outcomes_include_allowed_and_denied_for_as2() {
             payload: vec![1].into(),
             mdn_payload: mdn.into(),
             mdn_mode: As2MdnMode::Synchronous,
+            require_signed_mdn: false,
             expected_mic: None,
             policy: As2ReceivePolicy {
                 interop_mode: InteropMode::Relaxed,

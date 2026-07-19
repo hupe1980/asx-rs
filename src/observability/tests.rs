@@ -603,6 +603,55 @@ fn emit_audit_event_persists_to_durable_sink() {
     assert_eq!(events[0].metadata.stage.as_deref(), Some("audit_stage"));
 }
 
+/// Regression: `emit_audit_event` under `StrictWithAuditFallback` with **no**
+/// subscribers must persist the event exactly once. Previously it pre-persisted
+/// and then `emit`'s no-subscriber fallback persisted a second copy under a
+/// different `event_id`, inflating the compliance log.
+#[test]
+fn emit_audit_event_persists_exactly_once_in_audit_fallback_without_subscribers() {
+    let sink = Arc::new(DurableTestAuditSink::new());
+    let bus = EventBus::new_with_config_and_mode(
+        16,
+        Some(sink.clone()),
+        BackpressurePolicy::default(),
+        EventEmissionMode::StrictWithAuditFallback,
+    )
+    .expect("event bus");
+    let sess = session("s-audit-once", "p-audit");
+    // Intentionally no subscriber → emit takes the audit-fallback path.
+
+    emit_audit_event(
+        &bus,
+        &sess,
+        AsxEvent::InteropGuardrailEvaluated {
+            message_id: "msg-once".into(),
+            code: "test_guardrail",
+            outcome: "SecurityBlocked",
+            detail: "detail",
+        },
+        true,
+        "audit_stage",
+    )
+    .expect("audit event emit");
+
+    let events = sink
+        .retrieve_events_from(
+            &ReplayCursor {
+                last_event_id: "0".into(),
+                position: 0,
+                last_timestamp: 0,
+                integrity_tag_b64: String::new(),
+            },
+            10,
+        )
+        .expect("retrieve events");
+    assert_eq!(
+        events.len(),
+        1,
+        "audit event must be persisted exactly once"
+    );
+}
+
 #[test]
 fn emit_audit_event_fail_closed_when_sink_write_fails() {
     let sink = Arc::new(FailingAuditSink);
@@ -1076,6 +1125,48 @@ fn backpressure_fail_closed_on_drop_threshold() {
         .expect_err("at threshold must fail closed");
     assert_eq!(err.code, ErrorCode::ReliabilityFailure);
     assert!(err.message.contains("dropped"));
+}
+
+#[test]
+fn backpressure_fail_closed_lagged_window_self_heals_after_expiry() {
+    use std::sync::atomic::Ordering;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let bus = EventBus::new_with_config_and_mode(
+        16,
+        None,
+        BackpressurePolicy {
+            max_dropped: None,
+            max_lagged: Some(2),
+            action: BackpressureAction::FailClosed,
+            window_secs: 60,
+            session_channel_capacity: 64,
+        },
+        EventEmissionMode::BestEffort,
+    )
+    .expect("event bus");
+    let sess = session("s-bp-lag", "p1");
+
+    // Simulate a *past* window that saturated the lagged counter. Before the
+    // read-path reset fix, this stale count would wedge FailClosed forever.
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    bus.metrics
+        .window_epoch
+        .store(now.saturating_sub(120), Ordering::SeqCst);
+    bus.metrics.window_lagged.store(99, Ordering::SeqCst);
+
+    // The window has expired, so the effective count is 0 and emit succeeds.
+    assert_eq!(bus.metrics.current_window_lagged(), 0);
+    bus.emit(
+        &sess,
+        AsxEvent::MessageSigned {
+            message_id: "m-after-window".into(),
+        },
+    )
+    .expect("expired-window lag count must not wedge FailClosed");
 }
 
 #[test]

@@ -583,7 +583,7 @@ pub enum InteropMode {
     ///
     /// ```toml
     /// [dependencies]
-    /// asx = { version = "0.5", features = ["interop-relaxed"] }
+    /// asx-rs = { version = "0.9", features = ["interop-relaxed"] }
     /// ```
     #[cfg(feature = "interop-relaxed")]
     Relaxed,
@@ -1016,7 +1016,7 @@ impl PartialEq for X509StoreCache {
 #[cfg(any(feature = "as2", feature = "as4"))]
 impl Eq for X509StoreCache {}
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct CertHandle {
     pub key_id: String,
     pub fingerprint_sha256: String,
@@ -1053,6 +1053,39 @@ pub struct CertHandle {
     /// encrypt outbound AS4 / AS2 messages when the send policy has
     /// `encrypt = true` and no per-request credential is provided.
     pub recipient_cert_pem: Option<String>,
+}
+
+// Hand-written `Debug` that never renders private key material. The derived
+// `Debug` would forward through `Zeroizing<String>` and print the raw PEM (see
+// the `# Security` note on `signing_key_pem`), so any `?cert_handle`/`?session`
+// in a log line or panic message would leak the key. Presence is reported as a
+// redacted marker so debugging stays useful without exposing secrets.
+impl std::fmt::Debug for CertHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CertHandle")
+            .field("key_id", &self.key_id)
+            .field("fingerprint_sha256", &self.fingerprint_sha256)
+            .field("trust_anchor_pems", &self.trust_anchor_pems)
+            .field("intermediate_ca_pems", &self.intermediate_ca_pems)
+            .field("revocation_crl_pems", &self.revocation_crl_pems)
+            .field("ocsp_mode", &self.ocsp_mode)
+            .field("ocsp_failure_mode", &self.ocsp_failure_mode)
+            .field(
+                "stapled_ocsp_responses_der",
+                &self.stapled_ocsp_responses_der,
+            )
+            .field(
+                "responder_ocsp_responses_der",
+                &self.responder_ocsp_responses_der,
+            )
+            .field("signing_cert_pem", &self.signing_cert_pem)
+            .field(
+                "signing_key_pem",
+                &self.signing_key_pem.as_ref().map(|_| "<redacted>"),
+            )
+            .field("recipient_cert_pem", &self.recipient_cert_pem)
+            .finish()
+    }
 }
 
 impl CertHandle {

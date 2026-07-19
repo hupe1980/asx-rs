@@ -804,14 +804,26 @@ fn aes_128_key_unwrap(kek: &[u8; 16], ciphertext: &[u8]) -> Result<Vec<u8>> {
     Ok(result)
 }
 
-/// ConcatKDF (NIST SP 800-56A, one-pass DH, single iteration for \u2264256-bit output).
+/// ConcatKDF \u2014 the single-step Concatenation Key Derivation Function of
+/// NIST SP 800-56A \u00a75.8.1, as referenced by W3C XML Encryption 1.1 \u00a75.4.1.
 ///
-/// Hash input: `counter(4B BE=1) || Z || keydatalen(4B BE, bits)
-///             || len(AlgorithmID)(4B BE) || AlgorithmID
-///             || len(PartyUInfo)(4B BE)  || PartyUInfo
-///             || len(PartyVInfo)(4B BE)  || PartyVInfo`
+/// Hash input (one iteration; SHA-256 output \u2265 any key size we derive):
 ///
-/// Returns a 32-byte (256-bit) SHA-256 digest; the caller takes `[..keydatalen_bits/8]`.
+/// ```text
+/// H( counter(4B BE = 1) || Z || OtherInfo )
+/// OtherInfo = AlgorithmID || PartyUInfo || PartyVInfo   (raw concatenation)
+/// ```
+///
+/// `OtherInfo` is the **raw concatenation** of the fixed-info bit strings, per
+/// SP 800-56A \u00a75.8.1.2 and the XML-Enc 1.1 `ConcatKDFParams` model. It contains
+/// **no** embedded `keydatalen` field and **no** per-field length prefixes \u2014
+/// those belong to the JOSE Concat KDF (RFC 7518 \u00a74.6.2), a different scheme.
+/// A prior revision injected both, producing a KEK that no spec-conformant
+/// ECDH-ES peer (BDEW / BSI TR-03116-3 / eDelivery) could reproduce.
+///
+/// `keydatalen_bits` bounds the *output* length only: the caller takes
+/// `[..keydatalen_bits / 8]` of the returned 32-byte digest. For the AES-128-KW
+/// KEK (128 bits) a single SHA-256 iteration suffices.
 fn concat_kdf_sha256(
     z: &[u8],
     keydatalen_bits: u32,
@@ -819,17 +831,18 @@ fn concat_kdf_sha256(
     party_u_info: &[u8],
     party_v_info: &[u8],
 ) -> [u8; 32] {
+    debug_assert!(
+        keydatalen_bits as usize <= 256,
+        "single-iteration ConcatKDF only yields up to 256 bits of key material"
+    );
     let mut input: Vec<u8> = Vec::with_capacity(
-        4 + z.len() + 4 + 4 + algorithm_id.len() + 4 + party_u_info.len() + 4 + party_v_info.len(),
+        4 + z.len() + algorithm_id.len() + party_u_info.len() + party_v_info.len(),
     );
     input.extend_from_slice(&1u32.to_be_bytes()); // counter = 1
     input.extend_from_slice(z);
-    input.extend_from_slice(&keydatalen_bits.to_be_bytes());
-    input.extend_from_slice(&(algorithm_id.len() as u32).to_be_bytes());
+    // OtherInfo: raw concatenation, no length prefixes, no keydatalen.
     input.extend_from_slice(algorithm_id);
-    input.extend_from_slice(&(party_u_info.len() as u32).to_be_bytes());
     input.extend_from_slice(party_u_info);
-    input.extend_from_slice(&(party_v_info.len() as u32).to_be_bytes());
     input.extend_from_slice(party_v_info);
 
     let digest =
@@ -1381,6 +1394,45 @@ pub fn decrypt_payload_xmlenc(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Known-answer test locking the spec-conformant ConcatKDF form.
+    ///
+    /// With empty `ConcatKDFParams` (the AS4 default) `OtherInfo` is empty, so
+    /// per NIST SP 800-56A §5.8.1 the derived key material is
+    /// `SHA-256(counter=0x00000001 || Z)[..keydatalen/8]` — no `keydatalen`
+    /// field and no length prefixes in the hash input.
+    #[test]
+    fn concat_kdf_empty_otherinfo_matches_sp800_56a_single_step() {
+        let z = b"\x01\x02\x03\x04\x05\x06\x07\x08 shared-secret bytes";
+        let got = concat_kdf_sha256(z, 128, &[], &[], &[]);
+
+        let mut expected_input = Vec::new();
+        expected_input.extend_from_slice(&1u32.to_be_bytes());
+        expected_input.extend_from_slice(z);
+        let expected =
+            openssl::hash::hash(MessageDigest::sha256(), &expected_input).expect("sha256");
+
+        assert_eq!(
+            &got[..],
+            expected.as_ref(),
+            "ConcatKDF with empty OtherInfo must equal SHA-256(counter || Z)"
+        );
+        // The KEK is the leftmost 128 bits of that digest.
+        assert_eq!(&got[..16], &expected.as_ref()[..16]);
+    }
+
+    /// `OtherInfo` is a raw concatenation: no length prefixes are inserted
+    /// between AlgorithmID / PartyUInfo / PartyVInfo.
+    #[test]
+    fn concat_kdf_otherinfo_is_raw_concatenation() {
+        let z = b"Z-secret";
+        let combined = concat_kdf_sha256(z, 128, b"ABCDEF", &[], &[]);
+        let split = concat_kdf_sha256(z, 128, b"ABC", b"DEF", &[]);
+        assert_eq!(
+            combined, split,
+            "raw concatenation: AlgorithmID||PartyUInfo boundaries must not affect the hash"
+        );
+    }
 
     #[test]
     fn decrypt_payload_xmlenc_skips_comments_and_processing_instructions() {

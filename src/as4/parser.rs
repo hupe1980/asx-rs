@@ -26,6 +26,17 @@ const WSSE_NS: &str =
 const MAX_XML_ELEMENTS: usize = 10_000;
 const MAX_AS4_PRECHECK_HEADER_SPAN_BYTES: usize = 256 * 1024;
 
+/// Maximum byte length accepted for the inbound AS4 SOAP envelope before it is
+/// handed to the `roxmltree` DOM parser.
+///
+/// The element-count guard (`MAX_XML_ELEMENTS`) only fires *after* the whole DOM
+/// is materialized, and the header-span precheck only bounds the `Header`→`Body`
+/// distance — neither caps a well-formed envelope whose few elements carry
+/// hundreds of MiB of text. AS4 payloads travel as separate MIME attachments, so
+/// the SOAP envelope itself is small (a few KiB in practice); 4 MiB is ~1000× a
+/// typical Peppol/ebMS3 envelope while bounding peak parser memory.
+const MAX_AS4_SOAP_DOM_BYTES: usize = 4 * 1024 * 1024;
+
 #[derive(Default)]
 struct As4UserMessageParseState {
     has_messaging: bool,
@@ -321,6 +332,17 @@ pub(super) fn parse_as4_user_message_document<'a>(
     xml: &'a str,
     session: &SessionContext,
 ) -> Result<Document<'a>> {
+    if xml.len() > MAX_AS4_SOAP_DOM_BYTES {
+        return Err(AsxError::new(
+            ErrorCode::ParseFailed,
+            format!(
+                "AS4 SOAP envelope exceeds {} byte limit ({} bytes)",
+                MAX_AS4_SOAP_DOM_BYTES,
+                xml.len()
+            ),
+            ErrorContext::for_session("as4_parse_user_message", session),
+        ));
+    }
     let doc = roxmltree::Document::parse(xml).map_err(|e| {
         AsxError::new(
             ErrorCode::ParseFailed,

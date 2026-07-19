@@ -502,12 +502,26 @@ pub fn verify_enveloped_signature(xml: &str, opts: WsSecVerifyOptions<'_>) -> Re
     verify_enveloped_signature_with_parsed_signature_borrowed(&doc, xml, parsed, opts)
 }
 
+/// Outcome of a successful WS-Security signature verification: the set of
+/// same-document element `Id`s (`wsu:Id`/`xml:id`) whose digests were verified.
+///
+/// The AS4 receive layer uses this to defend against XML Signature Wrapping:
+/// it requires that the `eb:Messaging` element it actually consumes is one of
+/// these signed ids, so an attacker cannot relocate the signed element and feed
+/// the parser an unsigned, injected one.
+#[cfg(feature = "as4")]
+#[derive(Debug, Clone)]
+pub(crate) struct VerifiedSignatureCoverage {
+    /// `Id` values of same-document (`#...`) references that verified.
+    pub signed_same_document_ids: Vec<String>,
+}
+
 #[cfg(feature = "as4")]
 pub(crate) fn verify_enveloped_signature_optional_with_doc(
     doc: &Document<'_>,
     xml: &str,
     opts: WsSecVerifyOptions<'_>,
-) -> Result<bool> {
+) -> Result<Option<VerifiedSignatureCoverage>> {
     enforce_wssec_document_limits(
         xml,
         doc,
@@ -516,11 +530,24 @@ pub(crate) fn verify_enveloped_signature_optional_with_doc(
     )?;
 
     let Some(parsed) = parse_signature_envelope_from_doc_optional_borrowed(doc)? else {
-        return Ok(false);
+        return Ok(None);
     };
 
+    // Collect the same-document reference ids *before* consuming `parsed`; these
+    // are only trustworthy once verification below succeeds.
+    let signed_same_document_ids: Vec<String> = parsed
+        .references
+        .iter()
+        .filter_map(|r| match r.parsed_uri {
+            ParsedReferenceUri::SameDocument { target_id } => Some(target_id.to_string()),
+            ParsedReferenceUri::Cid { .. } => None,
+        })
+        .collect();
+
     verify_enveloped_signature_with_parsed_signature_borrowed(doc, xml, parsed, opts)?;
-    Ok(true)
+    Ok(Some(VerifiedSignatureCoverage {
+        signed_same_document_ids,
+    }))
 }
 
 fn verify_enveloped_signature_with_parsed_signature_borrowed(
@@ -1617,7 +1644,21 @@ fn parse_der_header(input: &[u8], stage: &'static str) -> Result<(usize, usize)>
                 )
             })?;
     }
-    Ok((2 + len_octets, value_len))
+
+    let header_len = 2 + len_octets;
+    // Reject a declared content length that does not fit within the remaining
+    // buffer. Without this check a caller slicing `input[..header_len + value_len]`
+    // (e.g. `split_x509_pkipath_der_certificates`) would index out of bounds and
+    // panic on an attacker-supplied `wsse:BinarySecurityToken`, crashing the
+    // worker thread before any trust decision is made.
+    if value_len > input.len() - header_len {
+        return Err(AsxError::new(
+            ErrorCode::ParseFailed,
+            "invalid DER: declared length exceeds available bytes",
+            ErrorContext::new(stage),
+        ));
+    }
+    Ok((header_len, value_len))
 }
 
 pub(crate) fn secure_eq(a: &[u8], b: &[u8]) -> bool {
@@ -1817,6 +1858,17 @@ mod tests {
 
         verify_enveloped_signature(&signed, WsSecVerifyOptions::new())
             .expect("verification should pass with X509PKIPathv1 token");
+    }
+
+    #[test]
+    fn split_x509_pkipath_rejects_inner_length_overrun_without_panicking() {
+        // Outer SEQUENCE (len 4) whose single inner element declares a 65535-byte
+        // content length with zero bytes present. Before the bounds check this
+        // sliced out of range and panicked the worker thread on attacker input.
+        let malicious = [0x30u8, 0x04, 0x30, 0x82, 0xFF, 0xFF];
+        let err = super::split_x509_pkipath_der_certificates(&malicious)
+            .expect_err("over-declared inner DER length must be rejected, not panic");
+        assert_eq!(err.code, crate::core::ErrorCode::ParseFailed);
     }
 
     #[test]

@@ -59,6 +59,7 @@ fn fuzz_smoke_as2_receive_paths_do_not_panic() {
                 payload: payload.into(),
                 mdn_payload: mdn.into(),
                 mdn_mode: As2MdnMode::Synchronous,
+                require_signed_mdn: false,
                 expected_mic: None,
                 policy: As2ReceivePolicy::default(),
                 original_message_id: None,

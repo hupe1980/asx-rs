@@ -443,11 +443,15 @@ fn send_sync_prepared_ref(
             )
         })?;
 
-        let message_id_reference = format!("#{}", crate::crypto::soap_builder::MESSAGE_ID_WSU_ID);
+        // Sign the entire <ebms:Messaging> block (covers all UserMessage
+        // metadata), the SOAP Body, and the payload attachment. Previously only
+        // <ebms:MessageId> was signed, leaving From/To/Service/Action/PartInfo
+        // unprotected against tampering.
+        let messaging_reference = format!("#{}", crate::crypto::soap_builder::MESSAGING_WSU_ID);
         let body_reference = format!("#{}", crate::crypto::soap_builder::SOAP_BODY_WSU_ID);
         let payload_reference = format!("cid:{payload_content_id}");
         let reference_uris = [
-            message_id_reference.as_str(),
+            messaging_reference.as_str(),
             body_reference.as_str(),
             payload_reference.as_str(),
         ];

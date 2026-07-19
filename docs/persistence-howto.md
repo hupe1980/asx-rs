@@ -51,37 +51,37 @@ pub trait ReconciliationStorage: Send + Sync {
 }
 ```
 
-## First-Party PostgreSQL Backends
+## Durable, cluster-safe backends are consumer-supplied
 
-Enable feature `postgres-storage` to use first-party durable, cluster-safe storage:
+`asx-rs` deliberately ships **no** database-backed storage. `DedupStorage`,
+`ReconciliationStorage`, and `DurableAuditSink` are the integration boundary —
+you implement them against your own store (PostgreSQL, Redis, DynamoDB, SQLite,
+…). The only in-tree implementations are the in-memory ones, which are for
+testing and single-process use.
 
-```toml
-asx-rs = { version = "0.8", features = ["as2", "as4", "postgres-storage"] }
-```
-
-Available implementations:
-
-- `asx_rs::storage::PostgresDedupStorage`
-- `asx_rs::storage::PostgresReconciliationStorage`
-
-Example bootstrap:
+A durable backend must return `true` from both `is_durable()` and
+`cluster_safe()` so it passes the strict production startup gate
+(`issue_strict_runtime_bootstrap_token`). A minimal PostgreSQL implementation
+wraps a connection pool and satisfies the trait as follows:
 
 ```rust,ignore
-use asx_rs::storage::{PostgresDedupStorage, PostgresReconciliationStorage};
+struct PostgresDedupStorage { /* pool, namespace */ }
 
-let dedup = PostgresDedupStorage::connect(
-    "postgres://app:secret@db/asx",
-    "prod-eu-west-1",
-)?;
-
-let reconciliation = PostgresReconciliationStorage::connect(
-    "postgres://app:secret@db/asx",
-    "prod-eu-west-1",
-)?;
-
-assert!(dedup.is_durable() && dedup.cluster_safe());
-assert!(reconciliation.is_durable() && reconciliation.cluster_safe());
+impl asx_rs::storage::DedupStorage for PostgresDedupStorage {
+    fn first_seen<'a>(&'a self, key: &'a str)
+        -> futures::future::BoxFuture<'a, asx_rs::core::Result<bool>>
+    {
+        Box::pin(async move {
+            // INSERT ... ON CONFLICT DO NOTHING; RETURNING true-if-inserted
+            todo!("run against your pool")
+        })
+    }
+    fn is_durable(&self) -> bool { true }
+    fn cluster_safe(&self) -> bool { true }
+}
 ```
+
+The reference SQL schema below is a starting point for such an implementation.
 
 ### Durable Audit
 

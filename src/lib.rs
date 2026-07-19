@@ -1,13 +1,15 @@
 /*!
-# asx — AS2/AS4 EDI protocol library
+# asx-rs — AS2/AS4 EDI protocol library
 
-`asx` is an async-native, memory-safe Rust library for the AS2 (RFC 4130) and
-AS4 (OASIS ebMS3 + eDelivery) EDI transport protocols.
+`asx-rs` is an async-native, memory-safe Rust library for the AS2 (RFC 4130) and
+AS4 (OASIS ebMS3 + eDelivery) EDI transport protocols. The crate is published as
+`asx-rs`; the library itself is imported as `asx_rs`.
 
 ## Feature flags
 
  The crate uses Cargo feature flags to limit the compiled surface and dependency
- tree.  The **default** feature set is `["interop-strict", "async-ocsp", "compression"]`.
+ tree.  The **default** feature set is
+ `["interop-strict", "async-ocsp", "compression", "trace"]`.
 
 | Feature | Enables | Required by |
 |---|---|---|
@@ -32,21 +34,21 @@ AS4 (OASIS ebMS3 + eDelivery) EDI transport protocols.
 
 ```toml
 # AS2 only (sign, encrypt, OCSP; compression is enabled by default):
-asx = { version = "0.5", features = ["as2", "async-ocsp"] }
+asx-rs = { version = "0.9", features = ["as2", "async-ocsp"] }
 
 # AS4 only (sign, encrypt; compression is enabled by default):
-asx = { version = "0.5", features = ["as4", "async-ocsp"] }
+asx-rs = { version = "0.9", features = ["as4", "async-ocsp"] }
 
 # Both protocols with compression:
-asx = { version = "0.5", features = ["as2", "as4", "compression", "async-ocsp"] }
+asx-rs = { version = "0.9", features = ["as2", "as4", "compression", "async-ocsp"] }
 
 # Both protocols, relaxed interop for legacy partners:
-asx = { version = "0.5", features = ["as2", "as4", "interop-relaxed", "async-ocsp"] }
+asx-rs = { version = "0.9", features = ["as2", "as4", "interop-relaxed", "async-ocsp"] }
 
 ```
 
 > **Note:** `as2` and `as4` are **not** in the default feature set.
-> Adding `asx` without explicit features compiles only the shared
+> Adding `asx-rs` without explicit features compiles only the shared
 > infrastructure (`core`, `crypto`, `reliability`, `observability`).
 
 ## Security notes

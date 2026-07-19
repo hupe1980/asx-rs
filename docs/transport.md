@@ -130,8 +130,24 @@ pub struct As4HttpIngress {
 ## Egress / HTTP Client (`client` feature)
 
 ```toml
-asx-rs = { version = "0.8", features = ["as2", "as4", "client"] }
+asx-rs = { version = "0.9", features = ["as2", "as4", "client"] }
 ```
+
+### SSRF protection
+
+All egress (and the OCSP and SMP clients) are hardened against Server-Side
+Request Forgery:
+
+- HTTPS-only; plain HTTP is rejected.
+- Private, loopback, link-local, CGNAT (`100.64.0.0/10`), documentation/reserved,
+  and IPv4-mapped-IPv6 (`::ffff:a.b.c.d`) target ranges are blocked. `0.0.0.0/8`
+  is blocked (it routes to localhost on Linux).
+- Hostnames are DNS-resolved and every resolved address is checked; the resolution
+  is then **pinned** for the actual connection (DNS-rebinding defence).
+- **HTTP redirects are never followed.** The validation and DNS pin only cover the
+  initial target, so a `3xx Location` to a different (possibly internal) host would
+  otherwise bypass the check entirely. AS2/AS4/OCSP/SMP endpoints are fixed URLs
+  and have no legitimate reason to redirect.
 
 ### AS2 send
 
@@ -220,7 +236,7 @@ impl HttpSendOutcome {
 ## Server / Axum Integration (`server` feature)
 
 ```toml
-asx-rs = { version = "0.8", features = ["as2", "as4", "server"] }
+asx-rs = { version = "0.9", features = ["as2", "as4", "server"] }
 ```
 
 The server layer provides axum 0.7 router builders with typed handler traits. It is built on top of the framework-agnostic ingress layer — the same validation logic runs regardless of how the request arrives.

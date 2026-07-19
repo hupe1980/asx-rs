@@ -181,6 +181,11 @@ impl SmpClient {
     pub fn with_config(config: SmpConfig) -> Self {
         let http = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(10))
+            // Do not follow redirects: the SMP lookup URL is SSRF-validated
+            // before the request, but a `3xx Location` from a compromised or
+            // spoofed SMP would be followed to an unchecked (possibly internal)
+            // host. SMP endpoints are fixed and never legitimately redirect.
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .expect("failed to build SMP reqwest client");
         Self { config, http }

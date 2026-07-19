@@ -1,5 +1,3 @@
-use std::sync::atomic::Ordering;
-
 use super::{
     AsxError, AsxEvent, BackpressureAction, ErrorCode, ErrorContext, EventBus, EventEmissionMode,
     Result, SessionContext,
@@ -9,7 +7,9 @@ pub(super) fn validate_lagged_backpressure(bus: &EventBus, session: &SessionCont
     if bus.backpressure.action == BackpressureAction::FailClosed
         && let Some(max_lagged) = bus.backpressure.max_lagged
     {
-        let lagged = bus.metrics.window_lagged.load(Ordering::Relaxed);
+        // Window-aware read: resets a stale count from an expired window so a
+        // past burst cannot wedge FailClosed forever (see current_window_lagged).
+        let lagged = bus.metrics.current_window_lagged();
         if lagged >= max_lagged {
             return Err(AsxError::new(
                 ErrorCode::ReliabilityFailure,
