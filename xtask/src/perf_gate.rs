@@ -323,6 +323,7 @@ fn run_results(#[allow(unused_variables)] iterations: u64) -> Vec<BenchResult> {
                             payload: std::sync::Arc::from([1u8]),
                             mdn_payload: std::sync::Arc::from(mdn_payload.as_slice()),
                             mdn_mode: As2MdnMode::Synchronous,
+                            require_signed_mdn: false,
                             expected_mic: Some(
                                 "KUPgyYBxFU9pqBBAxdTOeAw3hlDAepf6m2Pfoy8VI0g=".to_string(),
                             ),
