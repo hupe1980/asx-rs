@@ -62,6 +62,30 @@ use crate::transport::ingress::as4_ingress_from_http;
 ///
 /// All fields are extracted from the parsed ebMS3 `<eb:UserMessage>`.
 /// The `payload` is the decrypted, de-SBDH-unwrapped business payload bytes.
+///
+/// # Party ID population
+///
+/// `from_party_ids` contains all `<eb:From>/<eb:PartyId>` values from the
+/// inbound SOAP envelope.  In a typical BDEW / CEF AS4 send:
+///
+/// ```text
+/// sender session.session_id()  →  <eb:From><eb:PartyId>sender-gln</eb:PartyId></eb:From>
+/// sender session.partner_id()  →  <eb:To><eb:PartyId>receiver-gln</eb:PartyId></eb:To>
+/// ```
+///
+/// So `from_party_ids` contains the **sender's** GLN and `to_party_ids`
+/// contains the **receiver's** GLN, exactly as written by the outbound
+/// `SoapEnvelopeBuilder`.  The `action` field corresponds to the `bdew_action`
+/// or `policy.action` value used when constructing the send request.
+///
+/// # Example
+/// ```rust,ignore
+/// // Sender: session_id = "9900000000001", partner_id (receiver GLN) = "9900000000002"
+/// // Using bdew_pmode_sign_only("pm-1", "9900000000002", BdewAction::Utilmd)
+/// assert_eq!(msg.from_party_ids, vec!["9900000000001"]);
+/// assert_eq!(msg.to_party_ids,   vec!["9900000000002"]);
+/// assert_eq!(msg.action, "urn:entsoe.eu:wgedi:processes:utilmd:1.0");
+/// ```
 #[derive(Debug, Clone)]
 pub struct MockReceivedMessage {
     /// `<eb:Action>` from `<eb:CollaborationInfo>`.
@@ -110,6 +134,43 @@ struct MockEndpointState {
 }
 
 // ---------------------------------------------------------------------------
+// Public — MockAs4EndpointBuilder
+// ---------------------------------------------------------------------------
+
+/// Builder for [`MockAs4Endpoint`] that allows configuring decryption
+/// credentials before binding to a port.
+///
+/// Obtain via [`MockAs4Endpoint::builder()`].
+#[derive(Default)]
+pub struct MockAs4EndpointBuilder {
+    decryption_key_pem: Option<Vec<u8>>,
+}
+
+impl MockAs4EndpointBuilder {
+    /// Configure an EC or RSA private key (PEM) used to decrypt inbound
+    /// ECDH-ES / RSA-OAEP–encrypted AS4 messages.
+    ///
+    /// When set, the mock can receive fully encrypted messages
+    /// (sign-then-encrypt) and deliver the decrypted payload via
+    /// [`MockAs4Endpoint::next_received`].  Without this, sending an
+    /// encrypted message to the mock results in an HTTP 400 response.
+    pub fn with_decryption_key_pem(mut self, pem: impl Into<Vec<u8>>) -> Self {
+        self.decryption_key_pem = Some(pem.into());
+        self
+    }
+
+    /// Bind to `addr` and start serving with the configured options.
+    ///
+    /// Pass `"127.0.0.1:0"` to let the OS pick a random available port.
+    pub async fn bind(
+        self,
+        addr: impl tokio::net::ToSocketAddrs,
+    ) -> std::io::Result<MockAs4Endpoint> {
+        MockAs4Endpoint::bind_with_builder(addr, self).await
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Public — MockAs4Endpoint
 // ---------------------------------------------------------------------------
 
@@ -127,10 +188,29 @@ pub struct MockAs4Endpoint {
 }
 
 impl MockAs4Endpoint {
+    /// Start building an endpoint with optional PKI configuration.
+    ///
+    /// ```rust,ignore
+    /// let endpoint = MockAs4Endpoint::builder()
+    ///     .with_decryption_key_pem(receiver_key_pem)
+    ///     .bind("127.0.0.1:0")
+    ///     .await?;
+    /// ```
+    pub fn builder() -> MockAs4EndpointBuilder {
+        MockAs4EndpointBuilder::default()
+    }
+
     /// Bind to `addr` and start serving.
     ///
     /// Pass `"127.0.0.1:0"` to let the OS pick a random available port.
     pub async fn bind(addr: impl tokio::net::ToSocketAddrs) -> std::io::Result<Self> {
+        Self::bind_with_builder(addr, MockAs4EndpointBuilder::default()).await
+    }
+
+    async fn bind_with_builder(
+        addr: impl tokio::net::ToSocketAddrs,
+        config: MockAs4EndpointBuilder,
+    ) -> std::io::Result<Self> {
         let listener = tokio::net::TcpListener::bind(addr).await?;
         let local_addr = listener.local_addr()?;
 
@@ -140,18 +220,27 @@ impl MockAs4Endpoint {
             SessionContext::new("mock-as4-endpoint", "mock-partner", "strict")
                 .expect("mock session must always construct"),
         );
-        let event_bus = Arc::new(EventBus::new(128).expect("mock event bus must always construct"));
+        let event_bus = Arc::new(
+            EventBus::new_with_config_and_mode(
+                128,
+                None,
+                crate::observability::BackpressurePolicy::default(),
+                crate::observability::EventEmissionMode::BestEffort,
+            )
+            .expect("mock event bus must always construct"),
+        );
 
-        // Relaxed policy for testing: the InsecureBypassAs4Verifier handles all
-        // verification regardless of these settings, but we still configure
-        // sensible test defaults.  require_signed_receipt is kept at the default
-        // (true) because strict mode requires it; since receipt_payload is always
-        // None in mock requests, this check never fires at runtime.
-        let policy = As4PushPolicyBuilder::new()
+        let mut policy_builder = As4PushPolicyBuilder::new()
             .fail_closed_audit_events(false)
             .timestamp_freshness_window(None)
             .fragment_scope_policy(FragmentScopePolicy::UseSoapSenderId)
-            .allow_unsigned_push(true)
+            .allow_unsigned_push(true);
+
+        if let Some(key_pem) = config.decryption_key_pem {
+            policy_builder = policy_builder.inbound_decryption_key_pem(key_pem);
+        }
+
+        let policy = policy_builder
             .build()
             .expect("mock policy must always construct");
 

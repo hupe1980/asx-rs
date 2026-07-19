@@ -72,7 +72,7 @@ Skips all WS-Security checks on inbound AS4 push messages. Parity with
 
 ```toml
 [dev-dependencies]
-asx-rs = { version = "0.7", features = ["as4", "testing"] }
+asx-rs = { version = "0.8", features = ["as4", "testing"] }
 ```
 
 ```rust
@@ -100,15 +100,24 @@ synchronous AS4 receipt. Requires `testing + server` features.
 
 ```toml
 [dev-dependencies]
-asx-rs = { version = "0.7", features = ["as4", "testing", "server"] }
+asx-rs = { version = "0.8", features = ["as4", "testing", "server"] }
 ```
 
 ```rust
 use asx_rs::as4::mock_endpoint::MockAs4Endpoint;
 use tokio::time::{timeout, Duration};
 
-// Bind to a random OS-assigned port — no PKI certificates needed.
+// Simple case: bind to a random OS-assigned port — no PKI certificates needed.
 let endpoint = MockAs4Endpoint::bind("127.0.0.1:0").await.expect("bind");
+
+// Full sign+encrypt round-trip: configure a decryption key via builder.
+// The mock will decrypt ECDH-ES / RSA-OAEP inbound messages automatically.
+let endpoint = MockAs4Endpoint::builder()
+    .with_decryption_key_pem(my_ec_or_rsa_private_key_pem)
+    .bind("127.0.0.1:0")
+    .await
+    .expect("bind");
+
 let url = endpoint.local_url(); // "http://127.0.0.1:PORT/as4/inbox"
 
 // Send an AS4 message to `url` using any AS4 client...
@@ -134,11 +143,50 @@ let all = endpoint.drain_received().await;
 - `action` — `<eb:Action>` value
 - `service` — `<eb:Service>` value, if present
 - `message_id` — `<eb:MessageId>`
-- `from_party_ids` — all `<eb:From/eb:PartyId>` values
-- `to_party_ids` — all `<eb:To/eb:PartyId>` values
+- `from_party_ids` — all `<eb:From/eb:PartyId>` values (contains the **sender** GLN)
+- `to_party_ids` — all `<eb:To/eb:PartyId>` values (contains the **receiver** GLN)
 - `conversation_id` — `<eb:ConversationId>`, if present
 - `ref_to_message_id` — `<eb:RefToMessageId>` (Two-Way MEP correlation)
 - `payload` — decrypted, de-SBDH-stripped business payload bytes
+
+Party ID population: for a typical BDEW send where the session `session_id` is the
+sender GLN and `partner_id` is the receiver GLN, `from_party_ids[0]` == sender GLN
+and `to_party_ids[0]` == receiver GLN, as written by `SoapEnvelopeBuilder`.
+
+### `EventBus::new_for_testing()`
+
+A zero-config `BestEffort` event bus that never fails on emit when no broadcast subscriber
+is active. Use this in integration tests that do not assert on protocol events.
+
+```rust
+use asx_rs::observability::EventBus;
+
+// Requires `testing` feature. Equivalent to:
+// EventBus::new_with_config_and_mode(256, None, BackpressurePolicy::default(),
+//     EventEmissionMode::BestEffort)
+let bus = EventBus::new_for_testing();
+```
+
+> **Production note:** `new_for_testing()` silently discards all protocol events and
+> audit records. For production use, `EventBus::new(capacity)` (strict transactional) or
+> `EventBus::new_regulated(capacity, audit_sink)` are the correct APIs.
+
+### `As4HttpTransport::new_for_localhost_testing()`
+
+An HTTP transport that bypasses SSRF validation and HTTPS-only enforcement, enabling
+integration tests to POST to `MockAs4Endpoint` at `http://127.0.0.1:…` using the same
+`As4HttpTransport` code path as production.
+
+```rust
+use asx_rs::transport::egress::As4HttpTransport;
+
+let transport = As4HttpTransport::new_for_localhost_testing()?;
+let outcome = transport.send_to_localhost(&endpoint.local_url(), &output).await?;
+assert!(outcome.is_success());
+```
+
+This keeps test coverage over `As4HttpTransport`'s `Content-Type` headers, receipt
+inspection, and connection pooling — none of which are exercised by a raw `reqwest::Client`.
 
 ### `DurableInMemoryDedupBackend`
 
@@ -432,7 +480,7 @@ assert_eq!(response.status(), 200);
 ## Testing Feature Flag
 
 ```toml
-asx-rs = { version = "0.7", features = ["testing"] }
+asx-rs = { version = "0.8", features = ["testing"] }
 ```
 
 The `testing` feature exposes `asx_rs::fixtures` and `asx_rs::matrix` — test scaffold modules with `InteropFixtureMetadata`, `FixtureCatalog`, `MatrixSummary`, and related helpers. These are not part of the production library surface and are absent from builds without this feature.

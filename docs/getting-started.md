@@ -7,22 +7,22 @@ Add `asx-rs` to `Cargo.toml`. Because AS2 and AS4 are feature-gated, you must se
 ```toml
 [dependencies]
 # AS2 only
-asx-rs = { version = "0.7", features = ["as2", "async-ocsp"] }
+asx-rs = { version = "0.8", features = ["as2", "async-ocsp"] }
 
 # AS4 only
-asx-rs = { version = "0.7", features = ["as4", "async-ocsp"] }
+asx-rs = { version = "0.8", features = ["as4", "async-ocsp"] }
 
 # Both protocols
-asx-rs = { version = "0.7", features = ["as2", "as4", "async-ocsp"] }
+asx-rs = { version = "0.8", features = ["as2", "as4", "async-ocsp"] }
 
 # Both protocols with payload compression (RFC 5402)
-asx-rs = { version = "0.7", features = ["as2", "as4", "compression", "async-ocsp"] }
+asx-rs = { version = "0.8", features = ["as2", "as4", "compression", "async-ocsp"] }
 
 # HTTP client (outbound) + server (inbound) with both protocols
-asx-rs = { version = "0.7", features = ["as2", "as4", "client", "server", "async-ocsp"] }
+asx-rs = { version = "0.8", features = ["as2", "as4", "client", "server", "async-ocsp"] }
 
 # Relaxed interop for explicitly scoped partner exceptions
-asx-rs = { version = "0.7", features = ["as2", "as4", "interop-relaxed", "async-ocsp"] }
+asx-rs = { version = "0.8", features = ["as2", "as4", "interop-relaxed", "async-ocsp"] }
 ```
 
 > **Note:** The default feature set is `["interop-strict", "async-ocsp"]`. Adding `asx-rs` without explicit features gives you only the shared infrastructure — no AS2 or AS4 protocol functions are compiled.
@@ -41,7 +41,7 @@ asx-rs = { version = "0.7", features = ["as2", "as4", "interop-relaxed", "async-
 | `server` | Axum HTTP server routers (`as2_router`, `as4_router`) | No |
 | `trace` | `tracing` instrumentation on send/receive paths | No |
 | `postgres-storage` | PostgreSQL-backed durable, cluster-safe dedup/reconciliation backends | No |
-| `testing` | Exposes `fixtures` and `matrix` test-scaffold modules | No |
+| `testing` | `InsecureBypassAs4Verifier`, `MockAs4Endpoint` (with `builder().with_decryption_key_pem()`), `EventBus::new_for_testing()`, `As4HttpTransport::new_for_localhost_testing()`, keypair generators, interop matrix executor | No |
 
 ## Tokio Runtime
 
@@ -95,27 +95,71 @@ This fails closed when any strict-production invariant is missing (non-transacti
 
 Migration note: bind strict-runtime once per session with `session_with_strict_runtime_bootstrap_token(...)`, then call standard AS2/AS4 ingress helper methods.
 
+## Session Configuration (`SessionContextBuilder`)
+
+`SessionContextBuilder` is the primary way to configure sessions. All convenience
+setters auto-derive `key_id` from `partner_id` — no manual `CertHandle` construction
+needed for common cases:
+
+```rust
+use asx_rs::core::SessionContextBuilder;
+
+// Minimal trust-anchor-only session (receive path)
+let session = SessionContextBuilder::new("sess-recv", "partner-gln")
+    .with_trust_anchor_pem(partner_root_ca_pem)
+    .with_fingerprint_sha256("aabb1122...")   // optional: pin exact partner cert
+    .build()?;
+
+// Send session: signing material + trust in one chain
+let session = SessionContextBuilder::new("sess-send", "partner-gln")
+    .with_signing_material(our_cert_pem, our_key_pem) // sets both cert + key together
+    .with_trust_anchor_pem(partner_root_ca_pem)
+    .build()?;
+
+// Combine with per-request credential override (partial override merges with session)
+// Only recipient_cert_pem is overridden; signing material falls back to session
+let credentials = Some(As4SendCredentials {
+    recipient_cert_pem: Some(partner_enc_cert),
+    ..Default::default()  // signing_{cert,key}_pem = None → falls back to session
+});
+```
+
+`CertHandle` is now a **pure data struct** (all fields `pub`) — struct update syntax works
+from external crates with no restrictions:
+
+```rust
+let ch = asx_rs::core::CertHandle {
+    trust_anchor_pems: vec![root_ca_pem],
+    fingerprint_sha256: "aa...".into(),
+    ..asx_rs::core::CertHandle::new("my-key")  // ← no E0451 compile error in 0.8
+};
+// Assign signing key without depending on `zeroize` directly:
+ch.set_signing_key_pem(my_key_pem);
+```
+
 ## Quick Start: AS2 Send
 
 ```rust
 use asx_rs::as2::{send_sync, As2SendCredentials, As2SendPolicy, As2SendRequest};
-use asx_rs::core::SessionContext;
-use asx_rs::observability::{BackpressurePolicy, EventBus, EventEmissionMode};
+use asx_rs::core::SessionContextBuilder;
+use asx_rs::observability::EventBus;
 
 fn main() -> asx_rs::Result<()> {
-    let session = SessionContext::new("sess-as2-1", "partner-acme", "strict")?;
-    let bus = EventBus::new_with_config_and_mode(
-        64,
-        None,
-        BackpressurePolicy::default(),
-        EventEmissionMode::BestEffort,
-    )?;
+    // Fluent session builder — key_id auto-derived, signing material validated eagerly
+    let session = SessionContextBuilder::new("sess-as2-1", "partner-acme")
+        .with_signing_material(
+            std::fs::read_to_string("sender-cert.pem")?,
+            std::fs::read_to_string("sender-key.pem")?,
+        )
+        .with_trust_anchor_pem(std::fs::read_to_string("partner-root-ca.pem")?)
+        .build()?;
+    let bus = EventBus::new(64)?;
 
     let policy = As2SendPolicy { sign: true, encrypt: true, ..Default::default() };
     let creds = As2SendCredentials {
-        signing_cert_pem: Some(std::fs::read("sender-cert.pem")?),
-        signing_key_pem: Some(std::fs::read("sender-key.pem")?),
+        // signing material is optional here — falls back to session when None
         recipient_cert_pem: Some(std::fs::read("partner-cert.pem")?),
+        ..Default::default()
     };
 
     let output = send_sync(
@@ -140,17 +184,19 @@ fn main() -> asx_rs::Result<()> {
 
 ```rust
 use asx_rs::as4::{send_sync, As4SendPolicyBuilder, As4SendRequest};
-use asx_rs::core::SessionContext;
-use asx_rs::observability::{BackpressurePolicy, EventBus, EventEmissionMode};
+use asx_rs::core::SessionContextBuilder;
+use asx_rs::observability::EventBus;
 
 fn main() -> asx_rs::Result<()> {
-    let session = SessionContext::new("sess-as4-1", "partner-b", "strict")?;
-    let bus = EventBus::new_with_config_and_mode(
-        64,
-        None,
-        BackpressurePolicy::default(),
-        EventEmissionMode::BestEffort,
-    )?;
+    // Session carries signing material; no per-request credentials needed
+    let session = SessionContextBuilder::new("sess-as4-1", "partner-b")
+        .with_signing_material(
+            std::fs::read_to_string("sender-cert.pem")?,
+            std::fs::read_to_string("sender-key.pem")?,
+        )
+        .with_trust_anchor_pem(std::fs::read_to_string("partner-root-ca.pem")?)
+        .build()?;
+    let bus = EventBus::new(64)?;
 
     let (policy, creds) = As4SendPolicyBuilder::new()
         .signing_cert_pem(std::fs::read("sender-cert.pem")?)
@@ -164,7 +210,8 @@ fn main() -> asx_rs::Result<()> {
             message_id: "uuid-001@example.com".to_string(),
             payload: b"<Order>...</Order>".to_vec(),
             policy,
-            credentials: creds,
+            credentials: Some(creds),
+            payload_filename: None,
         },
     )?;
     // output.soap_envelope.body — multipart/related bytes

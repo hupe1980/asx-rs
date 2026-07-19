@@ -137,25 +137,41 @@ pub fn send_sync(
         payload_filename,
     } = request;
 
-    // Resolve effective credentials: per-request `Some(c)` wins; `None` falls
-    // back to the signing material stored in the session's CertHandle.
+    // Resolve effective credentials: per-request `Some(c)` is merged with the
+    // session CertHandle for any `None` fields, so callers only need to supply
+    // the fields they actually want to override.  `None` credentials fall back
+    // entirely to the session.
     let session_creds;
-    let credentials = match credentials_opt {
-        Some(c) => c,
-        None => {
-            let ch = session.cert_handle();
-            session_creds = As4SendCredentials {
-                signing_cert_pem: ch
-                    .signing_cert_pem
-                    .as_ref()
-                    .map(|s| Arc::from(s.as_bytes())),
-                signing_key_pem: ch.signing_key_pem.as_ref().map(|s| s.as_bytes().to_vec()),
-                recipient_cert_pem: ch
-                    .recipient_cert_pem
-                    .as_ref()
-                    .map(|s| Arc::from(s.as_bytes())),
-            };
-            session_creds
+    let credentials = {
+        let ch = session.cert_handle();
+        let session_signing_cert = ch
+            .signing_cert_pem
+            .as_ref()
+            .map(|s| Arc::from(s.as_bytes()));
+        let session_signing_key = ch.signing_key_pem.as_ref().map(|s| s.as_bytes().to_vec());
+        let session_recipient_cert = ch
+            .recipient_cert_pem
+            .as_ref()
+            .map(|s| Arc::from(s.as_bytes()));
+        match credentials_opt {
+            None => {
+                session_creds = As4SendCredentials {
+                    signing_cert_pem: session_signing_cert,
+                    signing_key_pem: session_signing_key,
+                    recipient_cert_pem: session_recipient_cert,
+                };
+                &session_creds
+            }
+            Some(ref c) => {
+                // Partial override: use per-request value when set, fall back
+                // to session material for each `None` field individually.
+                session_creds = As4SendCredentials {
+                    signing_cert_pem: c.signing_cert_pem.clone().or(session_signing_cert),
+                    signing_key_pem: c.signing_key_pem.clone().or(session_signing_key),
+                    recipient_cert_pem: c.recipient_cert_pem.clone().or(session_recipient_cert),
+                };
+                &session_creds
+            }
         }
     };
 
@@ -166,7 +182,7 @@ pub fn send_sync(
     validate_as4_send_policy_and_credentials_consistency(
         "as4_send_validate",
         &policy,
-        &credentials,
+        credentials,
         ErrorCode::PolicyViolation,
     )
     .map_err(|err| {

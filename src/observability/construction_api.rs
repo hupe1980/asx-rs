@@ -79,4 +79,24 @@ impl EventBus {
             metrics_sink,
         )
     }
+
+    /// Zero-config best-effort event bus for unit and integration tests.
+    ///
+    /// Uses [`EventEmissionMode::BestEffort`]: events are silently dropped when
+    /// no broadcast subscriber is active, so tests that do not assert on
+    /// protocol events never fail with `ReliabilityFailure`.
+    ///
+    /// **Never use this in production** — it silently discards all protocol
+    /// events and audit records.  For production use, see [`EventBus::new`],
+    /// [`EventBus::new_regulated`], or [`EventBus::new_strict_with_audit_fallback`].
+    #[cfg(feature = "testing")]
+    pub fn new_for_testing() -> Self {
+        Self::new_with_config_and_mode(
+            256,
+            None,
+            BackpressurePolicy::default(),
+            EventEmissionMode::BestEffort,
+        )
+        .expect("EventBus::new_for_testing: infallible BestEffort construction")
+    }
 }

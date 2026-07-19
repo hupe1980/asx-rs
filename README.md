@@ -64,11 +64,17 @@ EDI trading partner connections worldwide.
 ### 🧪 Testing (`testing` feature — never enable in production)
 - **`InsecureBypassAs4Verifier`** — skips all WS-Security verification; parity with
   `InsecureBypassTrustVerifier` on the AS2 side
-- **`MockAs4Endpoint`** (`testing + server`) — local HTTP AS4 server that accepts any push,
-  records messages in an async channel, and returns synchronous AS4 receipts; no BDEW WIRK
-  or PEPPOL test PKI certificates required
+- **`MockAs4Endpoint`** (`testing + server`) — local HTTP AS4 server that accepts any push
+  (signed, unsigned, encrypted, or plain), records messages in an async channel, and
+  returns synchronous AS4 receipts.  Configure decryption via
+  `MockAs4Endpoint::builder().with_decryption_key_pem(key_pem).bind(addr).await?`
+- **`EventBus::new_for_testing()`** — zero-config `BestEffort` bus; never fails on emit
+  when no subscriber is active — no more `new_with_config_and_mode(...)` boilerplate
 - **`DurableInMemoryDedupBackend`** — in-memory dedup with `is_durable() = true`; passes
   the strict durable-backend guard without a real persistent store
+- **`As4HttpTransport::new_for_localhost_testing()`** — plain-HTTP transport for
+  integration tests against `MockAs4Endpoint` on `http://127.0.0.1:…`; SSRF guards
+  disabled for the test binary only
 - **`generate_self_signed_ec_keypair(cn, curve)`** — self-signed EC cert+key (P-256 through
   BrainpoolP512r1); no openssl/rcgen dev-dependency needed in downstream crates
 - **`generate_self_signed_rsa_keypair(cn, bits)`** — same for RSA
@@ -82,14 +88,14 @@ EDI trading partner connections worldwide.
 ```toml
 [dependencies]
 # AS4 — PEPPOL / CEF eDelivery (RSA) or BDEW (EC/ECDH-ES) — same code, key type decides
-asx-rs = { version = "0.7", features = ["as4", "client", "server", "async-ocsp"] }
+asx-rs = { version = "0.8", features = ["as4", "client", "server", "async-ocsp"] }
 
 # AS2 + AS4 with compression
-asx-rs = { version = "0.7", features = ["as2", "as4", "compression", "client", "server", "async-ocsp"] }
+asx-rs = { version = "0.8", features = ["as2", "as4", "compression", "client", "server", "async-ocsp"] }
 
 [dev-dependencies]
 # Testing without PKI certificates (MockAs4Endpoint, bypass verifier, keypair generators)
-asx-rs = { version = "0.7", features = ["as4", "testing", "server"] }
+asx-rs = { version = "0.8", features = ["as4", "testing", "server"] }
 ```
 
 > `as2` and `as4` are **not** in the default feature set — add them explicitly.
@@ -107,8 +113,15 @@ The signing algorithm is chosen automatically from the key type — no configura
 
 ```rust
 use asx_rs::as4::{send_async, As4SendPolicyBuilder, As4SendRequest};
-use asx_rs::core::SessionContext;
+use asx_rs::core::SessionContextBuilder;
 use asx_rs::observability::EventBus;
+
+// Session with trust anchor + signing material — one fluent chain:
+let session = SessionContextBuilder::new("sess-001", "partner-gln")
+    .with_signing_material(my_signing_cert_pem, my_signing_key_pem)
+    .with_trust_anchor_pem(partner_root_ca_pem)
+    .with_fingerprint_sha256(partner_cert_sha256_hex) // optional hard pin
+    .build()?;
 
 // RSA or EC signing key — auto-detected:
 let (policy, creds) = As4SendPolicyBuilder::new()
@@ -120,7 +133,6 @@ let (policy, creds) = As4SendPolicyBuilder::new()
     .encrypt(true)
     .build()?;
 
-let session = SessionContext::new("sess-001", "partner-gln", "strict")?;
 let bus = EventBus::new(1024)?;
 
 let output = send_async(
@@ -165,18 +177,29 @@ let outcome = receive_push_with_dedup_async(
 
 ```rust
 use asx_rs::as4::mock_endpoint::MockAs4Endpoint;
+use asx_rs::observability::EventBus;
 use tokio::time::{timeout, Duration};
 
-// Bind to a random port — no cert, no WIRK, no PEPPOL test PKI needed
+// Plain receive: bind to a random port — no cert, no WIRK, no PEPPOL test PKI needed
 let endpoint = MockAs4Endpoint::bind("127.0.0.1:0").await?;
+
+// Receive encrypted messages: configure decryption key via builder
+let endpoint = MockAs4Endpoint::builder()
+    .with_decryption_key_pem(my_ec_or_rsa_private_key_pem)
+    .bind("127.0.0.1:0")
+    .await?;
+
 let url = endpoint.local_url(); // "http://127.0.0.1:PORT/as4/inbox"
 
-// Send an AS4 message to `url` via any client library...
+// Test EventBus: zero-config, never fails on emit (BestEffort)
+let bus = EventBus::new_for_testing(); // requires `testing` feature
 
+// Wait for the first message (returns None if the endpoint is dropped).
 let msg = timeout(Duration::from_secs(5), endpoint.next_message())
     .await??;
 assert_eq!(msg.action, "urn:bdew:as4:service:UTILMD");
 assert!(!msg.payload.is_empty());
+// from_party_ids contains the sender GLN; to_party_ids the receiver GLN
 ```
 
 ### AS4 — Generate EC or RSA test keypairs
@@ -307,8 +330,8 @@ let wrapped = StandardBusinessDocument {
 | `trace` | `tracing` instrumentation on hot paths | ❌ |
 | `prometheus` | Built-in Prometheus/OpenMetrics `MetricsSink` | ❌ |
 | `postgres-storage` | PostgreSQL-backed durable cluster-safe storage | ❌ |
-| `testing` | `InsecureBypassAs4Verifier`, `DurableInMemoryDedupBackend`, keypair generators, `verifier_seal`, interop matrix executor | ❌ |
-| `testing + server` | Also: `MockAs4Endpoint` | ❌ |
+| `testing` | `InsecureBypassAs4Verifier`, `DurableInMemoryDedupBackend`, keypair generators, `verifier_seal`, interop matrix executor, **`EventBus::new_for_testing()`** | ❌ |
+| `testing + server` | Also: **`MockAs4Endpoint`** (with `builder().with_decryption_key_pem()`) | ❌ |
 
 > **Security:** The `testing` feature triggers a `compile_error!` in release profile builds.
 > It must never appear in production binaries.
@@ -471,13 +494,13 @@ Add to `Cargo.toml`:
 ```toml
 [dependencies]
 # AS2 client + server with OCSP
-asx-rs = { version = "0.7", features = ["as2", "client", "server", "async-ocsp"] }
+asx-rs = { version = "0.8", features = ["as2", "client", "server", "async-ocsp"] }
 
 # AS4 only
-asx-rs = { version = "0.7", features = ["as4", "client", "server", "async-ocsp"] }
+asx-rs = { version = "0.8", features = ["as4", "client", "server", "async-ocsp"] }
 
 # Both protocols with compression (default)
-asx-rs = { version = "0.7", features = ["as2", "as4", "compression", "client", "server", "async-ocsp"] }
+asx-rs = { version = "0.8", features = ["as2", "as4", "compression", "client", "server", "async-ocsp"] }
 ```
 
 > `as2` and `as4` are **not** enabled by default — add them explicitly.

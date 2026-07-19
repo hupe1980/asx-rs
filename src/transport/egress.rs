@@ -271,7 +271,7 @@ impl Default for TransportConfig {
         Self {
             connect_timeout: Duration::from_secs(10),
             request_timeout: Duration::from_secs(60),
-            user_agent: "asx/0.2".to_string(),
+            user_agent: concat!("asx/", env!("CARGO_PKG_VERSION")).to_string(),
             pool_max_idle_per_host: 4,
             pool_idle_timeout: Duration::from_secs(90),
         }
@@ -642,7 +642,72 @@ impl As4HttpTransport {
     /// Returns [`ErrorCode::InvalidInput`] for disallowed URLs.
     /// Returns [`ErrorCode::TransportFailure`] on network or TLS errors.
     pub async fn send(&self, url: &str, output: &As4SendOutput) -> Result<HttpSendOutcome> {
-        let target = validate_egress_target_with_policy(url, "as4_transport_send").await?;
+        self.send_inner(url, output, true).await
+    }
+
+    /// Bypass SSRF / plain-HTTP guards for localhost-only integration tests.
+    ///
+    /// **Only available with `feature = "testing"`.**  The returned transport
+    /// connects to plain HTTP on loopback addresses (e.g. `http://127.0.0.1:…`)
+    /// to communicate with [`crate::as4::mock_endpoint::MockAs4Endpoint`].
+    /// Never expose this constructor in production builds.
+    #[cfg(feature = "testing")]
+    pub fn new_for_localhost_testing() -> Result<Self> {
+        let config = TransportConfig::default();
+        let client = reqwest::Client::builder()
+            .connect_timeout(config.connect_timeout)
+            .timeout(config.request_timeout)
+            .user_agent(&config.user_agent)
+            .pool_max_idle_per_host(config.pool_max_idle_per_host)
+            .pool_idle_timeout(Some(config.pool_idle_timeout))
+            .build()
+            .map_err(|err| {
+                AsxError::new(
+                    ErrorCode::TransportFailure,
+                    format!("failed to build localhost test HTTP client: {err}"),
+                    ErrorContext::new("as4_transport_localhost_testing_init"),
+                )
+            })?;
+        Ok(Self {
+            client,
+            runtime_config: config,
+        })
+    }
+
+    /// Send to a localhost testing endpoint, bypassing SSRF validation.
+    ///
+    /// Only available with `feature = "testing"`.
+    #[cfg(feature = "testing")]
+    pub async fn send_to_localhost(
+        &self,
+        url: &str,
+        output: &As4SendOutput,
+    ) -> Result<HttpSendOutcome> {
+        self.send_inner(url, output, false).await
+    }
+
+    async fn send_inner(
+        &self,
+        url: &str,
+        output: &As4SendOutput,
+        validate_url: bool,
+    ) -> Result<HttpSendOutcome> {
+        let target = if validate_url {
+            validate_egress_target_with_policy(url, "as4_transport_send").await?
+        } else {
+            let parsed = reqwest::Url::parse(url).map_err(|_| {
+                AsxError::new(
+                    ErrorCode::InvalidInput,
+                    format!("malformed egress URL: {url}"),
+                    ErrorContext::new("as4_transport_send"),
+                )
+            })?;
+            ValidatedEgressTarget {
+                url: parsed,
+                resolved_host: None,
+                resolved_addrs: vec![],
+            }
+        };
 
         let client = if let Some(host) = target.resolved_host.as_deref() {
             build_http_client(

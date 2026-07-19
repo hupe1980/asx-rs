@@ -168,6 +168,8 @@ pub(super) struct HttpJsonSpoolEncryptionKeyProvider {
 #[derive(Debug, Clone, Default)]
 pub(in crate::as2) struct HttpKeyProviderTlsConfig {
     pub(in crate::as2) client_cert_pem_path: Option<String>,
+    // Used by spool_http_helpers when feature = "client" is active.
+    #[allow(dead_code)]
     pub(in crate::as2) client_key_pem_path: Option<String>,
     pub(in crate::as2) trust_anchor_cert_pem_paths: Vec<String>,
 }

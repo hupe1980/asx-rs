@@ -100,7 +100,9 @@ mod tests {
     };
     use super::*;
     use crate::core::InteropMode;
-    use crate::core::{CertHandle, ErrorCode, OcspFailureMode, OcspMode, SessionContext};
+    #[cfg(feature = "interop-relaxed")]
+    use crate::core::{CertHandle, OcspFailureMode, OcspMode};
+    use crate::core::{ErrorCode, SessionContext};
     use crate::crypto::wssec::WsSecOutboundKeyInfoProfile;
     use crate::interop::{InteropExceptionCode, InteropExceptionPolicy};
     use crate::observability::{AsxEvent, EventBus};
@@ -114,6 +116,7 @@ mod tests {
     use openssl::pkey::PKey;
     use openssl::rsa::Rsa;
     use openssl::x509::{X509, X509NameBuilder};
+    #[cfg(feature = "interop-relaxed")]
     use sha2::{Digest as _, Sha256 as sha2_Sha256};
     use std::sync::Arc;
 

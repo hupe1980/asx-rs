@@ -651,6 +651,17 @@ pub struct SessionContext {
     /// [`rotate_cert_handle`]: SessionContext::rotate_cert_handle
     cert_handle: Arc<CertHandle>,
     correlation_scope: CorrelationScope,
+    /// Lazy-parsed trust-anchor cache.  Invalidated whenever `cert_handle` is
+    /// replaced via [`with_cert_handle`] or [`rotate_cert_handle`].
+    ///
+    /// [`with_cert_handle`]: SessionContext::with_cert_handle
+    /// [`rotate_cert_handle`]: SessionContext::rotate_cert_handle
+    #[cfg(any(feature = "as2", feature = "as4"))]
+    trust_anchors_cache: TrustAnchorCache,
+    /// Lazy-built X.509 store derived from `trust_anchor_pems`.
+    /// Invalidated whenever `cert_handle` is replaced.
+    #[cfg(any(feature = "as2", feature = "as4"))]
+    x509_store_cache: X509StoreCache,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -698,6 +709,19 @@ impl SessionContextBuilder {
         self
     }
 
+    /// Return a key_id string derived from the partner_id, matching the
+    /// pattern used by [`SessionContext::new`] for the default `CertHandle`.
+    fn default_cert_handle_key_id(&self) -> String {
+        format!("cert:{}", self.partner_id)
+    }
+
+    /// Get or lazily create the builder's CertHandle with a sensible key_id.
+    fn cert_handle_or_init(&mut self) -> &mut CertHandle {
+        let key_id = self.default_cert_handle_key_id();
+        self.cert_handle
+            .get_or_insert_with(|| CertHandle::new(key_id))
+    }
+
     /// Append a single PEM-encoded trust anchor to the session's certificate store.
     ///
     /// This is a convenience alternative to constructing a [`CertHandle`] manually.
@@ -710,8 +734,9 @@ impl SessionContextBuilder {
     ///     .build()?;
     /// ```
     pub fn with_trust_anchor_pem(mut self, pem: impl Into<String>) -> Self {
-        let cert_handle = self.cert_handle.get_or_insert_with(|| CertHandle::new(""));
-        cert_handle.trust_anchor_pems.push(pem.into());
+        self.cert_handle_or_init()
+            .trust_anchor_pems
+            .push(pem.into());
         self
     }
 
@@ -723,8 +748,7 @@ impl SessionContextBuilder {
         mut self,
         pems: impl IntoIterator<Item = impl Into<String>>,
     ) -> Self {
-        let cert_handle = self.cert_handle.get_or_insert_with(|| CertHandle::new(""));
-        cert_handle
+        self.cert_handle_or_init()
             .trust_anchor_pems
             .extend(pems.into_iter().map(|p| p.into()));
         self
@@ -734,8 +758,7 @@ impl SessionContextBuilder {
     ///
     /// Defaults to [`OcspMode::default()`] when not specified.
     pub fn with_ocsp_mode(mut self, mode: OcspMode) -> Self {
-        let cert_handle = self.cert_handle.get_or_insert_with(|| CertHandle::new(""));
-        cert_handle.ocsp_mode = mode;
+        self.cert_handle_or_init().ocsp_mode = mode;
         self
     }
 
@@ -767,8 +790,7 @@ impl SessionContextBuilder {
     /// })?;
     /// ```
     pub fn with_signing_cert_pem(mut self, pem: impl Into<String>) -> Self {
-        let cert_handle = self.cert_handle.get_or_insert_with(|| CertHandle::new(""));
-        cert_handle.signing_cert_pem = Some(pem.into());
+        self.cert_handle_or_init().signing_cert_pem = Some(pem.into());
         self
     }
 
@@ -778,8 +800,7 @@ impl SessionContextBuilder {
     /// [`with_signing_cert_pem`](Self::with_signing_cert_pem).  The raw key
     /// bytes are **zeroized on drop** via the `CertHandle` destructor.
     pub fn with_signing_key_pem(mut self, pem: impl Into<String>) -> Self {
-        let cert_handle = self.cert_handle.get_or_insert_with(|| CertHandle::new(""));
-        cert_handle.signing_key_pem = Some(zeroize::Zeroizing::new(pem.into()));
+        self.cert_handle_or_init().signing_key_pem = Some(zeroize::Zeroizing::new(pem.into()));
         self
     }
 
@@ -790,8 +811,38 @@ impl SessionContextBuilder {
     /// When set, sends with `encrypt = true` do not require a per-request
     /// `recipient_cert_pem` in `As4SendCredentials` / `As2SendCredentials`.
     pub fn with_recipient_cert_pem(mut self, pem: impl Into<String>) -> Self {
-        let cert_handle = self.cert_handle.get_or_insert_with(|| CertHandle::new(""));
-        cert_handle.recipient_cert_pem = Some(pem.into());
+        self.cert_handle_or_init().recipient_cert_pem = Some(pem.into());
+        self
+    }
+
+    /// Set both signing certificate and key in one call.
+    ///
+    /// Equivalent to chaining [`with_signing_cert_pem`](Self::with_signing_cert_pem)
+    /// and [`with_signing_key_pem`](Self::with_signing_key_pem), but eliminates the
+    /// intermediate half-configured state where one of the pair is set and the other
+    /// is not.  [`build`](Self::build) validates that the cert and key match.
+    pub fn with_signing_material(
+        mut self,
+        cert_pem: impl Into<String>,
+        key_pem: impl Into<String>,
+    ) -> Self {
+        let ch = self.cert_handle_or_init();
+        ch.signing_cert_pem = Some(cert_pem.into());
+        ch.signing_key_pem = Some(zeroize::Zeroizing::new(key_pem.into()));
+        self
+    }
+
+    /// Pin the expected SHA-256 fingerprint (lower-case hex, no separators) of
+    /// the partner's signing certificate.
+    ///
+    /// When set, the WS-Security / S/MIME verifier rejects any message whose
+    /// signing certificate does not match this fingerprint, even when the
+    /// signature is cryptographically valid and the cert chains to a trust anchor.
+    ///
+    /// Useful for high-assurance deployments where the exact partner certificate
+    /// is known in advance (e.g. BDEW regulated partners, Peppol cornernodes).
+    pub fn with_fingerprint_sha256(mut self, fingerprint: impl Into<String>) -> Self {
+        self.cert_handle_or_init().fingerprint_sha256 = fingerprint.into();
         self
     }
 
@@ -1002,15 +1053,6 @@ pub struct CertHandle {
     /// encrypt outbound AS4 / AS2 messages when the send policy has
     /// `encrypt = true` and no per-request credential is provided.
     pub recipient_cert_pem: Option<String>,
-    /// Lazy-parsed trust anchor X.509 certificates — shared across clones.
-    /// Populated on first call to [`CertHandle::trust_anchors_x509`].
-    #[cfg(any(feature = "as2", feature = "as4"))]
-    pub(crate) trust_anchors_cache: TrustAnchorCache,
-    /// Lazy-built X.509 trust store derived from `trust_anchor_pems`.
-    /// Shared across clones; built at most once per `CertHandle` lineage.
-    /// Populated on first call to [`CertHandle::trust_anchor_x509_store`].
-    #[cfg(any(feature = "as2", feature = "as4"))]
-    pub(crate) x509_store_cache: X509StoreCache,
 }
 
 impl CertHandle {
@@ -1042,78 +1084,16 @@ impl CertHandle {
             signing_cert_pem: None,
             signing_key_pem: None,
             recipient_cert_pem: None,
-            #[cfg(any(feature = "as2", feature = "as4"))]
-            trust_anchors_cache: TrustAnchorCache::default(),
-            #[cfg(any(feature = "as2", feature = "as4"))]
-            x509_store_cache: X509StoreCache::default(),
         }
     }
 
-    /// Return the parsed trust-anchor X.509 certificates, parsing from
-    /// [`Self::trust_anchor_pems`] on the first call.  Subsequent calls
-    /// (including from clones of this handle) return the cached result at
-    /// zero parse cost.
+    /// Set the PEM-encoded private key for outbound signing without requiring
+    /// callers to depend on the `zeroize` crate directly.
     ///
-    /// Each returned `X509` is backed by OpenSSL's internal reference counting,
-    /// so cloning the returned `Vec` is O(n) in the number of anchors but O(1)
-    /// per certificate.
-    #[cfg(any(feature = "as2", feature = "as4"))]
-    pub(crate) fn trust_anchors_x509(&self) -> Result<Vec<openssl::x509::X509>> {
-        // Fast path: already initialised by a previous call on any clone.
-        if let Some(anchors) = self.trust_anchors_cache.0.get() {
-            return Ok(anchors.clone());
-        }
-        // Slow path: parse once and populate the lock.  If two threads race
-        // here both compute the same result (deterministic from the PEM input)
-        // and the loser's `set` is silently dropped — correctness is preserved.
-        let mut anchors = Vec::new();
-        for pem in &self.trust_anchor_pems {
-            let certs = openssl::x509::X509::stack_from_pem(pem.as_bytes()).map_err(|e| {
-                AsxError::new(
-                    ErrorCode::InvalidInput,
-                    format!("invalid trust-anchor PEM in CertHandle: {e}"),
-                    ErrorContext::new("cert_handle_parse_anchors"),
-                )
-            })?;
-            anchors.extend(certs);
-        }
-        // Ignore Err — means another thread already set the same value.
-        let _ = self.trust_anchors_cache.0.set(anchors.clone());
-        Ok(anchors)
-    }
-
-    /// Return an `Arc`-wrapped `X509Store` built from the trust-anchor PEMs,
-    /// constructing and caching it on the first call.  Subsequent calls
-    /// (including from clones of this handle) return the same `Arc` at zero cost.
-    ///
-    /// The store is built from `trust_anchor_pems` only; CRL/OCSP revocation
-    /// checks are handled separately by the verification pipeline.
-    #[cfg(any(feature = "as2", feature = "as4"))]
-    pub(crate) fn trust_anchor_x509_store(&self) -> Result<Arc<openssl::x509::store::X509Store>> {
-        if let Some(store) = self.x509_store_cache.0.get() {
-            return Ok(Arc::clone(store));
-        }
-        // Build from cached parsed certs (avoids re-parsing PEM on slow path).
-        let anchors = self.trust_anchors_x509()?;
-        let mut builder = openssl::x509::store::X509StoreBuilder::new().map_err(|e| {
-            AsxError::new(
-                ErrorCode::InvalidInput,
-                format!("failed to build X.509 trust store: {e}"),
-                ErrorContext::new("cert_handle_build_x509_store"),
-            )
-        })?;
-        for cert in &anchors {
-            builder.add_cert(cert.clone()).map_err(|e| {
-                AsxError::new(
-                    ErrorCode::InvalidInput,
-                    format!("failed to add trust anchor to X.509 store: {e}"),
-                    ErrorContext::new("cert_handle_build_x509_store"),
-                )
-            })?;
-        }
-        let store = Arc::new(builder.build());
-        let _ = self.x509_store_cache.0.set(Arc::clone(&store));
-        Ok(store)
+    /// The key bytes are automatically wrapped in [`zeroize::Zeroizing`] and
+    /// will be zeroized on drop.
+    pub fn set_signing_key_pem(&mut self, key_pem: impl Into<String>) {
+        self.signing_key_pem = Some(zeroize::Zeroizing::new(key_pem.into()));
     }
 }
 
@@ -1561,6 +1541,10 @@ impl SessionContext {
             session_id,
             partner_id,
             profile_name,
+            #[cfg(any(feature = "as2", feature = "as4"))]
+            trust_anchors_cache: TrustAnchorCache::default(),
+            #[cfg(any(feature = "as2", feature = "as4"))]
+            x509_store_cache: X509StoreCache::default(),
         })
     }
 
@@ -1570,18 +1554,18 @@ impl SessionContext {
     /// session.  For rotation on an already-live session, prefer
     /// [`rotate_cert_handle`] which takes `&mut self`.
     ///
-    /// The `trust_anchors_cache` is always reset so that a handle constructed via
-    /// struct update syntax (`..old_handle`) does not carry a stale parsed-anchor
-    /// cache from its origin.
+    /// Both the trust-anchor parse cache and the X.509 store cache are reset so
+    /// that the new handle's anchors are parsed fresh on first use.
     ///
     /// [`rotate_cert_handle`]: Self::rotate_cert_handle
     pub fn with_cert_handle(mut self, cert_handle: CertHandle) -> Result<Self> {
         Self::validate_cert_handle_fields(&cert_handle, "session_context_cert_update", &self)?;
-        self.cert_handle = Arc::new(CertHandle {
-            #[cfg(any(feature = "as2", feature = "as4"))]
-            trust_anchors_cache: TrustAnchorCache::default(),
-            ..cert_handle
-        });
+        self.cert_handle = Arc::new(cert_handle);
+        #[cfg(any(feature = "as2", feature = "as4"))]
+        {
+            self.trust_anchors_cache = TrustAnchorCache::default();
+            self.x509_store_cache = X509StoreCache::default();
+        }
         Ok(self)
     }
 
@@ -1604,11 +1588,12 @@ impl SessionContext {
     /// [`with_cert_handle`]: Self::with_cert_handle
     pub fn rotate_cert_handle(&mut self, cert_handle: CertHandle) -> Result<()> {
         Self::validate_cert_handle_fields(&cert_handle, "session_context_cert_rotate", self)?;
-        self.cert_handle = Arc::new(CertHandle {
-            #[cfg(any(feature = "as2", feature = "as4"))]
-            trust_anchors_cache: TrustAnchorCache::default(),
-            ..cert_handle
-        });
+        self.cert_handle = Arc::new(cert_handle);
+        #[cfg(any(feature = "as2", feature = "as4"))]
+        {
+            self.trust_anchors_cache = TrustAnchorCache::default();
+            self.x509_store_cache = X509StoreCache::default();
+        }
         Ok(())
     }
 
@@ -1703,6 +1688,64 @@ impl SessionContext {
         self.cert_handle.as_ref()
     }
 
+    /// Return the parsed trust-anchor X.509 certificates, parsing from
+    /// `cert_handle.trust_anchor_pems` on first call and caching the result.
+    ///
+    /// Thread-safe: multiple concurrent callers share one parse via `OnceLock`.
+    /// The cache is invalidated automatically when `with_cert_handle` or
+    /// `rotate_cert_handle` is called on this session.
+    #[cfg(any(feature = "as2", feature = "as4"))]
+    pub(crate) fn trust_anchors_x509(&self) -> Result<Vec<openssl::x509::X509>> {
+        if let Some(anchors) = self.trust_anchors_cache.0.get() {
+            return Ok(anchors.clone());
+        }
+        let mut anchors = Vec::new();
+        for pem in &self.cert_handle.trust_anchor_pems {
+            let certs = openssl::x509::X509::stack_from_pem(pem.as_bytes()).map_err(|e| {
+                AsxError::new(
+                    ErrorCode::InvalidInput,
+                    format!("invalid trust-anchor PEM in CertHandle: {e}"),
+                    ErrorContext::new("session_parse_trust_anchors"),
+                )
+            })?;
+            anchors.extend(certs);
+        }
+        let _ = self.trust_anchors_cache.0.set(anchors.clone());
+        Ok(anchors)
+    }
+
+    /// Return an `Arc`-wrapped `X509Store` built from the trust-anchor PEMs.
+    ///
+    /// Built at most once per `(session, cert_handle)` pair and shared across
+    /// clones.  The cache is invalidated automatically when `with_cert_handle`
+    /// or `rotate_cert_handle` is called.
+    #[cfg(any(feature = "as2", feature = "as4"))]
+    pub(crate) fn trust_anchor_x509_store(&self) -> Result<Arc<openssl::x509::store::X509Store>> {
+        if let Some(store) = self.x509_store_cache.0.get() {
+            return Ok(Arc::clone(store));
+        }
+        let anchors = self.trust_anchors_x509()?;
+        let mut builder = openssl::x509::store::X509StoreBuilder::new().map_err(|e| {
+            AsxError::new(
+                ErrorCode::InvalidInput,
+                format!("failed to build X.509 trust store: {e}"),
+                ErrorContext::new("session_build_x509_store"),
+            )
+        })?;
+        for cert in &anchors {
+            builder.add_cert(cert.clone()).map_err(|e| {
+                AsxError::new(
+                    ErrorCode::InvalidInput,
+                    format!("failed to add trust anchor to X.509 store: {e}"),
+                    ErrorContext::new("session_build_x509_store"),
+                )
+            })?;
+        }
+        let store = Arc::new(builder.build());
+        let _ = self.x509_store_cache.0.set(Arc::clone(&store));
+        Ok(store)
+    }
+
     pub fn correlation_scope(&self) -> &CorrelationScope {
         &self.correlation_scope
     }
@@ -1758,6 +1801,10 @@ impl SessionContext {
             session_id,
             partner_id,
             profile_name: "test".into(),
+            #[cfg(any(feature = "as2", feature = "as4"))]
+            trust_anchors_cache: TrustAnchorCache::default(),
+            #[cfg(any(feature = "as2", feature = "as4"))]
+            x509_store_cache: X509StoreCache::default(),
         }
     }
 }
@@ -1938,20 +1985,94 @@ mod tests {
     #[test]
     #[cfg(any(feature = "as2", feature = "as4"))]
     fn with_cert_handle_resets_trust_anchor_cache() {
-        // Verify that cache is NOT shared between different CertHandles
-        // even when constructed via struct update syntax.
-        let old_cert = CertHandle::new("old-key");
-        // Force the cache to be populated on old_cert (simulate a warm cache).
-        // We can't easily populate it here since trust_anchors_x509 needs real PEM,
-        // but we can verify that a new CertHandle::new() gives a fresh cache Arc.
-        let new_cert = CertHandle {
+        // Verify that replacing cert_handle on a session resets the caches so
+        // the new anchor PEMs are parsed fresh on next access.
+        let session = SessionContext::new("s-cache", "partner-cache", "strict").expect("session");
+        // The initial session has empty trust_anchor_pems — caches default.
+        assert!(session.trust_anchors_cache.0.get().is_none());
+
+        let new_handle = CertHandle::new("partner-cache-cert");
+        // with_cert_handle always installs a fresh default cache, irrespective
+        // of what was in the provided CertHandle.
+        let session = session.with_cert_handle(new_handle).expect("set handle");
+        assert!(session.trust_anchors_cache.0.get().is_none());
+
+        // Struct update syntax now works from external callers too since
+        // CertHandle has no pub(crate) fields.
+        let handle2 = CertHandle {
             trust_anchor_pems: vec!["some-pem".into()],
-            ..CertHandle::new("new-key")
+            ..CertHandle::new("partner-cache-cert-2")
         };
-        // The cache Arcs should be different instances.
-        assert!(!Arc::ptr_eq(
-            &old_cert.trust_anchors_cache.0,
-            &new_cert.trust_anchors_cache.0
-        ));
+        let _ = session.with_cert_handle(handle2);
+    }
+
+    // ── BUG-1 regression: builder convenience setters must derive key_id ──────
+
+    #[test]
+    fn builder_with_trust_anchor_pem_does_not_leave_empty_key_id() {
+        // Any convenience builder setter should auto-derive key_id from partner_id,
+        // so build() must not fail with "cert handle key_id must not be empty".
+        let result = SessionContextBuilder::new("s1", "partner-xyz")
+            .with_trust_anchor_pem("fake-pem")
+            .build();
+        assert!(result.is_ok(), "build() must not fail: {:?}", result);
+        let session = result.unwrap();
+        assert_eq!(
+            session.cert_handle().key_id,
+            "cert:partner-xyz",
+            "key_id should be auto-derived from partner_id"
+        );
+    }
+
+    #[test]
+    fn builder_with_signing_cert_and_key_pem_do_not_leave_empty_key_id() {
+        // Regression for BUG-1: with_signing_cert_pem / with_signing_key_pem
+        // previously initialised CertHandle with key_id="" which caused build() to fail.
+        // We cannot use real PEM material here, so just verify that the cert_handle
+        // key_id is derived from partner_id.
+        let builder =
+            SessionContextBuilder::new("s1", "partner-abc").with_signing_cert_pem("not-real-pem");
+        assert_eq!(
+            builder.cert_handle.as_ref().expect("handle").key_id,
+            "cert:partner-abc",
+        );
+    }
+
+    #[test]
+    fn builder_with_fingerprint_sha256_sets_field() {
+        let builder =
+            SessionContextBuilder::new("s1", "partner-fp").with_fingerprint_sha256("aabbcc");
+        assert_eq!(
+            builder
+                .cert_handle
+                .as_ref()
+                .expect("handle")
+                .fingerprint_sha256,
+            "aabbcc",
+        );
+    }
+
+    #[test]
+    fn builder_with_signing_material_sets_both_fields() {
+        let builder = SessionContextBuilder::new("s1", "partner-mat")
+            .with_signing_material("cert-pem-value", "key-pem-value");
+        let ch = builder.cert_handle.as_ref().expect("handle");
+        assert_eq!(ch.signing_cert_pem.as_deref(), Some("cert-pem-value"));
+        assert!(ch.signing_key_pem.is_some());
+        assert_eq!(
+            ch.signing_key_pem.as_ref().map(|s| s.as_str()),
+            Some("key-pem-value")
+        );
+    }
+
+    #[test]
+    fn cert_handle_set_signing_key_pem_avoids_zeroize_dep() {
+        let mut ch = CertHandle::new("key");
+        ch.set_signing_key_pem("my-private-key");
+        assert!(ch.signing_key_pem.is_some());
+        assert_eq!(
+            ch.signing_key_pem.as_ref().map(|s| s.as_str()),
+            Some("my-private-key")
+        );
     }
 }

@@ -1912,3 +1912,35 @@ fn forward_receipt_taxonomy_alerts_fail_closed_surfaces_channel_error() {
         .expect_err("fail-closed forward must surface channel error");
     assert_eq!(err.code, ErrorCode::ReliabilityFailure);
 }
+
+// ── FR-2 regression: EventBus::new_for_testing ─────────────────────────────
+
+#[cfg(feature = "testing")]
+#[test]
+fn new_for_testing_is_best_effort_and_infallible() {
+    let bus = EventBus::new_for_testing();
+    assert_eq!(bus.emission_mode(), EventEmissionMode::BestEffort);
+}
+
+#[cfg(feature = "testing")]
+#[test]
+fn new_for_testing_silently_drops_events_without_subscriber() {
+    let bus = EventBus::new_for_testing();
+    let sess = crate::core::SessionContext::new("s-testing", "p1", "strict").expect("session");
+    // Emitting without a subscriber must not fail in BestEffort mode.
+    let result = bus.emit(
+        &sess,
+        crate::observability::AsxEvent::MessageSigned {
+            message_id: "m1".into(),
+        },
+    );
+    assert!(
+        result.is_ok(),
+        "new_for_testing must never fail on emit: {result:?}"
+    );
+    assert_eq!(
+        bus.metrics().dropped(),
+        1,
+        "event should be counted as dropped"
+    );
+}

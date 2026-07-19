@@ -130,7 +130,7 @@ pub struct As4HttpIngress {
 ## Egress / HTTP Client (`client` feature)
 
 ```toml
-asx-rs = { version = "0.7", features = ["as2", "as4", "client"] }
+asx-rs = { version = "0.8", features = ["as2", "as4", "client"] }
 ```
 
 ### AS2 send
@@ -162,37 +162,56 @@ use asx_rs::transport::egress::{As4HttpTransport, TransportConfig, HttpSendOutco
 
 let transport = As4HttpTransport::new(TransportConfig { ... });
 
-let outcome: HttpSendOutcome = transport.send_sync(
+let outcome: HttpSendOutcome = transport.send(
     "https://partner.example.com/as4/receive",
     &send_output,       // As4SendOutput from asx_rs::as4::send_sync
 ).await?;
 ```
 
+### AS4 send in integration tests (`testing` feature)
+
+`As4HttpTransport::new()` rejects plain-HTTP and loopback addresses (SSRF protection).
+For tests against `MockAs4Endpoint` on `http://127.0.0.1:…`, use the testing bypass:
+
+```rust
+use asx_rs::transport::egress::As4HttpTransport;
+
+// Requires `testing` feature. Bypasses HTTPS-only and SSRF guards.
+let transport = As4HttpTransport::new_for_localhost_testing()?;
+let outcome = transport.send_to_localhost(&endpoint.local_url(), &output).await?;
+assert!(outcome.is_success());
+```
+
+`send_to_localhost` is only available when `feature = "testing"` is active.
+`new_for_localhost_testing()` triggers a `compile_error!` in release profile builds.
+
 ### `TransportConfig`
 
 ```rust
 pub struct TransportConfig {
-    pub timeout_secs: u64,           // HTTP request timeout (default: 30)
-    pub max_idle_connections: usize, // Connection pool size (default: 10)
+    pub connect_timeout: Duration,   // TCP+TLS connect timeout (default: 10s)
+    pub request_timeout: Duration,   // Full round-trip timeout (default: 60s)
     pub user_agent: String,          // User-Agent header value
+    pub pool_max_idle_per_host: usize,
+    pub pool_idle_timeout: Duration,
 }
 ```
 
-Default: `TransportConfig::default()` — 30s timeout, 10 idle connections, `asx/<version>`.
+Default: `TransportConfig::default()` — 10s connect, 60s request, `asx/0.8`.
 
 ### `HttpSendOutcome`
 
 ```rust
 pub struct HttpSendOutcome {
     pub status: u16,
-    pub body: Vec<u8>,
-    pub content_type: Option<String>,
-    pub headers: Vec<(String, String)>,
+    pub headers: HttpHeaders,
+    pub body: Arc<[u8]>,
 }
 
 impl HttpSendOutcome {
-    /// Returns true when the response Content-Type is multipart/report (sync MDN).
-    pub fn is_sync_mdn(&self) -> bool { ... }
+    pub fn is_success(&self) -> bool;      // 2xx status
+    pub fn is_sync_mdn(&self) -> bool;     // multipart/report (AS2 sync MDN)
+    pub fn header(&self, name: &str) -> Option<&str>; // case-insensitive lookup
 }
 ```
 
@@ -201,7 +220,7 @@ impl HttpSendOutcome {
 ## Server / Axum Integration (`server` feature)
 
 ```toml
-asx-rs = { version = "0.7", features = ["as2", "as4", "server"] }
+asx-rs = { version = "0.8", features = ["as2", "as4", "server"] }
 ```
 
 The server layer provides axum 0.7 router builders with typed handler traits. It is built on top of the framework-agnostic ingress layer — the same validation logic runs regardless of how the request arrives.

@@ -272,8 +272,8 @@ impl CmsSmimeTrustVerifier {
             responder_ocsp_responses_der: &session.cert_handle().responder_ocsp_responses_der,
             ocsp_cache_namespace: session.partner_id(),
             require_chain_validation: true,
-            pre_parsed_trust_anchors: Some(session.cert_handle().trust_anchors_x509()?),
-            pre_built_x509_store: Some(session.cert_handle().trust_anchor_x509_store()?),
+            pre_parsed_trust_anchors: Some(session.trust_anchors_x509()?),
+            pre_built_x509_store: Some(session.trust_anchor_x509_store()?),
         })
     }
 }
