@@ -583,7 +583,7 @@ pub enum InteropMode {
     ///
     /// ```toml
     /// [dependencies]
-    /// asx-rs = { version = "0.9", features = ["interop-relaxed"] }
+    /// asx-rs = { version = "0.10", features = ["interop-relaxed"] }
     /// ```
     #[cfg(feature = "interop-relaxed")]
     Relaxed,

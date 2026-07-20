@@ -96,14 +96,14 @@ EDI trading partner connections worldwide.
 ```toml
 [dependencies]
 # AS4 — PEPPOL / CEF eDelivery (RSA) or BDEW (EC/ECDH-ES) — same code, key type decides
-asx-rs = { version = "0.9", features = ["as4", "client", "server", "async-ocsp"] }
+asx-rs = { version = "0.10", features = ["as4", "client", "server", "async-ocsp"] }
 
 # AS2 + AS4 with compression
-asx-rs = { version = "0.9", features = ["as2", "as4", "compression", "client", "server", "async-ocsp"] }
+asx-rs = { version = "0.10", features = ["as2", "as4", "compression", "client", "server", "async-ocsp"] }
 
 [dev-dependencies]
 # Testing without PKI certificates (MockAs4Endpoint, bypass verifier, keypair generators)
-asx-rs = { version = "0.9", features = ["as4", "testing", "server"] }
+asx-rs = { version = "0.10", features = ["as4", "testing", "server"] }
 ```
 
 > `as2` and `as4` are **not** in the default feature set — add them explicitly.

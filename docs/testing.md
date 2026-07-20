@@ -72,7 +72,7 @@ Skips all WS-Security checks on inbound AS4 push messages. Parity with
 
 ```toml
 [dev-dependencies]
-asx-rs = { version = "0.9", features = ["as4", "testing"] }
+asx-rs = { version = "0.10", features = ["as4", "testing"] }
 ```
 
 ```rust
@@ -100,7 +100,7 @@ synchronous AS4 receipt. Requires `testing + server` features.
 
 ```toml
 [dev-dependencies]
-asx-rs = { version = "0.9", features = ["as4", "testing", "server"] }
+asx-rs = { version = "0.10", features = ["as4", "testing", "server"] }
 ```
 
 ```rust
@@ -480,7 +480,7 @@ assert_eq!(response.status(), 200);
 ## Testing Feature Flag
 
 ```toml
-asx-rs = { version = "0.9", features = ["testing"] }
+asx-rs = { version = "0.10", features = ["testing"] }
 ```
 
 The `testing` feature exposes `asx_rs::fixtures` and `asx_rs::matrix` — test scaffold modules with `InteropFixtureMetadata`, `FixtureCatalog`, `MatrixSummary`, and related helpers. These are not part of the production library surface and are absent from builds without this feature.

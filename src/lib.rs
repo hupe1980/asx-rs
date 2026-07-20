@@ -34,16 +34,16 @@ AS4 (OASIS ebMS3 + eDelivery) EDI transport protocols. The crate is published as
 
 ```toml
 # AS2 only (sign, encrypt, OCSP; compression is enabled by default):
-asx-rs = { version = "0.9", features = ["as2", "async-ocsp"] }
+asx-rs = { version = "0.10", features = ["as2", "async-ocsp"] }
 
 # AS4 only (sign, encrypt; compression is enabled by default):
-asx-rs = { version = "0.9", features = ["as4", "async-ocsp"] }
+asx-rs = { version = "0.10", features = ["as4", "async-ocsp"] }
 
 # Both protocols with compression:
-asx-rs = { version = "0.9", features = ["as2", "as4", "compression", "async-ocsp"] }
+asx-rs = { version = "0.10", features = ["as2", "as4", "compression", "async-ocsp"] }
 
 # Both protocols, relaxed interop for legacy partners:
-asx-rs = { version = "0.9", features = ["as2", "as4", "interop-relaxed", "async-ocsp"] }
+asx-rs = { version = "0.10", features = ["as2", "as4", "interop-relaxed", "async-ocsp"] }
 
 ```
 

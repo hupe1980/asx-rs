@@ -175,7 +175,7 @@ fn enforce_messaging_signature_coverage(
 ///
 /// ```toml
 /// [dev-dependencies]
-/// asx-rs = { version = "0.9", features = ["as4", "testing"] }
+/// asx-rs = { version = "0.10", features = ["as4", "testing"] }
 /// ```
 ///
 /// [`MockAs4Endpoint`]: crate::as4::mock_endpoint::MockAs4Endpoint

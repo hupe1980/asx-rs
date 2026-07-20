@@ -1354,6 +1354,30 @@ impl Drop for As4PullRequestCredentials {
     }
 }
 
+/// Credentials required to generate a signed AS4 `eb:Receipt` signal.
+///
+/// Per eDelivery AS4 v1.15 §5.1.8 and profile derivatives (e.g. BDEW
+/// AS4-Profil §2.2.4), receipts must carry a WS-Security XML Signature so
+/// that Non-Repudiation of Receipt (NRR) holds.  Pass these credentials to
+/// [`crate::as4::generate_signed_receipt_with_nri`] or
+/// [`crate::as4::generate_signed_receipt_for_output`].
+#[derive(Debug, Clone)]
+pub struct As4ReceiptCredentials {
+    /// PEM-encoded private key used to sign the receipt signal.
+    pub signing_key_pem: Vec<u8>,
+    /// PEM-encoded X.509 certificate corresponding to `signing_key_pem`.
+    pub signing_cert_pem: Vec<u8>,
+    /// Key-info profile controlling how the signing certificate appears in
+    /// the `<ds:KeyInfo>` element of the generated XML signature.
+    pub key_info_profile: WsSecOutboundKeyInfoProfile,
+}
+
+impl Drop for As4ReceiptCredentials {
+    fn drop(&mut self) {
+        self.signing_key_pem.zeroize();
+    }
+}
+
 /// Parameters for [`crate::as4::generate_pull_request`].
 #[derive(Debug, Clone)]
 pub struct As4GeneratePullRequestPolicy {

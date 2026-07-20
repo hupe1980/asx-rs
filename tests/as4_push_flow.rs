@@ -249,6 +249,67 @@ fn cryptographically_signed_receipt_passes_end_to_end() {
 }
 
 #[test]
+fn library_generated_signed_receipt_passes_strict_receipt_gate() {
+    // Self-interop: a receipt produced by `generate_signed_receipt_with_nri`
+    // must be accepted by the receive path with `require_signed_receipt = true`
+    // (the default) — signature verified against the pinned trust anchor and
+    // classified as a signed NRR receipt.
+    use asx_rs::as4::{As4NriReference, As4ReceiptCredentials, generate_signed_receipt_with_nri};
+    use asx_rs::crypto::wssec::WsSecOutboundKeyInfoProfile;
+
+    let bus = EventBus::new(32).expect("bus");
+    let _events = bus.subscribe_scoped_events();
+    let signing_key_pem = pki_fixture("receipt_signing.key.pem");
+    let signing_cert_pem = pki_fixture("receipt_signing.cert.pem");
+    let trusted_session = session_with_trust_anchor_and_fingerprint_pin(&signing_cert_pem);
+
+    let credentials = As4ReceiptCredentials {
+        signing_key_pem,
+        signing_cert_pem,
+        key_info_profile: WsSecOutboundKeyInfoProfile::X509DataAndRsaKeyValue,
+    };
+    let nri_refs = vec![As4NriReference {
+        uri: "#as4-user-message".to_string(),
+        digest_method_uri: "http://www.w3.org/2001/04/xmlenc#sha256".to_string(),
+        digest_value_b64: "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=".to_string(),
+    }];
+    let receipt = generate_signed_receipt_with_nri(
+        &trusted_session,
+        "receipt-self-interop-1",
+        "msg-push-1",
+        &nri_refs,
+        &credentials,
+    )
+    .expect("signed receipt generation");
+
+    let dedup = dedup_backend();
+    let out = receive_push_with_dedup_sync(
+        &trusted_session,
+        &bus,
+        As4ReceivePushSyncRequest {
+            request: As4ReceivePushRequest {
+                http_content_type: multipart_content_type(),
+                payload: multipart_push_payload().into(),
+                receipt_payload: Some(receipt),
+                policy: as4_unsigned_push_policy(),
+                authenticated_sender_scope: None,
+            },
+            dedup_backend: &dedup,
+        },
+    )
+    .expect("library-generated signed receipt must pass the strict receipt gate")
+    .unwrap_output();
+
+    let receipt = out.receipt.expect("receipt");
+    assert!(receipt.is_signed, "receipt must be detected as signed");
+    assert!(
+        receipt.has_non_repudiation_info,
+        "receipt must carry NonRepudiationInformation"
+    );
+    assert_eq!(receipt.ref_to_message_id, "msg-push-1");
+}
+
+#[test]
 fn receipt_with_wrong_ref_to_message_id_detected_after_crypto_verify() {
     let bus = EventBus::new(32).expect("bus");
     let _events = bus.subscribe_scoped_events();

@@ -130,7 +130,7 @@ pub struct As4HttpIngress {
 ## Egress / HTTP Client (`client` feature)
 
 ```toml
-asx-rs = { version = "0.9", features = ["as2", "as4", "client"] }
+asx-rs = { version = "0.10", features = ["as2", "as4", "client"] }
 ```
 
 ### SSRF protection
@@ -236,7 +236,7 @@ impl HttpSendOutcome {
 ## Server / Axum Integration (`server` feature)
 
 ```toml
-asx-rs = { version = "0.9", features = ["as2", "as4", "server"] }
+asx-rs = { version = "0.10", features = ["as2", "as4", "server"] }
 ```
 
 The server layer provides axum 0.7 router builders with typed handler traits. It is built on top of the framework-agnostic ingress layer — the same validation logic runs regardless of how the request arrives.

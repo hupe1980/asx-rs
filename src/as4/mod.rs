@@ -36,7 +36,7 @@ pub use pull::{
 ///
 /// ```toml
 /// # Enable in dev-dependencies only
-/// asx-rs = { version = "0.9", features = ["as4", "testing"] }
+/// asx-rs = { version = "0.10", features = ["as4", "testing"] }
 /// ```
 ///
 /// ```rust,ignore
@@ -68,7 +68,8 @@ pub use send::{
 pub use send_mime::{inject_xop_include, package_as_mime};
 pub use signals::{
     generate_error_signal, generate_pull_request, generate_receipt, generate_receipt_for_output,
-    generate_receipt_with_nri,
+    generate_receipt_with_nri, generate_signed_receipt_for_output,
+    generate_signed_receipt_with_nri,
 };
 
 mod parser;
@@ -1546,6 +1547,297 @@ Content-ID: <{cid}>\r\n\
         let xml = std::str::from_utf8(&out).expect("utf8");
         assert!(!xml.contains("<script>"), "XML injection must be escaped");
         assert!(xml.contains("&amp;"), "ampersand must be entity-escaped");
+    }
+
+    fn test_receipt_credentials() -> As4ReceiptCredentials {
+        let creds = test_as4_credentials();
+        As4ReceiptCredentials {
+            signing_key_pem: creds.signing_key_pem.clone().unwrap(),
+            signing_cert_pem: creds.signing_cert_pem.as_deref().unwrap().to_vec(),
+            key_info_profile: WsSecOutboundKeyInfoProfile::default(),
+        }
+    }
+
+    fn test_nri_refs() -> Vec<As4NriReference> {
+        vec![As4NriReference {
+            uri: "#body".to_string(),
+            digest_method_uri: "http://www.w3.org/2001/04/xmlenc#sha256".to_string(),
+            digest_value_b64: "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=".to_string(),
+        }]
+    }
+
+    #[test]
+    fn generate_signed_receipt_with_nri_verifies_and_parses_as_signed() {
+        let session = SessionContext::new("s1", "p1", "strict")
+            .expect("session")
+            .with_strict_runtime_bootstrap_validated(true);
+        let creds = test_receipt_credentials();
+        let out = generate_signed_receipt_with_nri(
+            &session,
+            "receipt-signed-1",
+            "msg-1",
+            &test_nri_refs(),
+            &creds,
+        )
+        .expect("signed receipt");
+        let xml = std::str::from_utf8(&out).expect("utf8");
+
+        assert!(
+            xml.contains("wsse:Security"),
+            "signed receipt must carry a wsse:Security header"
+        );
+        assert!(
+            xml.contains("<ds:Signature"),
+            "signed receipt must carry a ds:Signature"
+        );
+        assert!(
+            xml.contains("<ebbpsig:MessagePartNRInformation>"),
+            "NRI refs must be echoed"
+        );
+        assert!(
+            xml.contains("<eb:RefToMessageId>msg-1</eb:RefToMessageId>"),
+            "receipt must reference the original message ID"
+        );
+
+        // The signature must verify with the library's own verifier …
+        verify_enveloped_signature(xml, WsSecVerifyOptions::new())
+            .expect("library-generated signed receipt must verify");
+
+        // … and the receipt parser must classify it as signed NRR receipt,
+        // i.e. it passes a `require_signed_receipt = true` policy gate.
+        let bus = EventBus::new(16).expect("bus");
+        let _events = bus.subscribe_scoped_events();
+        let parsed =
+            super::parser::parse_as4_receipt(&session, &bus, xml, InteropMode::Strict, false)
+                .expect("signed receipt must parse");
+        assert!(parsed.is_signed, "receipt must be detected as signed");
+        assert!(
+            parsed.has_non_repudiation_info,
+            "receipt must be detected as carrying NRI"
+        );
+        assert_eq!(parsed.ref_to_message_id, "msg-1");
+    }
+
+    #[test]
+    fn generate_signed_receipt_tampering_breaks_verification() {
+        let session = SessionContext::new("s1", "p1", "strict")
+            .expect("session")
+            .with_strict_runtime_bootstrap_validated(true);
+        let creds = test_receipt_credentials();
+        let out = generate_signed_receipt_with_nri(
+            &session,
+            "receipt-signed-2",
+            "msg-1",
+            &test_nri_refs(),
+            &creds,
+        )
+        .expect("signed receipt");
+        let xml = std::str::from_utf8(&out).expect("utf8");
+        let tampered = xml.replace(
+            "<eb:RefToMessageId>msg-1</eb:RefToMessageId>",
+            "<eb:RefToMessageId>msg-2</eb:RefToMessageId>",
+        );
+        assert_ne!(xml, tampered, "tampering must change the envelope");
+        verify_enveloped_signature(&tampered, WsSecVerifyOptions::new())
+            .expect_err("tampered signed receipt must fail verification");
+    }
+
+    #[test]
+    fn generate_signed_receipt_rejects_mismatched_credentials() {
+        let session = SessionContext::new("s1", "p1", "strict")
+            .expect("session")
+            .with_strict_runtime_bootstrap_validated(true);
+        let creds_a = test_as4_credentials();
+        let creds_b = test_as4_credentials();
+        let creds = As4ReceiptCredentials {
+            signing_key_pem: creds_b.signing_key_pem.clone().unwrap(),
+            signing_cert_pem: creds_a.signing_cert_pem.as_deref().unwrap().to_vec(),
+            key_info_profile: WsSecOutboundKeyInfoProfile::default(),
+        };
+        let err =
+            generate_signed_receipt_with_nri(&session, "receipt-signed-3", "msg-1", &[], &creds)
+                .expect_err("mismatched cert/key must fail");
+        assert_eq!(err.code, ErrorCode::InvalidInput);
+        assert!(err.message.contains("does not match signing_key_pem"));
+    }
+
+    #[test]
+    fn generate_signed_receipt_rejects_empty_message_id() {
+        let session = SessionContext::new("s1", "p1", "strict")
+            .expect("session")
+            .with_strict_runtime_bootstrap_validated(true);
+        let creds = test_receipt_credentials();
+        let err = generate_signed_receipt_with_nri(&session, "", "ref-1", &[], &creds)
+            .expect_err("must fail");
+        assert_eq!(err.code, ErrorCode::InvalidInput);
+    }
+
+    #[cfg(feature = "testing")]
+    #[tokio::test]
+    async fn generate_signed_receipt_for_output_echoes_inbound_digests() {
+        let session = SessionContext::new("s1", "p1", "strict")
+            .expect("session")
+            .with_strict_runtime_bootstrap_validated(true);
+        let bus = EventBus::new(16).expect("bus");
+        let _events = bus.subscribe_scoped_events();
+
+        // Obtain a genuine receive output for message "msg-1".
+        let payload = multipart_user_message_payload(
+            "msg-1",
+            "SubmitOrder",
+            Some("conv-7"),
+            b"payload-msg-1",
+        );
+        let (_, dedup) = reliability();
+        let out = receive_push_with_dedup_sync(
+            &session,
+            &bus,
+            As4ReceivePushSyncRequest {
+                request: As4ReceivePushRequest {
+                    http_content_type: "multipart/related; boundary=asx-test-boundary".into(),
+                    payload: Arc::from(payload),
+                    receipt_payload: None,
+                    policy: As4PushPolicy {
+                        interop: InteropMode::Strict,
+                        interop_exceptions: InteropExceptionPolicy::default(),
+                        require_signed_receipt: false,
+                        require_signed_push: false,
+                        fail_closed_audit_events: false,
+                        inbound_decryption_key_pem: None,
+                        require_encrypted_inbound: false,
+                        timestamp_freshness_window: None,
+                        fragment_scope_policy: FragmentScopePolicy::UseSoapSenderId,
+                    },
+                    authenticated_sender_scope: None,
+                },
+                dedup_backend: &dedup,
+            },
+        )
+        .expect("push receive")
+        .unwrap_output();
+
+        // Build a *signed* inbound wire message to extract NRI digests from.
+        let sent = send_sync(
+            &session,
+            &bus,
+            As4SendRequest {
+                message_id: "msg-1".to_string(),
+                payload: b"payload-msg-1".to_vec(),
+                policy: As4SendPolicy {
+                    interop: InteropMode::Strict,
+                    outbound_key_info_profile: WsSecOutboundKeyInfoProfile::X509DataAndRsaKeyValue,
+                    sign: true,
+                    encrypt: false,
+                    compress: false,
+                    payload_packaging_mode: super::pmode::PayloadPackagingMode::MimeAttachment,
+                    ..As4SendPolicy::default()
+                },
+                credentials: Some(test_as4_credentials()),
+                payload_filename: None,
+            },
+        )
+        .expect("send");
+
+        let creds = test_receipt_credentials();
+        let receipt = generate_signed_receipt_for_output(
+            &session,
+            "receipt-signed-out-1",
+            &out,
+            &sent.soap_envelope.body,
+            &sent.http_content_type,
+            &creds,
+        )
+        .expect("signed receipt for output");
+        let receipt_xml = std::str::from_utf8(&receipt).expect("utf8");
+
+        // The receipt must echo the digests of the inbound message signature.
+        let multipart = extract_multipart_related_payload_if_present(
+            &sent.soap_envelope.body,
+            &sent.http_content_type,
+            &session,
+            "test_extract",
+        )
+        .expect("multipart parse")
+        .expect("multipart payload");
+        let inbound_xml = std::str::from_utf8(multipart.soap_xml).expect("utf8");
+        let inbound_refs =
+            crate::crypto::wssec::parse_signature_references(inbound_xml).expect("inbound refs");
+        assert!(!inbound_refs.is_empty(), "inbound message must be signed");
+        for r in &inbound_refs {
+            assert!(
+                receipt_xml.contains(&r.digest_value_base64),
+                "receipt NRI must echo inbound digest {}",
+                r.digest_value_base64
+            );
+        }
+
+        assert!(
+            receipt_xml.contains("<eb:RefToMessageId>msg-1</eb:RefToMessageId>"),
+            "receipt must reference the received message"
+        );
+        verify_enveloped_signature(receipt_xml, WsSecVerifyOptions::new())
+            .expect("signed receipt for output must verify");
+    }
+
+    #[cfg(feature = "testing")]
+    #[tokio::test]
+    async fn generate_signed_receipt_for_output_rejects_unsigned_inbound() {
+        let session = SessionContext::new("s1", "p1", "strict")
+            .expect("session")
+            .with_strict_runtime_bootstrap_validated(true);
+        let bus = EventBus::new(16).expect("bus");
+        let _events = bus.subscribe_scoped_events();
+
+        let payload = multipart_user_message_payload(
+            "msg-unsigned-1",
+            "SubmitOrder",
+            None,
+            b"payload-unsigned",
+        );
+        let (_, dedup) = reliability();
+        let out = receive_push_with_dedup_sync(
+            &session,
+            &bus,
+            As4ReceivePushSyncRequest {
+                request: As4ReceivePushRequest {
+                    http_content_type: "multipart/related; boundary=asx-test-boundary".into(),
+                    payload: Arc::from(payload.clone()),
+                    receipt_payload: None,
+                    policy: As4PushPolicy {
+                        interop: InteropMode::Strict,
+                        interop_exceptions: InteropExceptionPolicy::default(),
+                        require_signed_receipt: false,
+                        require_signed_push: false,
+                        fail_closed_audit_events: false,
+                        inbound_decryption_key_pem: None,
+                        require_encrypted_inbound: false,
+                        timestamp_freshness_window: None,
+                        fragment_scope_policy: FragmentScopePolicy::UseSoapSenderId,
+                    },
+                    authenticated_sender_scope: None,
+                },
+                dedup_backend: &dedup,
+            },
+        )
+        .expect("push receive")
+        .unwrap_output();
+
+        let creds = test_receipt_credentials();
+        let err = generate_signed_receipt_for_output(
+            &session,
+            "receipt-signed-out-2",
+            &out,
+            &payload,
+            "multipart/related; boundary=asx-test-boundary",
+            &creds,
+        )
+        .expect_err("unsigned inbound must not yield an NRR receipt");
+        assert_eq!(err.code, ErrorCode::InvalidInput);
+        assert!(
+            err.message.contains("cannot build NRR receipt"),
+            "error must explain the missing inbound signature: {}",
+            err.message
+        );
     }
 
     #[test]
@@ -3107,6 +3399,10 @@ Content-ID: <{cid}>\r\n\
             "signed envelope must include ds:Signature"
         );
         assert!(xml.contains("urn:example:mpc"), "must embed the MPC");
+        // Regression: the envelope must be well-formed XML (wsse prefix
+        // declared) and the signature must verify end-to-end.
+        verify_enveloped_signature(&xml, WsSecVerifyOptions::new())
+            .expect("signed pull request must verify");
     }
 
     #[test]

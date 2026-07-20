@@ -1,9 +1,9 @@
 //! AS4 signal generation: Receipt, Error, and PullRequest signals.
 
-use super::stream::normalize_mpc;
+use super::stream::{extract_multipart_related_payload_if_present, normalize_mpc};
 use super::types::{
     As4ErrorCode, As4ErrorSeverity, As4GeneratePullRequestPolicy, As4NriReference,
-    As4ReceivePushOutput,
+    As4ReceiptCredentials, As4ReceivePushOutput,
 };
 use crate::core::{AsxError, ErrorCode, ErrorContext, Result, SessionContext};
 #[cfg(feature = "as4")]
@@ -20,8 +20,8 @@ use crate::crypto::wssec::generate_xmlsig_signature;
 /// For a conformant NRO receipt that echoes the original message's signed
 /// references, use [`generate_receipt_with_nri`] instead.
 ///
-/// The receipt is unsigned; if the P-Mode requires a signed receipt (NRI),
-/// the caller must sign the returned bytes before transmitting them.
+/// The receipt is unsigned; if the P-Mode requires a signed receipt (NRR),
+/// use [`generate_signed_receipt_with_nri`] instead.
 pub fn generate_receipt(
     session: &SessionContext,
     message_id: &str,
@@ -49,6 +49,10 @@ pub fn generate_receipt(
 /// let nri: Vec<As4NriReference> = sig_refs.into_iter().map(As4NriReference::from).collect();
 /// let receipt = generate_receipt_with_nri(&session, &id, &ref_id, &nri)?;
 /// ```
+///
+/// The receipt is unsigned; for a receipt carrying a WS-Security XML
+/// Signature (Non-Repudiation of Receipt), use
+/// [`generate_signed_receipt_with_nri`].
 #[cfg_attr(feature = "trace", tracing::instrument(skip_all, fields(message_id = %message_id, partner_id = %session.partner_id())))]
 pub fn generate_receipt_with_nri(
     session: &SessionContext,
@@ -56,54 +60,23 @@ pub fn generate_receipt_with_nri(
     ref_to_message_id: &str,
     nri_refs: &[As4NriReference],
 ) -> Result<Vec<u8>> {
-    if message_id.trim().is_empty() {
-        return Err(AsxError::new(
-            ErrorCode::InvalidInput,
-            "message_id must not be empty",
-            ErrorContext::for_session("as4_generate_receipt", session),
-        ));
-    }
-    if ref_to_message_id.trim().is_empty() {
-        return Err(AsxError::new(
-            ErrorCode::InvalidInput,
-            "ref_to_message_id must not be empty",
-            ErrorContext::for_session("as4_generate_receipt", session),
-        ));
-    }
+    validate_receipt_signal_ids(
+        session,
+        "as4_generate_receipt",
+        message_id,
+        ref_to_message_id,
+    )?;
 
     let timestamp = crate::time_utils::format_rfc3339_secs(std::time::SystemTime::now());
     // SECURITY: Escape caller-supplied values to prevent XML injection.
     let message_id_escaped = crate::wire::escape_xml(message_id);
     let ref_to_message_id_escaped = crate::wire::escape_xml(ref_to_message_id);
 
-    // Build <ebbpsig:NonRepudiationInformation> content.
-    // When NRI references are provided, each becomes a MessagePartNRInformation
-    // entry that echoes the original message's ds:Reference — conformant with
-    // eDelivery AS4 §5.1.3 Non-Repudiation of Origin.
-    let (nri_xml, ds_ns_attr) = if nri_refs.is_empty() {
-        ("<ebbpsig:NonRepudiationInformation/>".to_string(), "")
+    let nri_xml = build_receipt_nri_xml(nri_refs);
+    let ds_ns_attr = if nri_refs.is_empty() {
+        ""
     } else {
-        let mut nri = "<ebbpsig:NonRepudiationInformation>".to_string();
-        for r in nri_refs {
-            // SECURITY: escape all caller-controlled fields.
-            let uri_esc = crate::wire::escape_xml(&r.uri);
-            let dig_method_esc = crate::wire::escape_xml(&r.digest_method_uri);
-            let dig_value_esc = crate::wire::escape_xml(&r.digest_value_b64);
-            nri.push_str(&format!(
-                "<ebbpsig:MessagePartNRInformation>\
-<ds:Reference URI=\"{uri}\">\
-<ds:DigestMethod Algorithm=\"{dig_method}\"\
-></ds:DigestMethod\
-><ds:DigestValue>{dig_value}</ds:DigestValue>\
-</ds:Reference>\
-</ebbpsig:MessagePartNRInformation>",
-                uri = uri_esc,
-                dig_method = dig_method_esc,
-                dig_value = dig_value_esc,
-            ));
-        }
-        nri.push_str("</ebbpsig:NonRepudiationInformation>");
-        (nri, " xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\"")
+        " xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\""
     };
 
     let xml = format!(
@@ -130,6 +103,204 @@ pub fn generate_receipt_with_nri(
     Ok(xml.into_bytes())
 }
 
+/// Validate the message-ID pair shared by all receipt generators.
+fn validate_receipt_signal_ids(
+    session: &SessionContext,
+    stage: &'static str,
+    message_id: &str,
+    ref_to_message_id: &str,
+) -> Result<()> {
+    if message_id.trim().is_empty() {
+        return Err(AsxError::new(
+            ErrorCode::InvalidInput,
+            "message_id must not be empty",
+            ErrorContext::for_session(stage, session),
+        ));
+    }
+    if ref_to_message_id.trim().is_empty() {
+        return Err(AsxError::new(
+            ErrorCode::InvalidInput,
+            "ref_to_message_id must not be empty",
+            ErrorContext::for_session(stage, session),
+        ));
+    }
+    Ok(())
+}
+
+/// Build the `<ebbpsig:NonRepudiationInformation>` block for a receipt.
+///
+/// When NRI references are provided, each becomes a MessagePartNRInformation
+/// entry that echoes the original message's ds:Reference — conformant with
+/// eDelivery AS4 §5.1.3 Non-Repudiation of Origin.
+fn build_receipt_nri_xml(nri_refs: &[As4NriReference]) -> String {
+    if nri_refs.is_empty() {
+        return "<ebbpsig:NonRepudiationInformation/>".to_string();
+    }
+    let mut nri = "<ebbpsig:NonRepudiationInformation>".to_string();
+    for r in nri_refs {
+        // SECURITY: escape all caller-controlled fields.
+        let uri_esc = crate::wire::escape_xml(&r.uri);
+        let dig_method_esc = crate::wire::escape_xml(&r.digest_method_uri);
+        let dig_value_esc = crate::wire::escape_xml(&r.digest_value_b64);
+        nri.push_str(&format!(
+            "<ebbpsig:MessagePartNRInformation>\
+<ds:Reference URI=\"{uri}\">\
+<ds:DigestMethod Algorithm=\"{dig_method}\"\
+></ds:DigestMethod\
+><ds:DigestValue>{dig_value}</ds:DigestValue>\
+</ds:Reference>\
+</ebbpsig:MessagePartNRInformation>",
+            uri = uri_esc,
+            dig_method = dig_method_esc,
+            dig_value = dig_value_esc,
+        ));
+    }
+    nri.push_str("</ebbpsig:NonRepudiationInformation>");
+    nri
+}
+
+/// Validate that a PEM signing key and certificate parse and match each other.
+fn validate_signal_signing_credentials(
+    session: &SessionContext,
+    stage: &'static str,
+    signal_name: &str,
+    signing_key_pem: &[u8],
+    signing_cert_pem: &[u8],
+) -> Result<()> {
+    let signing_cert = openssl::x509::X509::from_pem(signing_cert_pem).map_err(|_err| {
+        AsxError::new(
+            ErrorCode::InvalidInput,
+            format!("AS4 {signal_name} signing_cert_pem is not a valid PEM X.509 certificate"),
+            ErrorContext::for_session(stage, session),
+        )
+    })?;
+
+    let signing_key =
+        openssl::pkey::PKey::private_key_from_pem(signing_key_pem).map_err(|_err| {
+            AsxError::new(
+                ErrorCode::InvalidInput,
+                format!("AS4 {signal_name} signing_key_pem is not a valid PEM private key"),
+                ErrorContext::for_session(stage, session),
+            )
+        })?;
+
+    let signing_cert_public = signing_cert.public_key().map_err(|_err| {
+        AsxError::new(
+            ErrorCode::InvalidInput,
+            format!("AS4 {signal_name} signing_cert_pem does not contain a usable public key"),
+            ErrorContext::for_session(stage, session),
+        )
+    })?;
+
+    if !signing_key.public_eq(&signing_cert_public) {
+        return Err(AsxError::new(
+            ErrorCode::InvalidInput,
+            format!("AS4 {signal_name} signing_cert_pem does not match signing_key_pem"),
+            ErrorContext::for_session(stage, session),
+        ));
+    }
+    Ok(())
+}
+
+const RECEIPT_MESSAGING_WSU_ID: &str = "as4-receipt-messaging";
+const RECEIPT_BODY_WSU_ID: &str = "as4-receipt-body";
+
+/// Generate a **signed** AS4 `eb:Receipt` SignalMessage with Non-Repudiation
+/// Information per ebMS3 §5.2.2.1 and eDelivery AS4 §5.1.8.
+///
+/// The returned SOAP envelope carries a `wsse:Security` header whose XML
+/// Signature covers the `eb:Messaging` header (the SignalMessage including
+/// the `NonRepudiationInformation` block) and the SOAP Body — providing
+/// Non-Repudiation of Receipt (NRR) as required by profiles such as the BDEW
+/// AS4-Profil §2.2.4.  The result verifies with
+/// [`crate::crypto::wssec::verify_enveloped_signature`] and is accepted by
+/// counterparties enforcing `require_signed_receipt = true`.
+///
+/// Obtain `nri_refs` from the inbound signed message via
+/// [`crate::crypto::wssec::parse_signature_references`], or use
+/// [`generate_signed_receipt_for_output`] which extracts them for you.
+#[cfg_attr(feature = "trace", tracing::instrument(skip_all, fields(message_id = %message_id, partner_id = %session.partner_id())))]
+pub fn generate_signed_receipt_with_nri(
+    session: &SessionContext,
+    message_id: &str,
+    ref_to_message_id: &str,
+    nri_refs: &[As4NriReference],
+    credentials: &As4ReceiptCredentials,
+) -> Result<Vec<u8>> {
+    let stage = "as4_generate_signed_receipt";
+    validate_receipt_signal_ids(session, stage, message_id, ref_to_message_id)?;
+    validate_signal_signing_credentials(
+        session,
+        stage,
+        "Receipt",
+        &credentials.signing_key_pem,
+        &credentials.signing_cert_pem,
+    )?;
+
+    let timestamp = crate::time_utils::format_rfc3339_secs(std::time::SystemTime::now());
+    // SECURITY: Escape caller-supplied values to prevent XML injection.
+    let message_id_escaped = crate::wire::escape_xml(message_id);
+    let ref_to_message_id_escaped = crate::wire::escape_xml(ref_to_message_id);
+    let nri_xml = build_receipt_nri_xml(nri_refs);
+
+    let envelope = format!(
+        "<S12:Envelope \
+ xmlns:S12=\"http://www.w3.org/2003/05/soap-envelope\" \
+ xmlns:eb=\"http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/\" \
+ xmlns:ebbpsig=\"http://docs.oasis-open.org/ebxml-bp/ebbp-signals-2.0\" \
+ xmlns:wsse=\"http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd\" \
+ xmlns:wsu=\"http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd\" \
+ xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\">\
+<S12:Header>\
+<!-- wsse-placeholder -->\
+<eb:Messaging S12:mustUnderstand=\"true\" wsu:Id=\"{RECEIPT_MESSAGING_WSU_ID}\">\
+<eb:SignalMessage>\
+<eb:MessageInfo>\
+<eb:Timestamp>{timestamp}</eb:Timestamp>\
+<eb:MessageId>{message_id_escaped}</eb:MessageId>\
+<eb:RefToMessageId>{ref_to_message_id_escaped}</eb:RefToMessageId>\
+</eb:MessageInfo>\
+<eb:Receipt>{nri_xml}</eb:Receipt>\
+</eb:SignalMessage>\
+</eb:Messaging>\
+</S12:Header>\
+<S12:Body wsu:Id=\"{RECEIPT_BODY_WSU_ID}\"/>\
+</S12:Envelope>",
+    );
+
+    let messaging_ref = format!("#{RECEIPT_MESSAGING_WSU_ID}");
+    let body_ref = format!("#{RECEIPT_BODY_WSU_ID}");
+    let reference_uris = [messaging_ref.as_str(), body_ref.as_str()];
+    let signature_xml = generate_xmlsig_signature(
+        &envelope,
+        &reference_uris,
+        &credentials.signing_key_pem,
+        &credentials.signing_cert_pem,
+        credentials.key_info_profile,
+    )?;
+    let wsse_header = WsSecurityHeaderBuilder::new()
+        .with_signing_cert(credentials.signing_cert_pem.clone())
+        .with_signature_xml(signature_xml)
+        .build()
+        .map_err(|err| {
+            AsxError::new(
+                ErrorCode::ParseFailed,
+                format!("failed to build WS-Security header for receipt: {err:?}"),
+                ErrorContext::for_session(stage, session),
+            )
+        })?;
+    let wsse_str = String::from_utf8(wsse_header).map_err(|_| {
+        AsxError::new(
+            ErrorCode::ParseFailed,
+            "WS-Security header for receipt is not valid UTF-8",
+            ErrorContext::for_session(stage, session),
+        )
+    })?;
+
+    let signed_envelope = envelope.replace("<!-- wsse-placeholder -->", &wsse_str);
+    Ok(signed_envelope.into_bytes())
+}
+
 /// Generate an AS4 `eb:Error` SignalMessage per ebMS3 §6.7.3.
 pub fn generate_error_signal(
     session: &SessionContext,
@@ -139,20 +310,12 @@ pub fn generate_error_signal(
     severity: As4ErrorSeverity,
     description: &str,
 ) -> Result<Vec<u8>> {
-    if message_id.trim().is_empty() {
-        return Err(AsxError::new(
-            ErrorCode::InvalidInput,
-            "message_id must not be empty",
-            ErrorContext::for_session("as4_generate_error_signal", session),
-        ));
-    }
-    if ref_to_message_id.trim().is_empty() {
-        return Err(AsxError::new(
-            ErrorCode::InvalidInput,
-            "ref_to_message_id must not be empty",
-            ErrorContext::for_session("as4_generate_error_signal", session),
-        ));
-    }
+    validate_receipt_signal_ids(
+        session,
+        "as4_generate_error_signal",
+        message_id,
+        ref_to_message_id,
+    )?;
     if description.trim().is_empty() {
         return Err(AsxError::new(
             ErrorCode::InvalidInput,
@@ -235,39 +398,13 @@ pub fn generate_pull_request(
     }
 
     if let Some(creds) = &policy.credentials {
-        let signing_cert =
-            openssl::x509::X509::from_pem(&creds.signing_cert_pem).map_err(|_err| {
-                AsxError::new(
-                    ErrorCode::InvalidInput,
-                    "AS4 PullRequest signing_cert_pem is not a valid PEM X.509 certificate",
-                    ErrorContext::for_session(stage, session),
-                )
-            })?;
-
-        let signing_key = openssl::pkey::PKey::private_key_from_pem(&creds.signing_key_pem)
-            .map_err(|_err| {
-                AsxError::new(
-                    ErrorCode::InvalidInput,
-                    "AS4 PullRequest signing_key_pem is not a valid PEM private key",
-                    ErrorContext::for_session(stage, session),
-                )
-            })?;
-
-        let signing_cert_public = signing_cert.public_key().map_err(|_err| {
-            AsxError::new(
-                ErrorCode::InvalidInput,
-                "AS4 PullRequest signing_cert_pem does not contain a usable public key",
-                ErrorContext::for_session(stage, session),
-            )
-        })?;
-
-        if !signing_key.public_eq(&signing_cert_public) {
-            return Err(AsxError::new(
-                ErrorCode::InvalidInput,
-                "AS4 PullRequest signing_cert_pem does not match signing_key_pem",
-                ErrorContext::for_session(stage, session),
-            ));
-        }
+        validate_signal_signing_credentials(
+            session,
+            stage,
+            "PullRequest",
+            &creds.signing_key_pem,
+            &creds.signing_cert_pem,
+        )?;
     }
 
     let timestamp = crate::time_utils::format_rfc3339_secs(std::time::SystemTime::now());
@@ -307,6 +444,7 @@ pub fn generate_pull_request(
     let envelope = format!(
         r#"<S12:Envelope xmlns:S12="http://www.w3.org/2003/05/soap-envelope"
   xmlns:eb="http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/"
+  xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd"
   xmlns:wsu="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd"
   xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
   <S12:Header>
@@ -362,6 +500,10 @@ pub fn generate_pull_request(
 /// use [`generate_receipt_with_nri`] directly with refs extracted from the
 /// raw inbound bytes.
 ///
+/// The result is **unsigned**; production deployments that must satisfy
+/// Non-Repudiation of Receipt (e.g. BDEW AS4-Profil §2.2.4) should use
+/// [`generate_signed_receipt_for_output`] instead.
+///
 /// # Example
 /// ```rust,ignore
 /// let outcome = asx_rs::as4::receive_push_with_dedup_async(&session, &bus, req, dedup).await?;
@@ -380,5 +522,72 @@ pub fn generate_receipt_for_output(
         receipt_message_id,
         &output.user_message.message_id,
         &[],
+    )
+}
+
+/// Generate a **signed** receipt for a completed receive output, echoing the
+/// inbound message's `ds:Reference` digests as Non-Repudiation Information.
+///
+/// `inbound_http_body` / `inbound_http_content_type` are the raw HTTP request
+/// body and `Content-Type` of the inbound push exactly as passed to the
+/// receive pipeline (MIME multipart or bare SOAP).  The NRI references are
+/// extracted from the inbound WS-Security signature via
+/// [`crate::crypto::wssec::parse_signature_references`], then the receipt is
+/// built and signed with [`generate_signed_receipt_with_nri`].
+///
+/// Returns [`ErrorCode::InvalidInput`] when the inbound message carries no
+/// `ds:Signature` — an NRR receipt cannot echo digests that do not exist.
+/// For unsigned inbound messages (test setups only), fall back to
+/// [`generate_receipt_for_output`].
+///
+/// # Example
+/// ```rust,ignore
+/// let outcome = asx_rs::as4::receive_push_with_dedup_async(&session, &bus, req, dedup).await?;
+/// if let As4ReceiveOutcome::FirstSeen(output) = outcome {
+///     let receipt_id = format!("receipt@{}", uuid::Uuid::new_v4());
+///     let receipt_bytes = generate_signed_receipt_for_output(
+///         &session, &receipt_id, &output, &raw_body, &content_type, &credentials,
+///     )?;
+/// }
+/// ```
+#[cfg_attr(feature = "trace", tracing::instrument(skip_all, fields(message_id = %receipt_message_id, partner_id = %session.partner_id())))]
+pub fn generate_signed_receipt_for_output(
+    session: &SessionContext,
+    receipt_message_id: &str,
+    output: &As4ReceivePushOutput,
+    inbound_http_body: &[u8],
+    inbound_http_content_type: &str,
+    credentials: &As4ReceiptCredentials,
+) -> Result<Vec<u8>> {
+    let stage = "as4_generate_signed_receipt";
+    let soap_bytes = match extract_multipart_related_payload_if_present(
+        inbound_http_body,
+        inbound_http_content_type,
+        session,
+        stage,
+    )? {
+        Some(multipart) => multipart.soap_xml,
+        None => inbound_http_body,
+    };
+    let soap_xml = crate::core::bytes_to_utf8_str(soap_bytes, stage, session)?;
+    let sig_refs = crate::crypto::wssec::parse_signature_references(soap_xml).map_err(|err| {
+        AsxError::new(
+            ErrorCode::InvalidInput,
+            format!(
+                "cannot build NRR receipt: failed to extract ds:Reference digests \
+                 from the inbound message signature ({}); for unsigned inbound \
+                 messages use generate_receipt_for_output instead",
+                err.message
+            ),
+            ErrorContext::for_session(stage, session),
+        )
+    })?;
+    let nri_refs: Vec<As4NriReference> = sig_refs.into_iter().map(As4NriReference::from).collect();
+    generate_signed_receipt_with_nri(
+        session,
+        receipt_message_id,
+        &output.user_message.message_id,
+        &nri_refs,
+        credentials,
     )
 }
