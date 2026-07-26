@@ -38,8 +38,21 @@ EDI trading partner connections worldwide.
   - **EC recipient** → ECDH-ES + ConcatKDF (NIST SP 800-56A §5.8.1) + AES-128 Key Wrap
     (RFC 3394) — BDEW AS4-Profil §2.2.6.2.2 / BSI TR-03116-3 §9.2
 - `X509PKIPathv1` BST token type (`WsSecOutboundKeyInfoProfile::X509PKIPathv1`)
+- **Reception Awareness / Non-Repudiation of Receipt, verified end to end** —
+  `verify_sync_response` parses the counterparty's synchronous `eb:Receipt`
+  namespace-correctly (prefix-agnostic, CDATA-aware), verifies its WS-Security
+  signature against the pinned partner certificate, and checks every
+  `MessagePartNRInformation` digest against the digests the sent message was
+  actually signed over. The signal it acts on must itself be covered by that
+  signature, so a counterparty cannot leave a genuinely signed element in place
+  and append an unsigned acknowledgement (XML Signature Wrapping). An `eb:Error`
+  reply comes back as a typed signal with the ebMS3 code intact, so
+  retry-vs-dead-letter routing keys on the real reason.
+  `As4HttpTransport::send_and_verify` does send + verify in one call.
 - `require_encrypted_inbound` policy field — rejects unencrypted push messages at the policy
-  layer (symmetric to `require_signed_push`)
+  layer (symmetric to `require_signed_push`); use
+  `As4PushPolicy::regulated_with_decryption_key(pem)` to set it together with the
+  key that satisfies it
 - Streaming receive path with bounded memory; conversation-ordered delivery gate
 - P-Mode registry for per-partner MEP/security configuration
 - SBDH 1.3 envelope wrap/unwrap for PEPPOL and CEF eDelivery
@@ -75,14 +88,17 @@ EDI trading partner connections worldwide.
 - **`MockAs4Endpoint`** (`testing + server`) — local HTTP AS4 server that accepts any push
   (signed, unsigned, encrypted, or plain), records messages in an async channel, and
   returns synchronous AS4 receipts.  Configure decryption via
-  `MockAs4Endpoint::builder().with_decryption_key_pem(key_pem).bind(addr).await?`
+  `MockAs4Endpoint::builder().with_decryption_key_pem(key_pem).bind(addr).await?`, and
+  signed NRR receipts via `.with_receipt_signing_material(cert_pem, key_pem)` so the
+  full receipt-verification round trip is exercisable without real PKI
 - **`EventBus::new_for_testing()`** — zero-config `BestEffort` bus; never fails on emit
   when no subscriber is active — no more `new_with_config_and_mode(...)` boilerplate
 - **`DurableInMemoryDedupBackend`** — in-memory dedup with `is_durable() = true`; passes
   the strict durable-backend guard without a real persistent store
 - **`As4HttpTransport::new_for_localhost_testing()`** — plain-HTTP transport for
   integration tests against `MockAs4Endpoint` on `http://127.0.0.1:…`; SSRF guards
-  disabled for the test binary only
+  disabled for the test binary only.  `send_and_verify_to_localhost` is the
+  receipt-verifying counterpart
 - **`generate_self_signed_ec_keypair(cn, curve)`** — self-signed EC cert+key (P-256 through
   BrainpoolP512r1); no openssl/rcgen dev-dependency needed in downstream crates
 - **`generate_self_signed_rsa_keypair(cn, bits)`** — same for RSA
@@ -96,14 +112,14 @@ EDI trading partner connections worldwide.
 ```toml
 [dependencies]
 # AS4 — PEPPOL / CEF eDelivery (RSA) or BDEW (EC/ECDH-ES) — same code, key type decides
-asx-rs = { version = "0.10", features = ["as4", "client", "server", "async-ocsp"] }
+asx-rs = { version = "0.11", features = ["as4", "client", "server", "async-ocsp"] }
 
 # AS2 + AS4 with compression
-asx-rs = { version = "0.10", features = ["as2", "as4", "compression", "client", "server", "async-ocsp"] }
+asx-rs = { version = "0.11", features = ["as2", "as4", "compression", "client", "server", "async-ocsp"] }
 
 [dev-dependencies]
 # Testing without PKI certificates (MockAs4Endpoint, bypass verifier, keypair generators)
-asx-rs = { version = "0.10", features = ["as4", "testing", "server"] }
+asx-rs = { version = "0.11", features = ["as4", "testing", "server"] }
 ```
 
 > `as2` and `as4` are **not** in the default feature set — add them explicitly.
@@ -157,15 +173,67 @@ let output = send_async(
 // output.http_content_type   → HTTP Content-Type header value
 ```
 
+### AS4 — Send and verify the receipt (Non-Repudiation of Receipt)
+
+A receipt is only evidence of delivery once its digests have been checked
+against the message you actually sent. Never scan the response body for
+`<eb:Receipt` — a conformant counterparty may use a different namespace prefix
+or CDATA, and a substring match cannot verify NRR at all.
+
+```rust
+use asx_rs::as4::{As4ReceiptPolicy, As4SyncSignal};
+use asx_rs::transport::{As4HttpTransport, TransportConfig};
+
+let transport = As4HttpTransport::new(TransportConfig::default())?;
+
+let outcome = transport
+    .send_and_verify(
+        "https://partner.example/as4",
+        &session,
+        &bus,
+        &output,
+        &As4ReceiptPolicy::regulated(), // signed receipt + NRR digests required
+    )
+    .await?;
+
+match outcome.signal {
+    As4SyncSignal::Receipt(receipt) => {
+        // Signed by the pinned partner cert AND every ds:Reference digest of the
+        // sent message was echoed and matched. Persist as delivery evidence.
+        assert!(receipt.is_non_repudiation_evidence());
+    }
+    As4SyncSignal::Error(err) => {
+        // Typed ebMS3 diagnostics — route retry vs dead-letter on the code.
+        tracing::error!(detail = %err.summary(), "counterparty rejected the message");
+    }
+}
+```
+
+Already have the response bytes? Verify them directly:
+
+```rust
+let receipt = asx_rs::as4::verify_sync_response(
+    &session, &bus, &output,
+    &http_response_body, content_type,
+    &As4ReceiptPolicy::regulated(),
+)?
+.into_receipt()?; // eb:Error becomes an Err here
+```
+
+`As4ReceiptPolicy::relaxed()` accepts unsigned acknowledgements for interop
+bring-up — but a digest or signature that *is* present is always verified, and a
+mismatch is always an error.
+
 ### AS4 — Receive push with encryption enforcement
 
 ```rust
 use asx_rs::as4::{receive_push_with_dedup_async, As4PushPolicyBuilder, As4ReceivePushRequest};
 use std::sync::Arc;
 
-let policy = As4PushPolicyBuilder::new()
-    .inbound_decryption_key_pem(my_ec_or_rsa_private_key_pem)
-    .require_encrypted_inbound(true)   // fail-closed: reject any unencrypted message
+// Sets the decryption key and `require_encrypted_inbound = true` together, so
+// the invariant cannot be split — there is no ordering to get wrong.
+let policy = As4PushPolicyBuilder::regulated()
+    .with_mandatory_inbound_encryption(my_ec_or_rsa_private_key_pem)
     .build()?;
 
 let outcome = receive_push_with_dedup_async(
@@ -175,6 +243,8 @@ let outcome = receive_push_with_dedup_async(
         payload,
         receipt_payload: None,
         policy,
+        // Fragment-scope policy applies to fragmented messages only, so a
+        // non-fragmenting profile always passes None here.
         authenticated_sender_scope: None,
     },
     dedup_backend,
@@ -430,17 +500,41 @@ follows from the key type.
 ## 📊 Status
 
 `asx-rs` is **beta quality**. Core AS2 and AS4 push/pull flows are implemented, tested
-(913+ tests across unit + integration suites), and exercised in production integrations.
+(950+ tests across unit + integration suites), and exercised in production integrations.
 
 - ✅ AS2 send/receive (signed, encrypted, compressed, sync + async)
 - ✅ AS4 push send/receive (signed, encrypted, dedup, fragment reassembly)
 - ✅ AS4 pull (with reliability classification)
 - ✅ WS-Security (RSA-SHA256, ECDSA-SHA256, ECDH-ES + ConcatKDF + AES-KW, XMLenc11)
+- ✅ AS4 Reception Awareness / Non-Repudiation of Receipt, verified end to end
 - ✅ OCSP + PKIX chain validation
 - ✅ Strict-mode production validation gate
 - ✅ Comprehensive testing infrastructure (bypass verifier, mock endpoint, keypair generators)
 - ⚠️  Persistent storage backends (dedup/reconciliation) are trait-defined but not shipped
   in-tree; deployers provide their own Redis/PostgreSQL/DynamoDB implementations.
+
+### Development
+
+Common tasks are wrapped in a [`justfile`](./justfile) ([just](https://github.com/casey/just)):
+
+```bash
+just              # list every recipe
+just test         # cargo test --all-features
+just lint         # fmt --check + clippy -D warnings
+just ci           # pre-push: lint + strict check + tests + feature matrix
+just release-gate # every mandatory gate from docs/release.md (slow)
+```
+
+Recipes mirror `.github/workflows/rust.yml` and [docs/release.md](./docs/release.md),
+so a local run and CI enforce the same thing.
+
+### Versioning
+
+`asx-rs` is pre-1.0, so **minor** bumps (`0.x` → `0.x+1`) are the breaking ones.
+Wire/crypto behaviour changes and security-default tightenings always get their
+own minor version and are called out separately from API changes — see the
+[CHANGELOG](./CHANGELOG.md) and its [SemVer policy](./CHANGELOG.md#semver-policy)
+before moving between minor versions.
 
 ---
 

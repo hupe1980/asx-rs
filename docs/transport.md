@@ -130,7 +130,7 @@ pub struct As4HttpIngress {
 ## Egress / HTTP Client (`client` feature)
 
 ```toml
-asx-rs = { version = "0.10", features = ["as2", "as4", "client"] }
+asx-rs = { version = "0.11", features = ["as2", "as4", "client"] }
 ```
 
 ### SSRF protection
@@ -184,6 +184,42 @@ let outcome: HttpSendOutcome = transport.send(
 ).await?;
 ```
 
+### AS4 send with receipt verification (recommended)
+
+`send()` returns the raw response body and leaves interpretation to the caller.
+For the One-Way/Push MEP with Reception Awareness, prefer `send_and_verify`,
+which parses and verifies the counterparty's signal instead:
+
+```rust
+use asx_rs::as4::{As4ReceiptPolicy, As4SyncSignal};
+
+let outcome = transport
+    .send_and_verify(
+        "https://partner.example.com/as4/receive",
+        &session,
+        &bus,
+        &send_output,
+        &As4ReceiptPolicy::regulated(),
+    )
+    .await?;
+
+// outcome.http    → the raw HttpSendOutcome (status, headers, body)
+// outcome.signal  → verified As4SyncSignal
+
+match outcome.signal {
+    As4SyncSignal::Receipt(receipt) => assert!(receipt.is_non_repudiation_evidence()),
+    As4SyncSignal::Error(err)       => tracing::error!(detail = %err.summary()),
+}
+```
+
+Do not inspect `HttpSendOutcome::body` for `<eb:Receipt` yourself — namespace
+prefixes are arbitrary and a substring match cannot verify Non-Repudiation of
+Receipt. See [AS4 — verify the synchronous response](as4.md#verify-the-synchronous-response-reception-awareness--nrr).
+
+A non-2xx status carrying a parseable `eb:Error` is surfaced as
+`As4SyncSignal::Error`; a non-2xx status with an unparseable body becomes
+`ErrorCode::TransportFailure`.
+
 ### AS4 send in integration tests (`testing` feature)
 
 `As4HttpTransport::new()` rejects plain-HTTP and loopback addresses (SSRF protection).
@@ -200,6 +236,10 @@ assert!(outcome.is_success());
 
 `send_to_localhost` is only available when `feature = "testing"` is active.
 `new_for_localhost_testing()` triggers a `compile_error!` in release profile builds.
+
+`send_and_verify_to_localhost(...)` is the verifying counterpart. Pair it with
+`MockAs4Endpoint::builder().with_receipt_signing_material(cert_pem, key_pem)` to
+exercise the full NRR round trip without real PKI.
 
 ### `TransportConfig`
 
@@ -236,7 +276,7 @@ impl HttpSendOutcome {
 ## Server / Axum Integration (`server` feature)
 
 ```toml
-asx-rs = { version = "0.10", features = ["as2", "as4", "server"] }
+asx-rs = { version = "0.11", features = ["as2", "as4", "server"] }
 ```
 
 The server layer provides axum 0.7 router builders with typed handler traits. It is built on top of the framework-agnostic ingress layer — the same validation logic runs regardless of how the request arrives.

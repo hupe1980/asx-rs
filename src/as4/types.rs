@@ -47,6 +47,18 @@ impl SoapEnvelope {
 /// incorporate an **authenticated** sender identity so that a malicious actor
 /// cannot forge `<eb:From>` to inject data into another sender's fragment group.
 ///
+/// # Scope: fragmented messages only
+///
+/// This policy is consulted **only** for inbound messages that carry an
+/// `mf:MessageFragment` element.  A non-fragmented single `eb:UserMessage` is
+/// never affected by it, so
+/// [`As4ReceivePushRequest::authenticated_sender_scope`] may always be `None`
+/// for profiles that do not use fragmentation (BDEW MaKo, for example).
+///
+/// Do **not** switch to [`UseSoapSenderId`](Self::UseSoapSenderId) merely to
+/// make a `None` scope safe — it already is.  Doing so only weakens the policy
+/// on the day a fragment does arrive.
+///
 /// # ⚠ Security
 ///
 /// The default (`RequireAuthenticatedScope`) is the safe choice for production.
@@ -119,7 +131,10 @@ pub struct As4PushPolicy {
     /// transport-layer sender identity (secure default) or the unauthenticated
     /// SOAP `<eb:From>` party ID (legacy fallback).
     ///
-    /// See [`FragmentScopePolicy`] for the security implications of each variant.
+    /// Applies to **fragmented messages only** — non-fragmented single
+    /// `eb:UserMessage` pushes are accepted with
+    /// `authenticated_sender_scope: None` regardless of this setting.  See
+    /// [`FragmentScopePolicy`] for the security implications of each variant.
     /// Defaults to [`FragmentScopePolicy::RequireAuthenticatedScope`].
     pub fragment_scope_policy: FragmentScopePolicy,
 }
@@ -163,6 +178,16 @@ impl As4PushPolicy {
     /// - signed receipt required
     /// - fail-closed audit emission
     /// - timestamp freshness enforcement enabled (5 minutes)
+    ///
+    /// Inbound encryption is **not** required, because requiring it without a
+    /// decryption key is an unsatisfiable configuration.  Use
+    /// [`regulated_with_decryption_key`](Self::regulated_with_decryption_key)
+    /// when the profile mandates encryption.
+    ///
+    /// `fragment_scope_policy` stays at
+    /// [`FragmentScopePolicy::RequireAuthenticatedScope`]; this affects
+    /// fragmented messages only, so non-fragmenting profiles need no override
+    /// and may pass `authenticated_sender_scope: None`.
     pub fn regulated() -> Self {
         Self {
             interop: InteropMode::Strict,
@@ -174,6 +199,31 @@ impl As4PushPolicy {
             require_encrypted_inbound: false,
             timestamp_freshness_window: Some(std::time::Duration::from_secs(300)),
             fragment_scope_policy: FragmentScopePolicy::RequireAuthenticatedScope,
+        }
+    }
+
+    /// [`regulated`](Self::regulated) with mandatory inbound XML encryption.
+    ///
+    /// Sets `inbound_decryption_key_pem` and `require_encrypted_inbound = true`
+    /// together, so the pair cannot be split: there is no ordering to get wrong
+    /// and no way to demand encryption without a key to satisfy the demand.
+    ///
+    /// This is the preset for profiles that mandate payload encryption, such as
+    /// BDEW AS4-Profil §2.2.6.2.2.
+    ///
+    /// `pem` accepts an RSA or EC private key; the EC path engages ECDH-ES +
+    /// ConcatKDF + AES key wrap per BSI TR-03116-3 §9.2.  The key is validated
+    /// by [`As4PushPolicyBuilder::build`], so route the result through the
+    /// builder to discover a bad key at startup:
+    ///
+    /// ```rust,ignore
+    /// let policy = As4PushPolicy::regulated_with_decryption_key(my_key_pem);
+    /// ```
+    pub fn regulated_with_decryption_key(pem: impl Into<Vec<u8>>) -> Self {
+        Self {
+            inbound_decryption_key_pem: Some(Arc::from(pem.into())),
+            require_encrypted_inbound: true,
+            ..Self::regulated()
         }
     }
 
@@ -467,6 +517,15 @@ impl As4PushPolicyBuilder {
         Self::default()
     }
 
+    /// Start from the fail-closed [`As4PushPolicy::regulated`] preset.
+    ///
+    /// Pair with
+    /// [`with_mandatory_inbound_encryption`](Self::with_mandatory_inbound_encryption)
+    /// for profiles that also mandate payload encryption.
+    pub fn regulated() -> Self {
+        Self(As4PushPolicy::regulated())
+    }
+
     pub fn interop(mut self, mode: InteropMode) -> Self {
         self.0.interop = mode;
         self
@@ -527,8 +586,35 @@ impl As4PushPolicyBuilder {
     /// [`build`](Self::build) returns an error if this is set to `true` but
     /// `inbound_decryption_key_pem` is not configured — an operator cannot
     /// meaningfully require encryption while providing no key to decrypt it.
+    ///
+    /// Prefer [`with_mandatory_inbound_encryption`](Self::with_mandatory_inbound_encryption),
+    /// which sets the key and the flag together so the invariant cannot be split.
     pub fn require_encrypted_inbound(mut self, require: bool) -> Self {
         self.0.require_encrypted_inbound = require;
+        self
+    }
+
+    /// Require inbound encryption **and** supply the key that makes it
+    /// satisfiable, in one call.
+    ///
+    /// Equivalent to
+    /// [`inbound_decryption_key_pem(pem)`](Self::inbound_decryption_key_pem)
+    /// followed by
+    /// [`require_encrypted_inbound(true)`](Self::require_encrypted_inbound),
+    /// but the two settings cannot drift apart: there is no ordering to get
+    /// wrong and no way to enable the requirement without a key.
+    ///
+    /// This is the shape mandated by profiles such as BDEW AS4-Profil
+    /// §2.2.6.2.2 and PEPPOL AS4 §Encryption.
+    ///
+    /// ```rust,ignore
+    /// let policy = As4PushPolicyBuilder::regulated()
+    ///     .with_mandatory_inbound_encryption(my_decryption_key_pem)
+    ///     .build()?;
+    /// ```
+    pub fn with_mandatory_inbound_encryption(mut self, pem: Vec<u8>) -> Self {
+        self.0.inbound_decryption_key_pem = Some(Arc::from(pem));
+        self.0.require_encrypted_inbound = true;
         self
     }
 
@@ -1333,6 +1419,164 @@ impl From<WsSecSignatureReference> for As4NriReference {
     }
 }
 
+/// A single `<eb:Error>` entry parsed from a counterparty `eb:SignalMessage`.
+///
+/// ebMS3 §6.2 defines `eb:Error` with the attributes reproduced here plus the
+/// optional `eb:Description` / `eb:ErrorDetail` child elements.  All fields
+/// except [`error_code`](Self::error_code) are optional in the schema and are
+/// reported exactly as received — no normalization, no defaulting.
+///
+/// Use [`As4ErrorCode::from_ebms_code`] to map [`error_code`](Self::error_code)
+/// onto the subset of codes this crate models, and
+/// [`As4ErrorSeverity::from_ebms_severity`] for
+/// [`severity`](Self::severity).  Codes outside that subset are still fully
+/// available as the raw string — an unrecognised code is never dropped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct As4ReceivedError {
+    /// The `errorCode` attribute, e.g. `"EBMS:0302"`.  `"unknown"` when the
+    /// counterparty omitted the attribute (schema-invalid but observed in the
+    /// wild).
+    pub error_code: String,
+    /// The `severity` attribute, e.g. `"failure"` / `"warning"`.
+    pub severity: Option<String>,
+    /// The `category` attribute, e.g. `"Content"`, `"Processing"`.
+    pub category: Option<String>,
+    /// The `origin` attribute, e.g. `"ebMS"`, `"security"`, `"reliability"`.
+    pub origin: Option<String>,
+    /// The `refToMessageId` attribute — the message this error refers to.
+    ///
+    /// Note that ebMS3 also allows the correlation to be carried only by the
+    /// enclosing `eb:MessageInfo/eb:RefToMessageId`; see
+    /// [`As4ErrorSignal::ref_to_message_id`].
+    pub ref_to_message_id: Option<String>,
+    /// The `shortDescription` attribute, e.g. `"InvalidReceipt"`.
+    pub short_description: Option<String>,
+    /// Text of the `eb:Description` child element.
+    pub description: Option<String>,
+    /// Text of the `eb:ErrorDetail` child element.
+    pub error_detail: Option<String>,
+}
+
+impl As4ReceivedError {
+    /// The modelled [`As4ErrorCode`] for [`error_code`](Self::error_code), when
+    /// this crate recognises it.
+    pub fn code(&self) -> Option<As4ErrorCode> {
+        As4ErrorCode::from_ebms_code(&self.error_code)
+    }
+
+    /// The modelled [`As4ErrorSeverity`], when the counterparty supplied a
+    /// recognised `severity` attribute.
+    pub fn parsed_severity(&self) -> Option<As4ErrorSeverity> {
+        self.severity
+            .as_deref()
+            .and_then(As4ErrorSeverity::from_ebms_severity)
+    }
+
+    /// Whether this entry is a hard failure.
+    ///
+    /// `true` when `severity` is absent — ebMS3 §6.2 makes the attribute
+    /// mandatory, so an omission is treated as the fail-closed reading rather
+    /// than silently downgraded to a warning.
+    pub fn is_failure(&self) -> bool {
+        !matches!(self.parsed_severity(), Some(As4ErrorSeverity::Warning))
+    }
+
+    /// Single-line human summary for logs and dead-letter records.
+    pub fn summary(&self) -> String {
+        let mut summary = self.error_code.clone();
+        if let Some(short) = &self.short_description {
+            summary.push_str(" (");
+            summary.push_str(short);
+            summary.push(')');
+        }
+        if let Some(description) = self.description.as_ref().or(self.error_detail.as_ref()) {
+            summary.push_str(": ");
+            summary.push_str(description);
+        }
+        summary
+    }
+}
+
+/// A counterparty `eb:SignalMessage` carrying one or more `eb:Error` entries.
+///
+/// Returned by [`crate::as4::verify_sync_response`] as
+/// [`As4SyncSignal::Error`] when the remote MSH rejected the message instead
+/// of acknowledging it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct As4ErrorSignal {
+    /// `eb:MessageInfo/eb:MessageId` of the error signal itself.
+    pub message_id: Option<String>,
+    /// `eb:MessageInfo/eb:RefToMessageId` — the message being rejected.
+    pub ref_to_message_id: Option<String>,
+    /// `eb:MessageInfo/eb:Timestamp` as received (RFC 3339).
+    pub timestamp: Option<String>,
+    /// Every `eb:Error` entry in the signal, in document order.
+    pub errors: Vec<As4ReceivedError>,
+}
+
+impl As4ErrorSignal {
+    /// Whether any entry has `severity` other than `warning`.
+    ///
+    /// A signal with no entries at all counts as a failure: an `eb:Error`
+    /// SignalMessage that carries no diagnosable entry is still a rejection.
+    pub fn is_failure(&self) -> bool {
+        self.errors.is_empty() || self.errors.iter().any(As4ReceivedError::is_failure)
+    }
+
+    /// Single-line summary of all entries, for logs and dead-letter records.
+    pub fn summary(&self) -> String {
+        if self.errors.is_empty() {
+            return "eb:Error signal with no eb:Error entries".to_string();
+        }
+        self.errors
+            .iter()
+            .map(As4ReceivedError::summary)
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+}
+
+/// A counterparty `eb:Receipt` that passed every check demanded by an
+/// [`As4ReceiptPolicy`](crate::as4::As4ReceiptPolicy).
+///
+/// Produced by [`crate::as4::verify_sync_response`].  Holding one of these is
+/// the evidence that the message was delivered: when
+/// [`non_repudiation`](Self::non_repudiation) is
+/// [`Verified`](crate::as4::As4NonRepudiation::Verified) the counterparty
+/// signed a statement about the exact digests the sent message was signed over.
+///
+/// Persist it alongside the sent envelope to satisfy audit requirements such as
+/// BDEW AS4-Profil §2.2.4.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct As4VerifiedReceipt {
+    /// `eb:MessageId` of the receipt SignalMessage itself, when present.
+    pub message_id: Option<String>,
+    /// `eb:RefToMessageId` — verified equal to the sent message id.
+    pub ref_to_message_id: String,
+    /// `eb:Timestamp` as received (RFC 3339), when present.
+    pub timestamp: Option<String>,
+    /// Whether the receipt carried a WS-Security XML Signature.  When `true`
+    /// the signature was verified — an unverifiable signature is an error, never
+    /// a `true` here.
+    pub signed: bool,
+    /// SHA-256 fingerprint the signer certificate was pinned against, when the
+    /// receipt was signed.
+    pub signer_fingerprint_sha256: Option<String>,
+    /// Outcome of the Non-Repudiation of Receipt digest check.
+    pub non_repudiation: crate::as4::As4NonRepudiation,
+}
+
+impl As4VerifiedReceipt {
+    /// Whether this receipt is full Non-Repudiation of Receipt evidence — both
+    /// signed by the counterparty and echoing the sent message's digests.
+    pub fn is_non_repudiation_evidence(&self) -> bool {
+        self.signed && self.non_repudiation.is_verified()
+    }
+}
+
 /// Credentials required to generate a signed AS4 `PullRequest` signal.
 ///
 /// Per eDelivery AS4 v1.15 §4.5.5, pull requests MUST be signed using the
@@ -1617,6 +1861,31 @@ impl As4ErrorCode {
             As4ErrorCode::DecompressionFailure => "EBMS:0303",
         }
     }
+
+    /// Map an `errorCode` attribute received from a counterparty back onto the
+    /// modelled variants, or `None` for any code outside this subset.
+    ///
+    /// The ebMS3 registry is larger than what this crate generates; callers
+    /// receiving an unmodelled code should keep the raw
+    /// [`As4ReceivedError::error_code`] string rather than discarding it.
+    /// Matching is ASCII case-insensitive on the `EBMS:` prefix.
+    pub fn from_ebms_code(code: &str) -> Option<Self> {
+        let code = code.trim();
+        let (prefix, digits) = code.split_at_checked(5)?;
+        if !prefix.eq_ignore_ascii_case("EBMS:") {
+            return None;
+        }
+        match digits {
+            "0001" => Some(As4ErrorCode::ValueNotRecognized),
+            "0002" => Some(As4ErrorCode::FeatureNotSupported),
+            "0003" => Some(As4ErrorCode::ValueInconsistent),
+            "0004" => Some(As4ErrorCode::Other),
+            "0301" => Some(As4ErrorCode::MissingReceipt),
+            "0302" => Some(As4ErrorCode::InvalidReceipt),
+            "0303" => Some(As4ErrorCode::DecompressionFailure),
+            _ => None,
+        }
+    }
 }
 
 /// Error severity for AS4 Error signal messages.
@@ -1630,10 +1899,27 @@ pub enum As4ErrorSeverity {
 }
 
 impl As4ErrorSeverity {
-    pub(super) fn as_str(self) -> &'static str {
+    /// The `severity` attribute value written on outbound `eb:Error` signals.
+    pub fn as_str(self) -> &'static str {
         match self {
             As4ErrorSeverity::Failure => "Failure",
             As4ErrorSeverity::Warning => "Warning",
+        }
+    }
+
+    /// Parse a received `severity` attribute, ASCII case-insensitively.
+    ///
+    /// Returns `None` for any value outside the ebMS3 vocabulary; callers
+    /// should treat an unrecognised severity as a failure rather than assuming
+    /// it is benign.
+    pub fn from_ebms_severity(severity: &str) -> Option<Self> {
+        let severity = severity.trim();
+        if severity.eq_ignore_ascii_case("failure") {
+            Some(As4ErrorSeverity::Failure)
+        } else if severity.eq_ignore_ascii_case("warning") {
+            Some(As4ErrorSeverity::Warning)
+        } else {
+            None
         }
     }
 }

@@ -5,7 +5,7 @@ use crate::as4::conversation_gate::As4ConversationOrderGate;
 use crate::as4::send_sync_fragmented;
 use crate::as4::types::{
     As4PushPolicyBuilder, As4ReceivePushProgress, As4ReceivePushRequest, As4SendCredentials,
-    As4SendPolicyBuilder,
+    As4SendPolicyBuilder, FragmentScopePolicy,
 };
 use crate::core::{CertHandle, ErrorCode, OcspFailureMode, OcspMode, SessionContext};
 use crate::reliability::InMemoryDedupBackend;
@@ -623,6 +623,101 @@ async fn async_fragment_aware_receive_accepts_typed_request() {
     }
 }
 
+/// Regression: `FragmentScopePolicy::RequireAuthenticatedScope` must not touch
+/// non-fragmented messages.
+///
+/// Profiles that never fragment (BDEW MaKo, for example) send a single
+/// `eb:UserMessage` and have no transport-layer scope to supply.  They must be
+/// able to keep the secure default and pass `authenticated_sender_scope: None`
+/// without downgrading to `UseSoapSenderId` — otherwise the "workaround" would
+/// weaken the policy for the fragments that might arrive later.
+#[cfg(feature = "interop-relaxed")]
+#[tokio::test]
+async fn non_fragmented_message_is_accepted_with_require_authenticated_scope_and_no_scope() {
+    let creds = test_as4_credentials();
+    let session = session_with_trust("sess-nonfragment-scope", "partner-a", &creds);
+    let bus = EventBus::new(32).expect("bus");
+
+    let (send_policy, send_credentials) = As4SendPolicyBuilder::new()
+        .interop(crate::core::InteropMode::Relaxed)
+        .sign(true)
+        .encrypt(false)
+        .fail_closed_audit_events(false)
+        .action("urn:test:non-fragment")
+        .service("urn:test:svc", "")
+        .signing_cert_pem(
+            creds
+                .signing_cert_pem
+                .as_ref()
+                .expect("signing cert")
+                .clone(),
+        )
+        .signing_key_pem(creds.signing_key_pem.as_ref().expect("signing key").clone())
+        .build()
+        .expect("send policy");
+
+    let sent = crate::as4::send_sync(
+        &session,
+        &bus,
+        crate::as4::As4SendRequest {
+            message_id: "mid-non-fragment-scope".to_string(),
+            payload: b"single-user-message-payload".to_vec(),
+            policy: send_policy,
+            credentials: Some(send_credentials),
+            payload_filename: None,
+        },
+    )
+    .expect("send_sync");
+
+    let policy = {
+        let builder = As4PushPolicyBuilder::new().interop(crate::core::InteropMode::Relaxed);
+        #[cfg(feature = "testing")]
+        let builder = builder.allow_unsigned_push(true);
+        builder
+            .fail_closed_audit_events(false)
+            .timestamp_freshness_window(None)
+            // Explicit, even though it is the default — this is the assertion.
+            .fragment_scope_policy(FragmentScopePolicy::RequireAuthenticatedScope)
+            .build()
+            .expect("policy")
+    };
+
+    let request = As4ReceivePushRequest {
+        http_content_type: sent.http_content_type.clone(),
+        payload: Arc::clone(&sent.soap_envelope.body),
+        receipt_payload: None,
+        policy,
+        authenticated_sender_scope: None,
+    };
+
+    let dedup: Arc<dyn crate::storage::DedupStorage> = Arc::new(DurableTestDedup(
+        InMemoryDedupBackend::new(Duration::from_secs(300)),
+    ));
+    let fragment_joiner = Arc::new(std::sync::Mutex::new(As4FragmentJoiner::new()));
+
+    let progress = receive_push_with_dedup_async_fragment_aware(
+        &session,
+        &bus,
+        As4ReceivePushAsyncFragmentAwareRequest {
+            request,
+            dedup_backend: dedup,
+            fragment_joiner,
+        },
+    )
+    .await
+    .expect(
+        "a non-fragmented UserMessage must be accepted with \
+         RequireAuthenticatedScope and authenticated_sender_scope = None",
+    );
+
+    match progress {
+        As4ReceivePushProgress::Complete(output) => {
+            assert_eq!(output.user_message.message_id, "mid-non-fragment-scope");
+        }
+        other => panic!("expected a completed receive, got {other:?}"),
+    }
+}
+
 #[cfg(feature = "interop-relaxed")]
 #[test]
 fn fragment_aware_receive_reassembles_and_processes_message() {
@@ -765,4 +860,68 @@ fn non_fragment_aware_receive_rejects_message_fragment_payload() {
 
     assert_eq!(err.code, ErrorCode::PolicyViolation);
     assert!(err.message.contains("fragment-aware"));
+}
+
+// ---------------------------------------------------------------------------
+// Regulated inbound-encryption configuration
+// ---------------------------------------------------------------------------
+
+/// The split-invariant footgun: enabling the requirement without a key must
+/// still be rejected, so the combined constructors below are the safe path.
+#[test]
+fn require_encrypted_inbound_without_a_key_is_rejected() {
+    let err = As4PushPolicyBuilder::new()
+        .require_encrypted_inbound(true)
+        .build()
+        .expect_err("require_encrypted_inbound without a key must not build");
+
+    assert_eq!(err.code, ErrorCode::InvalidInput);
+    assert!(err.message.contains("inbound_decryption_key_pem"));
+}
+
+#[test]
+fn regulated_with_decryption_key_sets_both_halves_of_the_invariant() {
+    let creds = test_as4_credentials();
+    let key_pem = creds.signing_key_pem.as_ref().expect("signing key").clone();
+
+    let policy = crate::as4::As4PushPolicy::regulated_with_decryption_key(key_pem.clone());
+
+    assert!(policy.require_encrypted_inbound);
+    assert_eq!(
+        policy.inbound_decryption_key_pem.as_deref(),
+        Some(key_pem.as_slice())
+    );
+    // Everything else must still match the fail-closed regulated preset.
+    let baseline = crate::as4::As4PushPolicy::regulated();
+    assert_eq!(policy.interop, baseline.interop);
+    assert_eq!(policy.require_signed_push, baseline.require_signed_push);
+    assert_eq!(
+        policy.require_signed_receipt,
+        baseline.require_signed_receipt
+    );
+    assert_eq!(
+        policy.fail_closed_audit_events,
+        baseline.fail_closed_audit_events
+    );
+    assert_eq!(
+        policy.timestamp_freshness_window,
+        baseline.timestamp_freshness_window
+    );
+    assert_eq!(policy.fragment_scope_policy, baseline.fragment_scope_policy);
+}
+
+#[test]
+fn builder_with_mandatory_inbound_encryption_matches_the_constructor() {
+    let creds = test_as4_credentials();
+    let key_pem = creds.signing_key_pem.as_ref().expect("signing key").clone();
+
+    let built = As4PushPolicyBuilder::regulated()
+        .with_mandatory_inbound_encryption(key_pem.clone())
+        .build()
+        .expect("mandatory inbound encryption must build in one call");
+
+    assert_eq!(
+        built,
+        crate::as4::As4PushPolicy::regulated_with_decryption_key(key_pem)
+    );
 }

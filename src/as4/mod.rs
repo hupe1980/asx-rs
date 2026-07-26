@@ -2,6 +2,7 @@ mod conversation_gate;
 mod coordination;
 mod large_message;
 mod pull;
+mod receipt_verify;
 mod receive;
 mod send;
 mod send_mime;
@@ -31,12 +32,16 @@ pub use pull::{
     As4EnqueuePullWithReliabilityRequest, As4ReceivePullWithReliabilityRequest,
     enqueue_pull_with_reliability, receive_pull_with_reliability,
 };
+pub use receipt_verify::{
+    As4NonRepudiation, As4ReceiptPolicy, As4SyncSignal, DEFAULT_MAX_RECEIPT_BYTES,
+    verify_sync_response,
+};
 /// Re-export of the `As4Verifier` sealing trait — available only under
 /// `testing` so external crates can implement their own custom verifiers.
 ///
 /// ```toml
 /// # Enable in dev-dependencies only
-/// asx-rs = { version = "0.10", features = ["as4", "testing"] }
+/// asx-rs = { version = "0.11", features = ["as4", "testing"] }
 /// ```
 ///
 /// ```rust,ignore

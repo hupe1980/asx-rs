@@ -35,7 +35,18 @@
 //!
 //! ## Fragment scope policy
 //!
-//! When `fragment_scope_policy` is [`FragmentScopePolicy::RequireAuthenticatedScope`] (default),
+//! **This policy applies to fragmented messages only.**  It is consulted after
+//! an inbound message has been identified as carrying an `mf:MessageFragment`
+//! (ebMS3 Part 2 §5); ordinary single-`UserMessage` pushes never reach it.
+//!
+//! Profiles that do not use fragmentation at all — BDEW MaKo, for example — can
+//! therefore leave `fragment_scope_policy` at its secure default and always pass
+//! `authenticated_sender_scope: None`.  No override is needed, and setting
+//! [`FragmentScopePolicy::UseSoapSenderId`] to "make `None` safe" would only
+//! weaken the policy if fragments ever did arrive.
+//!
+//! For **fragmented** messages, when `fragment_scope_policy` is
+//! [`FragmentScopePolicy::RequireAuthenticatedScope`] (default),
 //! `As4ReceivePushRequest::authenticated_sender_scope` **must** be `Some(_)` — a transport-layer
 //! identity (e.g., mTLS client certificate CN) that cannot be forged by the message sender.
 //! When it is `None`, the pipeline returns [`crate::core::ErrorCode::PolicyViolation`].

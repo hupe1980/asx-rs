@@ -1,8 +1,9 @@
 #![cfg(feature = "interop-relaxed")]
 use asx_rs::core::{InteropMode, SessionContext};
 use asx_rs::interop::{
-    BaseProfile, CanonicalizationPolicy, DiffRiskLevel, ProfileExtension, ProfilePolicyOverrides,
-    ProfileStack, SecurityPolicy, ValidationPolicy, diff_effective_policy_snapshots,
+    As2ValidationPolicy, BaseProfile, CanonicalizationPolicy, DiffRiskLevel, ProfileExtension,
+    ProfilePolicyOverrides, ProfileStack, SecurityPolicy, ValidationPolicy,
+    diff_effective_policy_snapshots,
 };
 
 fn base_stack() -> ProfileStack {
@@ -14,6 +15,7 @@ fn base_stack() -> ProfileStack {
             canonicalization: CanonicalizationPolicy::default(),
             security: SecurityPolicy::default(),
             validation: ValidationPolicy::default(),
+            as2_validation: As2ValidationPolicy::default(),
         },
         extensions: vec![],
         overrides: vec![],

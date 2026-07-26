@@ -3,10 +3,10 @@
 
 use asx_rs::core::{ErrorCode, InteropMode, SessionContext};
 use asx_rs::interop::{
-    BaseProfile, CanonicalizationPolicy, EffectivePolicySnapshot, InteropDecision,
-    InteropExceptionCode, InteropExceptionPolicy, ProfilePolicyOverrides, ProfileStack,
-    RegionalProfilePack, SecurityPolicy, ValidationPolicy, diff_effective_policy_snapshots,
-    enforce_exception,
+    As2ValidationPolicy, BaseProfile, CanonicalizationPolicy, EffectivePolicySnapshot,
+    InteropDecision, InteropExceptionCode, InteropExceptionPolicy, ProfilePolicyOverrides,
+    ProfileStack, RegionalProfilePack, SecurityPolicy, ValidationPolicy,
+    diff_effective_policy_snapshots, enforce_exception,
 };
 
 fn base_stack() -> ProfileStack {
@@ -18,6 +18,7 @@ fn base_stack() -> ProfileStack {
             canonicalization: CanonicalizationPolicy::default(),
             security: SecurityPolicy::default(),
             validation: ValidationPolicy::default(),
+            as2_validation: As2ValidationPolicy::default(),
         },
         extensions: vec![],
         overrides: vec![],
@@ -101,6 +102,7 @@ fn snapshot_event_detail_shows_none_when_resolution_trace_is_empty() {
         canonicalization: CanonicalizationPolicy::default(),
         security: SecurityPolicy::default(),
         validation: ValidationPolicy::default(),
+        as2_validation: As2ValidationPolicy::default(),
         resolution_trace: vec![],
         resolution_diagnostics: vec![],
     };
@@ -138,10 +140,7 @@ fn apply_regional_packs_applies_in_sequence() {
         version: "1.0.1".to_string(),
         applies_to_base_profile: "base".to_string(),
         overrides: ProfilePolicyOverrides {
-            validation: Some(ValidationPolicy {
-                require_as2_mic: false,
-                ..ValidationPolicy::default()
-            }),
+            as2_validation: Some(As2ValidationPolicy { require_mic: false }),
             ..ProfilePolicyOverrides::default()
         },
     };
@@ -152,7 +151,7 @@ fn apply_regional_packs_applies_in_sequence() {
     let effective = merged.resolve(&session());
 
     assert_eq!(effective.mode, InteropMode::Relaxed);
-    assert!(!effective.validation.require_as2_mic);
+    assert!(!effective.as2_validation.require_mic);
 }
 
 #[test]

@@ -62,11 +62,14 @@ impl Default for SecurityPolicy {
     }
 }
 
+/// Protocol-neutral validation knobs that apply to both AS2 and AS4.
+///
+/// AS2-only settings live in [`As2ValidationPolicy`] so that an AS4 profile
+/// never has to carry — or explicitly disable — a knob that cannot apply to it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ValidationPolicy {
     pub reject_ambiguous_headers: bool,
     pub enforce_payload_limits: bool,
-    pub require_as2_mic: bool,
 }
 
 impl Default for ValidationPolicy {
@@ -74,8 +77,27 @@ impl Default for ValidationPolicy {
         Self {
             reject_ambiguous_headers: true,
             enforce_payload_limits: true,
-            require_as2_mic: true,
         }
+    }
+}
+
+/// AS2-only validation knobs.
+///
+/// Kept out of [`ValidationPolicy`] because these concepts have no AS4
+/// equivalent: AS4 integrity is carried by the WS-Security XML Signature, not
+/// by an RFC 4130 MIC.
+///
+/// Only meaningful in profiles that carry AS2 traffic; AS4-only profiles can
+/// leave this at its default and ignore it entirely.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct As2ValidationPolicy {
+    /// Require an RFC 4130 §7.3 `Received-Content-MIC` on inbound MDNs.
+    pub require_mic: bool,
+}
+
+impl Default for As2ValidationPolicy {
+    fn default() -> Self {
+        Self { require_mic: true }
     }
 }
 
@@ -85,6 +107,9 @@ pub struct ProfilePolicyOverrides {
     pub canonicalization: Option<CanonicalizationPolicy>,
     pub security: Option<SecurityPolicy>,
     pub validation: Option<ValidationPolicy>,
+    /// AS2-only overrides.  `None` on AS4 profiles, which is the common case.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub as2_validation: Option<As2ValidationPolicy>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -101,6 +126,8 @@ pub struct BaseProfile {
     pub canonicalization: CanonicalizationPolicy,
     pub security: SecurityPolicy,
     pub validation: ValidationPolicy,
+    /// AS2-only validation settings.  Ignored by AS4 profiles.
+    pub as2_validation: As2ValidationPolicy,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -233,6 +260,8 @@ pub struct EffectiveProfile {
     pub canonicalization: CanonicalizationPolicy,
     pub security: SecurityPolicy,
     pub validation: ValidationPolicy,
+    /// AS2-only validation settings.  Ignored by AS4 profiles.
+    pub as2_validation: As2ValidationPolicy,
     pub snapshot: EffectivePolicySnapshot,
 }
 
@@ -245,6 +274,8 @@ pub struct EffectivePolicySnapshot {
     pub canonicalization: CanonicalizationPolicy,
     pub security: SecurityPolicy,
     pub validation: ValidationPolicy,
+    #[serde(default)]
+    pub as2_validation: As2ValidationPolicy,
     pub resolution_trace: Vec<String>,
     pub resolution_diagnostics: Vec<ResolutionDiagnostic>,
 }
@@ -262,6 +293,8 @@ pub enum ResolutionField {
     Canonicalization,
     Security,
     Validation,
+    /// AS2-only validation settings.
+    As2Validation,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -571,6 +604,21 @@ pub fn diff_effective_policy_snapshots(
         });
     }
 
+    if before.as2_validation != after.as2_validation {
+        // Graded Medium (non-blocking), matching how this change was classified
+        // when `require_mic` lived inside `ValidationPolicy`: only
+        // `enforce_payload_limits` escalates the validation stage to High.
+        changes.push(EffectivePolicyDiffEntry {
+            field: ResolutionField::As2Validation,
+            stage: DiffStage::Validation,
+            previous_value: format!("{:?}", before.as2_validation),
+            new_value: format!("{:?}", after.as2_validation),
+            risk: DiffRiskLevel::Medium,
+            rationale: "AS2 validation constraints changed; MDN integrity enforcement may differ"
+                .to_string(),
+        });
+    }
+
     let highest_risk = changes
         .iter()
         .map(|change| change.risk)
@@ -594,6 +642,7 @@ struct ResolvedPolicyState {
     canonicalization: CanonicalizationPolicy,
     security: SecurityPolicy,
     validation: ValidationPolicy,
+    as2_validation: As2ValidationPolicy,
     trace: Vec<String>,
     diagnostics: Vec<ResolutionDiagnostic>,
 }
@@ -604,6 +653,7 @@ struct EffectivePolicyState {
     canonicalization: CanonicalizationPolicy,
     security: SecurityPolicy,
     validation: ValidationPolicy,
+    as2_validation: As2ValidationPolicy,
 }
 
 impl ProfileStack {
@@ -707,6 +757,19 @@ impl ProfileStack {
                 layer: layer_name.to_string(),
             });
         }
+
+        if let Some(as2_validation) = overrides.as2_validation
+            && as2_validation == current.as2_validation
+        {
+            lints.push(ProfileLintFinding {
+                code: ProfileLintCode::DeadOverride,
+                message: format!(
+                    "{layer_name} sets AS2 validation policy to current effective value"
+                ),
+                remediation_hint: "Remove redundant as2_validation override".into(),
+                layer: layer_name.to_string(),
+            });
+        }
     }
 
     fn apply_effective_state_overrides(
@@ -724,6 +787,9 @@ impl ProfileStack {
         }
         if let Some(validation) = overrides.validation {
             current.validation = validation;
+        }
+        if let Some(as2_validation) = overrides.as2_validation {
+            current.as2_validation = as2_validation;
         }
     }
 
@@ -773,6 +839,7 @@ impl ProfileStack {
             canonicalization: self.base.canonicalization.clone(),
             security: self.base.security,
             validation: self.base.validation,
+            as2_validation: self.base.as2_validation,
         };
 
         Self::validate_policy_layer(
@@ -862,6 +929,21 @@ impl ProfileStack {
                 new_value: format!("{:?}", override_validation),
             });
         }
+        if let Some(override_as2_validation) = overrides.as2_validation {
+            let previous_as2_validation = resolved.as2_validation;
+            resolved.as2_validation = override_as2_validation;
+            resolved.trace.push(format!(
+                "{layer_kind}:{layer_name}.as2_validation=>{:?}",
+                override_as2_validation
+            ));
+            resolved.diagnostics.push(ResolutionDiagnostic {
+                layer,
+                layer_name: layer_name.to_string(),
+                field: ResolutionField::As2Validation,
+                previous_value: format!("{:?}", previous_as2_validation),
+                new_value: format!("{:?}", override_as2_validation),
+            });
+        }
     }
 
     pub fn resolve(&self, session: &SessionContext) -> EffectiveProfile {
@@ -870,6 +952,7 @@ impl ProfileStack {
             canonicalization: self.base.canonicalization.clone(),
             security: self.base.security,
             validation: self.base.validation,
+            as2_validation: self.base.as2_validation,
             trace: vec![
                 format!("base:{}=>{:?}", self.base.name, self.base.mode),
                 format!(
@@ -898,6 +981,7 @@ impl ProfileStack {
             canonicalization: resolved.canonicalization.clone(),
             security: resolved.security,
             validation: resolved.validation,
+            as2_validation: resolved.as2_validation,
             snapshot: EffectivePolicySnapshot {
                 session_id: session.session_id().to_string(),
                 partner_id: session.partner_id().to_string(),
@@ -906,6 +990,7 @@ impl ProfileStack {
                 canonicalization: resolved.canonicalization.clone(),
                 security: resolved.security,
                 validation: resolved.validation,
+                as2_validation: resolved.as2_validation,
                 resolution_trace: resolved.trace,
                 resolution_diagnostics: resolved.diagnostics,
             },

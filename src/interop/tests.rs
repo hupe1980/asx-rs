@@ -9,6 +9,7 @@ fn base_profile() -> BaseProfile {
         canonicalization: CanonicalizationPolicy::default(),
         security: SecurityPolicy::default(),
         validation: ValidationPolicy::default(),
+        as2_validation: As2ValidationPolicy::default(),
     }
 }
 
@@ -234,6 +235,7 @@ fn explicit_policy_layers_resolve_deterministically() {
             },
             security: SecurityPolicy::default(),
             validation: ValidationPolicy::default(),
+            as2_validation: As2ValidationPolicy::default(),
         },
         extensions: vec![ProfileExtension {
             name: "vendor".into(),
@@ -242,10 +244,7 @@ fn explicit_policy_layers_resolve_deterministically() {
         overrides: vec![ProfileOverride {
             name: "partner".into(),
             overrides: ProfilePolicyOverrides {
-                validation: Some(ValidationPolicy {
-                    require_as2_mic: false,
-                    ..ValidationPolicy::default()
-                }),
+                as2_validation: Some(As2ValidationPolicy { require_mic: false }),
                 ..ProfilePolicyOverrides::default()
             },
         }],
@@ -255,7 +254,7 @@ fn explicit_policy_layers_resolve_deterministically() {
     let session = SessionContext::new("s1", "partner-a", "profile-a").expect("session");
     let effective = stack.resolve(&session);
 
-    assert!(!effective.validation.require_as2_mic);
+    assert!(!effective.as2_validation.require_mic);
     assert_eq!(effective.mode, InteropMode::Strict);
 }
 
@@ -325,6 +324,7 @@ fn invalid_profile_combinations_fail_fast_with_machine_readable_codes() {
                 require_encryption: false,
             },
             validation: ValidationPolicy::default(),
+            as2_validation: As2ValidationPolicy::default(),
         },
         extensions: vec![],
         overrides: vec![],
@@ -405,10 +405,7 @@ fn partner_profile_overlays_are_partner_scoped_with_traceable_precedence() {
         overrides: vec![ProfileOverride {
             name: "global".into(),
             overrides: ProfilePolicyOverrides {
-                validation: Some(ValidationPolicy {
-                    require_as2_mic: false,
-                    ..ValidationPolicy::default()
-                }),
+                as2_validation: Some(As2ValidationPolicy { require_mic: false }),
                 ..ProfilePolicyOverrides::default()
             },
         }],
@@ -665,10 +662,7 @@ fn diff_mic_requirement_change_is_medium_risk() {
     };
     let after_stack = ProfileStack {
         base: BaseProfile {
-            validation: ValidationPolicy {
-                require_as2_mic: false,
-                ..ValidationPolicy::default()
-            },
+            as2_validation: As2ValidationPolicy { require_mic: false },
             ..base_profile()
         },
         extensions: vec![],
@@ -729,6 +723,7 @@ fn snapshot_as_event_detail_empty_trace_shows_none() {
         canonicalization: CanonicalizationPolicy::default(),
         security: SecurityPolicy::default(),
         validation: ValidationPolicy::default(),
+        as2_validation: As2ValidationPolicy::default(),
         resolution_trace: vec![],
         resolution_diagnostics: vec![],
     };

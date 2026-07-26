@@ -131,6 +131,7 @@ struct MockEndpointState {
     session: Arc<SessionContext>,
     event_bus: Arc<EventBus>,
     policy: crate::as4::types::As4PushPolicy,
+    receipt_credentials: Option<Arc<crate::as4::As4ReceiptCredentials>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -144,6 +145,7 @@ struct MockEndpointState {
 #[derive(Default)]
 pub struct MockAs4EndpointBuilder {
     decryption_key_pem: Option<Vec<u8>>,
+    receipt_signing: Option<(Vec<u8>, Vec<u8>)>,
 }
 
 impl MockAs4EndpointBuilder {
@@ -156,6 +158,47 @@ impl MockAs4EndpointBuilder {
     /// encrypted message to the mock results in an HTTP 400 response.
     pub fn with_decryption_key_pem(mut self, pem: impl Into<Vec<u8>>) -> Self {
         self.decryption_key_pem = Some(pem.into());
+        self
+    }
+
+    /// Make the mock answer with a **signed** receipt carrying Non-Repudiation
+    /// Information echoed from the inbound message's signature.
+    ///
+    /// Without this the mock replies with an unsigned receipt containing an
+    /// empty `<ebbpsig:NonRepudiationInformation/>`, which
+    /// [`crate::as4::verify_sync_response`] rejects under
+    /// [`As4ReceiptPolicy::regulated`](crate::as4::As4ReceiptPolicy::regulated).
+    /// Set it to exercise the full NRR round trip end to end:
+    ///
+    /// ```rust,ignore
+    /// let endpoint = MockAs4Endpoint::builder()
+    ///     .with_receipt_signing_material(receiver_cert_pem, receiver_key_pem)
+    ///     .bind("127.0.0.1:0")
+    ///     .await?;
+    ///
+    /// let outcome = transport
+    ///     .send_and_verify_to_localhost(
+    ///         &endpoint.local_url(), &session, &bus, &sent,
+    ///         &As4ReceiptPolicy::regulated(),
+    ///     )
+    ///     .await?;
+    /// assert!(outcome.into_receipt()?.is_non_repudiation_evidence());
+    /// ```
+    ///
+    /// The sending session must pin this certificate's SHA-256 fingerprint
+    /// (via `cert_handle.fingerprint_sha256` or
+    /// [`As4ReceiptPolicy::with_expected_signer_fingerprint`](crate::as4::As4ReceiptPolicy::with_expected_signer_fingerprint))
+    /// for the signature check to pass.
+    ///
+    /// Falls back to an unsigned receipt when the inbound message carried no
+    /// signature to echo — a signed receipt cannot reference digests that do
+    /// not exist.
+    pub fn with_receipt_signing_material(
+        mut self,
+        cert_pem: impl Into<Vec<u8>>,
+        key_pem: impl Into<Vec<u8>>,
+    ) -> Self {
+        self.receipt_signing = Some((cert_pem.into(), key_pem.into()));
         self
     }
 
@@ -244,6 +287,14 @@ impl MockAs4Endpoint {
             .build()
             .expect("mock policy must always construct");
 
+        let receipt_credentials = config.receipt_signing.map(|(cert_pem, key_pem)| {
+            Arc::new(crate::as4::As4ReceiptCredentials {
+                signing_key_pem: key_pem,
+                signing_cert_pem: cert_pem,
+                key_info_profile: crate::crypto::wssec::WsSecOutboundKeyInfoProfile::default(),
+            })
+        });
+
         let state = Arc::new(MockEndpointState {
             tx,
             dedup: Arc::new(MockDedup(InMemoryDedupBackend::new(
@@ -252,6 +303,7 @@ impl MockAs4Endpoint {
             session,
             event_bus,
             policy,
+            receipt_credentials,
         });
 
         let router: Router = Router::new()
@@ -368,6 +420,7 @@ async fn mock_as4_handler(State(state): State<Arc<MockEndpointState>>, req: Requ
     match outcome {
         Ok(As4ReceiveOutcome::FirstSeen(output)) => {
             let ref_id = output.user_message.message_id.clone();
+            let receipt = build_receipt_bytes(&state, &output, &ingress);
             let msg = MockReceivedMessage {
                 action: output.user_message.action.clone(),
                 service: output.user_message.service.clone(),
@@ -387,7 +440,8 @@ async fn mock_as4_handler(State(state): State<Arc<MockEndpointState>>, req: Requ
                 "MockAs4Endpoint: recorded first-seen message"
             );
             let _ = state.tx.send(msg);
-            generate_receipt_response(&state.session, &ref_id)
+            let _ = &ref_id;
+            receipt_response(receipt)
         }
         Ok(As4ReceiveOutcome::Duplicate { ref message_id }) => {
             // Still return an acknowledgement — the sender may not have received the first one.
@@ -396,7 +450,9 @@ async fn mock_as4_handler(State(state): State<Arc<MockEndpointState>>, req: Requ
                 message_id = %message_id,
                 "MockAs4Endpoint: duplicate message (replay)"
             );
-            generate_receipt_response(&state.session, message_id)
+            // A replay is acknowledged with a plain receipt: the original
+            // inbound bytes are no longer available to echo NRI digests from.
+            receipt_response(generate_plain_receipt(&state.session, message_id))
         }
         Err(e) => {
             use crate::core::ErrorCode;
@@ -418,9 +474,57 @@ async fn mock_as4_handler(State(state): State<Arc<MockEndpointState>>, req: Requ
     }
 }
 
-fn generate_receipt_response(session: &SessionContext, ref_to_message_id: &str) -> Response {
+/// Build the receipt bytes for a first-seen message.
+///
+/// When receipt signing material is configured, produce a signed receipt whose
+/// `MessagePartNRInformation` echoes the inbound signature's `ds:Reference`
+/// digests, so the sender's NRR check has something real to verify.  Falls back
+/// to a plain receipt when signing is unconfigured or the inbound message was
+/// unsigned.
+fn build_receipt_bytes(
+    state: &MockEndpointState,
+    output: &crate::as4::As4ReceivePushOutput,
+    ingress: &crate::transport::ingress::As4HttpIngress,
+) -> crate::core::Result<Vec<u8>> {
     let receipt_id = format!("mock-receipt-{}@mock.endpoint", uuid::Uuid::new_v4());
-    match crate::as4::signals::generate_receipt(session, &receipt_id, ref_to_message_id) {
+    let ref_id = &output.user_message.message_id;
+
+    let Some(credentials) = state.receipt_credentials.as_deref() else {
+        return crate::as4::signals::generate_receipt(&state.session, &receipt_id, ref_id);
+    };
+
+    match crate::as4::generate_signed_receipt_for_output(
+        &state.session,
+        &receipt_id,
+        output,
+        &ingress.body,
+        &ingress.content_type,
+        credentials,
+    ) {
+        Ok(bytes) => Ok(bytes),
+        Err(err) => {
+            tracing::debug!(
+                target: "asx_rs::as4::mock_endpoint",
+                error = %err.message,
+                message_id = %ref_id,
+                "MockAs4Endpoint: inbound message carried no signature to echo; \
+                 falling back to an unsigned receipt"
+            );
+            crate::as4::signals::generate_receipt(&state.session, &receipt_id, ref_id)
+        }
+    }
+}
+
+fn generate_plain_receipt(
+    session: &SessionContext,
+    ref_to_message_id: &str,
+) -> crate::core::Result<Vec<u8>> {
+    let receipt_id = format!("mock-receipt-{}@mock.endpoint", uuid::Uuid::new_v4());
+    crate::as4::signals::generate_receipt(session, &receipt_id, ref_to_message_id)
+}
+
+fn receipt_response(receipt: crate::core::Result<Vec<u8>>) -> Response {
+    match receipt {
         Ok(bytes) => (
             StatusCode::OK,
             [(CONTENT_TYPE, "application/soap+xml")],
@@ -431,7 +535,6 @@ fn generate_receipt_response(session: &SessionContext, ref_to_message_id: &str) 
             tracing::error!(
                 target: "asx_rs::as4::mock_endpoint",
                 error = %e.message,
-                ref_to_message_id = %ref_to_message_id,
                 "MockAs4Endpoint: receipt generation failed"
             );
             StatusCode::INTERNAL_SERVER_ERROR.into_response()

@@ -1,5 +1,5 @@
 use super::{ParsedAs4Receipt, ParsedAs4UserMessage};
-use crate::as4::types::ParsedWsAddressingHeaders;
+use crate::as4::types::{As4NriReference, As4ReceivedError, ParsedWsAddressingHeaders};
 use crate::core::InteropMode;
 use crate::core::{AsxError, ErrorCode, ErrorContext, Result, SessionContext};
 use crate::observability::{AsxEvent, EventBus, emit_audit_event};
@@ -970,7 +970,7 @@ pub(super) fn parse_as4_receipt(
         ));
     }
 
-    let parsed = parse_as4_receipt_signal_summary_streaming(xml, session)?;
+    let parsed = parse_as4_signal_envelope(xml, session, "as4_parse_receipt")?;
     if !parsed.has_signal_message {
         return Err(AsxError::new(
             ErrorCode::ParseFailed,
@@ -1036,139 +1036,445 @@ pub(super) fn parse_as4_receipt(
     })
 }
 
+// ---------------------------------------------------------------------------
+// SignalMessage parser (Receipt + Error)
+// ---------------------------------------------------------------------------
+//
+// Shared by the inbound receipt check (`parse_as4_receipt`) and the outbound
+// receipt verification in `as4::receipt_verify`.
+//
+// Structural rules enforced here, all of them anti-wrapping measures rather
+// than mere syntax checks:
+//
+// * at most one `eb:Messaging` block and one `eb:SignalMessage` — otherwise an
+//   unsigned block could supply the values the caller acts on while a genuine
+//   signed block satisfies the signature check;
+// * `NonRepudiationInformation` is harvested only from inside the
+//   `eb:Receipt` of that SignalMessage;
+// * each `eb:MessageInfo` child appears at most once, so an injected duplicate
+//   cannot shadow the real value.
+
+/// Upper bound on `<ebbpsig:MessagePartNRInformation>` entries retained from a
+/// counterparty receipt.  A conformant AS4 receipt echoes one entry per
+/// `<ds:Reference>` of the original signature — in practice 2–5 (Messaging,
+/// Body, and one per MIME attachment).  The cap bounds allocation from a
+/// hostile MSH independently of the element-count guard.
+const MAX_SIGNAL_NRI_REFERENCES: usize = 256;
+
+/// Upper bound on `<eb:Error>` entries retained from a counterparty signal.
+const MAX_SIGNAL_ERRORS: usize = 64;
+
+/// Everything the receipt paths need from a counterparty `eb:SignalMessage`.
+///
+/// Populated by [`parse_as4_signal_envelope`] using namespace-resolved
+/// streaming parsing — prefix-agnostic (`eb:`, `eb3:`, `ns2:`, default-ns …)
+/// and CDATA-aware.
 #[derive(Debug, Default)]
-struct ParsedAs4ReceiptSignalSummary {
-    has_signal_message: bool,
-    has_receipt: bool,
-    has_non_repudiation_info: bool,
-    has_signature: bool,
-    ref_to_message_id: Option<String>,
+pub(super) struct ParsedAs4SignalEnvelope {
+    pub(super) has_signal_message: bool,
+    pub(super) has_receipt: bool,
+    pub(super) has_non_repudiation_info: bool,
+    pub(super) has_signature: bool,
+    pub(super) message_id: Option<String>,
+    pub(super) ref_to_message_id: Option<String>,
+    pub(super) timestamp: Option<String>,
+    pub(super) nri_references: Vec<As4NriReference>,
+    pub(super) errors: Vec<As4ReceivedError>,
 }
 
-fn parse_as4_receipt_signal_summary_streaming(
+/// Text sinks the signal parser can be actively filling.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SignalTextSink {
+    MessageId,
+    RefToMessageId,
+    Timestamp,
+    DigestValue,
+    ErrorDescription,
+    ErrorDetail,
+}
+
+#[derive(Default)]
+struct PartialNriReference {
+    uri: Option<String>,
+    digest_method_uri: Option<String>,
+    digest_value_b64: Option<String>,
+}
+
+/// Streaming state machine backing [`parse_as4_signal_envelope`].
+struct SignalParseState<'a> {
+    out: ParsedAs4SignalEnvelope,
+    session: &'a SessionContext,
+    stage: &'static str,
+    /// Depth of the innermost open `eb:SignalMessage`, if any.
+    signal_depth: Option<usize>,
+    /// Depth of the innermost open `ebbpsig:NonRepudiationInformation`, if any.
+    nri_block_depth: Option<usize>,
+    /// Depth of the innermost open `eb:MessageInfo`, if any.
+    message_info_depth: Option<usize>,
+    /// Depth of the innermost open `eb:Receipt`, if any.
+    receipt_depth: Option<usize>,
+    /// Active text sink and the depth of the element that opened it.
+    sink: Option<(SignalTextSink, usize)>,
+    /// `ds:Reference` being assembled inside a `MessagePartNRInformation`.
+    current_ref: Option<(PartialNriReference, usize)>,
+    /// `eb:Error` being assembled, and the depth of its opening element.
+    current_error: Option<(As4ReceivedError, usize)>,
+    /// Number of `eb:Messaging` blocks seen anywhere in the document.
+    messaging_count: usize,
+    /// Number of `eb:SignalMessage` blocks seen anywhere in the document.
+    signal_message_count: usize,
+}
+
+/// Read an unprefixed attribute by local name.
+///
+/// ebMS3 (`errorCode`, `severity`, …) and XMLDSig (`URI`, `Algorithm`) both
+/// declare these unqualified, so prefixed look-alikes are deliberately ignored.
+fn signal_attribute(element: &quick_xml::events::BytesStart<'_>, name: &[u8]) -> Option<String> {
+    for attr in element.attributes().with_checks(false).flatten() {
+        let key = attr.key;
+        if key.prefix().is_none() && key.local_name().as_ref() == name {
+            let raw = std::str::from_utf8(attr.value.as_ref()).ok()?;
+            let value = quick_xml::escape::unescape(raw).ok()?;
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    None
+}
+
+impl SignalParseState<'_> {
+    fn parse_error(&self, message: impl Into<String>) -> AsxError {
+        AsxError::new(
+            ErrorCode::ParseFailed,
+            message,
+            ErrorContext::for_session(self.stage, self.session),
+        )
+    }
+
+    /// Error for structural shapes that are signature-wrapping vectors rather
+    /// than mere syntax problems — classified so callers and alerting can tell
+    /// a malformed response from an attack shape.
+    fn wrapping_error(&self, message: impl Into<String>) -> AsxError {
+        AsxError::new(
+            ErrorCode::SecurityVerificationFailed,
+            message,
+            ErrorContext::for_session(self.stage, self.session),
+        )
+    }
+
+    /// Error for a `MessageInfo` element repeated inside one SignalMessage.
+    fn duplicate_error(&self, element: &str) -> AsxError {
+        self.wrapping_error(format!(
+            "AS4 eb:SignalMessage contains more than one {element}; a repeated \
+             element makes the signal ambiguous (possible element injection)"
+        ))
+    }
+
+    fn open_element(
+        &mut self,
+        ns: &ResolveResult<'_>,
+        element: &quick_xml::events::BytesStart<'_>,
+        depth: usize,
+    ) -> Result<()> {
+        let local_name = element.local_name();
+        let local = local_name.as_ref();
+
+        if ns_matches(ns, XMLDSIG_NS) && local == b"Signature" {
+            self.out.has_signature = true;
+        }
+
+        if ns_matches(ns, EBMS3_CORE_NS) && local == b"Messaging" {
+            self.messaging_count += 1;
+            // A signature can only cover one of them; merging fields across
+            // blocks would let an unsigned block supply the values the caller
+            // acts on while a genuine signed block satisfies the signature.
+            if self.messaging_count > 1 {
+                return Err(self.wrapping_error(
+                    "AS4 signal envelope contains more than one eb:Messaging header block \
+                     (possible XML signature wrapping)",
+                ));
+            }
+        }
+
+        if ns_matches(ns, EBMS3_CORE_NS) && local == b"SignalMessage" {
+            self.signal_message_count += 1;
+            // Likewise, a second SignalMessage could carry a Receipt for a
+            // different message alongside a genuine one.  ebMS3 permits
+            // bundled signals; this crate deliberately does not accept them,
+            // because correlating a bundle to one sent message is ambiguous.
+            if self.signal_message_count > 1 {
+                return Err(self.wrapping_error(
+                    "AS4 signal envelope contains more than one eb:SignalMessage; \
+                     bundled signals are not accepted because the acknowledgement \
+                     cannot be unambiguously correlated to the sent message",
+                ));
+            }
+            self.out.has_signal_message = true;
+            self.signal_depth = Some(depth);
+            return Ok(());
+        }
+
+        // Everything below is only meaningful inside a SignalMessage.
+        if self.signal_depth.is_none() {
+            return Ok(());
+        }
+
+        if ns_matches(ns, EBMS3_CORE_NS) {
+            match local {
+                b"MessageInfo" => self.message_info_depth = Some(depth),
+                b"Receipt" => {
+                    self.out.has_receipt = true;
+                    self.receipt_depth = Some(depth);
+                }
+                b"MessageId" if self.message_info_depth.is_some() => {
+                    self.sink = Some((SignalTextSink::MessageId, depth));
+                }
+                b"RefToMessageId" if self.message_info_depth.is_some() => {
+                    self.sink = Some((SignalTextSink::RefToMessageId, depth));
+                }
+                b"Timestamp" if self.message_info_depth.is_some() => {
+                    self.sink = Some((SignalTextSink::Timestamp, depth));
+                }
+                b"Error" => self.open_error_element(element, depth),
+                b"Description" if self.current_error.is_some() => {
+                    self.sink = Some((SignalTextSink::ErrorDescription, depth));
+                }
+                b"ErrorDetail" if self.current_error.is_some() => {
+                    self.sink = Some((SignalTextSink::ErrorDetail, depth));
+                }
+                _ => {}
+            }
+        }
+
+        // NonRepudiationInformation is only meaningful inside the eb:Receipt of
+        // this SignalMessage; a block placed elsewhere is not an
+        // acknowledgement of anything and must not be harvested as one.
+        if self.receipt_depth.is_some()
+            && (ns_matches(ns, EBBP_SIGNALS_NS) || ns_matches(ns, EBMS3_CORE_NS))
+            && local == b"NonRepudiationInformation"
+        {
+            self.out.has_non_repudiation_info = true;
+            self.nri_block_depth = Some(depth);
+        }
+
+        if self.nri_block_depth.is_some() && ns_matches(ns, XMLDSIG_NS) {
+            match local {
+                b"Reference" => {
+                    if self.out.nri_references.len() >= MAX_SIGNAL_NRI_REFERENCES {
+                        return Err(self.parse_error(format!(
+                            "AS4 receipt NonRepudiationInformation exceeds the \
+                             MessagePartNRInformation limit ({MAX_SIGNAL_NRI_REFERENCES})"
+                        )));
+                    }
+                    self.current_ref = Some((
+                        PartialNriReference {
+                            uri: signal_attribute(element, b"URI"),
+                            ..PartialNriReference::default()
+                        },
+                        depth,
+                    ));
+                }
+                b"DigestMethod" => {
+                    let algorithm = signal_attribute(element, b"Algorithm");
+                    if let Some((partial, _)) = self.current_ref.as_mut() {
+                        partial.digest_method_uri = algorithm;
+                    }
+                }
+                b"DigestValue" if self.current_ref.is_some() => {
+                    self.sink = Some((SignalTextSink::DigestValue, depth));
+                }
+                _ => {}
+            }
+        }
+
+        Ok(())
+    }
+
+    fn open_error_element(&mut self, element: &quick_xml::events::BytesStart<'_>, depth: usize) {
+        if self.out.errors.len() >= MAX_SIGNAL_ERRORS {
+            return;
+        }
+        let received = As4ReceivedError {
+            error_code: signal_attribute(element, b"errorCode")
+                .unwrap_or_else(|| "unknown".to_string()),
+            severity: signal_attribute(element, b"severity"),
+            category: signal_attribute(element, b"category"),
+            origin: signal_attribute(element, b"origin"),
+            ref_to_message_id: signal_attribute(element, b"refToMessageId"),
+            short_description: signal_attribute(element, b"shortDescription"),
+            description: None,
+            error_detail: None,
+        };
+        self.current_error = Some((received, depth));
+    }
+
+    fn close_element(&mut self, depth: usize) {
+        if self.sink.is_some_and(|(_, sink_depth)| sink_depth == depth) {
+            self.sink = None;
+        }
+        if self
+            .current_ref
+            .as_ref()
+            .is_some_and(|(_, ref_depth)| *ref_depth == depth)
+            && let Some((partial, _)) = self.current_ref.take()
+            && let (Some(uri), Some(digest_method_uri), Some(digest_value_b64)) = (
+                partial.uri,
+                partial.digest_method_uri,
+                partial.digest_value_b64,
+            )
+        {
+            self.out.nri_references.push(As4NriReference {
+                uri,
+                digest_method_uri,
+                digest_value_b64,
+            });
+        }
+        if self
+            .current_error
+            .as_ref()
+            .is_some_and(|(_, error_depth)| *error_depth == depth)
+            && let Some((received, _)) = self.current_error.take()
+        {
+            self.out.errors.push(received);
+        }
+        if self.nri_block_depth == Some(depth) {
+            self.nri_block_depth = None;
+        }
+        if self.receipt_depth == Some(depth) {
+            self.receipt_depth = None;
+        }
+        if self.message_info_depth == Some(depth) {
+            self.message_info_depth = None;
+        }
+        if self.signal_depth == Some(depth) {
+            self.signal_depth = None;
+        }
+    }
+
+    fn accept_text(&mut self, bytes: &[u8]) -> Result<()> {
+        let Some((sink, _)) = self.sink else {
+            return Ok(());
+        };
+        let Some(value) = decode_text_event_with_stage(bytes, self.session, self.stage)? else {
+            return Ok(());
+        };
+        // ebMS3 §5.2.2.1 declares each MessageInfo child at most once, so a
+        // second occurrence is rejected rather than silently first-wins —
+        // otherwise an injected duplicate could shadow the real value.
+        match sink {
+            SignalTextSink::MessageId => {
+                if self.out.message_id.is_some() {
+                    return Err(self.duplicate_error("eb:MessageId"));
+                }
+                self.out.message_id = Some(value);
+            }
+            SignalTextSink::RefToMessageId => {
+                if self.out.ref_to_message_id.is_some() {
+                    return Err(self.duplicate_error("eb:RefToMessageId"));
+                }
+                self.out.ref_to_message_id = Some(value);
+            }
+            SignalTextSink::Timestamp => {
+                if self.out.timestamp.is_some() {
+                    return Err(self.duplicate_error("eb:Timestamp"));
+                }
+                self.out.timestamp = Some(value);
+            }
+            SignalTextSink::DigestValue => {
+                if let Some((partial, _)) = self.current_ref.as_mut() {
+                    partial.digest_value_b64.get_or_insert(value);
+                }
+            }
+            SignalTextSink::ErrorDescription => {
+                if let Some((received, _)) = self.current_error.as_mut() {
+                    received.description.get_or_insert(value);
+                }
+            }
+            SignalTextSink::ErrorDetail => {
+                if let Some((received, _)) = self.current_error.as_mut() {
+                    received.error_detail.get_or_insert(value);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Parse an AS4 `eb:SignalMessage` envelope (Receipt and/or Error).
+///
+/// This applies no *policy* — it extracts structure and enforces the
+/// unambiguity rules described above.  Policy enforcement lives in
+/// [`parse_as4_receipt`] (inbound) and [`crate::as4::verify_sync_response`]
+/// (outbound), so callers can distinguish "counterparty rejected the message"
+/// (Error signal) from "counterparty acknowledged it" (Receipt).
+///
+/// Parsing is namespace-resolved rather than prefix-matched, so `eb:`, `eb3:`,
+/// `ns2:` and default-namespace documents are all handled identically, and
+/// CDATA-wrapped element text is decoded like ordinary text.
+pub(super) fn parse_as4_signal_envelope(
     xml: &str,
     session: &SessionContext,
-) -> Result<ParsedAs4ReceiptSignalSummary> {
+    stage: &'static str,
+) -> Result<ParsedAs4SignalEnvelope> {
+    if xml.trim().is_empty() {
+        return Err(AsxError::new(
+            ErrorCode::ParseFailed,
+            "AS4 signal payload is empty",
+            ErrorContext::for_session(stage, session),
+        ));
+    }
+
     let mut reader = NsReader::from_reader(xml.as_bytes());
     reader.config_mut().trim_text(true);
 
-    let mut summary = ParsedAs4ReceiptSignalSummary::default();
+    let mut state = SignalParseState {
+        out: ParsedAs4SignalEnvelope::default(),
+        session,
+        stage,
+        signal_depth: None,
+        nri_block_depth: None,
+        message_info_depth: None,
+        receipt_depth: None,
+        sink: None,
+        current_ref: None,
+        current_error: None,
+        messaging_count: 0,
+        signal_message_count: 0,
+    };
+
     let mut element_count = 0usize;
     let mut depth = 0usize;
-    let mut signal_message_depth: Option<usize> = None;
-    let mut ref_to_message_id_depth: Option<usize> = None;
 
     loop {
         let (ns, event) = reader.read_resolved_event().map_err(|e| {
             AsxError::new(
                 ErrorCode::ParseFailed,
-                format!("failed to parse AS4 receipt signal: {e}"),
-                ErrorContext::for_session("as4_parse_receipt", session),
+                format!("failed to parse AS4 signal message: {e}"),
+                ErrorContext::for_session(stage, session),
             )
         })?;
 
         match event {
             XmlEvent::Start(element) => {
-                depth += 1;
                 element_count += 1;
-                if element_count > MAX_XML_ELEMENTS {
-                    return Err(AsxError::new(
-                        ErrorCode::ParseFailed,
-                        format!(
-                            "AS4 XML document exceeds element limit ({} > {})",
-                            element_count, MAX_XML_ELEMENTS
-                        ),
-                        ErrorContext::for_session("as4_parse_receipt", session),
-                    ));
-                }
-
-                let local_name = element.local_name();
-                let local_name = local_name.as_ref();
-
-                if ns_matches(&ns, EBMS3_CORE_NS) && local_name == b"SignalMessage" {
-                    summary.has_signal_message = true;
-                    signal_message_depth = Some(depth);
-                }
-
-                if signal_message_depth.is_some() && ns_matches(&ns, EBMS3_CORE_NS) {
-                    if local_name == b"Receipt" {
-                        summary.has_receipt = true;
-                    } else if local_name == b"RefToMessageId" && summary.ref_to_message_id.is_none()
-                    {
-                        ref_to_message_id_depth = Some(depth);
-                    }
-                }
-
-                if ns_matches(&ns, XMLDSIG_NS) && local_name == b"Signature" {
-                    summary.has_signature = true;
-                }
-
-                if (ns_matches(&ns, EBMS3_CORE_NS) || ns_matches(&ns, EBBP_SIGNALS_NS))
-                    && local_name == b"NonRepudiationInformation"
-                {
-                    summary.has_non_repudiation_info = true;
-                }
+                enforce_signal_element_budget(element_count, session, stage)?;
+                depth += 1;
+                state.open_element(&ns, &element, depth)?;
             }
             XmlEvent::Empty(element) => {
                 element_count += 1;
-                if element_count > MAX_XML_ELEMENTS {
-                    return Err(AsxError::new(
-                        ErrorCode::ParseFailed,
-                        format!(
-                            "AS4 XML document exceeds element limit ({} > {})",
-                            element_count, MAX_XML_ELEMENTS
-                        ),
-                        ErrorContext::for_session("as4_parse_receipt", session),
-                    ));
-                }
-
-                let local_name = element.local_name();
-                let local_name = local_name.as_ref();
-
-                if signal_message_depth.is_some()
-                    && ns_matches(&ns, EBMS3_CORE_NS)
-                    && local_name == b"Receipt"
-                {
-                    summary.has_receipt = true;
-                }
-
-                if ns_matches(&ns, EBMS3_CORE_NS) && local_name == b"SignalMessage" {
-                    summary.has_signal_message = true;
-                }
-
-                if ns_matches(&ns, XMLDSIG_NS) && local_name == b"Signature" {
-                    summary.has_signature = true;
-                }
-
-                if (ns_matches(&ns, EBMS3_CORE_NS) || ns_matches(&ns, EBBP_SIGNALS_NS))
-                    && local_name == b"NonRepudiationInformation"
-                {
-                    summary.has_non_repudiation_info = true;
-                }
+                enforce_signal_element_budget(element_count, session, stage)?;
+                // An empty element opens and closes at the same virtual depth.
+                let virtual_depth = depth + 1;
+                state.open_element(&ns, &element, virtual_depth)?;
+                state.close_element(virtual_depth);
             }
-            XmlEvent::Text(text) => {
-                if ref_to_message_id_depth.is_some()
-                    && summary.ref_to_message_id.is_none()
-                    && let Some(value) = decode_text_event(text.as_ref(), session)?
-                {
-                    summary.ref_to_message_id = Some(value);
-                }
-            }
-            XmlEvent::CData(text) => {
-                if ref_to_message_id_depth.is_some()
-                    && summary.ref_to_message_id.is_none()
-                    && let Some(value) = decode_text_event(text.as_ref(), session)?
-                {
-                    summary.ref_to_message_id = Some(value);
-                }
-            }
+            XmlEvent::Text(text) => state.accept_text(text.as_ref())?,
+            XmlEvent::CData(text) => state.accept_text(text.as_ref())?,
             XmlEvent::End(_) => {
-                if signal_message_depth == Some(depth) {
-                    signal_message_depth = None;
-                }
-                if ref_to_message_id_depth == Some(depth) {
-                    ref_to_message_id_depth = None;
-                }
+                state.close_element(depth);
                 depth = depth.saturating_sub(1);
             }
             XmlEvent::Eof => break,
@@ -1176,16 +1482,29 @@ fn parse_as4_receipt_signal_summary_streaming(
         }
     }
 
-    Ok(summary)
+    Ok(state.out)
+}
+
+fn enforce_signal_element_budget(
+    element_count: usize,
+    session: &SessionContext,
+    stage: &'static str,
+) -> Result<()> {
+    if element_count > MAX_XML_ELEMENTS {
+        return Err(AsxError::new(
+            ErrorCode::ParseFailed,
+            format!(
+                "AS4 XML document exceeds element limit ({element_count} > {MAX_XML_ELEMENTS})"
+            ),
+            ErrorContext::for_session(stage, session),
+        ));
+    }
+    Ok(())
 }
 
 #[inline]
 fn ns_matches(ns: &ResolveResult<'_>, expected: &str) -> bool {
     matches!(ns, ResolveResult::Bound(namespace) if namespace.as_ref() == expected.as_bytes())
-}
-
-fn decode_text_event(bytes: &[u8], session: &SessionContext) -> Result<Option<String>> {
-    decode_text_event_with_stage(bytes, session, "as4_parse_receipt")
 }
 
 fn decode_text_event_with_stage(

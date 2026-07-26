@@ -140,7 +140,11 @@ pub fn enforce_payload_limit(
 ) -> Result<()> {
     if payload_len > max_body_bytes {
         return Err(AsxError::new(
-            ErrorCode::PolicyViolation,
+            // `PayloadTooLarge` maps to HTTP 413, which is what an ingress
+            // handler must return here.  `PolicyViolation` (used before
+            // v0.11.0) mapped to 403 and misreported an oversize body as an
+            // authorization failure.
+            ErrorCode::PayloadTooLarge,
             format!(
                 "payload exceeds configured max bytes: {} > {}",
                 payload_len, max_body_bytes
@@ -637,7 +641,7 @@ mod tests {
             &governance,
         )
         .expect_err("oversized request body must fail");
-        assert_eq!(err.code, ErrorCode::PolicyViolation);
+        assert_eq!(err.code, ErrorCode::PayloadTooLarge);
     }
 
     #[test]
@@ -756,7 +760,7 @@ mod tests {
         )
         .await
         .expect_err("oversized async stream must fail");
-        assert_eq!(err.code, ErrorCode::PolicyViolation);
+        assert_eq!(err.code, ErrorCode::PayloadTooLarge);
     }
 
     #[tokio::test]
@@ -1133,7 +1137,7 @@ mod tests {
         )
         .await
         .expect_err("oversized async copy stream must fail");
-        assert_eq!(err.code, ErrorCode::PolicyViolation);
+        assert_eq!(err.code, ErrorCode::PayloadTooLarge);
     }
 
     #[tokio::test]

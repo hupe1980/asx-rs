@@ -1,7 +1,8 @@
 use super::super::parser::{parse_as4_receipt, precheck_as4_receipt_structure_bytes};
 use super::super::services::{
     emit_receive_push_receipt_received, emit_receive_push_receipt_taxonomy_outcome,
-    expected_fingerprint_from_session, wssec_revocation_policy_from_session,
+    enforce_signal_signature_coverage, expected_fingerprint_from_session,
+    wssec_revocation_policy_from_session,
 };
 use super::super::types::As4PushPolicy;
 use crate::core::{AsxError, ErrorCode, ErrorContext, Result, SessionContext};
@@ -58,28 +59,87 @@ pub(super) fn parse_and_verify_receipt_if_present(
             ));
         }
         let revocation_policy = wssec_revocation_policy_from_session(session)?;
-        match crate::crypto::wssec::verify_enveloped_signature(
-            receipt_xml,
-            WsSecVerifyOptions::new()
-                .with_expected_fingerprint(expected_fingerprint)
-                .with_revocation(revocation_policy),
-        ) {
-            Ok(()) => (),
-            Err(err) => {
-                emit_receive_push_receipt_taxonomy_outcome(
-                    session,
-                    event_bus,
-                    &message_id,
-                    "security_verification_failed",
-                    "receipt_signature_verification_failed",
-                    policy.fail_closed_audit_events,
-                )?;
-                return Err(normalize_receipt_signature_verification_error(
+        let receipt_doc = roxmltree::Document::parse(receipt_xml).map_err(|err| {
+            AsxError::new(
+                ErrorCode::ParseFailed,
+                format!("failed to parse AS4 receipt for signature verification: {err}"),
+                ErrorContext::for_session_with_message(
+                    "as4_receive_receipt",
                     session,
                     message_id.as_ref(),
-                    err,
-                ));
-            }
+                ),
+            )
+        })?;
+
+        let coverage =
+            match crate::crypto::wssec::verify::verify_enveloped_signature_optional_with_doc(
+                &receipt_doc,
+                receipt_xml,
+                WsSecVerifyOptions::new()
+                    .with_expected_fingerprint(expected_fingerprint)
+                    .with_revocation(revocation_policy),
+            ) {
+                Ok(Some(coverage)) => coverage,
+                // The structural parse saw a ds:Signature but WS-Security found no
+                // verifiable enveloped signature — never downgrade that to
+                // "unsigned", which would silently skip the requirement below.
+                Ok(None) => {
+                    emit_receive_push_receipt_taxonomy_outcome(
+                        session,
+                        event_bus,
+                        &message_id,
+                        "security_verification_failed",
+                        "receipt_signature_not_verifiable",
+                        policy.fail_closed_audit_events,
+                    )?;
+                    return Err(AsxError::new(
+                        ErrorCode::SecurityVerificationFailed,
+                        "AS4 receipt contains a ds:Signature element that is not a verifiable \
+                     WS-Security enveloped signature",
+                        ErrorContext::for_session_with_message(
+                            "as4_receive_receipt",
+                            session,
+                            message_id.as_ref(),
+                        ),
+                    ));
+                }
+                Err(err) => {
+                    emit_receive_push_receipt_taxonomy_outcome(
+                        session,
+                        event_bus,
+                        &message_id,
+                        "security_verification_failed",
+                        "receipt_signature_verification_failed",
+                        policy.fail_closed_audit_events,
+                    )?;
+                    return Err(normalize_receipt_signature_verification_error(
+                        session,
+                        message_id.as_ref(),
+                        err,
+                    ));
+                }
+            };
+
+        // XML Signature Wrapping defence: the eb:Messaging block whose
+        // RefToMessageId is checked below must be the block the signature
+        // actually covered.  Otherwise a genuine signature over some other
+        // exchange could authenticate an injected, unsigned acknowledgement.
+        if let Err(err) = enforce_signal_signature_coverage(
+            session,
+            &receipt_doc,
+            "as4_receive_receipt",
+            message_id.as_ref(),
+            &coverage,
+        ) {
+            emit_receive_push_receipt_taxonomy_outcome(
+                session,
+                event_bus,
+                &message_id,
+                "security_verification_failed",
+                "receipt_signal_not_signed",
+                policy.fail_closed_audit_events,
+            )?;
+            return Err(err);
         }
     } else if policy.require_signed_receipt {
         emit_receive_push_receipt_taxonomy_outcome(

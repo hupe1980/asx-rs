@@ -50,7 +50,7 @@ pub use egress::{HttpSendOutcome, TransportConfig};
 pub use egress::As2HttpTransport;
 
 #[cfg(all(feature = "client", feature = "as4"))]
-pub use egress::As4HttpTransport;
+pub use egress::{As4HttpTransport, As4SendAndVerifyOutcome};
 
 #[cfg(feature = "server")]
 pub use server::{HandlerOutcome, RouterConfig};

@@ -72,7 +72,7 @@ Skips all WS-Security checks on inbound AS4 push messages. Parity with
 
 ```toml
 [dev-dependencies]
-asx-rs = { version = "0.10", features = ["as4", "testing"] }
+asx-rs = { version = "0.11", features = ["as4", "testing"] }
 ```
 
 ```rust
@@ -100,7 +100,7 @@ synchronous AS4 receipt. Requires `testing + server` features.
 
 ```toml
 [dev-dependencies]
-asx-rs = { version = "0.10", features = ["as4", "testing", "server"] }
+asx-rs = { version = "0.11", features = ["as4", "testing", "server"] }
 ```
 
 ```rust
@@ -114,6 +114,17 @@ let endpoint = MockAs4Endpoint::bind("127.0.0.1:0").await.expect("bind");
 // The mock will decrypt ECDH-ES / RSA-OAEP inbound messages automatically.
 let endpoint = MockAs4Endpoint::builder()
     .with_decryption_key_pem(my_ec_or_rsa_private_key_pem)
+    .bind("127.0.0.1:0")
+    .await
+    .expect("bind");
+
+// Full NRR round-trip: make the mock answer with a *signed* receipt whose
+// MessagePartNRInformation echoes the inbound signature's digests, so
+// `verify_sync_response` under `As4ReceiptPolicy::regulated()` has real
+// evidence to check.  Without this the mock replies with an unsigned receipt
+// carrying an empty <NonRepudiationInformation/>, which `regulated()` rejects.
+let endpoint = MockAs4Endpoint::builder()
+    .with_receipt_signing_material(receiver_cert_pem, receiver_key_pem)
     .bind("127.0.0.1:0")
     .await
     .expect("bind");
@@ -183,6 +194,24 @@ use asx_rs::transport::egress::As4HttpTransport;
 let transport = As4HttpTransport::new_for_localhost_testing()?;
 let outcome = transport.send_to_localhost(&endpoint.local_url(), &output).await?;
 assert!(outcome.is_success());
+```
+
+To cover receipt verification too, use the verifying counterpart. The sending
+session must pin the mock's receipt-signing certificate (via
+`cert_handle.fingerprint_sha256`, or
+`As4ReceiptPolicy::with_expected_signer_fingerprint`):
+
+```rust
+use asx_rs::as4::As4ReceiptPolicy;
+
+let outcome = transport
+    .send_and_verify_to_localhost(
+        &endpoint.local_url(), &session, &bus, &output,
+        &As4ReceiptPolicy::regulated(),
+    )
+    .await?;
+
+assert!(outcome.into_receipt()?.is_non_repudiation_evidence());
 ```
 
 This keeps test coverage over `As4HttpTransport`'s `Content-Type` headers, receipt
@@ -480,7 +509,7 @@ assert_eq!(response.status(), 200);
 ## Testing Feature Flag
 
 ```toml
-asx-rs = { version = "0.10", features = ["testing"] }
+asx-rs = { version = "0.11", features = ["testing"] }
 ```
 
 The `testing` feature exposes `asx_rs::fixtures` and `asx_rs::matrix` — test scaffold modules with `InteropFixtureMetadata`, `FixtureCatalog`, `MatrixSummary`, and related helpers. These are not part of the production library surface and are absent from builds without this feature.

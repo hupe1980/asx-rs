@@ -6,16 +6,29 @@ Before tagging a release candidate:
 
 1. The CI release-candidate-gate workflow is green.
 2. No unquarantined flaky tests in the interop matrix.
+3. [`CHANGELOG.md`](../CHANGELOG.md) has an entry for the release, and the
+   version bump matches the [SemVer policy](../CHANGELOG.md#semver-policy) — see
+   [gate 14](#14-changelog-and-version-classification).
 
 ---
 
 ## One-Shot Release Gate
 
 ```bash
-bash scripts/release_gate.sh
+just release-gate
 ```
 
-This runs all mandatory gates in sequence. Individual gates can be run independently (see sections below).
+This runs every implemented mandatory gate in sequence. Individual gates can be
+run independently — `just --list` shows them all, and each section below names
+the recipe alongside the raw command.
+
+`just ci` is the faster pre-push subset (lint + strict check + tests + feature
+matrix), matching what the CI `lint` and `check-test` jobs run.
+
+Two gates below are **not** implemented: the test-quarantine gate (gate 5) and
+the spool hygiene benchmark gate (gate 13). Both cite scripts that do not exist
+in this repository. Until they are written, `just release-gate` skips them and
+says so.
 
 ---
 
@@ -24,45 +37,45 @@ This runs all mandatory gates in sequence. Individual gates can be run independe
 ### 1. Formatting
 
 ```bash
-cargo fmt --all -- --check
+just fmt-check        # cargo fmt --all -- --check
 ```
 
 ### 2. Compile checks
 
 ```bash
-cargo check --all-targets
-RUSTFLAGS='-D warnings' cargo check --all-targets --all-features
+just check            # cargo check --all-targets --all-features
+just check-strict     # RUSTFLAGS='-D warnings' cargo check --all-targets --all-features
 ```
 
 ### 3. Lint
 
 ```bash
-cargo clippy --all-targets --all-features -- -D warnings
+just clippy           # cargo clippy --workspace --all-targets --all-features -- -D warnings
 ```
 
 ### 4. Feature-aware test sweep
 
 ```bash
-cargo test --all-features --lib
-for t in $(find tests -maxdepth 1 -name '*.rs' -print | sed -E 's@.*/@@; s@\.rs$@@' | sort); do
-  cargo test --all-features --test "$t"
-done
+just test-sweep
 ```
 
 This preserves full integration coverage while emitting per-suite output that makes failures easier to localize than a single broad `cargo test --all-features` invocation.
 
-### 5. Test quarantine validation
+### 5. Test quarantine validation — **not implemented**
 
 ```bash
-bash scripts/check_test_quarantine.sh docs/test-quarantine.txt
+bash scripts/check_test_quarantine.sh docs/test-quarantine.txt   # script does not exist
 ```
 
-Validates that all entries in the quarantine file are still referenced in the test suite.
+Intended to validate that all entries in the quarantine file are still
+referenced in the test suite. Neither `scripts/check_test_quarantine.sh` nor
+`docs/test-quarantine.txt` exists; no `just` recipe wraps it. Either write both
+or drop this gate.
 
 ### 6. Interop matrix gate
 
 ```bash
-bash scripts/run_interop_matrix.sh
+just interop-matrix   # bash scripts/run_interop_matrix.sh
 ```
 
 Runs the full interop fixture corpus. Exits non-zero if any fixture fails or any flaky fixture lacks a quarantine entry.
@@ -70,7 +83,7 @@ Runs the full interop fixture corpus. Exits non-zero if any fixture fails or any
 ### 7. WS-Security vector gate
 
 ```bash
-bash scripts/run_wssec_vector_gate.sh
+just wssec-vectors    # bash scripts/run_wssec_vector_gate.sh
 ```
 
 Validates all C14N golden vectors and strict WS-Security matrix scenarios.
@@ -78,7 +91,7 @@ Validates all C14N golden vectors and strict WS-Security matrix scenarios.
 ### 8. Profile / interop coverage gate
 
 ```bash
-bash scripts/check_profile_coverage.sh 85 src/interop.rs
+just profile-coverage # bash scripts/check_profile_coverage.sh 85 src/interop.rs
 ```
 
 Enforces ≥85% line coverage on `src/interop.rs` using `cargo llvm-cov`.
@@ -86,7 +99,7 @@ Enforces ≥85% line coverage on `src/interop.rs` using `cargo llvm-cov`.
 ### 9. Adversarial fuzz gate
 
 ```bash
-bash scripts/run_fuzz_gate.sh 4000 2500 artifacts/fuzz
+just fuzz-gate        # bash scripts/run_fuzz_gate.sh 4000 2500 artifacts/fuzz
 ```
 
 Arguments: `[iterations] [budget_ms] [output_dir]`. Runs 4000 iterations with a 2500 ms budget per target.
@@ -94,43 +107,41 @@ Arguments: `[iterations] [budget_ms] [output_dir]`. Runs 4000 iterations with a 
 ### 10. Feature matrix compile checks
 
 ```bash
-cargo check --no-default-features --features "as2,client"
-cargo check --no-default-features --features "as4,server"
-cargo check --no-default-features --features "as2,as4,client,server"
+just matrix
 ```
+
+Compiles **and tests** each combination from the CI matrix.
 
 ### 11. Performance gate
 
 ```bash
-cargo run --release -p xtask --all-features -- \
-  perf-gate --iterations 2000 \
-  --check-baseline docs/perf-baseline.txt \
-  --max-regression 0.25
+just perf-gate
 ```
 
 Fails if any operation regresses more than 25% from the recorded baseline.
 
+Note the explicit feature list rather than `--all-features`: the crate refuses
+to compile a `--release` build with the `testing` feature (it disables
+WS-Security enforcement gates), so `cargo run --release -p xtask --all-features`
+fails to build. `just perf-gate` uses the same feature set as CI.
+
 ### 12. Hygiene scan
 
 ```bash
-if rg -n "TODO|FIXME|HACK" src tests docs .github scripts \
-  --glob '!docs/release-checklist.md' \
-  --glob '!docs/release.md' \
-  --glob '!scripts/release_gate.sh'; then
-  exit 1
-fi
-if rg -n "allow\(deprecated\)|#\[deprecated" src tests benches; then
-  exit 1
-fi
+just hygiene
 ```
+
+Scans `src tests docs .github scripts` for `TODO`/`FIXME`/`HACK` (excluding this
+file, which names the markers to describe the gate) and `src tests benches` for
+`allow(deprecated)` / `#[deprecated]`.
 
 Any matches are blocking. Deprecation scanning is intentionally code-focused to
 avoid false positives from descriptive documentation text.
 
-### 13. Spool hygiene benchmark regression gate
+### 13. Spool hygiene benchmark regression gate — **not implemented**
 
 ```bash
-bash scripts/check_spool_hygiene_bench.sh 20 0.2 0.6
+bash scripts/check_spool_hygiene_bench.sh 20 0.2 0.6   # script does not exist
 ```
 
 Runs the dedicated startup-heavy and steady-state spool hygiene Criterion lanes,
@@ -143,6 +154,36 @@ Default thresholds can be tuned via environment variables:
 `ASX_SPOOL_HYGIENE_MAX_STEADY_STATE_NS`,
 `ASX_SPOOL_HYGIENE_MIN_ENABLED_DISABLED_RATIO`, and
 `ASX_SPOOL_HYGIENE_MIN_ENABLED_STEADY_RATIO`.
+
+---
+
+### 14. CHANGELOG and version classification
+
+Every release adds a [`CHANGELOG.md`](../CHANGELOG.md) entry that separates the
+two kinds of change an integrator has to reason about:
+
+- **Wire / crypto behaviour** — what goes on the network, or what is accepted
+  from it. Breaks interop with a counterparty even when consumer code compiles
+  unchanged.
+- **API** — signatures, types, feature gates. Breaks the build, which is the
+  safe direction.
+
+Then classify the release against the
+[SemVer policy](../CHANGELOG.md#semver-policy). Two rules do most of the work:
+
+1. **A wire-behaviour change is never a patch release.** If the bytes on the
+   wire changed, or the set of accepted inbound messages changed, it is a minor
+   bump (`0.x` → `0.x+1`) even when the Rust API is untouched.
+2. **Security defaults tighten in minor releases, not patches.** If the release
+   starts rejecting something it previously accepted, say so explicitly in the
+   entry so integrators can schedule the upgrade.
+
+Checklist for the entry:
+
+- [ ] Every breaking API change has a before/after migration snippet
+- [ ] Every wire/crypto change is labelled as such, not buried under "Changed"
+- [ ] Newly enforced rejections appear under `### Security`
+- [ ] The version bump matches the policy table
 
 ---
 
@@ -173,33 +214,35 @@ There is no manual override path in the release workflow. All jobs must pass.
 
 ## Release Checklist
 
-- [ ] `cargo fmt --all -- --check` passes
-- [ ] `cargo check --all-targets` passes
-- [ ] `RUSTFLAGS='-D warnings' cargo check --all-targets --all-features` passes
-- [ ] `cargo clippy --all-targets --all-features -- -D warnings` passes
-- [ ] Feature-aware lib + integration sweep passes (`cargo test --all-features --lib` plus each `cargo test --all-features --test <target>` from `tests/*.rs`)
-- [ ] `run_interop_matrix.sh` — no blocking failures
-- [ ] `run_wssec_vector_gate.sh` — all vectors pass
-- [ ] `check_profile_coverage.sh 85 src/interop.rs` — ≥85% coverage
-- [ ] `run_fuzz_gate.sh 4000 2500 artifacts/fuzz` — no panics or invariant violations
-- [ ] Feature compile matrix passes (`as2,client` / `as4,server` / `as2,as4,client,server`)
-- [ ] Performance gate — no operation regresses >25%
-- [ ] Spool hygiene benchmark gate passes (`check_spool_hygiene_bench.sh`)
-- [ ] Hygiene scan — no TODO/FIXME/HACK and no code-level deprecated markers
+`just release-gate` covers every implemented item below in one run.
+
+- [ ] `just fmt-check` passes
+- [ ] `just check` and `just check-strict` pass
+- [ ] `just clippy` passes
+- [ ] `just test-sweep` passes (lib + every integration suite)
+- [ ] `just interop-matrix` — no blocking failures
+- [ ] `just wssec-vectors` — all vectors pass
+- [ ] `just profile-coverage` — ≥85% coverage on `src/interop.rs`
+- [ ] `just fuzz-gate` — no panics or invariant violations
+- [ ] `just matrix` — every CI feature combination compiles and tests
+- [ ] `just perf-gate` — no operation regresses >25%
+- [ ] `just hygiene` — no TODO/FIXME/HACK and no code-level deprecated markers
+- [ ] ~~Spool hygiene benchmark gate~~ — gate 13 is not implemented
 - [ ] `docs/perf-baseline.txt` updated if performance characteristics changed
-- [ ] `Cargo.toml` version bumped
-- [ ] `CHANGELOG.md` entry written
+- [ ] `Cargo.toml` version bumped per the [SemVer policy](../CHANGELOG.md#semver-policy)
+- [ ] `CHANGELOG.md` entry written, wire/crypto changes labelled separately from API changes
 - [ ] Git tag `v{version}` created
-- [ ] `cargo publish --dry-run` succeeds
+- [ ] `just publish-dry` succeeds
 
 ---
 
 ## Updating the Performance Baseline
 
-When the performance profile intentionally improves (or a new benchmark is added), update the baseline:
+When the performance profile intentionally improves (or a new benchmark is added), update the baseline with `just perf-baseline-write`, or directly:
 
 ```bash
-cargo run --release -p xtask --all-features -- \
+cargo run --release -p xtask \
+  --no-default-features --features "as2,as4,client,server,trace,compression,async-ocsp,interop-strict" -- \
   perf-gate --iterations 2000 --write-baseline docs/perf-baseline.txt
 ```
 

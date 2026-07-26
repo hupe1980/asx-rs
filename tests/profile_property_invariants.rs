@@ -3,8 +3,9 @@
 
 use asx_rs::core::{InteropMode, SessionContext};
 use asx_rs::interop::{
-    BaseProfile, CanonicalizationPolicy, PartnerProfileOverlay, ProfileExtension,
-    ProfilePolicyOverrides, ProfileStack, ProfileValidationCode, SecurityPolicy, ValidationPolicy,
+    As2ValidationPolicy, BaseProfile, CanonicalizationPolicy, PartnerProfileOverlay,
+    ProfileExtension, ProfilePolicyOverrides, ProfileStack, ProfileValidationCode, SecurityPolicy,
+    ValidationPolicy,
 };
 use proptest::prelude::*;
 
@@ -12,7 +13,6 @@ fn session(partner: &str, profile: &str) -> SessionContext {
     SessionContext::new(format!("prop-{partner}-{profile}"), partner, profile).expect("session")
 }
 
-#[cfg_attr(not(feature = "interop-relaxed"), allow(deprecated))]
 fn mode_strategy() -> impl Strategy<Value = InteropMode> {
     prop_oneof![Just(InteropMode::Strict), Just(InteropMode::Relaxed)]
 }
@@ -25,6 +25,7 @@ fn base_profile(mode: InteropMode) -> BaseProfile {
         canonicalization: CanonicalizationPolicy::default(),
         security: SecurityPolicy::default(),
         validation: ValidationPolicy::default(),
+        as2_validation: As2ValidationPolicy::default(),
     }
 }
 
@@ -127,6 +128,7 @@ proptest! {
                     require_encryption: !disable_encryption,
                 },
                 validation: ValidationPolicy::default(),
+                as2_validation: As2ValidationPolicy::default(),
             },
             extensions: vec![],
             overrides: vec![],

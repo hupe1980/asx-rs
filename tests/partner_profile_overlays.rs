@@ -1,8 +1,9 @@
 #![cfg(feature = "interop-relaxed")]
 use asx_rs::core::{InteropMode, SessionContext};
 use asx_rs::interop::{
-    BaseProfile, CanonicalizationPolicy, PartnerProfileOverlay, ProfileExtension, ProfileOverride,
-    ProfilePolicyOverrides, ProfileStack, SecurityPolicy, ValidationPolicy,
+    As2ValidationPolicy, BaseProfile, CanonicalizationPolicy, PartnerProfileOverlay,
+    ProfileExtension, ProfileOverride, ProfilePolicyOverrides, ProfileStack, SecurityPolicy,
+    ValidationPolicy,
 };
 
 fn base_profile() -> BaseProfile {
@@ -13,6 +14,7 @@ fn base_profile() -> BaseProfile {
         canonicalization: CanonicalizationPolicy::default(),
         security: SecurityPolicy::default(),
         validation: ValidationPolicy::default(),
+        as2_validation: As2ValidationPolicy::default(),
     }
 }
 
@@ -31,10 +33,7 @@ fn conflicting_partner_overlays_resolve_per_partner_without_leakage() {
         overrides: vec![ProfileOverride {
             name: "global".into(),
             overrides: ProfilePolicyOverrides {
-                validation: Some(ValidationPolicy {
-                    require_as2_mic: false,
-                    ..ValidationPolicy::default()
-                }),
+                as2_validation: Some(As2ValidationPolicy { require_mic: false }),
                 ..ProfilePolicyOverrides::default()
             },
         }],

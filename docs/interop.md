@@ -26,7 +26,7 @@ let session = SessionContext::new("sess-1", "partner-a", "profile-a")?;
 
 `interop-strict` is in the default Cargo feature set. `interop-relaxed` is optional and must be explicitly enabled:
 ```toml
-asx-rs = { version = "0.10", features = ["as2", "interop-relaxed"] }
+asx-rs = { version = "0.11", features = ["as2", "interop-relaxed"] }
 ```
 
 ---
@@ -111,14 +111,46 @@ let json = snapshot.to_json_pretty()?;
   },
   "validation": {
     "reject_ambiguous_headers": true,
-    "enforce_payload_limits": true,
-    "require_as2_mic": true
+    "enforce_payload_limits": true
+  },
+  "as2_validation": {
+    "require_mic": true
   },
   "resolution_trace": ["base", "extension:peppol-bis", "partner:partner-acme"]
 }
 ```
 
 Snapshots are round-trippable: `EffectivePolicySnapshot::from_json(&json)?`.
+
+### Protocol-neutral vs AS2-only validation
+
+`ValidationPolicy` carries only knobs that apply to both protocols
+(`reject_ambiguous_headers`, `enforce_payload_limits`). AS2-only settings live in
+`As2ValidationPolicy`, so an AS4 profile never has to carry — or explicitly
+disable — a setting that cannot apply to it:
+
+| Type | Field | Applies to |
+|---|---|---|
+| `ValidationPolicy` | `reject_ambiguous_headers` | AS2 + AS4 |
+| `ValidationPolicy` | `enforce_payload_limits` | AS2 + AS4 |
+| `As2ValidationPolicy` | `require_mic` | AS2 only (RFC 4130 §7.3 `Received-Content-MIC`) |
+
+AS4 integrity is carried by the WS-Security XML Signature, not by an AS2 MIC, so
+AS4-only profiles can leave `as2_validation` at its default and ignore it.
+
+`as2_validation` is `#[serde(default)]` on both `ProfilePolicyOverrides` and
+`EffectivePolicySnapshot`, so JSON written before the split still deserializes; a
+stale `require_as2_mic` key inside `validation` is ignored. Override it like any
+other layer:
+
+```json
+{
+  "pack_id": "de-as2",
+  "version": "1.0.0",
+  "applies_to_base_profile": "base",
+  "overrides": { "as2_validation": { "require_mic": false } }
+}
+```
 
 ---
 

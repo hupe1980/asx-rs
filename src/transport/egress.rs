@@ -48,6 +48,10 @@ use crate::http::HttpHeaders;
 use crate::as2::As2SendOutput;
 #[cfg(feature = "as4")]
 use crate::as4::As4SendOutput;
+#[cfg(feature = "as4")]
+use crate::core::SessionContext;
+#[cfg(feature = "as4")]
+use crate::observability::EventBus;
 
 // ── SSRF protection ─────────────────────────────────────────────────────────
 
@@ -714,6 +718,74 @@ impl As4HttpTransport {
         self.send_inner(url, output, false).await
     }
 
+    /// Send an AS4 message and verify the counterparty's synchronous signal.
+    ///
+    /// This is [`send`](Self::send) followed by
+    /// [`crate::as4::verify_sync_response`], which is the combination the
+    /// One-Way/Push MEP with Reception Awareness requires: the receipt arrives
+    /// on the same connection and is only evidence of delivery once its
+    /// signature and Non-Repudiation digests have been checked against the
+    /// message that was sent.
+    ///
+    /// Prefer this over `send` + hand-rolled response inspection.  Substring
+    /// scanning for `<eb:Receipt` misses conformant counterparties that use a
+    /// different namespace prefix or CDATA, and cannot verify NRR at all.
+    ///
+    /// # Example
+    /// ```rust,ignore
+    /// let sent = asx_rs::as4::send_async(&session, &bus, request).await?;
+    /// let outcome = transport
+    ///     .send_and_verify(&url, &session, &bus, &sent, &As4ReceiptPolicy::regulated())
+    ///     .await?;
+    ///
+    /// match outcome.signal {
+    ///     As4SyncSignal::Receipt(receipt) => {
+    ///         assert!(receipt.is_non_repudiation_evidence());
+    ///     }
+    ///     As4SyncSignal::Error(err) => {
+    ///         // Route on the ebMS3 code: retry vs dead-letter.
+    ///         tracing::error!(code = %err.summary(), "counterparty rejected the message");
+    ///     }
+    /// }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorCode::TransportFailure`] when the counterparty answered
+    /// with a non-2xx status and no parseable `eb:SignalMessage` — a non-2xx
+    /// response that *does* carry an `eb:Error` signal is returned as
+    /// [`As4SyncSignal::Error`] instead, since the ebMS3 diagnostics are more
+    /// actionable than the HTTP status.  All verification failures surface with
+    /// the codes documented on [`crate::as4::verify_sync_response`].
+    pub async fn send_and_verify(
+        &self,
+        url: &str,
+        session: &SessionContext,
+        event_bus: &EventBus,
+        output: &As4SendOutput,
+        policy: &crate::as4::As4ReceiptPolicy,
+    ) -> Result<As4SendAndVerifyOutcome> {
+        let http = self.send_inner(url, output, true).await?;
+        finish_send_and_verify(session, event_bus, output, policy, http)
+    }
+
+    /// [`send_and_verify`](Self::send_and_verify) against a localhost testing
+    /// endpoint, bypassing the SSRF and plain-HTTP guards.
+    ///
+    /// Only available with `feature = "testing"`.
+    #[cfg(feature = "testing")]
+    pub async fn send_and_verify_to_localhost(
+        &self,
+        url: &str,
+        session: &SessionContext,
+        event_bus: &EventBus,
+        output: &As4SendOutput,
+        policy: &crate::as4::As4ReceiptPolicy,
+    ) -> Result<As4SendAndVerifyOutcome> {
+        let http = self.send_inner(url, output, false).await?;
+        finish_send_and_verify(session, event_bus, output, policy, http)
+    }
+
     async fn send_inner(
         &self,
         url: &str,
@@ -780,6 +852,73 @@ impl As4HttpTransport {
             body: body.into(),
         })
     }
+}
+
+/// Result of [`As4HttpTransport::send_and_verify`].
+#[cfg(feature = "as4")]
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct As4SendAndVerifyOutcome {
+    /// The raw HTTP exchange — status, headers and body — retained so callers
+    /// can log or persist the wire evidence alongside the verified signal.
+    pub http: HttpSendOutcome,
+    /// The verified `eb:Receipt`, or the counterparty's `eb:Error`.
+    pub signal: crate::as4::As4SyncSignal,
+}
+
+#[cfg(feature = "as4")]
+impl As4SendAndVerifyOutcome {
+    /// The verified receipt, or an error carrying the counterparty's ebMS3
+    /// diagnostics when the signal was an `eb:Error`.
+    pub fn into_receipt(self) -> Result<crate::as4::As4VerifiedReceipt> {
+        self.signal.into_receipt()
+    }
+}
+
+/// Shared tail of [`As4HttpTransport::send_and_verify`]: classify the HTTP
+/// outcome, then verify whatever signal the counterparty returned.
+#[cfg(feature = "as4")]
+fn finish_send_and_verify(
+    session: &SessionContext,
+    event_bus: &EventBus,
+    output: &As4SendOutput,
+    policy: &crate::as4::As4ReceiptPolicy,
+    http: HttpSendOutcome,
+) -> Result<As4SendAndVerifyOutcome> {
+    let content_type = http
+        .header("Content-Type")
+        .unwrap_or("application/soap+xml")
+        .to_string();
+
+    let signal = match crate::as4::verify_sync_response(
+        session,
+        event_bus,
+        output,
+        &http.body,
+        &content_type,
+        policy,
+    ) {
+        Ok(signal) => signal,
+        // A non-2xx status with an unparseable body is a transport-level
+        // failure: reporting "missing eb:Receipt" would hide the real cause.
+        Err(err) if !http.is_success() => {
+            return Err(AsxError::new(
+                ErrorCode::TransportFailure,
+                format!(
+                    "AS4 counterparty returned HTTP {} with no parseable eb:SignalMessage: {}",
+                    http.status, err.message
+                ),
+                ErrorContext::for_session_with_message(
+                    "as4_transport_send_and_verify",
+                    session,
+                    &output.message_id,
+                ),
+            ));
+        }
+        Err(err) => return Err(err),
+    };
+
+    Ok(As4SendAndVerifyOutcome { http, signal })
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────

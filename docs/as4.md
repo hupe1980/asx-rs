@@ -154,18 +154,52 @@ pub struct As4PushPolicy {
     pub fail_closed_audit_events: bool,
 
     /// Fragment group sender-scope policy.
+    ///
+    /// Applies to **fragmented messages only** — see the note below.
     pub fragment_scope_policy: FragmentScopePolicy,
 }
 ```
 
-### Builder example — regulated deployment with mandatory encryption
+### `fragment_scope_policy` applies to fragmented messages only
+
+`FragmentScopePolicy::RequireAuthenticatedScope` (the default) is consulted only
+after an inbound message has been identified as carrying an
+`mf:MessageFragment` (ebMS3 Part 2 §5). An ordinary single-`eb:UserMessage` push
+never reaches that check.
+
+So a profile that never fragments — BDEW MaKo, for example — should keep the
+secure default and pass `authenticated_sender_scope: None`:
 
 ```rust
-let policy = As4PushPolicyBuilder::new()
-    .inbound_decryption_key_pem(my_ec_private_key_pem)
-    .require_encrypted_inbound(true)  // ← reject unencrypted messages fail-closed
-    .build()?;
+let policy = As4PushPolicyBuilder::regulated().build()?;  // RequireAuthenticatedScope
+
+let request = As4ReceivePushRequest {
+    // ...
+    authenticated_sender_scope: None,  // ← correct for non-fragmented messages
+};
 ```
+
+Do **not** switch to `UseSoapSenderId` to "make `None` safe" — it already is,
+and the downgrade only weakens the policy on the day a fragment does arrive.
+
+### Builder example — regulated deployment with mandatory encryption
+
+`require_encrypted_inbound` and `inbound_decryption_key_pem` form one invariant:
+the builder rejects the first without the second. Set both in one call so they
+cannot drift apart:
+
+```rust
+let policy = As4PushPolicyBuilder::regulated()
+    .with_mandatory_inbound_encryption(my_ec_private_key_pem)
+    .build()?;
+
+// Equivalent, without the builder:
+let policy = As4PushPolicy::regulated_with_decryption_key(my_ec_private_key_pem);
+```
+
+The two settings remain individually available
+(`inbound_decryption_key_pem(..)` / `require_encrypted_inbound(true)`) for
+callers that genuinely need to configure decryption without mandating it.
 
 ### Builder example — testing without PKI
 
@@ -241,6 +275,109 @@ Behavior notes:
    `wsu:Id` must be in the verified reference set) — an XML-Signature-Wrapping
    defence.
 4. Optional XML encryption is applied before outbound packaging.
+
+### Verify the synchronous response (Reception Awareness / NRR)
+
+```rust
+pub fn verify_sync_response(
+    session: &SessionContext,
+    event_bus: &EventBus,
+    sent: &As4SendOutput,
+    response_body: &[u8],
+    response_content_type: &str,
+    policy: &As4ReceiptPolicy,
+) -> Result<As4SyncSignal>
+```
+
+In the One-Way/Push MEP with Reception Awareness (eDelivery AS4 v1.15 §5.1,
+BDEW AS4-Profil §4.6.3) the receiving MSH answers on the same HTTP connection
+with an `eb:Receipt` or an `eb:Error`. `verify_sync_response` turns that raw
+body into a typed, verified outcome. Checks, in order:
+
+| # | Check | Failure code |
+|---|---|---|
+| 1 | Body non-empty and within `max_receipt_bytes` (256 KiB default) | `ParseFailed` / `PayloadTooLarge` |
+| 2 | Namespace-resolved parse of the `eb:SignalMessage` (prefix-agnostic, CDATA-aware) | `ParseFailed` |
+| 3 | At most one `eb:Messaging` / `eb:SignalMessage`; no repeated `eb:MessageInfo` child; `NonRepudiationInformation` only inside the `eb:Receipt` | `SecurityVerificationFailed` |
+| 4 | `eb:Error` classified and returned as `As4SyncSignal::Error`; a signal carrying both Receipt and Error is ambiguous | — / `InteropViolation` |
+| 5 | Receipt `ds:Signature` verified against the pinned partner certificate, trust anchors and revocation policy | `SecurityVerificationFailed` |
+| 6 | The `eb:SignalMessage` acted on is covered by that signature, directly or via a signed ancestor (XML Signature Wrapping defence) | `SecurityVerificationFailed` |
+| 7 | `eb:RefToMessageId` equals the sent `message_id`; an `eb:Error` correlating elsewhere is not attributed to this message | `InteropViolation` |
+| 8 | Every sent `ds:Reference` echoed by a `MessagePartNRInformation` entry with matching digest algorithm and value | `SecurityVerificationFailed` |
+| 9 | `eb:Timestamp` present and inside the replay window | `SecurityVerificationFailed` |
+
+Step 8 is what makes a receipt evidence rather than decoration: it proves the
+counterparty signed a statement about the exact bytes that were sent. The digest
+set is read from the sent message's own signature, unwrapping the
+`multipart/related` MIME package first, so `cid:` attachment references are
+covered too.
+
+There is deliberately **no** result variant for a digest mismatch — a mismatch is
+always an error, never a value the caller can ignore.
+
+Steps 3 and 6 are the wrapping defences: without them a counterparty could leave
+an element it genuinely signed in place, so the signature still verifies against
+the pinned certificate, and append an unsigned element acknowledging a different
+message. The same defences apply to the inbound `receipt_payload` path, which
+shares this parser.
+
+`As4SyncSignal::Error` reports what the connection returned, not a proven fact —
+error signals are typically unsigned. Treat one as a routing hint (retry vs
+dead-letter); only `As4VerifiedReceipt::is_non_repudiation_evidence()` asserts a
+cryptographically proven outcome.
+
+#### Presets
+
+| Preset | Signature | NRR digests | Interop | Freshness |
+|---|---|---|---|---|
+| `As4ReceiptPolicy::regulated()` (default) | required | required | Strict | 5 min |
+| `As4ReceiptPolicy::strict()` | alias for `regulated()` | | | |
+| `As4ReceiptPolicy::relaxed()` | optional | optional | Relaxed | disabled |
+
+Under `relaxed()` a signature or digest that *is* present is still fully
+verified; only their absence is tolerated.
+
+#### Transport wrapper
+
+```rust
+pub async fn send_and_verify(
+    &self,
+    url: &str,
+    session: &SessionContext,
+    event_bus: &EventBus,
+    output: &As4SendOutput,
+    policy: &As4ReceiptPolicy,
+) -> Result<As4SendAndVerifyOutcome>
+```
+
+`As4SendAndVerifyOutcome` keeps the raw `HttpSendOutcome` alongside the verified
+signal so the wire evidence can be logged or persisted. A non-2xx status whose
+body carries a parseable `eb:Error` is returned as that error signal — the ebMS3
+diagnostics are more actionable than the HTTP status. A non-2xx status with an
+unparseable body becomes `TransportFailure`.
+
+```rust
+let outcome = transport
+    .send_and_verify(&url, &session, &bus, &sent, &As4ReceiptPolicy::regulated())
+    .await?;
+
+match outcome.signal {
+    As4SyncSignal::Receipt(receipt) => assert!(receipt.is_non_repudiation_evidence()),
+    As4SyncSignal::Error(err) => {
+        // As4ErrorCode::from_ebms_code drives retry vs dead-letter.
+        for entry in &err.errors {
+            tracing::error!(code = %entry.error_code, detail = %entry.summary());
+        }
+    }
+}
+```
+
+#### Asynchronous MEP
+
+`verify_sync_response` rejects an empty body: the synchronous MEP requires a
+signal on the same connection. Deployments using the asynchronous MEP receive
+the receipt as a separate inbound request and should handle it through the
+receive path instead.
 
 ### Receive push (owned)
 
@@ -355,8 +492,12 @@ policy.
 
 ### Signal generation
 
-`generate_receipt`, `generate_receipt_with_nri`, `generate_error_signal`, and
+`generate_receipt`, `generate_receipt_with_nri`, `generate_signed_receipt_with_nri`,
+`generate_signed_receipt_for_output`, `generate_error_signal`, and
 `generate_pull_request` are available in `asx_rs::as4`.
+
+Signal *verification* on the send side is
+[`verify_sync_response`](#verify-the-synchronous-response-reception-awareness--nrr).
 
 ## Core Types
 
@@ -373,13 +514,18 @@ policy.
 11. `As4EnqueuePullWithReliabilityRequest`
 12. `As4ReceivePullWithReliabilityRequest`
 13. `PMode` / `PModeRegistry`
+14. `As4ReceiptPolicy` — synchronous-signal verification policy
+15. `As4SyncSignal` — verified `eb:Receipt` or typed `eb:Error`
+16. `As4VerifiedReceipt` / `As4NonRepudiation` — delivery evidence
+17. `As4ErrorSignal` / `As4ReceivedError` — parsed ebMS3 error diagnostics
 
 ## Interop Notes
 
 1. Strict mode is default and recommended.
 2. Relaxed interop remains available by feature/profile policy for scoped exceptions.
 3. Inbound payloads must be multipart/related with detached attachment bytes.
-4. Signed inbound messages are validated in pinned-sender mode and require `SessionContext.cert_handle.fingerprint_sha256` to be configured.
+4. Signed inbound messages are validated in pinned-sender mode and require `SessionContext.cert_handle.fingerprint_sha256` to be configured. The same pin is used to verify counterparty receipt signatures; override it with `As4ReceiptPolicy::with_expected_signer_fingerprint` when a partner signs receipts with a different certificate.
+5. Never detect a receipt by scanning the response body for `<eb:Receipt`. Prefixes are arbitrary (`eb:`, `eb3:`, `ns2:`, default namespace) and element text may be CDATA-wrapped; `verify_sync_response` resolves namespaces properly.
 
 ## Test Service and P-Mode
 
@@ -396,7 +542,7 @@ certificate from the SMP.
 Enable the `smp` module with the `client` feature:
 
 ```toml
-asx-rs = { version = "0.10", features = ["as4", "client", "async-ocsp"] }
+asx-rs = { version = "0.11", features = ["as4", "client", "async-ocsp"] }
 ```
 
 ### Lookup and Register a Runtime P-Mode

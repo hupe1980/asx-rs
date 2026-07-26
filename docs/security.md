@@ -157,6 +157,58 @@ Outbound timestamps include `wsu:Created` (now) and `wsu:Expires` (now + 5 minut
 
 ---
 
+## Non-Repudiation of Receipt (AS4 send path)
+
+A counterparty's `eb:Receipt` is only delivery evidence once it has been checked
+against the message that was actually sent. `asx_rs::as4::verify_sync_response`
+(and `As4HttpTransport::send_and_verify`) performs that check; nothing else in
+the send path does.
+
+Threat model for the receipt, and what defends against each:
+
+| Threat | Defence |
+|---|---|
+| Attacker or misconfigured MSH returns a receipt it did not sign | WS-Security signature verified against the pinned partner certificate (`cert_handle.fingerprint_sha256`), trust anchors and revocation policy |
+| **Signature wrapping** — leave a genuinely signed element in place so the signature verifies, and append an unsigned acknowledgement for another message | the `eb:SignalMessage` acted on must itself be covered by the verified signature, directly or via a signed ancestor; at most one `eb:Messaging` and one `eb:SignalMessage` are accepted |
+| Element injection — a duplicate `eb:RefToMessageId` / `eb:MessageId` / `eb:Timestamp` shadowing the real one | a repeated `eb:MessageInfo` child is rejected outright rather than resolved first-wins |
+| Digests parked outside the `eb:Receipt` to fake non-repudiation | `NonRepudiationInformation` is read only from inside the `eb:Receipt` of that SignalMessage |
+| Counterparty acknowledges a *different* message | `eb:RefToMessageId` compared to the sent `message_id` |
+| Counterparty acknowledges *different bytes* — the core NRR guarantee | every `ds:Reference` of the sent message's own signature must be echoed by a `MessagePartNRInformation` entry with a matching digest algorithm and digest value |
+| Receipt acknowledges only part of a multi-part message | a sent reference with no echoed entry is rejected; the MIME package is unwrapped so `cid:` attachment references are covered |
+| Padding a valid entry with a second, conflicting one for the same URI | duplicate `MessagePartNRInformation` URIs are rejected outright |
+| Entries for URIs the sender never signed | rejected under `reject_unexpected_references` (on in `regulated()`) |
+| Replay of an old receipt | `eb:Timestamp` freshness window, 5 minutes by default; a receipt with **no** timestamp is rejected rather than skipping the check |
+| A `ds:Signature` element that is not a verifiable enveloped signature | treated as a verification failure, never downgraded to "unsigned" |
+| An `eb:Error` for someone else's message causing a wrongful dead-letter | the error signal's correlation (`eb:MessageInfo/eb:RefToMessageId` or the `eb:Error/@refToMessageId` attribute) must match the sent message when present |
+| A signal that both acknowledges and rejects | rejected as ambiguous — neither confirmed delivered nor confirmed rejected |
+| Resource exhaustion from a hostile response | 256 KiB body cap, XML element-count cap, bounded NRI and error-entry counts |
+
+The same wrapping and ambiguity defences apply to the **inbound** receipt path
+(`receipt_payload` on `As4ReceivePushRequest`), which shares the parser and the
+signature-coverage binding.
+
+### Error signals are not authenticated
+
+`As4SyncSignal::Error` reports what the connection returned; it does not prove
+it. Error signals are typically unsigned, so treat one as a routing hint (retry
+vs dead-letter), never as evidence about the message's fate. Only
+`As4VerifiedReceipt::is_non_repudiation_evidence()` asserts a cryptographically
+proven outcome.
+
+A digest that is present and wrong is **always** an error
+(`SecurityVerificationFailed`) regardless of policy — `As4NonRepudiation` has no
+"mismatch" variant, so a mismatch cannot be returned as a value the caller might
+ignore. `As4ReceiptPolicy::require_non_repudiation = false` only tolerates the
+*absence* of digests, and the resulting `As4NonRepudiation::NotProvided` makes
+`As4VerifiedReceipt::is_non_repudiation_evidence()` return `false`.
+
+Do not detect receipts by scanning the response body for `<eb:Receipt`.
+Namespace prefixes are arbitrary and element text may be CDATA-wrapped, so a
+substring match yields false delivery failures against conformant partners — and
+it cannot verify non-repudiation at all.
+
+---
+
 ## `InsecureBypassTrustVerifier`
 
 ```rust
@@ -184,6 +236,17 @@ Override per-session:
 ```rust
 As2PushPolicy::builder().max_body_bytes(64 * 1024 * 1024)  // 64 MiB
 ```
+
+An over-limit body fails with `ErrorCode::PayloadTooLarge`, which maps to
+HTTP 413. (Before v0.11.0 `wire::enforce_payload_limit` returned
+`PolicyViolation` → HTTP 403, misreporting an oversize body as an authorization
+failure; ingress handlers matching on `PolicyViolation` for size must be
+updated.)
+
+AS4 synchronous receipts are bounded separately and much more tightly at
+**256 KiB** (`as4::DEFAULT_MAX_RECEIPT_BYTES`, tunable via
+`As4ReceiptPolicy::max_receipt_bytes`) — a SignalMessage carries no business
+payload, so anything larger is malformed or hostile.
 
 ---
 

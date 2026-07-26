@@ -649,7 +649,7 @@ fn as2_receive_rejects_oversized_payload() {
         &InsecureBypassTrustVerifier::new(TrustEvidence::verified_and_decryptable()),
     )
     .expect_err("oversized payload must fail");
-    assert_eq!(err.code, ErrorCode::PolicyViolation);
+    assert_eq!(err.code, ErrorCode::PayloadTooLarge);
 }
 
 #[tokio::test]

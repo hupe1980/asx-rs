@@ -365,3 +365,85 @@ pub(crate) fn check_duplicate_push_sync(
         fail_closed_audit_events,
     ))
 }
+
+// ---------------------------------------------------------------------------
+// Signal signature coverage (XML Signature Wrapping defence)
+// ---------------------------------------------------------------------------
+
+/// ebMS3 core namespace.
+const EBMS3_CORE_NS: &str = "http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/";
+/// WS-Security utility namespace, source of the `wsu:Id` attribute.
+const WSU_NS: &str =
+    "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd";
+
+/// Require that the `eb:SignalMessage` a caller acts on is actually covered by
+/// the verified WS-Security signature.
+///
+/// Without this binding, a counterparty could take a receipt it legitimately
+/// signed for message A, leave the signed element in place so the signature
+/// still verifies, and add an unsigned element acknowledging message B —
+/// manufacturing non-repudiation evidence it never signed. This is the signal
+/// counterpart of the `eb:UserMessage` defence in
+/// [`crate::as4::As4WsSecVerifier`].
+///
+/// Coverage is satisfied by the SignalMessage itself **or any ancestor** (in
+/// practice `eb:Messaging`) appearing in the verified same-document id set:
+/// signing an ancestor necessarily covers its descendants. Both conventions
+/// occur in the wild — this crate signs `eb:Messaging`, other MSHs sign
+/// `eb:SignalMessage` — and both are conformant.
+///
+/// Uniqueness of `eb:Messaging` and `eb:SignalMessage` is enforced by
+/// [`crate::as4::parser::parse_as4_signal_envelope`] before this runs, so the
+/// element located here is unambiguous.
+pub(super) fn enforce_signal_signature_coverage(
+    session: &SessionContext,
+    doc: &roxmltree::Document<'_>,
+    stage: &'static str,
+    message_id: &str,
+    coverage: &crate::crypto::wssec::verify::VerifiedSignatureCoverage,
+) -> Result<()> {
+    let signal_nodes: Vec<_> = doc
+        .descendants()
+        .filter(|node| {
+            node.is_element()
+                && node.tag_name().name() == "SignalMessage"
+                && node.tag_name().namespace() == Some(EBMS3_CORE_NS)
+        })
+        .collect();
+
+    if signal_nodes.len() != 1 {
+        return Err(AsxError::new(
+            ErrorCode::SecurityVerificationFailed,
+            format!(
+                "AS4 signal must contain exactly one eb:SignalMessage (found {})",
+                signal_nodes.len()
+            ),
+            ErrorContext::for_session_with_message(stage, session, message_id),
+        ));
+    }
+
+    let covered = signal_nodes[0]
+        .ancestors() // `ancestors()` yields the node itself first.
+        .filter_map(|node| {
+            node.attribute((WSU_NS, "Id"))
+                .or_else(|| node.attribute("Id"))
+        })
+        .any(|id| {
+            coverage
+                .signed_same_document_ids
+                .iter()
+                .any(|signed| signed == id)
+        });
+
+    if !covered {
+        return Err(AsxError::new(
+            ErrorCode::SecurityVerificationFailed,
+            "AS4 eb:SignalMessage is not covered by the verified WS-Security signature \
+             (possible XML signature wrapping); the acknowledgement asserts content the \
+             counterparty did not sign",
+            ErrorContext::for_session_with_message(stage, session, message_id),
+        ));
+    }
+
+    Ok(())
+}
