@@ -1,6 +1,6 @@
 [package]
 name = "asx-rs"
-version = "0.11.0"
+version = "0.11.1"
 edition = "2024"
 authors = ["hupe1980"]
 description = "AS2 and AS4 B2B messaging library for Rust — signing, encryption, MDN, and ebMS3/AS4 profile support"
@@ -44,7 +44,11 @@ x509-parser = "0.18"
 openssl = { version = "0.10", optional = true }
 aes-gcm = { version = "0.11", optional = true }
 flate2 = { version = "1", optional = true }
-reqwest = { version = ">=0.13, <0.14", default-features = false, features = ["json", "rustls", "rustls-native-certs", "http2"], optional = true }
+# `rustls` already enables platform certificate verification (rustls-platform-verifier),
+# i.e. the OS/native trust store — reqwest 0.13 has no separate `rustls-native-certs`
+# feature (that was never a valid reqwest feature name), so listing it broke resolution
+# whenever reqwest re-resolved within the `>=0.13,<0.14` range.
+reqwest = { version = ">=0.13, <0.14", default-features = false, features = ["json", "rustls", "http2"], optional = true }
 axum = { version = ">=0.8, <0.9", optional = true }
 uuid = { version = "1", features = ["v4", "serde"] }
 dashmap = "6"
