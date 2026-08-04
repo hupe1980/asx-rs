@@ -7,7 +7,8 @@
 //! pressure for large payloads (10MB+) and eliminates unnecessary cloning in the hot path.
 //!
 //! Architecture: StreamingMimeParser yields part references (slices) without materializing.
-//! Only SOAP root and matched attachment are promoted to `Vec<u8>`.
+//! Only the SOAP root and the parts referenced by an `xop:Include` are kept;
+//! unreferenced parts are skipped without allocation.
 //!
 //! All functions are `pub(super)` — they are implementation details of the
 //! `as4` module family and must not be part of the public API.
@@ -16,10 +17,39 @@ use crate::core::{AsxError, ErrorCode, ErrorContext, Result, SessionContext};
 use crate::crypto::wssec::decrypt_payload_xmlenc;
 use memchr::{memchr, memmem};
 
+/// One inbound MIME payload part, resolved against an `xop:Include` reference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct InboundAttachment<'a> {
+    /// Content-ID, normalized: no `cid:` scheme, no angle brackets.
+    pub content_id: &'a str,
+    pub bytes: &'a [u8],
+}
+
+#[derive(Debug)]
 pub(super) struct MultipartAs4Payload<'a> {
     pub soap_xml: &'a [u8],
-    pub payload_content_id: Option<&'a str>,
-    pub payload_attachment: Option<&'a [u8]>,
+    /// Payload attachments in `xop:Include` document order.
+    ///
+    /// ebMS3 allows several `eb:PartInfo` entries per `UserMessage`, and the
+    /// eDelivery conformance payload profiles exercise up to four. Empty when
+    /// the body carries no `xop:Include`.
+    pub payloads: Vec<InboundAttachment<'a>>,
+}
+
+impl<'a> MultipartAs4Payload<'a> {
+    /// The first payload attachment — the common single-payload case.
+    #[cfg(test)]
+    pub fn primary(&self) -> Option<InboundAttachment<'a>> {
+        self.payloads.first().copied()
+    }
+
+    /// `(content_id, bytes)` pairs for WS-Security `cid:` reference resolution.
+    pub fn external_references(&self) -> Vec<(&'a str, &'a [u8])> {
+        self.payloads
+            .iter()
+            .map(|p| (p.content_id, p.bytes))
+            .collect()
+    }
 }
 
 fn parse_multipart_boundary_from_content_type(content_type: &str) -> Result<Option<String>> {
@@ -65,13 +95,86 @@ fn parse_multipart_boundary_from_content_type(content_type: &str) -> Result<Opti
     ))
 }
 
+/// Content-ID of the first `href="cid:…"` in the SOAP envelope, with the
+/// scheme prefix stripped.
+#[cfg(test)]
 pub(super) fn extract_xop_cid_href_bytes(soap_xml: &[u8]) -> Option<&str> {
-    const MARKER: &[u8] = b"href=\"cid:";
-    let start = memmem::find(soap_xml, MARKER)? + MARKER.len();
-    let end_rel = memmem::find(&soap_xml[start..], b"\"")?;
-    let end = start + end_rel;
-    std::str::from_utf8(&soap_xml[start..end]).ok()
+    collect_xop_cid_hrefs(soap_xml, 1).into_iter().next()
 }
+
+/// Collect up to `limit` distinct `cid:` hrefs, in document order.
+///
+/// Accepts both XML quoting styles and optional whitespace around `=`, so
+/// `href="cid:x"`, `href='cid:x'` and `href = "cid:x"` are all recognised. A
+/// single-quoted `href` is legal XML and several stacks emit it; matching only
+/// the double-quoted form used to leave the attachment unidentified, which in
+/// turn meant it could not be tied to a `ds:Reference URI="cid:…"` and so could
+/// never be proven signature-covered.
+///
+/// Duplicate references are collapsed — one attachment referenced twice is
+/// still one attachment.
+pub(super) fn collect_xop_cid_hrefs(soap_xml: &[u8], limit: usize) -> Vec<&str> {
+    let mut found: Vec<&str> = Vec::new();
+    let mut search_from = 0usize;
+
+    while found.len() < limit
+        && let Some(rel) = memmem::find(&soap_xml[search_from..], b"href")
+    {
+        let after_name = search_from + rel + b"href".len();
+        search_from = after_name;
+
+        let mut cursor = after_name;
+        // `href` must be followed by `=`, optionally separated by whitespace.
+        while soap_xml.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+            cursor += 1;
+        }
+        if soap_xml.get(cursor) != Some(&b'=') {
+            continue;
+        }
+        cursor += 1;
+        while soap_xml.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+            cursor += 1;
+        }
+
+        let quote = match soap_xml.get(cursor) {
+            Some(&q @ (b'"' | b'\'')) => q,
+            _ => continue,
+        };
+        cursor += 1;
+
+        let value_start = cursor;
+        let Some(end_rel) = memchr::memchr(quote, &soap_xml[value_start..]) else {
+            continue;
+        };
+        let value = &soap_xml[value_start..value_start + end_rel];
+
+        // Only `cid:` hrefs identify a MIME attachment.
+        let Some(cid) = value
+            .get(..4)
+            .filter(|prefix| prefix.eq_ignore_ascii_case(b"cid:"))
+            .map(|_| &value[4..])
+        else {
+            continue;
+        };
+
+        if let Ok(cid) = std::str::from_utf8(cid)
+            && !cid.is_empty()
+            && !found.contains(&cid)
+        {
+            found.push(cid);
+        }
+    }
+
+    found
+}
+
+/// Upper bound on payload attachments resolved from one inbound message.
+///
+/// ebMS3 places no limit on `eb:PartInfo` entries, so this caps the work an
+/// attacker can induce with a body full of `xop:Include` references. The
+/// eDelivery conformance payload profiles use four; 16 leaves ample headroom
+/// for real profiles while keeping the resolution pass bounded.
+pub(super) const MAX_INBOUND_PAYLOADS: usize = 16;
 
 /// Strip `<`, `>`, and `cid:`/`CID:` prefixes from a MIME Content-ID value,
 /// returning the bare CID token as a borrowed byte slice (zero allocation).
@@ -354,47 +457,64 @@ pub(super) fn extract_multipart_related_payload_if_present<'a>(
     // only taken later if decrypt/domain boundaries require it.
     let soap_xml = root.body;
 
-    // Extract XOP CID reference if present
-    let payload_content_id = extract_xop_cid_href_bytes(soap_xml);
-    let payload_attachment = if let Some(xop_cid) = payload_content_id {
-        let mut matched = None;
+    // Every `xop:Include href="cid:…"` in the body, in document order.
+    //
+    // A body with no `xop:Include` yields an empty list rather than adopting
+    // "the next MIME part": with no Content-ID there is nothing to tie such a
+    // part to a `ds:Reference URI="cid:…"`, so it could never be shown to be
+    // signature-covered. `resolve_verified_payload` turns the empty case into
+    // an actionable error.
+    let cid_hrefs = collect_xop_cid_hrefs(soap_xml, MAX_INBOUND_PAYLOADS + 1);
+    if cid_hrefs.len() > MAX_INBOUND_PAYLOADS {
+        return Err(AsxError::new(
+            ErrorCode::PayloadTooLarge,
+            format!(
+                "AS4 message references more than {MAX_INBOUND_PAYLOADS} payload \
+                 attachments; refusing to resolve an unbounded attachment set"
+            ),
+            ErrorContext::for_session(stage, session),
+        ));
+    }
 
-        // Scan remaining parts for matching Content-ID.
-        // `content_ids_match` compares normalised byte slices without allocating,
-        // so non-matching parts are examined and skipped with zero heap allocation.
-        while matched.is_none() {
-            if let Some(part) = parser.next_part_slice()? {
-                let is_match = content_id_matches_from_block(part.headers, xop_cid.as_bytes())?;
-                if is_match {
-                    matched = Some(part.body);
-                }
-                // Non-matching parts are skipped without materialization.
-            } else {
+    // Single pass over the remaining MIME parts, matching each against the
+    // wanted Content-ID set. Parts are examined as borrowed slices and those
+    // that match no reference are skipped without materialization.
+    let mut resolved: Vec<Option<&[u8]>> = vec![None; cid_hrefs.len()];
+    if !cid_hrefs.is_empty() {
+        let mut outstanding = cid_hrefs.len();
+        while outstanding > 0 {
+            let Some(part) = parser.next_part_slice()? else {
                 break;
+            };
+            for (index, cid) in cid_hrefs.iter().enumerate() {
+                if resolved[index].is_none()
+                    && content_id_matches_from_block(part.headers, cid.as_bytes())?
+                {
+                    resolved[index] = Some(part.body);
+                    outstanding -= 1;
+                    break;
+                }
             }
         }
+    }
 
-        if matched.is_none() {
-            let wanted =
-                std::str::from_utf8(normalized_cid_bytes(xop_cid.as_bytes())).unwrap_or(xop_cid);
+    let mut payloads = Vec::with_capacity(cid_hrefs.len());
+    for (index, cid) in cid_hrefs.iter().enumerate() {
+        let Some(bytes) = resolved[index] else {
+            let wanted = std::str::from_utf8(normalized_cid_bytes(cid.as_bytes())).unwrap_or(cid);
             return Err(AsxError::new(
                 ErrorCode::ParseFailed,
                 format!("xop:Include references missing MIME Content-ID: {wanted}"),
                 ErrorContext::for_session(stage, session),
             ));
-        }
+        };
+        payloads.push(InboundAttachment {
+            content_id: cid,
+            bytes,
+        });
+    }
 
-        matched
-    } else {
-        // If no XOP reference, borrow the next part as payload.
-        parser.next_part_slice()?.map(|p| p.body)
-    };
-
-    Ok(Some(MultipartAs4Payload {
-        soap_xml,
-        payload_content_id,
-        payload_attachment,
-    }))
+    Ok(Some(MultipartAs4Payload { soap_xml, payloads }))
 }
 
 fn content_id_matches_from_block(headers: &[u8], expected_cid: &[u8]) -> Result<bool> {
@@ -495,4 +615,49 @@ pub(super) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
         return false;
     }
     a.ct_eq(b).into()
+}
+
+#[cfg(test)]
+mod xop_href_tests {
+    use super::extract_xop_cid_href_bytes;
+
+    #[test]
+    fn accepts_both_xml_quoting_styles_and_whitespace() {
+        for body in [
+            br#"<S12:Body><xop:Include href="cid:p@e.com"/></S12:Body>"#.as_slice(),
+            br#"<S12:Body><xop:Include href='cid:p@e.com'/></S12:Body>"#.as_slice(),
+            br#"<S12:Body><xop:Include href = "cid:p@e.com"/></S12:Body>"#.as_slice(),
+            br#"<S12:Body><xop:Include href
+                ='cid:p@e.com'/></S12:Body>"#
+                .as_slice(),
+            // Scheme prefix is case-insensitive per RFC 3986 §3.1.
+            br#"<S12:Body><xop:Include href="CID:p@e.com"/></S12:Body>"#.as_slice(),
+        ] {
+            assert_eq!(
+                extract_xop_cid_href_bytes(body),
+                Some("p@e.com"),
+                "failed for: {}",
+                String::from_utf8_lossy(body)
+            );
+        }
+    }
+
+    #[test]
+    fn skips_non_cid_hrefs_and_finds_the_cid_one() {
+        let body = br#"<a href="https://example.com/x"/><xop:Include href='cid:real@e.com'/>"#;
+        assert_eq!(extract_xop_cid_href_bytes(body), Some("real@e.com"));
+    }
+
+    #[test]
+    fn returns_none_without_a_cid_href() {
+        assert_eq!(extract_xop_cid_href_bytes(b"<S12:Body/>"), None);
+        assert_eq!(
+            extract_xop_cid_href_bytes(br#"<a href="https://example.com"/>"#),
+            None
+        );
+        // Empty cid is not a usable Content-ID.
+        assert_eq!(extract_xop_cid_href_bytes(br#"<x href="cid:"/>"#), None);
+        // `href` not followed by `=` must not be mistaken for an attribute.
+        assert_eq!(extract_xop_cid_href_bytes(b"the word href appears"), None);
+    }
 }

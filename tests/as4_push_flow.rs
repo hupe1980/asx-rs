@@ -12,11 +12,11 @@
 //!    Currently: payloads embedded in SOAP `<asx:Base64>` within Body element
 //!    Required: Standard MIME multipart attachment packaging with Content-ID references
 //!    Impact: Strict AP networks expect MIME attachments per OpenPeppol AS4 profile
-//!    See: FINDINGS.md Section 0 and critical finding #3
+//!    See: the CHANGELOG Section 0 and critical finding #3
 //!
 //! 2. **Dynamic SMP-driven P-Mode materialization**
 //!    Required for strict profile compliance: automatic endpoint/cert/service discovery
-//!    See: FINDINGS.md P1 outcome #2
+//!    See: the CHANGELOG P1 outcome #2
 
 #[path = "common/as4_push.rs"]
 mod common;

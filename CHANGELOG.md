@@ -15,7 +15,304 @@ Versioning follows the [SemVer policy](#semver-policy) below.
 
 ---
 
-## [0.11.0] — unreleased
+## [0.12.0] — unreleased
+
+Two workstreams:
+
+1. **Integrator feedback** from a BDEW Marktkommunikation deployment
+   integrating `asx-rs` 0.11.0 — two defects and two feature requests, plus a
+   release-gate gap found while fixing them.
+2. **A full-surface security audit**, which closed the items left tracked
+   after the 0.8.0 pass and found new defects in the AS4 attachment, pull and
+   XML-canonicalization paths.
+
+### Fixed
+
+**Wire/crypto — XML canonicalization stripped whitespace, so no conformant
+counterparty could verify an ASX signature.** ⚠ **This is the most
+interop-significant fix in the crate's history.**
+
+`WsSecCanonicalizationProfile` defaulted to `strip_blank_text: true` and the
+canonicalizer dropped whitespace-only text nodes. Neither Canonical XML 1.0 nor
+Exclusive C14N does that — they differ only in namespace rendering. Because AS4
+envelopes are pretty-printed, **every signed message ASX produced was
+unverifiable by a conformant peer, and every signed message it received from
+one was rejected.** ASX's own verifier stripped too, so signer and verifier
+agreed and 998 tests passed; one test even asserted the behaviour as correct.
+
+- `strip_blank_text` is **removed from `WsSecCanonicalizationProfile`**, not
+  merely defaulted to `false`. No W3C canonicalization strips whitespace, so
+  the knob had no valid setting.
+- Same-document `ds:Reference` elements now declare
+  `<ds:Transforms><ds:Transform Algorithm="…xml-exc-c14n#"/></ds:Transforms>`.
+  XMLDSig §4.3.3.2 makes *inclusive* C14N the default for a transform-less
+  same-document reference, so the exclusive algorithm must be stated. `cid:`
+  references correctly carry no transform (octet stream, not a node-set).
+- Verified by `tests/interop_xmlsec_oracle.rs`, which checks ASX output with
+  **xmlsec1**, the W3C XMLDSig reference implementation, in a testcontainers-
+  managed container: 3/3 reference digests match (0/3 before). Run it with
+  `cargo test --all-features --test interop_xmlsec_oracle -- --ignored`.
+  Adds a `testcontainers` **dev-dependency**; the tests are `#[ignore]`d, so a
+  normal `cargo test` never starts a container.
+
+**Any deployment on 0.11.x or earlier that appeared to interoperate was either
+talking only to other ASX instances or not verifying signatures.**
+
+**Security — multi-payload AS4 messages silently lost every attachment but the
+first.** `MultipartAs4Payload` held a single attachment and the Content-ID
+scanner returned only the first `xop:Include`. ebMS3 permits several
+`eb:PartInfo` entries per `UserMessage`; a sender using them had payloads 2..n
+discarded with no error on either side — silent business-data loss, and an
+eDelivery conformance blocker (the conformance payload profiles define four
+parts).
+
+The receive pipeline now carries a payload *collection* end to end:
+
+- Every referenced part is resolved in `xop:Include` document order, in one
+  pass over the MIME parts, bounded by 16 attachments. A reference with no
+  matching MIME part is an error rather than a silent drop.
+- Each attachment is decrypted and policy-checked independently, so a message
+  that encrypts payload 1 and leaves payload 2 in plaintext is rejected under
+  `require_encrypted_inbound`.
+- Every attachment must be signature-covered, not just the first.
+
+**Security — the AS4 payload attachment was not required to be signed.** The
+receive path enforced that the `eb:Messaging` header block was covered by the
+WS-Security signature (the XML-Signature-Wrapping defence added in 0.9.0), but
+nothing required the *payload* — the actual business document, which travels as
+a detached MIME part — to be covered. A signature over the header and body
+alone verified happily, so an intermediary could swap the attachment without
+invalidating it, and the pipeline handed the substituted bytes to the
+application as `DomainReady`.
+
+- `VerifiedSignatureCoverage` now also reports `signed_cid_references`; `cid:`
+  references were previously parsed, digest-checked, and then discarded from
+  the coverage set.
+- `As4WsSecVerifier` rejects a message whose payload attachment is not covered
+  by a verified `ds:Reference URI="cid:…"`.
+- The multipart reader no longer adopts "the next MIME part" as the payload
+  when the SOAP body has no `xop:Include`. With no Content-ID there is nothing
+  to tie such a part to a signature reference, so it could never be shown to be
+  covered.
+
+**Interop — a single-quoted `xop:Include href` was not recognised.**
+`href='cid:…'` is legal XML and several stacks emit it, but the Content-ID
+scanner matched only the double-quoted form. The attachment then fell through
+to the positional path above. The scanner now accepts both quoting styles,
+optional whitespace around `=`, and a case-insensitive `cid:` scheme.
+
+**Security — a replayed AS4 PullRequest could dequeue a second message.**
+`check_duplicate_pull` returned whether the PullRequest `MessageId` had been
+seen; the call site discarded it. Inside the FIFO-bounded served-response cache
+a replay still returned the original response, but past that window it fell
+through to a fresh dequeue: the initiator received a *different* message under
+the same PullRequest id, and the original was silently consumed. A replay now
+returns the cached response or, if it has been evicted, no payload at all — it
+never dequeues. (An in-crate test asserted the old behaviour and has been
+corrected.)
+
+**Security — an unauthorized PullRequest poisoned the dedup store.**
+`check_duplicate_pull` runs `first_seen`, which *records* the MessageId, and it
+ran before `validate_pull_authorization_info`. An unauthorized peer could
+insert arbitrary keys into a durable, shared dedup backend and burn a MessageId
+for its legitimate owner. Authorization is now checked first.
+
+**Interop — `ds:CanonicalizationMethod` was written but never read.**
+Verification canonicalizes `SignedInfo` as Exclusive C14N unconditionally. A
+signature declaring Inclusive C14N was canonicalized as exclusive anyway and
+failed with an opaque "signature value mismatch", sending operators hunting for
+a key problem that did not exist. The declared algorithm is now validated and a
+non-exclusive one is rejected by name (`ErrorCode::InteropViolation`). A missing
+`ds:CanonicalizationMethod` is also rejected — XMLDSig requires it, and several
+in-crate test fixtures had been getting away without one.
+
+**Security — SMP `ServiceMetadata` signatures are now verified.** The SMP
+lookup decides where a message is sent and which key it is encrypted to, and
+TLS authenticates the SMP host rather than the metadata it serves. Previously
+ASX parsed the response without checking its signature at all.
+
+- New `crypto::wssec::verify_enveloped_document_signature` — verifies an
+  **enveloped whole-document** XML signature (`ds:Reference URI=""` plus the
+  XMLDSig `enveloped-signature` transform). This is the shape SMP responses
+  use; AS4 never does, which is why the WS-Security verifier could not handle
+  it before. Backed by a new `canonicalize_enveloped_document`, which
+  canonicalizes the document with the `ds:Signature` subtree removed.
+- `SmpSignaturePolicy` gains `Verify(OwnedRevocationPolicy)` — chains the SMP
+  signing certificate to the network's SMP CA. Construct it with
+  `SmpSignaturePolicy::verify_with_trust_anchors(vec![smp_ca_pem])`.
+- `SmpEndpoint::verified_signer_fingerprint_sha256` is `Some` only when the
+  signature was actually verified, so callers can assert authentication from
+  the return value instead of trusting their own configuration.
+- Unsigned responses remain rejected by default
+  (`SmpSignaturePolicy::RequireSignaturePresent`);
+  `SmpEndpoint::signed_document` still exposes the raw bytes.
+
+The enveloped path is newer than the AS4 signing path and is not yet
+cross-validated against an independent implementation — see
+`docs/security.md`.
+
+**Security — a partner overlay could silently disable encryption.** Profile
+validation only rejected a layer that turned *both* signature and encryption
+off. A layer that kept signing and dropped encryption validated cleanly, so a
+single partner overlay could downgrade one counterparty to plaintext while the
+profile reported itself valid. This breaks BDEW AS4-Profil v1.2 §2.2.6.2.2,
+PEPPOL, and CEF eDelivery, all of which mandate both.
+
+- New `BaseProfile::security_floor: SecurityPolicy` (default
+  `SIGN_AND_ENCRYPT`) — a minimum no layer may resolve below. It lives on the
+  base profile only, so no extension, global override, partner overlay, or
+  regional pack can lower it.
+- `ProfileStack::validate()` now enforces it, reporting
+  `ProfileValidationCode::SecurityFloorViolation`.
+- A layer that weakens security while still clearing the floor is reported as a
+  `ProfileLintCode::SecurityRelaxation` lint at
+  `ProfileLintSeverity::Critical`, so a deliberate downgrade is visible rather
+  than silent.
+
+**Validation — one partner's overlay contaminated another's findings.**
+Validation walked every partner overlay in a single cumulative chain, so a
+downgrade declared for partner A was also attributed to partner B, and B's
+overlay was evaluated against A's resolved state. Validation now resolves the
+deployment baseline once and forks it per partner. Every finding carries
+`partner_id`, and errors are raised against the **resolved** policy per scope —
+a dip that a later overlay restores is a lint, not an error, because it has no
+runtime effect.
+
+**Release gate — lowering the security floor was invisible.**
+`EffectivePolicySnapshot` now records `security_floor`, and
+`diff_effective_policy_snapshots` grades a *lowered* floor as `High` risk
+(`release_blocked`). Without this, relaxing the floor changed nothing in the
+snapshot — the resolved policy is unchanged — yet every future overlay had
+become free to relax security. Raising the floor is graded `Medium`.
+
+**`xtask profile-lint-gate`** reported `profiles_checked: 0` unconditionally,
+and validated each profile against its own floor rather than the shipped
+mandate. It now counts the catalog, asserts
+`validate_with_floor(SIGN_AND_ENCRYPT)` so a profile cannot opt out of the gate
+by lowering its own floor, and renders findings through `Display` alongside the
+JSON.
+
+### Added
+
+**API — `ProfileValidationFailure` is now a real error type.** It sits in the
+error half of the crate's own `ProfileValidationResult` alias but implemented
+neither `Display` nor `std::error::Error`, so consumers could not use
+`thiserror`'s `#[from]` / `#[error(transparent)]`, `?` into `anyhow::Error`, or
+`Box<dyn Error>` — and had to render it through `Debug`.
+
+- `Display` + `std::error::Error` for `ProfileValidationFailure` (with the first
+  issue as `source()`) and for `ProfileValidationIssue`; `Display` for
+  `ProfileLintFinding`, `ProfileValidationCode`, `ProfileLintCode`,
+  `ProfileLintSeverity`, `SecurityPolicy` and `SecurityRequirement`.
+- `Display` renders a bounded one-line summary (first
+  `ProfileValidationFailure::DISPLAY_ERROR_LIMIT` errors, then `(+N more)`);
+  `ProfileValidationFailure::report()` renders every error and lint across
+  multiple lines for a startup log.
+- `From<ProfileValidationFailure> for AsxError` (`ErrorCode::PolicyViolation`),
+  so `stack.validate()?` works in any function returning the crate's `Result`.
+- Accessors: `first_error()`, `has_code(code)`, `affected_partners()`.
+- `as_str()` on `ProfileValidationCode`, `ProfileLintCode` and
+  `ProfileLintSeverity` for stable log fields and alert rules.
+
+**API — session-free profile resolution.** `resolve(&SessionContext)` needs a
+live session, which startup validation does not have; consumers were
+re-implementing layer resolution to audit their partners.
+
+- `ProfileStack::resolve_all_partners()` → `Vec<ResolvedPolicyView>` — the
+  deployment baseline, then one view per distinct partner.
+- `ProfileStack::resolve_baseline()`, `resolve_partner(id)`, `partner_ids()`.
+- `ResolvedPolicyView` with `scope_label()` and `satisfies(floor)`.
+- All of these share one resolution path with `resolve()`, so a session-free
+  view cannot drift from what a live session receives.
+
+**API — floor enforcement knobs.**
+
+- `ProfileStack::validate_with_floor(floor)` — assert a host mandate without
+  trusting the profile's own floor. The two are combined with
+  `SecurityPolicy::strengthen`, so a deployment floor can only tighten.
+- `ProfileStack::validate_with(&ProfileValidationOptions)` with
+  `with_security_floor(..)` and `forbidding_security_relaxation()`.
+- `SecurityPolicy` lattice: constants `SIGN_AND_ENCRYPT`, `SIGN_ONLY`,
+  `ENCRYPT_ONLY`, `UNCONSTRAINED`; `satisfies`, `unmet_by`, `relaxations_to`,
+  `requires`, `strengthen` (join), `weaken` (meet); new `SecurityRequirement`
+  enum naming which protection a layer dropped.
+- `ProfileLintFinding::severity` and `ProfileValidationReport::
+  highest_lint_severity()` / `lints_at_least(..)`.
+- `BaseProfile::new(name, version)`, `BaseProfile::with_security_floor(..)`, and
+  `impl Default for BaseProfile` (strict, fail-closed).
+
+### Changed
+
+**API — breaking.**
+
+- `SmpEndpoint` gains a required `signed_document: Arc<[u8]>` field, and
+  `SmpConfig` a required `signature_policy: SmpSignaturePolicy`. Unsigned SMP
+  responses are rejected by default; set `SmpSignaturePolicy::AllowUnsigned`
+  for a closed or test network.
+- A multipart AS4 message whose SOAP body has no `xop:Include` is now rejected
+  with "no MIME payload attachment" rather than silently using the next part.
+- A signed AS4 message whose payload attachment carries no matching
+  `ds:Reference URI="cid:…"` is now rejected.
+- `As4ReceivePushOutput` gains `payload_content_id: String` and
+  `additional_payloads: Vec<As4ReceivedPayload>`, plus `payloads()`,
+  `payload_count()` and `payload_by_content_id()`. `payload` still holds the
+  primary attachment, so single-payload callers are unaffected.
+- `As4Verifier::verify_security` takes `external_references: &[(&str, &[u8])]`
+  instead of `Option<(&str, &[u8])>` — custom verifiers built under the
+  `testing` feature must update the signature.
+- A `ds:SignedInfo` with a missing or non-exclusive `ds:CanonicalizationMethod`
+  is now rejected.
+- `WsSecCanonicalizationProfile` loses its `strip_blank_text` field. Struct
+  literals must drop it; `..Default::default()` is unaffected.
+- `SmpSignaturePolicy` is no longer `Copy`/`PartialEq` (it now carries a
+  revocation policy) and `SmpEndpoint` gains
+  `verified_signer_fingerprint_sha256: Option<String>`.
+
+- `BaseProfile` gains a required `security_floor` field. Existing struct
+  literals must add it; `BaseProfile::new(..)` or `..BaseProfile::default()`
+  supply the fail-closed value.
+- `EffectivePolicySnapshot` and `EffectiveProfile` gain a required
+  `security_floor` field. Snapshot JSON written by 0.11.x lacks the key and no
+  longer deserializes — regenerate snapshots before diffing across the upgrade.
+- `ProfileLintFinding` gains `severity`; `ProfileLintFinding` and
+  `ProfileValidationIssue` gain `partner_id: Option<String>` (`#[serde(default)]`).
+- `ProfileValidationCode`, `ProfileLintCode` and `ResolutionField` are now
+  `#[non_exhaustive]` and carry new variants (`SecurityFloorViolation`,
+  `SecurityRelaxation`, `SecurityFloor`). Match arms need a wildcard.
+- `ProfileValidationCode::NoCriticalSecurityInvariant` is now only raised when
+  the floor is permissive enough not to preempt it; a default floor reports
+  `SecurityFloorViolation` instead.
+
+**Documentation — rustdoc links.** 18 broken intra-doc links across `core`,
+`crypto`, `as2`, `as4`, `reliability`, `smp` and `observability` rendered as
+plain text instead of links; `cargo doc` now builds clean under
+`RUSTDOCFLAGS="-D warnings"`. Two of them were factual errors rather than typos:
+
+- `smp::fetch_*` documented `ErrorCode::TransportError`, which does not exist —
+  the code raises `ErrorCode::TransportFailure`.
+- `As2TrustVerifier` claimed that "enabling `testing` unlocks
+  `InsecureBypassTrustVerifier`", and the README claimed AS2/AS4 parity for it.
+  AS2's bypass verifier is `#[cfg(test)]` and reachable only inside this
+  crate's own tests — unlike `InsecureBypassAs4Verifier`, which is
+  `testing`-gated and downstream-visible. Downstream AS2 tests must implement
+  `As2TrustVerifier` against a local fixture, which `TrustVerifierSeal`
+  permits. The gating is unchanged; only the false claim is.
+- `SessionContext::with_incoming_traceparent` referenced
+  `parse_as2_ingress_request` / `parse_as4_ingress_request`, which are named
+  `as2_ingress_from_http` / `as4_ingress_from_http`.
+
+**Documentation.** `SecurityPolicy` and `InteropMode` now state explicitly that
+the interop axis and the security axis are independent — `interop-strict` does
+not imply a strict security policy. `docs/interop.md` gains security-floor,
+session-free-resolution and error-handling sections, and its stale claims are
+corrected (a `ProfileStack::builder()` that never existed, a `validate()` that
+returned a flat finding list, a `diff_effective_policy_snapshots` shown as
+fallible, a `resolve_for_session` shown as returning a snapshot, and a
+`BaseProfile` example missing `as2_validation`).
+
+---
+
+## [0.11.0] — 2026-07-26
 
 Driven by integrator feedback from a BDEW Marktkommunikation deployment.
 

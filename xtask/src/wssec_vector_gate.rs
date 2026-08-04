@@ -65,23 +65,29 @@ pub fn run(args: &[String]) -> Result<(), String> {
         }
     }
 
+    // Canonicalization is whitespace-exact: no W3C algorithm strips
+    // whitespace-only text nodes. Re-indenting the signed subtree must
+    // therefore change the digest. (This vector used to contrast a
+    // `strip_blank_text` profile against the default; that knob is gone — see
+    // the CHANGELOG entry on XML canonicalization.)
     let whitespace_payload =
         "    <eb:Payload wsu:Id=\"payload-1\">\n      <eb:Value>ABC</eb:Value>\n    </eb:Payload>";
-    let whitespace_unsigned = signed_xml("#payload-1", whitespace_payload, "placeholder");
-    let whitespace_digest = canonicalize_reference(
-        &whitespace_unsigned,
+    let compact_payload = "<eb:Payload wsu:Id=\"payload-1\"><eb:Value>ABC</eb:Value></eb:Payload>";
+
+    let compact_digest = canonicalize_reference(
+        &signed_xml("#payload-1", compact_payload, "placeholder"),
         "#payload-1",
         WsSecCanonicalizationProfile {
             kind: WsSecCanonicalizationKind::Exclusive,
             include_comments: false,
-            strip_blank_text: false,
             inclusive_ns_prefixes: Vec::new(),
         },
     )
-    .map_err(|err| format!("whitespace-profile digest generation failed: {}", err))?
+    .map_err(|err| format!("compact-payload digest generation failed: {}", err))?
     .digest_value_base64;
 
-    let whitespace_signed = signed_xml("#payload-1", whitespace_payload, &whitespace_digest);
+    // Compact digest presented against the indented document.
+    let whitespace_signed = signed_xml("#payload-1", whitespace_payload, &compact_digest);
     let whitespace_refs = parse_signature_references(&whitespace_signed)
         .map_err(|err| format!("failed to parse whitespace signed refs: {}", err))?;
 

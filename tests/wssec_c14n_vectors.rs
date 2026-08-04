@@ -301,8 +301,20 @@ fn processing_instruction_changes_digest_under_default_profile() {
     );
 }
 
+/// Whitespace between elements is part of the canonical octet stream.
+///
+/// Neither Canonical XML 1.0 nor Exclusive C14N removes whitespace-only text
+/// nodes — they differ only in how namespace declarations are rendered. ASX
+/// used to strip them (`strip_blank_text: true` on the default profile), so it
+/// digested an octet stream no conformant implementation computes, and its own
+/// verifier agreed because it stripped too. The xmlsec1 oracle
+/// (`tests/interop_xmlsec_oracle.rs`) is what surfaced it.
+///
+/// The previous version of this test asserted the *opposite* — that the
+/// default profile "normalizes ignorable blank text differences" — and so
+/// locked the defect in.
 #[test]
-fn strip_blank_text_profile_controls_whitespace_digest_sensitivity() {
+fn canonicalization_preserves_whitespace_between_elements() {
     let compact = r#"<S12:Envelope xmlns:S12="http://www.w3.org/2003/05/soap-envelope"
         xmlns:eb="http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/">
         <S12:Body><eb:Payload id="payload-1"><eb:Chunk>A</eb:Chunk><eb:Chunk>B</eb:Chunk></eb:Payload></S12:Body>
@@ -318,28 +330,22 @@ fn strip_blank_text_profile_controls_whitespace_digest_sensitivity() {
         </S12:Body>
     </S12:Envelope>"#;
 
-    let strip_profile = WsSecCanonicalizationProfile::default();
-    let keep_profile = WsSecCanonicalizationProfile {
-        strip_blank_text: false,
-        ..WsSecCanonicalizationProfile::default()
-    };
+    let profile = WsSecCanonicalizationProfile::default();
+    let compact_c14n = canonicalize_reference(compact, "#payload-1", profile.clone())
+        .expect("compact canonicalization");
+    let expanded_c14n =
+        canonicalize_reference(expanded, "#payload-1", profile).expect("expanded canonicalization");
 
-    let compact_strip = canonicalize_reference(compact, "#payload-1", strip_profile.clone())
-        .expect("compact strip profile canonicalization");
-    let expanded_strip = canonicalize_reference(expanded, "#payload-1", strip_profile)
-        .expect("expanded strip profile canonicalization");
-    assert_eq!(
-        compact_strip.digest_value_base64, expanded_strip.digest_value_base64,
-        "strip_blank_text=true should normalize ignorable blank text differences"
+    assert_ne!(
+        compact_c14n.digest_value_base64, expanded_c14n.digest_value_base64,
+        "indentation inside the signed subtree changes the canonical octets, so it \
+         must change the digest; treating it as ignorable is what broke interop"
     );
 
-    let compact_keep = canonicalize_reference(compact, "#payload-1", keep_profile.clone())
-        .expect("compact keep profile canonicalization");
-    let expanded_keep = canonicalize_reference(expanded, "#payload-1", keep_profile)
-        .expect("expanded keep profile canonicalization");
-    assert_ne!(
-        compact_keep.digest_value_base64, expanded_keep.digest_value_base64,
-        "strip_blank_text=false should preserve blank-text differences in digest"
+    let expanded_text = String::from_utf8(expanded_c14n.canonical_bytes).expect("utf8");
+    assert!(
+        expanded_text.contains(">\n            <eb:Chunk>"),
+        "whitespace text nodes must survive canonicalization verbatim: {expanded_text}"
     );
 }
 
@@ -1231,7 +1237,6 @@ fn inclusive_c14n_includes_non_utilized_ancestor_namespaces() {
 
     let inc_profile = WsSecCanonicalizationProfile {
         kind: WsSecCanonicalizationKind::Inclusive,
-        strip_blank_text: false,
         ..WsSecCanonicalizationProfile::default()
     };
 
@@ -1276,7 +1281,6 @@ fn inclusive_c14n_versus_exclusive_differ_on_non_utilized_namespaces() {
     let exc_profile = WsSecCanonicalizationProfile::default();
     let inc_profile = WsSecCanonicalizationProfile {
         kind: WsSecCanonicalizationKind::Inclusive,
-        strip_blank_text: false,
         ..WsSecCanonicalizationProfile::default()
     };
 
@@ -1369,10 +1373,6 @@ fn inclusive_c14n_profile_helper_sets_correct_defaults() {
 
     let profile = WsSecCanonicalizationProfile::inclusive();
     assert_eq!(profile.kind, WsSecCanonicalizationKind::Inclusive);
-    assert!(
-        !profile.strip_blank_text,
-        "Inclusive C14N must preserve whitespace"
-    );
     assert!(!profile.include_comments);
 }
 

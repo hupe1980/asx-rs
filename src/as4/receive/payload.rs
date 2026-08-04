@@ -101,13 +101,27 @@ pub(super) fn maybe_unwrap_sbdh_payload<'a>(
     ))
 }
 
-pub(super) fn resolve_verified_payload<'a>(
+/// A resolved payload together with the Content-ID it arrived under.
+pub(super) struct ResolvedNamedPayload<'a> {
+    pub content_id: String,
+    pub payload: ResolvedVerifiedPayload<'a>,
+}
+
+/// Resolve **every** payload attachment: decrypt each if XML-encrypted, and
+/// enforce the encryption policy per attachment.
+///
+/// Returns at least one payload; the first is the primary. Each attachment is
+/// checked independently, so a message that encrypts its first payload and
+/// leaves a second in plaintext is rejected under
+/// `require_encrypted_inbound` rather than passing on the strength of the
+/// first.
+pub(super) fn resolve_verified_payloads<'a>(
     session: &SessionContext,
     policy: &As4PushPolicy,
     message_id: &str,
     multipart: Option<MultipartAs4Payload<'a>>,
     soap_bytes: &'a [u8],
-) -> Result<ResolvedVerifiedPayload<'a>> {
+) -> Result<Vec<ResolvedNamedPayload<'a>>> {
     let multipart = multipart.ok_or_else(|| {
         AsxError::new(
             ErrorCode::PolicyViolation,
@@ -116,43 +130,54 @@ pub(super) fn resolve_verified_payload<'a>(
         )
     })?;
 
-    let payload_part = multipart.payload_attachment.ok_or_else(|| {
-        AsxError::new(
+    if multipart.payloads.is_empty() {
+        if memmem::find(soap_bytes, b"<asx:Base64>").is_some() {
+            return Err(AsxError::new(
+                ErrorCode::PolicyViolation,
+                "embedded AS4 payload receive is unsupported; inbound payload must be multipart/related",
+                ErrorContext::for_session_with_message("as4_receive_push", session, message_id),
+            ));
+        }
+        return Err(AsxError::new(
             ErrorCode::InteropViolation,
             "AS4 message has no MIME payload attachment: inline SOAP body payloads are not \
              supported. PEPPOL/CEF require MIME multipart/related attachment packaging. \
              If the sending partner uses inline body mode, reconfigure their AS4 gateway \
              to use SwA/XOP MIME attachment packaging.",
             ErrorContext::for_session_with_message("as4_receive_push", session, message_id),
-        )
-    })?;
-
-    if let Some(decrypted) = decrypt_xmlenc_payload_if_present(
-        payload_part,
-        policy.inbound_decryption_key_pem.as_deref(),
-        "as4_receive_push",
-    )? {
-        return Ok(ResolvedVerifiedPayload::Owned(decrypted));
-    }
-
-    // Fail closed if the policy requires encryption: the payload was not
-    // encrypted (decrypt_xmlenc_payload_if_present returned None, meaning no
-    // xenc:EncryptedData marker was found in the payload bytes).
-    if policy.require_encrypted_inbound {
-        return Err(AsxError::new(
-            ErrorCode::PolicyViolation,
-            "inbound AS4 payload is not XML-encrypted but require_encrypted_inbound = true",
-            ErrorContext::for_session_with_message("as4_receive_push", session, message_id),
         ));
     }
 
-    if memmem::find(soap_bytes, b"<asx:Base64>").is_some() {
-        return Err(AsxError::new(
-            ErrorCode::PolicyViolation,
-            "embedded AS4 payload receive is unsupported; inbound payload must be multipart/related",
-            ErrorContext::for_session_with_message("as4_receive_push", session, message_id),
-        ));
+    let mut resolved = Vec::with_capacity(multipart.payloads.len());
+    for attachment in &multipart.payloads {
+        let payload = if let Some(decrypted) = decrypt_xmlenc_payload_if_present(
+            attachment.bytes,
+            policy.inbound_decryption_key_pem.as_deref(),
+            "as4_receive_push",
+        )? {
+            ResolvedVerifiedPayload::Owned(decrypted)
+        } else {
+            // Fail closed if the policy requires encryption: no
+            // xenc:EncryptedData marker was found in this attachment.
+            if policy.require_encrypted_inbound {
+                return Err(AsxError::new(
+                    ErrorCode::PolicyViolation,
+                    format!(
+                        "inbound AS4 payload cid:{} is not XML-encrypted but \
+                         require_encrypted_inbound = true",
+                        attachment.content_id
+                    ),
+                    ErrorContext::for_session_with_message("as4_receive_push", session, message_id),
+                ));
+            }
+            ResolvedVerifiedPayload::Borrowed(attachment.bytes)
+        };
+
+        resolved.push(ResolvedNamedPayload {
+            content_id: attachment.content_id.to_string(),
+            payload,
+        });
     }
 
-    Ok(ResolvedVerifiedPayload::Borrowed(payload_part))
+    Ok(resolved)
 }

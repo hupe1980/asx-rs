@@ -8,8 +8,18 @@ fn base_profile() -> BaseProfile {
         mode: InteropMode::Strict,
         canonicalization: CanonicalizationPolicy::default(),
         security: SecurityPolicy::default(),
+        security_floor: SecurityPolicy::default(),
         validation: ValidationPolicy::default(),
         as2_validation: As2ValidationPolicy::default(),
+    }
+}
+
+/// Base profile whose floor imposes nothing, so tests can exercise the
+/// per-layer checks that a default (sign-and-encrypt) floor would preempt.
+fn unfloored_base_profile() -> BaseProfile {
+    BaseProfile {
+        security_floor: SecurityPolicy::UNCONSTRAINED,
+        ..base_profile()
     }
 }
 
@@ -234,6 +244,7 @@ fn explicit_policy_layers_resolve_deterministically() {
                 ..CanonicalizationPolicy::default()
             },
             security: SecurityPolicy::default(),
+            security_floor: SecurityPolicy::default(),
             validation: ValidationPolicy::default(),
             as2_validation: As2ValidationPolicy::default(),
         },
@@ -313,18 +324,12 @@ fn guardrail_classification_is_allowed_or_denied() {
 
 #[test]
 fn invalid_profile_combinations_fail_fast_with_machine_readable_codes() {
+    // Floor deliberately unconstrained so the both-off degenerate case is what
+    // fires, rather than the floor violation that would otherwise preempt it.
     let stack = ProfileStack {
         base: BaseProfile {
-            name: "base".into(),
-            version: "1".into(),
-            mode: InteropMode::Strict,
-            canonicalization: CanonicalizationPolicy::default(),
-            security: SecurityPolicy {
-                require_signature: false,
-                require_encryption: false,
-            },
-            validation: ValidationPolicy::default(),
-            as2_validation: As2ValidationPolicy::default(),
+            security: SecurityPolicy::UNCONSTRAINED,
+            ..unfloored_base_profile()
         },
         extensions: vec![],
         overrides: vec![],
@@ -722,6 +727,7 @@ fn snapshot_as_event_detail_empty_trace_shows_none() {
         resolved_mode: InteropMode::Strict,
         canonicalization: CanonicalizationPolicy::default(),
         security: SecurityPolicy::default(),
+        security_floor: SecurityPolicy::default(),
         validation: ValidationPolicy::default(),
         as2_validation: As2ValidationPolicy::default(),
         resolution_trace: vec![],

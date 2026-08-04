@@ -53,6 +53,10 @@ EDI trading partner connections worldwide.
   layer (symmetric to `require_signed_push`); use
   `As4PushPolicy::regulated_with_decryption_key(pem)` to set it together with the
   key that satisfies it
+- **Multi-payload messages** — several `eb:PartInfo` attachments per `UserMessage`
+  are resolved in `xop:Include` order, each decrypted and signature-verified
+  independently; reachable via `As4ReceivePushOutput::payloads()` (send is
+  currently single-payload)
 - Streaming receive path with bounded memory; conversation-ordered delivery gate
 - P-Mode registry for per-partner MEP/security configuration
 - SBDH 1.3 envelope wrap/unwrap for PEPPOL and CEF eDelivery
@@ -79,12 +83,19 @@ EDI trading partner connections worldwide.
 
 ### 🧩 Interop
 - Profile stacking with regional packs and per-partner overlays
-- `interop-strict` (default) and `interop-relaxed` feature-gated modes
+- **Security floor** (`BaseProfile::security_floor`, default sign *and* encrypt) —
+  no override or partner overlay can resolve below it; enforced per partner by
+  `validate()`, or against a host mandate with `validate_with_floor(..)`
+- Session-free resolution (`resolve_all_partners`) for startup audits
+- `interop-strict` (default) and `interop-relaxed` feature-gated modes —
+  these govern header/ambiguity handling, **not** the security policy
 - Exception policies (`InteropExceptionPolicy`) for well-known deviations
 
 ### 🧪 Testing (`testing` feature — never enable in production)
-- **`InsecureBypassAs4Verifier`** — skips all WS-Security verification; parity with
-  `InsecureBypassTrustVerifier` on the AS2 side
+- **`InsecureBypassAs4Verifier`** — skips all WS-Security verification. There is no
+  AS2 counterpart exposed to dependent crates: AS2's bypass verifier is `#[cfg(test)]`
+  and crate-internal. For AS2, implement `As2TrustVerifier` against a local fixture —
+  the `testing` feature unseals the trait via `TrustVerifierSeal`
 - **`MockAs4Endpoint`** (`testing + server`) — local HTTP AS4 server that accepts any push
   (signed, unsigned, encrypted, or plain), records messages in an async channel, and
   returns synchronous AS4 receipts.  Configure decryption via
@@ -112,14 +123,14 @@ EDI trading partner connections worldwide.
 ```toml
 [dependencies]
 # AS4 — PEPPOL / CEF eDelivery (RSA) or BDEW (EC/ECDH-ES) — same code, key type decides
-asx-rs = { version = "0.11", features = ["as4", "client", "server", "async-ocsp"] }
+asx-rs = { version = "0.12", features = ["as4", "client", "server", "async-ocsp"] }
 
 # AS2 + AS4 with compression
-asx-rs = { version = "0.11", features = ["as2", "as4", "compression", "client", "server", "async-ocsp"] }
+asx-rs = { version = "0.12", features = ["as2", "as4", "compression", "client", "server", "async-ocsp"] }
 
 [dev-dependencies]
 # Testing without PKI certificates (MockAs4Endpoint, bypass verifier, keypair generators)
-asx-rs = { version = "0.11", features = ["as4", "testing", "server"] }
+asx-rs = { version = "0.12", features = ["as4", "testing", "server"] }
 ```
 
 > `as2` and `as4` are **not** in the default feature set — add them explicitly.
@@ -491,16 +502,33 @@ follows from the key type.
   ranges are blocked, DNS resolution is pinned against rebinding, and **HTTP redirects are
   never followed** (a redirect cannot escape the validated target). Applies to AS2/AS4
   egress, OCSP, and SMP clients.
+- **Signature conformance is checked against an independent implementation**, not
+  only against ourselves: `tests/interop_xmlsec_oracle.rs` verifies ASX output with
+  **xmlsec1**, the W3C XMLDSig reference implementation, in a container
+  (`cargo test --test interop_xmlsec_oracle -- --ignored`). See
+  [docs/conformance.md](docs/conformance.md).
 - **AS4 message integrity**: the WS-Security signature covers the whole `eb:Messaging`
   metadata block; the receive path binds the consumed block to the verified signature
-  (XML-Signature-Wrapping defence).
+  (XML-Signature-Wrapping defence) **and requires the payload attachment to be covered
+  by a verified `ds:Reference URI="cid:…"`** — signing the envelope proves nothing
+  about the detached MIME part that carries the actual business document.
+- **SMP discovery signature verification**: `SmpSignaturePolicy::Verify` checks the
+  enveloped XMLDSig on the `ServiceMetadata` response and chains the SMP certificate
+  to the network's SMP CA, so the endpoint URL and recipient certificate are
+  authenticated rather than trusted on TLS alone. Unsigned responses are rejected by
+  default even without it — see [docs/security.md](docs/security.md).
+- **Profile security invariants are floors, not defaults**: `BaseProfile::security_floor`
+  defaults to sign-and-encrypt and cannot be lowered by any extension, override,
+  partner overlay, or regional pack. `validate()` enforces it against the resolved
+  policy of every declared partner, and the profile-diff gate blocks a release that
+  lowers it. Interop mode is a separate axis and does not affect it.
 
 ---
 
 ## 📊 Status
 
 `asx-rs` is **beta quality**. Core AS2 and AS4 push/pull flows are implemented, tested
-(950+ tests across unit + integration suites), and exercised in production integrations.
+(1000+ tests across unit + integration suites), and exercised in production integrations.
 
 - ✅ AS2 send/receive (signed, encrypted, compressed, sync + async)
 - ✅ AS4 push send/receive (signed, encrypted, dedup, fragment reassembly)
@@ -510,8 +538,15 @@ follows from the key type.
 - ✅ OCSP + PKIX chain validation
 - ✅ Strict-mode production validation gate
 - ✅ Comprehensive testing infrastructure (bypass verifier, mock endpoint, keypair generators)
+- ✅ Multi-payload AS4 receive (every `eb:PartInfo` attachment verified and decrypted)
 - ⚠️  Persistent storage backends (dedup/reconciliation) are trait-defined but not shipped
   in-tree; deployers provide their own Redis/PostgreSQL/DynamoDB implementations.
+- ⚠️  AS4 **send** is single-payload; multi-payload send is the remaining eDelivery
+  conformance gap — see [docs/conformance.md](docs/conformance.md).
+- ⚠️  No third-party conformance certificate yet. Official EC eDelivery conformance
+  testing is **free of charge**; what it needs from us (a publicly reachable access
+  point + a SUT Controller) and a testcontainers-based interop plan that runs in CI
+  are written up in [docs/conformance.md](docs/conformance.md).
 
 ### Development
 

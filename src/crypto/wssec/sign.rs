@@ -69,7 +69,7 @@ pub fn generate_xmlsig_signature_with_external_references(
 /// Generate XMLDSig with optional external reference bodies using a pre-parsed
 /// key/certificate pair to avoid repeated PEM parsing on hot paths.
 ///
-/// Prefer [`generate_xmlsig_signature_with_provider`] for new code; this
+/// Prefer `generate_xmlsig_signature_with_provider` for new code; this
 /// overload exists for callers that already hold an `openssl::pkey::PKey` and
 /// `openssl::x509::X509` object (e.g., caches populated by `prepare_for_policy`).
 pub fn generate_xmlsig_signature_with_external_references_preparsed(
@@ -368,13 +368,41 @@ fn build_signed_info_xml(
     // what the old `canonicalize_signed_info_xml` round-trip produced.
     let mut refs_xml = String::new();
     for reference in references {
+        // XMLDSig §4.3.3.2: dereferencing a same-document `#id` URI yields a
+        // *node-set*, and absent a transform the signature application must
+        // serialise it with **inclusive** Canonical XML. We digest with
+        // exclusive C14N, so the transform has to be declared — otherwise a
+        // conformant verifier canonicalizes differently than we did and every
+        // digest mismatches. (Our own verifier applies exclusive
+        // unconditionally, which is exactly why this was invisible in-house
+        // until an independent oracle was pointed at it.)
+        //
+        // A `cid:` reference dereferences to an octet stream, not a node-set,
+        // so no canonicalization applies and no transform is emitted — the
+        // digest is over the raw attachment bytes.
+        //
+        // Schema order inside ds:Reference is `Transforms?, DigestMethod,
+        // DigestValue`. Empty elements are written open+close, per C14N.
+        let transforms_xml = if reference.uri.starts_with("cid:") {
+            String::new()
+        } else {
+            format!(
+                "<ds:Transforms\
+><ds:Transform Algorithm=\"{XML_EXC_C14N_URI}\"\
+></ds:Transform\
+></ds:Transforms>"
+            )
+        };
+
         refs_xml.push_str(&format!(
             "<ds:Reference URI=\"{uri}\"\
-><ds:DigestMethod Algorithm=\"{dig}\"\
+>{transforms}\
+<ds:DigestMethod Algorithm=\"{dig}\"\
 ></ds:DigestMethod\
 ><ds:DigestValue>{val}</ds:DigestValue\
 ></ds:Reference>",
             uri = reference.uri,
+            transforms = transforms_xml,
             dig = SHA256_URI,
             val = reference.digest_value_base64
         ));
@@ -441,7 +469,7 @@ mod tests {
 
         // Old round-trip path (kept here for comparison only).
         let old_format = format!(
-            "<ds:SignedInfo xmlns:ds=\"{ns}\"><ds:CanonicalizationMethod Algorithm=\"{c14n}\"/><ds:SignatureMethod Algorithm=\"{sig}\"/><ds:Reference URI=\"{uri}\"><ds:DigestMethod Algorithm=\"{dig}\"/><ds:DigestValue>{val}</ds:DigestValue></ds:Reference></ds:SignedInfo>",
+            "<ds:SignedInfo xmlns:ds=\"{ns}\"><ds:CanonicalizationMethod Algorithm=\"{c14n}\"/><ds:SignatureMethod Algorithm=\"{sig}\"/><ds:Reference URI=\"{uri}\"><ds:Transforms><ds:Transform Algorithm=\"{c14n}\"/></ds:Transforms><ds:DigestMethod Algorithm=\"{dig}\"/><ds:DigestValue>{val}</ds:DigestValue></ds:Reference></ds:SignedInfo>",
             ns = DS_NS,
             c14n = XML_EXC_C14N_URI,
             sig = RSA_SHA256_URI,

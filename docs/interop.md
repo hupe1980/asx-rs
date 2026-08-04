@@ -26,8 +26,22 @@ let session = SessionContext::new("sess-1", "partner-a", "profile-a")?;
 
 `interop-strict` is in the default Cargo feature set. `interop-relaxed` is optional and must be explicitly enabled:
 ```toml
-asx-rs = { version = "0.11", features = ["as2", "interop-relaxed"] }
+asx-rs = { version = "0.12", features = ["as2", "interop-relaxed"] }
 ```
+
+### Interop mode does not govern message security
+
+Neither `InteropMode::Strict` nor the `interop-strict` feature implies a strict
+*security* policy. The two axes are independent:
+
+| Axis | Controlled by | Governs |
+|---|---|---|
+| Interop | `InteropMode` / `interop-strict` | Header parsing, ambiguity tolerance, scoped exception guardrails |
+| Security | `SecurityPolicy` / `BaseProfile::security_floor` | Whether signature and encryption are required |
+
+A profile can be `InteropMode::Strict` and still resolve to
+`require_encryption: false`. Enforce the security axis with a
+[security floor](#security-floor), not by selecting a strict interop mode.
 
 ---
 
@@ -43,14 +57,9 @@ use asx_rs::interop::{
 };
 
 let stack = ProfileStack {
-  base: BaseProfile {
-    name: "strict-edelivery".into(),
-    version: "2.0".into(),
-    mode: InteropMode::Strict,
-    canonicalization: CanonicalizationPolicy::default(),
-    security: SecurityPolicy::default(),
-    validation: ValidationPolicy::default(),
-  },
+  // `BaseProfile::new(name, version)` fills the rest from `BaseProfile::default()`:
+  // strict mode, sign-and-encrypt required, and a matching sign-and-encrypt floor.
+  base: BaseProfile::new("strict-edelivery", "2.0"),
   extensions: vec![ProfileExtension {
     name: "peppol-bis".into(),
     overrides: ProfilePolicyOverrides {
@@ -73,7 +82,23 @@ let stack = ProfileStack {
 };
 ```
 
-Resolution is deterministic: the last applicable partner overlay wins for any given field. `ProfileStack::validate()` checks for malformed or conflicting policy combinations and returns structured lint findings before any message processing.
+Every field of `BaseProfile` is spelled out below; construct it directly when you
+need to depart from the fail-closed defaults:
+
+```rust
+let base = BaseProfile {
+  name: "strict-edelivery".into(),
+  version: "2.0".into(),
+  mode: InteropMode::Strict,
+  canonicalization: CanonicalizationPolicy::default(),
+  security: SecurityPolicy::default(),        // require_signature + require_encryption
+  security_floor: SecurityPolicy::default(),  // no layer may go below this
+  validation: ValidationPolicy::default(),
+  as2_validation: Default::default(),
+};
+```
+
+Resolution is deterministic: the last applicable partner overlay wins for any given field. `ProfileStack::validate()` checks the resolved policy for every partner before any message processing, and returns structured errors and lint findings.
 
 ### Resolution precedence (highest to lowest)
 
@@ -82,6 +107,9 @@ Resolution is deterministic: the last applicable partner overlay wins for any gi
 3. Extension profile (protocol or regional extension)
 4. Base profile (protocol defaults)
 
+`security_floor` is deliberately **not** in this list: it lives on the base
+profile only, because it is the invariant the other layers are checked against.
+
 ---
 
 ## Effective Policy Snapshot
@@ -89,9 +117,12 @@ Resolution is deterministic: the last applicable partner overlay wins for any gi
 After profile resolution, the effective policy for a session is captured in an `EffectivePolicySnapshot`. This snapshot is the authoritative record of what policy was applied for a given message exchange.
 
 ```rust
-let snapshot = stack.resolve_for_session(&session)?;
-let json = snapshot.to_json_pretty()?;
+let resolved = stack.resolve_for_session(&session)?;
+let json = resolved.effective_profile.snapshot.to_json_pretty()?;
 ```
+
+`resolve_for_session` returns a `ResolvedSessionProfile` carrying both the
+`effective_profile` and a `session` clone with the snapshot JSON attached.
 
 ### Snapshot schema
 
@@ -106,6 +137,10 @@ let json = snapshot.to_json_pretty()?;
     "normalize_mime_headers": true
   },
   "security": {
+    "require_signature": true,
+    "require_encryption": true
+  },
+  "security_floor": {
     "require_signature": true,
     "require_encryption": true
   },
@@ -161,7 +196,7 @@ Compare two profile snapshots to detect security-relevant changes before a relea
 ```rust
 use asx_rs::interop::diff_effective_policy_snapshots;
 
-let report = diff_effective_policy_snapshots(&before_snapshot, &after_snapshot)?;
+let report = diff_effective_policy_snapshots(&before_snapshot, &after_snapshot);
 println!("{}", report.to_json_pretty()?);
 ```
 
@@ -170,11 +205,17 @@ println!("{}", report.to_json_pretty()?);
 - `highest_risk` — highest risk across all changes.
 - `release_blocked` — `true` if any change is `High` risk.
 
-**High-risk changes** (block release):
+**High risk** (blocks release):
 - Removing a signature or encryption requirement
-- Broad relaxed-mode overrides outside scoped partner overlays
+- **Lowering `security_floor`** — flagged even when the resolved policy is unchanged, because it is precisely the change that lets a later overlay relax security without validation objecting
 - Disabling payload limit enforcement
-- Downgrading message validation or canonicalization strictness
+
+**Medium risk** (reported, does not block):
+- Interop mode changes
+- Canonicalization changes
+- Raising `security_floor`
+- Strengthening the security policy
+- AS2 `require_mic` changes
 
 Run via CI gate:
 ```bash
@@ -184,22 +225,142 @@ Exits non-zero for high-risk diffs.
 
 ---
 
-## Profile Validation and Linting
+## Security Floor
 
-`ProfileStack::validate()` runs before any message processing and surfaces actionable findings:
+`ProfileStack.overrides` and `ProfileStack.partner_overrides` are public `Vec`
+fields, so any overlay can rewrite `SecurityPolicy`. `BaseProfile::security_floor`
+is the invariant that survives that: **no layer may resolve below it.**
+
+It defaults to `SecurityPolicy::SIGN_AND_ENCRYPT`, which is what PEPPOL, CEF
+eDelivery and BDEW AS4-Profil v1.2 §2.2.6.2.2 all mandate. A partner overlay that
+keeps signing but turns encryption off is therefore rejected:
 
 ```rust
-let findings = stack.validate()?;
-for finding in &findings {
-    eprintln!("[{}] {}", finding.severity, finding.message);
+stack.partner_overrides.push(PartnerProfileOverlay {
+  name: "legacy-partner".into(),
+  partner_id: "9900000000001".into(),
+  overrides: ProfilePolicyOverrides {
+    security: Some(SecurityPolicy::SIGN_ONLY),
+    ..Default::default()
+  },
+});
+
+let failure = stack.validate().unwrap_err();
+assert!(failure.has_code(ProfileValidationCode::SecurityFloorViolation));
+assert_eq!(failure.affected_partners(), vec!["9900000000001"]);
+```
+
+`SecurityPolicy` is a two-element lattice with named constants and ordering
+helpers:
+
+| Item | Meaning |
+|---|---|
+| `SecurityPolicy::SIGN_AND_ENCRYPT` | Both required — the default, and the default floor |
+| `SecurityPolicy::SIGN_ONLY` / `ENCRYPT_ONLY` | One required |
+| `SecurityPolicy::UNCONSTRAINED` | Neither required; valid as a *floor*, rejected as an effective policy |
+| `a.satisfies(floor)` | `a` is at least as strong as `floor` |
+| `floor.unmet_by(a)` | Which requirements `a` is missing, as `Vec<SecurityRequirement>` |
+| `a.strengthen(b)` / `a.weaken(b)` | Lattice join / meet |
+
+### Enforcing a floor the profile does not declare
+
+A host with its own mandate should not have to trust the profile's floor.
+`validate_with_floor` combines the two by taking the stronger of each
+requirement, so it can only tighten validation:
+
+```rust
+// Fails if any partner resolves below sign-and-encrypt, regardless of
+// what BaseProfile::security_floor says.
+stack.validate_with_floor(SecurityPolicy::SIGN_AND_ENCRYPT)?;
+```
+
+For full control, use `validate_with`:
+
+```rust
+use asx_rs::interop::ProfileValidationOptions;
+
+stack.validate_with(
+  &ProfileValidationOptions::default()
+    .with_security_floor(SecurityPolicy::SIGN_AND_ENCRYPT)
+    // Any overlay that weakens security fails, even above the floor.
+    .forbidding_security_relaxation(),
+)?;
+```
+
+---
+
+## Profile Validation and Linting
+
+`ProfileStack::validate()` runs before any message processing. It resolves the
+stack **once per scope** — the deployment baseline, then a fork of it for every
+partner in `partner_overrides` — so one partner's overlay never contaminates
+another's findings, and every finding names the scope it came from.
+
+```rust
+match stack.validate() {
+    Ok(report) => {
+        for lint in &report.lints {
+            eprintln!("{lint}");   // [info/dead_override] override:x: … — hint: …
+        }
+    }
+    Err(failure) => {
+        // Multi-line operator rendering, every error and lint.
+        eprintln!("{}", failure.report());
+    }
 }
 ```
 
-Lint findings include:
-- Conflicting policy combinations (e.g., `require_signature = false` + `require_encryption = true`)
-- Missing required fields for a given base profile
-- Partner overlay keys that do not match any known partner
-- Dead overrides that do not affect the resolved effective policy
+### Errors (block validation)
+
+| Code | Raised when |
+|---|---|
+| `SecurityFloorViolation` | A scope's **resolved** policy is below the effective floor |
+| `NoCriticalSecurityInvariant` | A scope resolves with neither signature nor encryption (only reachable when the floor is permissive) |
+| `SecurityRelaxation` | A layer weakened security while `forbid_security_relaxation` was set |
+
+Errors are raised against the *resolved* policy per scope, not per layer: a dip
+that a later overlay restores has no runtime effect and is not an error.
+
+### Lints (never block; carry a severity)
+
+| Code | Severity | Raised when |
+|---|---|---|
+| `SecurityRelaxation` | `Critical` | Any layer drops a requirement a lower layer had enabled — including a dip that is later restored |
+| `DeadOverride` | `Info` | A layer sets a field to the value already in effect |
+
+```rust
+let report = stack.validate()?;
+if report.highest_lint_severity() >= Some(ProfileLintSeverity::Critical) {
+    for lint in report.lints_at_least(ProfileLintSeverity::Critical) {
+        eprintln!("blocking: {lint}");
+    }
+}
+```
+
+### Error handling
+
+`ProfileValidationFailure` implements `Display` and `std::error::Error`, so it
+composes with `thiserror`, `anyhow`, and `Box<dyn Error>`:
+
+```rust
+#[derive(Debug, thiserror::Error)]
+pub enum StartupError {
+    #[error(transparent)]
+    Profile(#[from] asx_rs::interop::ProfileValidationFailure),
+}
+```
+
+`?` also works directly in any function returning the crate's `Result`, via
+`From<ProfileValidationFailure> for AsxError` (`ErrorCode::PolicyViolation`).
+
+| Rendering | Shape | Use for |
+|---|---|---|
+| `Display` / `to_string()` | One line, first 3 errors, then `(+N more)` | Error chains, log fields |
+| `report()` | Multi-line, every error and lint with hints | Startup failure logs |
+| `Debug` | Struct dump | Test assertions only |
+
+Programmatic access stays available: `errors`, `lints`, `first_error()`,
+`has_code(code)`, and `affected_partners()`.
 
 Validation is enforced as a hard release gate (`scripts/check_profile_coverage.sh`).
 
@@ -224,6 +385,34 @@ let overlay = PartnerProfileOverlay {
 
 Overlays are composable: multiple overlays for the same partner are merged in declaration order, with later entries winning.
 
+### Auditing overlays without a session
+
+`ProfileStack::resolve(&SessionContext)` needs a live session, which startup
+validation does not have. The session-free counterparts answer "what will
+partner X actually get?" before the first message:
+
+| Method | Returns |
+|---|---|
+| `resolve_baseline()` | `ResolvedPolicyView` for base + extensions + global overrides |
+| `resolve_partner(id)` | `ResolvedPolicyView` for one partner |
+| `resolve_all_partners()` | Baseline first, then one view per distinct partner |
+| `partner_ids()` | Distinct partner ids carrying an overlay, in declaration order |
+
+All of them go through the same resolution path as `resolve()`, so a
+session-free view can never drift from what a live session receives.
+
+```rust
+let weak: Vec<_> = stack
+    .resolve_all_partners()
+    .into_iter()
+    .filter(|view| !view.satisfies(SecurityPolicy::SIGN_AND_ENCRYPT))
+    .map(|view| view.scope_label().to_string())  // "<baseline>" or the partner id
+    .collect();
+```
+
+Prefer `validate_with_floor` when the assertion is a plain security floor; use
+`resolve_all_partners()` when it is over other policy fields.
+
 ---
 
 ## Regional Profile Packs
@@ -234,18 +423,23 @@ Regional profile packs provide data-driven policy overlays loadable from JSON wi
 use asx_rs::interop::RegionalProfilePack;
 
 let pack = RegionalProfilePack::from_json(json_str)?;
-let stack = ProfileStack::builder()
-    .base(BaseProfile::default())
-    .regional_pack(pack)
-    .build()?;
+let stack = base_stack.apply_regional_pack(&pack)?;   // or apply_regional_packs(&[…])
 ```
 
-A regional pack can define:
-- Override values for any `EffectivePolicySnapshot` field
-- Partner-specific sub-overrides
-- Required feature flags (e.g., `"require_sbdh": true` for Peppol)
+A pack is applied as an additional extension layer, so it sits above the base
+profile and below global and partner overrides. A pack whose
+`applies_to_base_profile` does not match the active base is rejected with
+`ErrorCode::PolicyViolation`.
 
-Packs are validated on load: unknown field names and type mismatches fail fast with diagnostics.
+A regional pack can define override values for `mode`, `canonicalization`,
+`security`, `validation`, and `as2_validation`. It cannot raise or lower
+`security_floor` — the floor is base-only, so a data-driven pack can never
+loosen the invariant a pack-applying deployment relies on.
+
+Packs are validated on load: the JSON is capped at
+`RegionalProfilePack::MAX_PACK_JSON_BYTES` (512 KiB), `pack_id` and
+`applies_to_base_profile` must be non-empty, and `version` must be semver-like
+`x.y.z`.
 
 ---
 

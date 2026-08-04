@@ -2,7 +2,8 @@ use super::super::large_message::{As4FragmentJoiner, As4JoinProgress, parse_frag
 use super::super::services::emit_receive_push_signed_encrypted;
 use super::super::stream::MultipartAs4Payload;
 use super::super::types::{
-    As4PushPolicy, As4ReceivePushOutput, As4ReceivePushProgress, FragmentScopePolicy,
+    As4PushPolicy, As4ReceivePushOutput, As4ReceivePushProgress, As4ReceivedPayload,
+    FragmentScopePolicy,
 };
 use super::{As4PushReceiveCtx, metadata, payload, receipt};
 use crate::core::{AsxError, ErrorCode, ErrorContext, PayloadInput, Result, SessionContext};
@@ -13,7 +14,13 @@ use memchr::memmem;
 use std::sync::Arc;
 
 /// Return type for verified payload + optional SBDH header.
-type VerifiedPayloadWithSbdh = (DomainReady<Arc<[u8]>>, Option<SbdhHeader>);
+/// `(primary payload, primary Content-ID, additional payloads, SBDH header)`
+type VerifiedPayloadWithSbdh = (
+    DomainReady<Arc<[u8]>>,
+    String,
+    Vec<As4ReceivedPayload>,
+    Option<SbdhHeader>,
+);
 
 pub(super) fn maybe_handle_fragment_message(
     ctx: &As4PushReceiveCtx<'_>,
@@ -125,15 +132,16 @@ pub(super) fn process_non_fragment_push(
 
     enforce_non_fragment_timestamp_freshness(ctx.session, ctx.policy, &parsed)?;
 
-    let (payload, sbdh_header) = materialize_non_fragment_payload(
-        ctx.session,
-        ctx.event_bus,
-        ctx.policy,
-        &parsed,
-        multipart,
-        soap_bytes,
-        gate,
-    )?;
+    let (payload, payload_content_id, additional_payloads, sbdh_header) =
+        materialize_non_fragment_payload(
+            ctx.session,
+            ctx.event_bus,
+            ctx.policy,
+            &parsed,
+            multipart,
+            soap_bytes,
+            gate,
+        )?;
 
     let receipt = verify_non_fragment_receipt(
         ctx.session,
@@ -145,6 +153,8 @@ pub(super) fn process_non_fragment_push(
 
     Ok(assemble_non_fragment_output(
         payload,
+        payload_content_id,
+        additional_payloads,
         sbdh_header,
         parsed,
         receipt,
@@ -186,17 +196,40 @@ fn materialize_non_fragment_payload<'a>(
     soap_bytes: &'a [u8],
     gate: payload::WsSecVerifiedGate,
 ) -> Result<VerifiedPayloadWithSbdh> {
-    let payload = payload::resolve_verified_payload(
+    let resolved = payload::resolve_verified_payloads(
         session,
         policy,
         &parsed.message_id,
         multipart,
         soap_bytes,
     )?;
-    let (payload, sbdh_header) =
-        payload::maybe_unwrap_sbdh_payload(session, &parsed.message_id, payload)?;
-    let verified_payload = payload::WsSecVerifiedPayload::new(payload, gate);
-    let payload = payload::promote_payload_to_domain_ready(session, verified_payload)?;
+
+    // The gate is a zero-sized proof that WS-Security verification covered this
+    // message; every attachment was checked against it, so each promotion
+    // presents its own copy.
+    let _ = &gate;
+
+    let mut promoted: Vec<(String, DomainReady<Arc<[u8]>>)> = Vec::with_capacity(resolved.len());
+    let mut sbdh_header = None;
+    for (index, named) in resolved.into_iter().enumerate() {
+        // SBDH wrapping applies to the business document, i.e. the primary
+        // attachment. Additional parts travel as-is.
+        let payload_bytes = if index == 0 {
+            let (unwrapped, header) =
+                payload::maybe_unwrap_sbdh_payload(session, &parsed.message_id, named.payload)?;
+            sbdh_header = header;
+            unwrapped
+        } else {
+            named.payload
+        };
+
+        let verified =
+            payload::WsSecVerifiedPayload::new(payload_bytes, payload::WsSecVerifiedGate);
+        promoted.push((
+            named.content_id,
+            payload::promote_payload_to_domain_ready(session, verified)?,
+        ));
+    }
 
     emit_receive_push_signed_encrypted(
         session,
@@ -205,7 +238,18 @@ fn materialize_non_fragment_payload<'a>(
         policy.fail_closed_audit_events,
     )?;
 
-    Ok((payload, sbdh_header))
+    let mut promoted = promoted.into_iter();
+    let (primary_cid, primary) = promoted
+        .next()
+        .expect("resolve_verified_payloads returns at least one payload");
+    let additional = promoted
+        .map(|(content_id, payload)| As4ReceivedPayload {
+            content_id,
+            payload,
+        })
+        .collect();
+
+    Ok((primary, primary_cid, additional, sbdh_header))
 }
 
 fn verify_non_fragment_receipt(
@@ -224,14 +268,19 @@ fn verify_non_fragment_receipt(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn assemble_non_fragment_output(
     payload: DomainReady<Arc<[u8]>>,
+    payload_content_id: String,
+    additional_payloads: Vec<As4ReceivedPayload>,
     sbdh_header: Option<SbdhHeader>,
     parsed: super::super::ParsedAs4UserMessage,
     receipt: Option<super::super::ParsedAs4Receipt>,
 ) -> As4ReceivePushProgress {
     As4ReceivePushProgress::Complete(Box::new(As4ReceivePushOutput {
         payload,
+        payload_content_id,
+        additional_payloads,
         sbdh_header,
         user_message: parsed,
         receipt,

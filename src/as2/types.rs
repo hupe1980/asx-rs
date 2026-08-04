@@ -51,7 +51,7 @@ impl MimeEnvelope {
 
 /// Well-known `Content-Type` strings for AS2 business payloads.
 ///
-/// Pass one of these constants to [`As2SendPolicy::payload_content_type`] so
+/// Pass one of these constants to [`As2SendPolicy::payload_content_type`](crate::as2::As2SendPolicy::payload_content_type) so
 /// that the RFC 4130 §7.3.1 Message Integrity Check (MIC) is computed with the
 /// correct content-type header, as required by AS2 trading agreements.
 ///
@@ -96,7 +96,7 @@ pub mod payload_content_type {
 
     /// Raw binary payload (`application/octet-stream`).
     ///
-    /// Default when [`As2SendPolicy::payload_content_type`] is `None`.
+    /// Default when [`As2SendPolicy::payload_content_type`](crate::as2::As2SendPolicy::payload_content_type) is `None`.
     pub const OCTET_STREAM: &str = "application/octet-stream";
 
     /// Plain text payload (`text/plain`).
@@ -638,7 +638,7 @@ pub struct As2ReceiveMdnRequest {
     ///
     /// When `parse_mdn` fails (e.g. malformed MDN or signature error) before
     /// the message ID can be extracted from the MDN itself, this value is used
-    /// to queue a [`ReconciliationRequest`] with reason `PendingVerification`
+    /// to queue a [`ReconciliationRequest`](crate::reliability::ReconciliationRequest) with reason `PendingVerification`
     /// so the original message is not silently stranded.  Set to `None` when
     /// the message ID is unknown (e.g. async MDN without an out-of-band
     /// reference).

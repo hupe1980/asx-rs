@@ -229,7 +229,7 @@ pub enum WsSecOutboundKeyInfoProfile {
     ///
     /// Required by BDEW AS4-Profil §2.2.6.2.1 and some German energy market
     /// profiles.  When this profile is selected, the caller must also use
-    /// [`WsSecurityHeaderBuilder::with_signing_cert_pkipath_der`] so that the
+    /// [`WsSecurityHeaderBuilder::with_signing_cert_pkipath_der`](crate::crypto::soap_builder::WsSecurityHeaderBuilder::with_signing_cert_pkipath_der) so that the
     /// BST element and `ds:KeyInfo` reference are consistent.
     X509PKIPathv1,
 }
@@ -253,7 +253,6 @@ pub enum WsSecCanonicalizationKind {
 pub struct WsSecCanonicalizationProfile {
     pub kind: WsSecCanonicalizationKind,
     pub include_comments: bool,
-    pub strip_blank_text: bool,
     /// Prefixes from `exc-c14n:InclusiveNamespaces/@PrefixList`.
     ///
     /// Per W3C Exc-C14N §2.1: when a namespace prefix appears in this list and
@@ -269,7 +268,6 @@ impl Default for WsSecCanonicalizationProfile {
         Self {
             kind: WsSecCanonicalizationKind::Exclusive,
             include_comments: false,
-            strip_blank_text: true,
             inclusive_ns_prefixes: Vec::new(),
         }
     }
@@ -289,7 +287,6 @@ impl WsSecCanonicalizationProfile {
         Self {
             kind: WsSecCanonicalizationKind::Inclusive,
             include_comments: false,
-            strip_blank_text: false, // Inclusive C14N preserves all whitespace
             inclusive_ns_prefixes: Vec::new(),
         }
     }
@@ -367,7 +364,10 @@ pub struct WsSecCanonicalizedReference {
 }
 
 /// Internal-only material extracted from a `<ds:Signature>` element.
-#[cfg(test)]
+///
+/// Gated to match its only consumer, the `as4` test module below — a `test`
+/// build without `as4` would otherwise define it and never construct it.
+#[cfg(all(test, feature = "as4"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct WsSecSignatureMaterial {
     pub(crate) signed_info_c14n: Vec<u8>,
@@ -390,8 +390,8 @@ pub use xmlenc::{
 
 #[cfg(feature = "as4")]
 pub use canonicalize::{
-    SameDocumentReferenceIndex, canonical_vector_diff, canonicalize_reference,
-    canonicalize_reference_digest_from_doc_with_inclusive_ns_and_index,
+    SameDocumentReferenceIndex, canonical_vector_diff, canonicalize_enveloped_document,
+    canonicalize_reference, canonicalize_reference_digest_from_doc_with_inclusive_ns_and_index,
     canonicalize_reference_from_doc, canonicalize_reference_from_doc_with_inclusive_ns,
 };
 pub use ocsp::CertOcspOutcome;
@@ -402,7 +402,8 @@ pub use sign::{
 };
 #[cfg(feature = "as4")]
 pub use verify::{
-    WsSecVerifyOptions, parse_signature_references, verify_enveloped_signature,
+    ENVELOPED_SIGNATURE_URI, VerifiedEnvelopedSignature, WsSecVerifyOptions,
+    parse_signature_references, verify_enveloped_document_signature, verify_enveloped_signature,
     verify_signature_references_strict,
 };
 pub use x509::validate_certificate_chain as validate_certificate_chain_with_revocation_vectors;
@@ -472,6 +473,7 @@ mod tests {
     <soap:Header>
         <ds:Signature>
             <ds:SignedInfo>
+                <ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>
                 <ds:SignatureMethod Algorithm="{RSA_SHA256_URI}"/>
                 <ds:Reference URI="{reference_uri}">
                     <ds:DigestMethod Algorithm="{SHA256_URI}"/>
@@ -513,6 +515,7 @@ mod tests {
     <soap:Header>
         <ds:Signature>
             <ds:SignedInfo>
+                <ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>
                 <ds:SignatureMethod Algorithm="{RSA_SHA256_URI}"/>
                 <ds:Reference URI="{reference_uri}">
                     <ds:DigestMethod Algorithm="{SHA256_URI}"/>
@@ -555,6 +558,7 @@ mod tests {
     <soap:Header>
         <ds:Signature>
             <ds:SignedInfo>
+                <ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>
                 <ds:SignatureMethod Algorithm="{RSA_SHA256_URI}"/>
                 <ds:Reference URI="{reference_uri}">
                     <ds:DigestMethod Algorithm="{SHA256_URI}"/>
@@ -589,6 +593,7 @@ mod tests {
 <d:Envelope xmlns:d="urn:example" xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
   <ds:Signature>
     <ds:SignedInfo>
+        <ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>
       <ds:Reference URI="#x">
         <ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/>
         <ds:DigestValue>
@@ -612,6 +617,7 @@ mod tests {
 <d:Envelope xmlns:d="urn:example" xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
   <ds:Signature>
     <ds:SignedInfo>
+        <ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>
       <ds:Reference URI="#x">
         <ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/>
         <ds:DigestValue>abcd==</ds:DigestValue>
@@ -631,6 +637,7 @@ mod tests {
 <d:Envelope xmlns:d="urn:example" xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
     <ds:Signature>
         <ds:SignedInfo>
+            <ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>
             <ds:Reference URI="#x">
                 <ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/>
                 <ds:DigestValue>abcd==</ds:DigestValue>
@@ -655,6 +662,7 @@ mod tests {
 <d:Envelope xmlns:d="urn:example" xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
     <ds:Signature>
         <ds:SignedInfo>
+            <ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>
             <ds:Reference URI="#x">
                 <ds:Transforms>
                     <ds:Transform Algorithm="http://www.w3.org/2000/09/xmldsig#enveloped-signature"/>
@@ -1202,7 +1210,6 @@ mod tests {
             WsSecCanonicalizationProfile {
                 kind: WsSecCanonicalizationKind::Exclusive,
                 include_comments: false,
-                strip_blank_text: false,
                 inclusive_ns_prefixes: Vec::new(),
             },
         )
@@ -1297,7 +1304,6 @@ mod tests {
             WsSecCanonicalizationProfile {
                 kind: WsSecCanonicalizationKind::Exclusive,
                 include_comments: true,
-                strip_blank_text: false,
                 inclusive_ns_prefixes: Vec::new(),
             },
         )
@@ -1319,7 +1325,6 @@ mod tests {
             WsSecCanonicalizationProfile {
                 kind: WsSecCanonicalizationKind::Exclusive,
                 include_comments: false,
-                strip_blank_text: false,
                 inclusive_ns_prefixes: vec!["xsi".to_string()],
             },
         )
@@ -1343,7 +1348,6 @@ mod tests {
             WsSecCanonicalizationProfile {
                 kind: WsSecCanonicalizationKind::Exclusive,
                 include_comments: false,
-                strip_blank_text: false,
                 inclusive_ns_prefixes: vec!["xsi".to_string()],
             },
         )

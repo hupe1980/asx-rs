@@ -120,7 +120,7 @@ pub struct PModeSecurity {
     /// | `X509PKIPathv1` | `wsse:BinarySecurityToken` + `SecurityTokenReference` | BDEW AS4-Profil §2.2.6.2.1 |
     ///
     /// For BDEW / BSI TR-03116-3 deployments set this to
-    /// [`WsSecOutboundKeyInfoProfile::X509PKIPathv1`].
+    /// [`WsSecOutboundKeyInfoProfile::X509PKIPathv1`](crate::crypto::wssec::WsSecOutboundKeyInfoProfile::X509PKIPathv1).
     pub outbound_key_info_profile: crate::crypto::wssec::WsSecOutboundKeyInfoProfile,
 }
 
@@ -624,15 +624,14 @@ mod tests {
         let mut pm = pmode("pm-kip3", "p1", "urn:svc", "urn:act", MepType::OneWayPush);
         pm.security.outbound_key_info_profile = WsSecOutboundKeyInfoProfile::X509PKIPathv1;
 
-        // Build manually since we don't have credentials here.
-        let builder = pm.to_send_policy_builder();
-
         // Verify the builder was initialised with the correct profile.
         // Full assertion requires `interop-relaxed` to build a sign=false policy.
         #[cfg(all(feature = "testing", feature = "interop-relaxed"))]
         {
             use crate::core::InteropMode;
-            let policy = builder
+            // Built manually since we don't have credentials here.
+            let policy = pm
+                .to_send_policy_builder()
                 .interop(InteropMode::Relaxed)
                 .sign(false)
                 .fail_closed_audit_events(false)

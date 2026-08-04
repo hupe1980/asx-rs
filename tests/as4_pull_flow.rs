@@ -457,3 +457,182 @@ async fn as4_pull_dedup_is_correct_under_parallel_duplicate_requests() {
 
     assert!(duplicate_seen);
 }
+
+/// A PullRequest replayed after its cached response has been evicted must not
+/// dequeue a *second* message.
+///
+/// The served cache is FIFO-bounded, so a long-lived initiator that reuses a
+/// MessageId outside that window used to fall through to a fresh dequeue: the
+/// original message was consumed and never re-delivered, and a different one
+/// was handed back under the same PullRequest id. The dedup backend already
+/// knew the id was a replay — the answer was just discarded.
+#[tokio::test(flavor = "current_thread")]
+async fn as4_pull_replay_past_the_served_cache_does_not_consume_another_message() {
+    use asx_rs::as4::{As4PullQueueOverflowPolicy, As4PullStoreLimits};
+
+    let bus = EventBus::new(32).expect("bus");
+    let _events = bus.subscribe_scoped_events();
+    // One served entry, so the second pull evicts the first pull's response.
+    let store = As4PullStore::with_limits(As4PullStoreLimits {
+        max_queue_per_mpc: 16,
+        max_served_entries: 1,
+        queue_overflow_policy: As4PullQueueOverflowPolicy::RejectNew,
+    })
+    .expect("store");
+    let s = session();
+    let (hook, dedup) = reliability();
+
+    // Distinct inner MessageIds: three separate business messages queued on
+    // the same MPC.
+    for n in 1..=3 {
+        let message_id = format!("msg-pull-{n}");
+        let payload = String::from_utf8(multipart_pull_fixture("as4_pull_user_message.golden"))
+            .expect("utf8")
+            .replace("msg-pull-1", &message_id);
+        let enqueued = enqueue_pull_with_reliability(
+            &s,
+            &bus,
+            As4EnqueuePullWithReliabilityRequest {
+                store: &store,
+                mpc: "urn:mpc:priority".to_string(),
+                message: As4QueuedPullMessage {
+                    message_id: Arc::from(message_id.as_str()),
+                    payload: Arc::from(payload.into_bytes()),
+                    http_content_type: Arc::from(
+                        "multipart/related; boundary=asx-pull-flow-boundary",
+                    ),
+                },
+                reconciliation_hook: &hook,
+                fail_closed_audit_events: false,
+            },
+        )
+        .await
+        .expect("enqueue");
+        assert_eq!(enqueued, As4PullEnqueueOutcome::Enqueued);
+    }
+
+    let pull = async |id: &str| {
+        receive_pull_with_reliability(
+            &s,
+            &bus,
+            As4ReceivePullWithReliabilityRequest {
+                store: &store,
+                request: As4ReceivePullRequest {
+                    pull_message_id: id.to_string(),
+                    policy: pull_policy("urn:mpc:priority"),
+                    receipt_payload: None,
+                    authorization_info: None,
+                },
+                reconciliation_hook: &hook,
+                dedup_backend: Arc::clone(&dedup),
+            },
+        )
+        .await
+        .expect("pull")
+    };
+
+    let a = pull("pull-A").await;
+    assert!(a.pulled.is_some(), "first pull drains a message");
+    // Evicts pull-A from the one-entry served cache.
+    let b = pull("pull-B").await;
+    assert!(b.pulled.is_some());
+
+    // Replay of pull-A: dedup knows it, cache no longer holds the response.
+    let replay = pull("pull-A").await;
+    assert!(replay.duplicate_retrieval, "replay must be flagged");
+    assert!(
+        replay.pulled.is_none(),
+        "a replay outside the served-cache window must not hand back a \
+         different message"
+    );
+    assert_eq!(replay.outcome, DeliveryOutcome::Indeterminate);
+
+    // The decisive check: the third message is still queued, i.e. the replay
+    // consumed nothing.
+    let c = pull("pull-C").await;
+    assert!(
+        c.pulled.is_some(),
+        "the replay must not have silently consumed the remaining message"
+    );
+    assert!(!c.duplicate_retrieval);
+}
+
+/// A PullRequest that fails `AuthorizationInfo` must not write its MessageId
+/// into the dedup backend.
+///
+/// The dedup check runs `first_seen`, which *records* the key. Running it
+/// before authorization let an unauthorized peer insert arbitrary keys into a
+/// durable, shared store — and burned the MessageId for the legitimate owner.
+#[tokio::test(flavor = "current_thread")]
+async fn as4_pull_unauthorized_request_does_not_poison_the_dedup_store() {
+    let bus = EventBus::new(32).expect("bus");
+    let _events = bus.subscribe_scoped_events();
+    let store = As4PullStore::new();
+    let s = session();
+    let (hook, dedup) = reliability();
+
+    let authorized_policy = || {
+        As4PullPolicyBuilder::new()
+            .mpc("urn:mpc:priority")
+            .allow_unsigned_push(true)
+            .fail_closed_audit_events(false)
+            .expected_authorization_info(Some("s3cret".to_string()))
+            .build()
+            .expect("policy")
+    };
+
+    enqueue_pull_with_reliability(
+        &s,
+        &bus,
+        As4EnqueuePullWithReliabilityRequest {
+            store: &store,
+            mpc: "urn:mpc:priority".to_string(),
+            message: As4QueuedPullMessage {
+                message_id: Arc::from("msg-pull-1"),
+                payload: Arc::from(multipart_pull_fixture("as4_pull_user_message.golden")),
+                http_content_type: Arc::from("multipart/related; boundary=asx-pull-flow-boundary"),
+            },
+            reconciliation_hook: &hook,
+            fail_closed_audit_events: false,
+        },
+    )
+    .await
+    .expect("enqueue");
+
+    let attempt = async |auth: Option<&str>| {
+        receive_pull_with_reliability(
+            &s,
+            &bus,
+            As4ReceivePullWithReliabilityRequest {
+                store: &store,
+                request: As4ReceivePullRequest {
+                    pull_message_id: "pull-contested".to_string(),
+                    policy: authorized_policy(),
+                    receipt_payload: None,
+                    authorization_info: auth.map(str::to_string),
+                },
+                reconciliation_hook: &hook,
+                dedup_backend: Arc::clone(&dedup),
+            },
+        )
+        .await
+    };
+
+    let rejected = attempt(Some("wrong")).await.expect_err("must reject");
+    assert_eq!(
+        rejected.code,
+        asx_rs::core::ErrorCode::SecurityVerificationFailed
+    );
+
+    // The legitimate initiator uses the same MessageId and must still be
+    // treated as first-seen.
+    let ok = attempt(Some("s3cret")).await.expect("authorized pull");
+    assert!(
+        !ok.duplicate_retrieval,
+        "the rejected attempt must not have burned the MessageId"
+    );
+    assert!(
+        ok.pulled.is_some(),
+        "authorized pull must receive the message"
+    );
+}

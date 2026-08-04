@@ -1,5 +1,7 @@
 use asx::core::InteropMode;
-use asx::interop::{ProfileLintFinding, ProfileValidationFailure, ProfileValidationIssue};
+use asx::interop::{
+    ProfileLintFinding, ProfileValidationFailure, ProfileValidationIssue, SecurityPolicy,
+};
 use serde::Serialize;
 
 pub fn run(args: &[String]) -> Result<(), String> {
@@ -8,8 +10,10 @@ pub fn run(args: &[String]) -> Result<(), String> {
     }
 
     let mut failures = Vec::new();
+    let catalog = profile_catalog();
+    let profiles_checked = catalog.len();
 
-    for profile in profile_catalog() {
+    for profile in catalog {
         let mut profile_failures = Vec::new();
 
         if profile.base.base.mode != InteropMode::Strict {
@@ -19,21 +23,27 @@ pub fn run(args: &[String]) -> Result<(), String> {
             });
         }
 
-        if !profile.base.base.security.require_signature {
-            profile_failures.push(ProfileGateFailure::Simple {
-                kind: "security",
-                message: "base policy must require signature".to_string(),
-            });
+        for (requirement, present) in [
+            ("signature", profile.base.base.security.require_signature),
+            ("encryption", profile.base.base.security.require_encryption),
+        ] {
+            if !present {
+                profile_failures.push(ProfileGateFailure::Simple {
+                    kind: "security",
+                    message: format!("base policy must require {requirement}"),
+                });
+            }
         }
 
-        if !profile.base.base.security.require_encryption {
-            profile_failures.push(ProfileGateFailure::Simple {
-                kind: "security",
-                message: "base policy must require encryption".to_string(),
-            });
-        }
-
-        match profile.base.validate() {
+        // The gate asserts the shipped mandate (sign *and* encrypt) rather than
+        // trusting each profile's own floor, so a profile cannot opt out of the
+        // gate by lowering `BaseProfile::security_floor`. This resolves every
+        // declared partner, so a partner overlay that relaxes security fails
+        // here even when the base profile is impeccable.
+        match profile
+            .base
+            .validate_with_floor(SecurityPolicy::SIGN_AND_ENCRYPT)
+        {
             Ok(report) => {
                 if !report.lints.is_empty() {
                     profile_failures.push(ProfileGateFailure::Lints {
@@ -61,7 +71,8 @@ pub fn run(args: &[String]) -> Result<(), String> {
 
     let summary = GateSummary {
         gate: "profile-lint-gate",
-        profiles_checked: 0,
+        profiles_checked,
+        enforced_security_floor: SecurityPolicy::SIGN_AND_ENCRYPT,
         failures,
     };
 
@@ -72,10 +83,32 @@ pub fn run(args: &[String]) -> Result<(), String> {
     );
 
     if summary.failures.is_empty() {
-        Ok(())
-    } else {
-        Err("profile lint gate failed: profile validation errors/lints detected".to_string())
+        return Ok(());
     }
+
+    // Render through Display rather than Debug so the CI log is readable
+    // alongside the machine-readable JSON above.
+    for record in &summary.failures {
+        for failure in &record.failures {
+            match failure {
+                ProfileGateFailure::Simple { kind, message } => {
+                    eprintln!("{}: [{kind}] {message}", record.profile);
+                }
+                ProfileGateFailure::Errors { errors } => {
+                    for issue in errors {
+                        eprintln!("{}: {issue}", record.profile);
+                    }
+                }
+                ProfileGateFailure::Lints { lints } => {
+                    for lint in lints {
+                        eprintln!("{}: {lint}", record.profile);
+                    }
+                }
+            }
+        }
+    }
+
+    Err("profile lint gate failed: profile validation errors/lints detected".to_string())
 }
 
 struct NamedProfile {
@@ -93,6 +126,9 @@ fn profile_catalog() -> [NamedProfile; 0] {
 struct GateSummary {
     gate: &'static str,
     profiles_checked: usize,
+    /// Recorded in the gate output so a change to the enforced mandate is
+    /// visible in CI history rather than only in this source file.
+    enforced_security_floor: SecurityPolicy,
     failures: Vec<ProfileFailureRecord>,
 }
 

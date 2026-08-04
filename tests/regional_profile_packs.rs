@@ -13,6 +13,7 @@ fn base_stack() -> ProfileStack {
             mode: InteropMode::Strict,
             canonicalization: CanonicalizationPolicy::default(),
             security: SecurityPolicy::default(),
+            security_floor: SecurityPolicy::default(),
             validation: ValidationPolicy::default(),
             as2_validation: As2ValidationPolicy::default(),
         },

@@ -301,6 +301,12 @@ fn run_policy_resolver_case(input: &[u8]) -> Result<(), String> {
                 require_signature: !b(1),
                 require_encryption: !b(2),
             },
+            // Fuzz the floor too, so both the "clears the floor" and the
+            // "violates the floor" branches of validate() get exercised.
+            security_floor: SecurityPolicy {
+                require_signature: !b(7),
+                require_encryption: !b(8),
+            },
             validation: ValidationPolicy {
                 reject_ambiguous_headers: !b(4),
                 enforce_payload_limits: !b(5),
@@ -325,6 +331,10 @@ fn run_policy_resolver_case(input: &[u8]) -> Result<(), String> {
             partner_id: "partner-fuzz".to_string(),
             overrides: ProfilePolicyOverrides {
                 mode: Some(InteropMode::Strict),
+                security: b(9).then_some(SecurityPolicy {
+                    require_signature: !b(10),
+                    require_encryption: !b(11),
+                }),
                 ..ProfilePolicyOverrides::default()
             },
         }],
@@ -339,6 +349,14 @@ fn run_policy_resolver_case(input: &[u8]) -> Result<(), String> {
         return Err("resolver produced non-deterministic effective profile".to_string());
     }
 
+    // The session-free view must agree with what a live session resolves to,
+    // for every shape the fuzzer produces.
+    let view = stack.resolve_partner("partner-fuzz");
+    if view.security != first.security || view.mode != first.mode {
+        return Err("session-free resolution diverged from session resolution".to_string());
+    }
+
+    let floor = stack.base.security_floor;
     match stack.validate() {
         Ok(report) => {
             if report
@@ -347,6 +365,23 @@ fn run_policy_resolver_case(input: &[u8]) -> Result<(), String> {
                 .any(|lint| lint.remediation_hint.trim().is_empty())
             {
                 return Err("lint entry had empty remediation hint".to_string());
+            }
+            // The security invariant: validate() succeeding means every scope
+            // the runtime can resolve is at or above the floor.
+            for scope in stack.resolve_all_partners() {
+                if !scope.satisfies(floor) {
+                    return Err(format!(
+                        "validate() accepted a stack whose {} scope is below the floor",
+                        scope.scope_label()
+                    ));
+                }
+                if scope.security == SecurityPolicy::UNCONSTRAINED {
+                    return Err(format!(
+                        "validate() accepted a stack whose {} scope requires neither \
+                         signature nor encryption",
+                        scope.scope_label()
+                    ));
+                }
             }
         }
         Err(failure) => {
@@ -359,6 +394,15 @@ fn run_policy_resolver_case(input: &[u8]) -> Result<(), String> {
                 .any(|issue| issue.remediation_hint.trim().is_empty())
             {
                 return Err("validation issue had empty remediation hint".to_string());
+            }
+            // Display must never be empty or fall back to the Debug form —
+            // consumers put this straight into a startup log.
+            let rendered = failure.to_string();
+            if rendered.trim().is_empty() || rendered.contains("ProfileValidationIssue") {
+                return Err(format!("validation failure rendered unusably: {rendered}"));
+            }
+            if failure.report().lines().count() < failure.errors.len() + 1 {
+                return Err("report() elided errors".to_string());
             }
         }
     }
@@ -528,6 +572,7 @@ fn base_stack() -> ProfileStack {
             mode: InteropMode::Strict,
             canonicalization: CanonicalizationPolicy::default(),
             security: SecurityPolicy::default(),
+            security_floor: SecurityPolicy::default(),
             validation: ValidationPolicy::default(),
             as2_validation: As2ValidationPolicy::default(),
         },

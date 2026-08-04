@@ -120,6 +120,47 @@ and the KEK is the leftmost `keydatalen/8` bytes.
 
 ---
 
+## Multi-Payload Messages
+
+ebMS3 allows several `eb:PartInfo` entries per `UserMessage`. On receive, every
+part referenced by an `xop:Include` is resolved, in document order:
+
+```rust
+let out = /* As4ReceivePushOutput */;
+
+out.payload;                 // primary (first) attachment
+out.payload_content_id;      // its Content-ID, no `cid:` prefix
+out.additional_payloads;     // the rest, in eb:PartInfo order
+out.payload_count();         // always >= 1
+
+for (content_id, payload) in out.payloads() { /* uniform iteration */ }
+out.payload_by_content_id("cid:xmlpayload2@gitb");
+```
+
+Each attachment is treated on equal terms:
+
+| Check | Applied to |
+|---|---|
+| WS-Security `cid:` signature coverage | **every** attachment — a signature referencing only payload 1 leaves 2..n swappable |
+| XML-Encryption decryption | each attachment independently |
+| `require_encrypted_inbound` | each attachment independently — one plaintext part fails the message |
+
+Bounds and failure modes:
+
+- At most 16 attachments per message (`MAX_INBOUND_PAYLOADS`), so a body full of
+  `xop:Include` references cannot induce unbounded work.
+- An `xop:Include` with no matching MIME `Content-ID` is an error, not a skip.
+- MIME parts not referenced by any `xop:Include` are ignored without allocation.
+- A body with **no** `xop:Include` is rejected: with no Content-ID there is
+  nothing to tie a part to a `ds:Reference URI="cid:…"`, so it could never be
+  shown to be signature-covered.
+
+> **Send is single-payload.** `As4SendRequest::payload` takes one payload. This
+> is the remaining gap for eDelivery conformance, whose payload profiles define
+> four parts — see [conformance.md](conformance.md).
+
+---
+
 ## `As4PushPolicy` — inbound receive policy
 
 ```rust
@@ -542,7 +583,7 @@ certificate from the SMP.
 Enable the `smp` module with the `client` feature:
 
 ```toml
-asx-rs = { version = "0.11", features = ["as4", "client", "async-ocsp"] }
+asx-rs = { version = "0.12", features = ["as4", "client", "async-ocsp"] }
 ```
 
 ### Lookup and Register a Runtime P-Mode

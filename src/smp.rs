@@ -20,6 +20,23 @@
 //! GET {smp_base}{url_encoded_canonical}/services/{url_encoded_document_type_id}
 //! ```
 //!
+//! # ⚠ The SMP response is not cryptographically verified
+//!
+//! This client parses `ServiceMetadata` but does **not** verify its enveloped
+//! XMLDSig signature. The lookup result decides *where a message is sent* and
+//! *which public key it is encrypted to*, and TLS authenticates the SMP host,
+//! not the metadata it serves — so a rogue or compromised SMP can redirect
+//! traffic and substitute its own recipient certificate.
+//!
+//! PEPPOL and CEF eDelivery both require the consumer to verify the signature
+//! and chain the SMP signing certificate to the network's SMP CA. Until ASX
+//! implements this (it needs whole-document `URI=""` reference support that the
+//! WS-Security verifier lacks), the embedder must do it, using the response
+//! bytes returned in [`SmpEndpoint::signed_document`].
+//!
+//! [`SmpConfig::signature_policy`] defaults to rejecting a response that
+//! carries no `ds:Signature` at all — presence, not validity.
+//!
 //! # SSRF protection
 //!
 //! The constructed SMP URL is validated before the HTTP request is issued.
@@ -81,6 +98,13 @@ pub struct SmpConfig {
     /// Default transport profile used when [`SmpLookupRequest::transport_profile`]
     /// is `None`.  Default: [`PEPPOL_AS4_TRANSPORT_PROFILE`].
     pub transport_profile: String,
+
+    /// Whether an unsigned `ServiceMetadata` response is accepted.
+    ///
+    /// Defaults to [`SmpSignaturePolicy::RequireSignaturePresent`]. See
+    /// [`SmpEndpoint::signed_document`] — the signature is checked for
+    /// *presence* only; verifying it remains the embedder's job.
+    pub signature_policy: SmpSignaturePolicy,
 }
 
 impl SmpConfig {
@@ -90,6 +114,7 @@ impl SmpConfig {
             sml_zone: "acc.edelivery.tech.ec.europa.eu".to_string(),
             participant_scheme: PEPPOL_PARTICIPANT_SCHEME.to_string(),
             transport_profile: PEPPOL_AS4_TRANSPORT_PROFILE.to_string(),
+            signature_policy: SmpSignaturePolicy::RequireSignaturePresent,
         }
     }
 
@@ -99,15 +124,89 @@ impl SmpConfig {
             sml_zone: "edelivery.tech.ec.europa.eu".to_string(),
             participant_scheme: PEPPOL_PARTICIPANT_SCHEME.to_string(),
             transport_profile: PEPPOL_AS4_TRANSPORT_PROFILE.to_string(),
+            signature_policy: SmpSignaturePolicy::RequireSignaturePresent,
         }
     }
 }
 
-/// A single AS4 endpoint extracted from SMP [`ServiceMetadata`].
+/// Whether a lookup requires the SMP response to carry an XMLDSig signature.
+///
+/// ASX does **not** cryptographically verify the SMP signature — see
+/// [`SmpEndpoint::signed_document`] for why that matters and what to do about
+/// it. This policy controls only whether a response with *no* signature at all
+/// is accepted, which is the one part of the check the library can make
+/// unambiguously.
+#[derive(Debug, Clone, Default)]
+#[non_exhaustive]
+pub enum SmpSignaturePolicy {
+    /// **Verify** the enveloped `ds:Signature` and chain the SMP signing
+    /// certificate to the supplied trust anchors.
+    ///
+    /// This is the only setting that makes an SMP lookup trustworthy: it is
+    /// what proves the endpoint URL and recipient certificate really came from
+    /// the network's SMP and were not substituted in transit.
+    ///
+    /// Supply the network's SMP CA (PEPPOL / CEF publish these). An empty
+    /// anchor set with `require_chain_validation` fails closed.
+    Verify(Box<crate::crypto::wssec::OwnedRevocationPolicy>),
+    /// Require a `ds:Signature` to be present but do not verify it.
+    ///
+    /// A stepping stone, not a destination: it catches an outright unsigned or
+    /// misconfigured SMP but nothing else. Prefer [`Self::Verify`].
+    #[default]
+    RequireSignaturePresent,
+    /// Accept an unsigned `ServiceMetadata` response.
+    ///
+    /// For closed networks and test SMPs that do not sign. Do not use against
+    /// a public network.
+    AllowUnsigned,
+}
+
+impl SmpSignaturePolicy {
+    /// Verify signatures against the given SMP CA trust anchors.
+    pub fn verify_with_trust_anchors(trust_anchor_pems: Vec<String>) -> Self {
+        Self::Verify(Box::new(
+            crate::crypto::wssec::OwnedRevocationPolicy::production(trust_anchor_pems),
+        ))
+    }
+}
+
+/// A single AS4 endpoint extracted from SMP `ServiceMetadata`.
 #[derive(Debug, Clone)]
 pub struct SmpEndpoint {
     /// URL the sender should POST AS4 messages to.
     pub url: String,
+
+    /// SHA-256 fingerprint (lowercase hex) of the SMP certificate whose
+    /// signature over this response was **verified**.
+    ///
+    /// `Some` only under [`SmpSignaturePolicy::Verify`]. `None` means the
+    /// signature was not checked, so [`Self::url`] and
+    /// [`Self::certificate_der_b64`] are unauthenticated.
+    pub verified_signer_fingerprint_sha256: Option<String>,
+
+    /// The exact `ServiceMetadata` bytes the SMP returned, retained so the
+    /// caller can verify the enveloped XMLDSig itself if it prefers.
+    ///
+    /// # This response is not cryptographically verified by ASX
+    ///
+    /// [`Self::url`] and [`Self::certificate_der_b64`] come straight from this
+    /// document. Everything downstream — where the message is sent, and which
+    /// public key it is encrypted to — is therefore only as trustworthy as the
+    /// SMP response, and TLS authenticates *the SMP host*, not the metadata it
+    /// serves. A rogue or compromised SMP can redirect traffic and substitute
+    /// its own recipient certificate.
+    ///
+    /// PEPPOL and CEF eDelivery both require the consumer to verify the
+    /// enveloped signature and chain the signing certificate to the network's
+    /// SMP CA. ASX does not do this yet (the WS-Security verifier cannot
+    /// process the whole-document `URI=""` reference with an enveloped-signature
+    /// transform that SMP responses use), so **the embedder must**. These bytes
+    /// are the input to that check.
+    ///
+    /// [`SmpSignaturePolicy::RequireSignaturePresent`] guarantees only that a
+    /// `ds:Signature` element exists — not that it verifies.
+    pub signed_document: std::sync::Arc<[u8]>,
 
     /// Base64-encoded DER X.509 certificate of the receiving party's signing
     /// key.  Validate this against your trust store before pinning it.
@@ -171,6 +270,7 @@ impl SmpClient {
             sml_zone: sml_zone.into(),
             participant_scheme: PEPPOL_PARTICIPANT_SCHEME.to_string(),
             transport_profile: PEPPOL_AS4_TRANSPORT_PROFILE.to_string(),
+            signature_policy: SmpSignaturePolicy::RequireSignaturePresent,
         })
     }
 
@@ -206,7 +306,7 @@ impl SmpClient {
     ///
     /// - [`ErrorCode::InvalidInput`] — URL validation failed (bad SML zone or
     ///   private-range host after DNS resolution).
-    /// - [`ErrorCode::TransportError`] — HTTP request failed.
+    /// - [`ErrorCode::TransportFailure`] — HTTP request failed.
     /// - [`ErrorCode::NotFound`] — SMP returned a non-2xx status.
     /// - [`ErrorCode::ParseFailed`] — XML parsing or endpoint extraction failed.
     pub async fn lookup_endpoint(&self, req: SmpLookupRequest) -> Result<SmpEndpoint> {
@@ -246,7 +346,12 @@ impl SmpClient {
             .as_deref()
             .unwrap_or(&self.config.transport_profile);
 
-        parse_service_metadata(&body, &req.process_id, transport_profile)
+        parse_service_metadata(
+            &body,
+            &req.process_id,
+            transport_profile,
+            &self.config.signature_policy,
+        )
     }
 
     /// Compute the full SMP ServiceMetadata lookup URL for a request.
@@ -290,6 +395,7 @@ fn parse_service_metadata(
     xml: &[u8],
     process_id: &str,
     transport_profile: &str,
+    signature_policy: &SmpSignaturePolicy,
 ) -> Result<SmpEndpoint> {
     let text = std::str::from_utf8(xml).map_err(|_| {
         AsxError::new(
@@ -307,7 +413,9 @@ fn parse_service_metadata(
         )
     })?;
 
-    extract_endpoint(&doc, process_id, transport_profile).ok_or_else(|| {
+    let signer = enforce_smp_signature_policy(text, &doc, signature_policy)?;
+
+    let mut endpoint = extract_endpoint(&doc, process_id, transport_profile).ok_or_else(|| {
         AsxError::new(
             ErrorCode::NotFound,
             format!(
@@ -316,6 +424,70 @@ fn parse_service_metadata(
             ),
             ErrorContext::new("smp_parse"),
         )
+    })?;
+
+    endpoint.signed_document = std::sync::Arc::from(xml);
+    endpoint.verified_signer_fingerprint_sha256 = signer;
+    Ok(endpoint)
+}
+
+/// Apply [`SmpSignaturePolicy`], returning the verified signer fingerprint when
+/// the signature was actually checked.
+fn enforce_smp_signature_policy(
+    text: &str,
+    doc: &Document<'_>,
+    policy: &SmpSignaturePolicy,
+) -> Result<Option<String>> {
+    match policy {
+        SmpSignaturePolicy::Verify(revocation) => {
+            let verified = crate::crypto::wssec::verify_enveloped_document_signature(
+                text,
+                None,
+                &crate::crypto::wssec::RevocationPolicy::from(revocation.as_ref()),
+            )
+            .map_err(|err| {
+                AsxError::new(
+                    ErrorCode::SecurityVerificationFailed,
+                    format!(
+                        "SMP ServiceMetadata signature verification failed: {}. The endpoint \
+                         URL and recipient certificate in this response cannot be trusted",
+                        err.message
+                    ),
+                    ErrorContext::new("smp_verify_signature"),
+                )
+            })?;
+            Ok(Some(verified.signer_fingerprint_sha256))
+        }
+        SmpSignaturePolicy::RequireSignaturePresent => {
+            if !has_enveloped_signature(doc) {
+                return Err(AsxError::new(
+                    ErrorCode::SecurityVerificationFailed,
+                    "SMP ServiceMetadata response carries no ds:Signature; PEPPOL and CEF \
+                     eDelivery require the SMP to sign its metadata. Set \
+                     SmpConfig::signature_policy = AllowUnsigned only for a closed or test \
+                     network",
+                    ErrorContext::new("smp_parse_signature"),
+                ));
+            }
+            Ok(None)
+        }
+        SmpSignaturePolicy::AllowUnsigned => Ok(None),
+    }
+}
+
+/// XML Signature namespace.
+const XMLDSIG_NS: &str = "http://www.w3.org/2000/09/xmldsig#";
+
+/// Whether the document contains a `ds:Signature` element.
+///
+/// Presence only — verifying it requires whole-document (`URI=""`) reference
+/// support that the WS-Security verifier does not implement. See
+/// [`SmpEndpoint::signed_document`].
+fn has_enveloped_signature(doc: &Document<'_>) -> bool {
+    doc.descendants().any(|n| {
+        n.is_element()
+            && n.tag_name().namespace() == Some(XMLDSIG_NS)
+            && n.tag_name().name() == "Signature"
     })
 }
 
@@ -356,6 +528,9 @@ fn extract_endpoint(
         let service_expiration_date = find_child_text(&node, "ServiceExpirationDate");
 
         return Some(SmpEndpoint {
+            // Both replaced by `parse_service_metadata` once the policy has run.
+            signed_document: std::sync::Arc::from(&[][..]),
+            verified_signer_fingerprint_sha256: None,
             url: url.trim().to_string(),
             certificate_der_b64: certificate_der_b64.map(|s| s.trim().to_string()),
             transport_profile: profile.to_string(),
@@ -517,6 +692,7 @@ mod tests {
             xml.as_bytes(),
             "urn:test:process",
             "peppol-transport-as4-v2_0",
+            &SmpSignaturePolicy::AllowUnsigned,
         )
         .expect("should parse");
         assert_eq!(ep.url, "https://ap.example.com/as4/receive");
@@ -546,8 +722,72 @@ mod tests {
             xml.as_bytes(),
             "urn:test:process", // does not match "urn:other:process"
             "peppol-transport-as4-v2_0",
+            &SmpSignaturePolicy::AllowUnsigned,
         )
         .unwrap_err();
         assert_eq!(err.code, crate::core::ErrorCode::NotFound);
     }
+
+    /// An unsigned `ServiceMetadata` is never valid on a public network, so the
+    /// default policy rejects it rather than silently trusting the endpoint and
+    /// certificate it advertises.
+    #[test]
+    fn unsigned_service_metadata_is_rejected_by_default() {
+        let xml = SIGNED_FIXTURE_TEMPLATE.replace("{signature}", "");
+        let err = parse_service_metadata(
+            xml.as_bytes(),
+            "urn:test:process",
+            "peppol-transport-as4-v2_0",
+            &SmpSignaturePolicy::default(),
+        )
+        .expect_err("unsigned response must be rejected under the default policy");
+        assert_eq!(err.code, crate::core::ErrorCode::SecurityVerificationFailed);
+        assert!(err.message.contains("ds:Signature"), "{}", err.message);
+    }
+
+    #[test]
+    fn signed_service_metadata_is_accepted_and_bytes_are_retained() {
+        let signature = r#"<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:SignatureValue>AAAA</ds:SignatureValue></ds:Signature>"#;
+        let xml = SIGNED_FIXTURE_TEMPLATE.replace("{signature}", signature);
+        let ep = parse_service_metadata(
+            xml.as_bytes(),
+            "urn:test:process",
+            "peppol-transport-as4-v2_0",
+            &SmpSignaturePolicy::default(),
+        )
+        .expect("a signed response passes the presence gate");
+
+        // The caller needs the exact bytes to verify the signature itself —
+        // ASX only checked that one is present.
+        assert_eq!(ep.signed_document.as_ref(), xml.as_bytes());
+    }
+
+    #[test]
+    fn signature_presence_gate_can_be_disabled_for_closed_networks() {
+        let xml = SIGNED_FIXTURE_TEMPLATE.replace("{signature}", "");
+        parse_service_metadata(
+            xml.as_bytes(),
+            "urn:test:process",
+            "peppol-transport-as4-v2_0",
+            &SmpSignaturePolicy::AllowUnsigned,
+        )
+        .expect("closed networks may opt out");
+    }
+
+    const SIGNED_FIXTURE_TEMPLATE: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<ServiceMetadata xmlns="http://busdox.org/serviceMetadata/publishing/1.0/">
+  <ServiceInformation>
+    <ProcessList>
+      <Process>
+        <ProcessIdentifier scheme="cenbii-procid-ubl">urn:test:process</ProcessIdentifier>
+        <ServiceEndpointList>
+          <Endpoint transportProfile="peppol-transport-as4-v2_0">
+            <EndpointURI>https://ap.example.com/as4/receive</EndpointURI>
+          </Endpoint>
+        </ServiceEndpointList>
+      </Process>
+    </ProcessList>
+  </ServiceInformation>
+  {signature}
+</ServiceMetadata>"#;
 }

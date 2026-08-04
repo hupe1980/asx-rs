@@ -32,6 +32,42 @@ pub fn canonicalize_reference(
     canonicalize_reference_from_doc(&doc, uri, &profile)
 }
 
+/// Canonicalize the **whole document** for a `URI=""` reference, with the
+/// enveloped `ds:Signature` removed.
+///
+/// XMLDSig §4.3.3.2: an empty reference URI selects the entire document node
+/// (minus the comment nodes). Combined with the `enveloped-signature`
+/// transform, that is the shape every SMP `ServiceMetadata` response uses.
+pub fn canonicalize_enveloped_document(
+    doc: &Document<'_>,
+    profile: &WsSecCanonicalizationProfile,
+    signature: Node<'_, '_>,
+) -> Result<WsSecCanonicalizedReference> {
+    let mut out = String::new();
+    try_serialize_node_omitting(
+        doc.root(),
+        &mut out,
+        profile,
+        &EMPTY_NS_MAP,
+        None,
+        Some(signature),
+    )
+    .map_err(|_err| {
+        AsxError::new(
+            ErrorCode::SecurityVerificationFailed,
+            "failed to canonicalize enveloped document",
+            ErrorContext::new("wssec_canonicalize"),
+        )
+    })?;
+
+    let digest = Sha256::digest(out.as_bytes());
+    Ok(WsSecCanonicalizedReference {
+        uri: String::new(),
+        canonical_bytes: out.into_bytes(),
+        digest_value_base64: BASE64_STANDARD.encode(digest),
+    })
+}
+
 pub fn canonicalize_reference_from_doc(
     doc: &Document<'_>,
     uri: &str,
@@ -574,6 +610,36 @@ pub(crate) fn try_serialize_node_with_inclusive_ns(
     parent_ns: &BTreeMap<String, String>,
     inclusive_ns_prefixes_override: Option<&[String]>,
 ) -> std::fmt::Result {
+    try_serialize_node_omitting(
+        node,
+        out,
+        profile,
+        parent_ns,
+        inclusive_ns_prefixes_override,
+        None,
+    )
+}
+
+/// Serialize `node`, skipping `omit` and its subtree wherever it appears.
+///
+/// This is the XMLDSig `enveloped-signature` transform (§6.6.4): the
+/// `ds:Signature` element being verified is removed from the node-set before
+/// canonicalization, because it cannot contain its own digest. SMP
+/// `ServiceMetadata` responses use it together with a whole-document
+/// `URI=""` reference; AS4 never does.
+pub(crate) fn try_serialize_node_omitting(
+    node: Node<'_, '_>,
+    out: &mut impl std::fmt::Write,
+    profile: &WsSecCanonicalizationProfile,
+    parent_ns: &BTreeMap<String, String>,
+    inclusive_ns_prefixes_override: Option<&[String]>,
+    omit: Option<Node<'_, '_>>,
+) -> std::fmt::Result {
+    if let Some(omit) = omit
+        && node == omit
+    {
+        return Ok(());
+    }
     match node.node_type() {
         NodeType::Element => serialize_element(
             node,
@@ -581,12 +647,15 @@ pub(crate) fn try_serialize_node_with_inclusive_ns(
             profile,
             parent_ns,
             inclusive_ns_prefixes_override,
+            omit,
         ),
         NodeType::Text => {
+            // Every text node is emitted verbatim (modulo escaping), including
+            // whitespace-only nodes. Neither Canonical XML 1.0 nor Exclusive
+            // C14N removes whitespace — they differ only in namespace
+            // rendering. Stripping it here produced digests over an octet
+            // stream no conformant implementation computes.
             if let Some(text) = node.text() {
-                if profile.strip_blank_text && text.trim().is_empty() {
-                    return Ok(());
-                }
                 escape_text(text, out)?;
             }
             Ok(())
@@ -620,12 +689,13 @@ pub(crate) fn try_serialize_node_with_inclusive_ns(
         }
         NodeType::Root => {
             for child in node.children() {
-                try_serialize_node_with_inclusive_ns(
+                try_serialize_node_omitting(
                     child,
                     out,
                     profile,
                     parent_ns,
                     inclusive_ns_prefixes_override,
+                    omit,
                 )?;
             }
             Ok(())
@@ -639,6 +709,7 @@ fn serialize_element(
     profile: &WsSecCanonicalizationProfile,
     parent_ns: &BTreeMap<String, String>,
     inclusive_ns_prefixes_override: Option<&[String]>,
+    omit: Option<Node<'_, '_>>,
 ) -> std::fmt::Result {
     // Build URI → prefix map from all in-scope namespace declarations at this
     // node.  When multiple prefixes are bound to the same URI, one is kept
@@ -809,12 +880,13 @@ fn serialize_element(
     };
 
     for child in node.children() {
-        try_serialize_node_with_inclusive_ns(
+        try_serialize_node_omitting(
             child,
             out,
             profile,
             child_ns.as_ref(),
             inclusive_ns_prefixes_override,
+            omit,
         )?;
     }
 
@@ -924,7 +996,6 @@ mod w3c_c14n_vectors {
         WsSecCanonicalizationProfile {
             kind: WsSecCanonicalizationKind::Inclusive,
             include_comments: false,
-            strip_blank_text: false,
             inclusive_ns_prefixes: Vec::new(),
         }
     }
@@ -933,7 +1004,6 @@ mod w3c_c14n_vectors {
         WsSecCanonicalizationProfile {
             kind: WsSecCanonicalizationKind::Inclusive,
             include_comments: true,
-            strip_blank_text: false,
             inclusive_ns_prefixes: Vec::new(),
         }
     }
@@ -942,7 +1012,6 @@ mod w3c_c14n_vectors {
         WsSecCanonicalizationProfile {
             kind: WsSecCanonicalizationKind::Exclusive,
             include_comments: false,
-            strip_blank_text: false,
             inclusive_ns_prefixes: Vec::new(),
         }
     }

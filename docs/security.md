@@ -6,6 +6,31 @@
 2. **Explicit trust transitions** — trust is not implicit; it must be established at each cryptographic stage.
 3. **No silent bypasses** — signature verification results are always propagated; `let _ = verify(...)` is forbidden.
 4. **Algorithm agility with compliance first** — AS4 WS-Security runtime verification is strict-only (no legacy inbound fallback paths); any non-default compatibility behavior must be explicit and scoped through interop policy outside WS-Security cryptographic verification.
+5. **Security invariants are floors, not defaults** — a safe default that any configuration layer can silently overwrite is not an invariant. Where a policy layer is publicly mutable, the safe value is additionally pinned by a floor that validation enforces; see [Profile security floor](#profile-security-floor).
+
+---
+
+## Profile Security Floor
+
+`ProfileStack.overrides` and `ProfileStack.partner_overrides` are public `Vec`
+fields, so a single overlay can rewrite `SecurityPolicy` for one partner.
+`BaseProfile::security_floor` is the invariant that survives that.
+
+| Property | Behaviour |
+|---|---|
+| Default | `SecurityPolicy::SIGN_AND_ENCRYPT` — matches PEPPOL, CEF eDelivery and BDEW AS4-Profil v1.2 §2.2.6.2.2 |
+| Overridable by a layer | **No.** The floor lives on `BaseProfile` only, so no extension, global override, partner overlay, or regional pack can lower it |
+| Enforced by | `ProfileStack::validate()`, against the **resolved** policy of the deployment baseline and of every declared partner |
+| Enforced by a host mandate | `validate_with_floor(floor)` — takes the stronger of the host floor and the profile's, so it can only tighten |
+| Visible in audit | Recorded in `EffectivePolicySnapshot::security_floor`; `diff_effective_policy_snapshots` grades a **lowered** floor as `High` risk and blocks release even when the resolved policy is unchanged |
+
+A layer that weakens security while still clearing the floor is reported as a
+`ProfileLintCode::SecurityRelaxation` lint at `ProfileLintSeverity::Critical`;
+`ProfileValidationOptions::forbid_security_relaxation` escalates it to an error.
+
+**Interop mode is a separate axis.** Neither `InteropMode::Strict` nor the
+`interop-strict` feature implies a strict security policy — they govern header
+and ambiguity handling. Enforce the security axis with a floor.
 
 ---
 
@@ -112,7 +137,16 @@ ASX uses **AES-256-GCM** (authenticated encryption) for outbound AS4 encryption 
 
 ### Canonicalization (C14N)
 
-WS-Security signature computation uses XML Exclusive C14N (W3C `exc-c14n`). The implementation:
+WS-Security signature computation uses XML Exclusive C14N (W3C `exc-c14n`).
+
+> **Whitespace is signed.** Exclusive and Inclusive C14N differ *only* in
+> namespace rendering; neither removes whitespace-only text nodes. ASX has no
+> option to strip them — a `strip_blank_text` knob existed until 0.12.0 and made
+> every signature non-interoperable. Conformance is
+> now checked against xmlsec1, the XMLDSig reference implementation, by
+> `tests/interop_xmlsec_oracle.rs`.
+
+The implementation:
 - Correctly handles namespace propagation for visibly-utilized namespaces.
 - Forwards processing instruction nodes (`<?target data?>`).
 - Implements `InclusiveNamespaces PrefixList` per W3C Exc-C14N §2.1 — ancestor namespace bindings for listed prefixes are rendered even when not directly utilized at the element.
@@ -120,6 +154,25 @@ WS-Security signature computation uses XML Exclusive C14N (W3C `exc-c14n`). The 
 - Sorts attributes in lexicographic order (namespace URI, local name) as required by C14N.
 
 Validated against W3C C14N test vectors (namespace propagation, attribute ordering, text/attribute escaping, PI forwarding, comment stripping, comment preservation).
+
+### Payload attachment coverage
+
+The AS4 payload — the actual business document — travels as a detached MIME
+part, not inside the SOAP envelope. Signing `eb:Messaging` and the SOAP Body
+therefore proves nothing about it.
+
+On receive, when a signature is present, ASX requires the payload attachment to
+be covered by a verified `ds:Reference URI="cid:…"` matching the attachment's
+`Content-ID`. A message whose signature omits the attachment reference is
+rejected with `ErrorCode::SecurityVerificationFailed` — otherwise an
+intermediary could swap the payload without invalidating the signature.
+
+Two supporting rules make this enforceable:
+
+| Rule | Why |
+|---|---|
+| The SOAP body must carry an `xop:Include href="cid:…"` | Without a Content-ID there is nothing to match a `cid:` reference against, so coverage could never be proven. A multipart message without one is rejected as having no payload attachment. |
+| `href` is matched in both XML quoting styles | `href='cid:…'` is legal XML; matching only the double-quoted form left the attachment unidentified. |
 
 ### Signed scope and XML Signature Wrapping defence
 
@@ -271,10 +324,44 @@ These controls are mandatory complements to in-process zeroization when handling
 
 ---
 
+## SMP Discovery Verification
+
+`smp::SmpClient` resolves the AS4 endpoint URL and the recipient's certificate.
+TLS authenticates the SMP *host*, not the metadata it serves, so a rogue or
+compromised SMP could otherwise redirect traffic and substitute its own
+recipient certificate. Verify the response signature with
+`SmpSignaturePolicy::Verify`.
+
+| Control | Status |
+|---|---|
+| SMP URL SSRF validation + DNS pinning + no redirects | ✅ enforced |
+| `ds:Signature` **present** on the response | ✅ enforced by default (`SmpSignaturePolicy::RequireSignaturePresent`) |
+| `ds:Signature` **verifies** | ✅ with `SmpSignaturePolicy::Verify` |
+| SMP certificate chains to the network SMP CA | ✅ with `SmpSignaturePolicy::Verify` |
+
+```rust
+let config = SmpConfig {
+    signature_policy: SmpSignaturePolicy::verify_with_trust_anchors(vec![smp_ca_pem]),
+    ..SmpConfig::peppol_production()
+};
+```
+
+`SmpEndpoint::verified_signer_fingerprint_sha256` is `Some` only when the
+signature was actually verified — check it rather than assuming, since the
+other two policies leave it `None`. `SmpEndpoint::signed_document` still
+returns the exact response bytes for callers that want to verify independently.
+
+**Assurance note.** The enveloped whole-document path is newer than the AS4
+signing path and is not yet cross-validated against an independent
+implementation, so treat it accordingly.
+
+---
+
 ## Known Limitations
 
 | Limitation | Mitigation |
 |---|---|
+| SMP enveloped-signature path not yet cross-validated against another stack | Pin partner certificates out of band as defence in depth (see above) |
 | Custom XML Exclusive C14N implementation | Validated against W3C test vectors and interop compatibility matrix; not yet replaced by a vetted library |
 | In-memory dedup provides no replay protection across restarts | Use `TtlDedupStorage` with a distributed backend for production; document required 48h window per RFC 4130 §5.2.1 |
 | No TLS mutual authentication (mTLS) at the library level | Configure mTLS at the TLS terminator / reverse proxy layer |

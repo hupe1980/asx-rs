@@ -17,7 +17,7 @@ fn verify_wssec_gate(
     soap_doc: &Document<'_>,
     policy: &As4PushPolicy,
     message_id: &str,
-    external_reference: Option<(&str, &[u8])>,
+    external_references: &[(&str, &[u8])],
     verifier: &(dyn As4Verifier + Send + Sync),
 ) -> Result<payload::WsSecVerifiedGate> {
     verifier.verify_security(
@@ -26,18 +26,21 @@ fn verify_wssec_gate(
         xml,
         soap_doc,
         message_id,
-        external_reference,
+        external_references,
     )?;
     Ok(payload::WsSecVerifiedGate)
 }
 
-fn wssec_external_reference<'a>(
+/// `cid:` reference material for WS-Security verification: **every** payload
+/// attachment, so each one's digest can be checked and each one can be proven
+/// signature-covered.
+fn wssec_external_references<'a>(
     multipart: &'a Option<MultipartAs4Payload<'a>>,
-) -> Option<(&'a str, &'a [u8])> {
-    let multipart = multipart.as_ref()?;
-    let payload = multipart.payload_attachment?;
-    let cid = multipart.payload_content_id?;
-    Some((cid, payload))
+) -> Vec<(&'a str, &'a [u8])> {
+    multipart
+        .as_ref()
+        .map(MultipartAs4Payload::external_references)
+        .unwrap_or_default()
 }
 
 #[allow(clippy::type_complexity)]
@@ -71,7 +74,7 @@ pub(super) fn parse_verify_and_emit_receive_push_metadata<'a>(
 
     let xml = crate::core::bytes_to_utf8_str(soap_bytes, "as4_receive_push", session)?;
     let doc = parse_as4_user_message_document(xml, session)?;
-    let wssec_external_reference = wssec_external_reference(&multipart);
+    let wssec_external_references = wssec_external_references(&multipart);
 
     let parsed = parse_as4_user_message_from_doc(
         session,
@@ -86,9 +89,7 @@ pub(super) fn parse_verify_and_emit_receive_push_metadata<'a>(
         &doc,
         policy,
         &parsed.message_id,
-        wssec_external_reference
-            .as_ref()
-            .map(|(uri, payload)| (*uri, *payload)),
+        &wssec_external_references,
         verifier,
     )?;
 

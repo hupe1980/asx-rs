@@ -149,7 +149,7 @@ fn wssec_verifier_unsigned_path_requires_signature_when_missing() {
     let doc = Document::parse(xml).expect("document");
 
     let err = As4WsSecVerifier
-        .verify_security(&session, &policy, xml, &doc, "msg-registered", None)
+        .verify_security(&session, &policy, xml, &doc, "msg-registered", &[])
         .expect_err("unsigned strict receive should fail when signature is required");
 
     assert_eq!(err.code, ErrorCode::SecurityVerificationFailed);
@@ -259,7 +259,7 @@ impl As4Verifier for SlowVerifier {
         _soap_xml: &str,
         _soap_doc: &Document<'_>,
         message_id: &str,
-        _external_reference: Option<(&str, &[u8])>,
+        _external_references: &[(&str, &[u8])],
     ) -> Result<()> {
         if message_id == "msg-1" {
             std::thread::sleep(Duration::from_millis(120));

@@ -1280,11 +1280,62 @@ pub struct ParsedAs4Receipt {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct As4ReceivePushOutput {
+    /// Primary payload — the first `eb:PartInfo` attachment.
+    ///
+    /// The overwhelmingly common case is a single payload, so this stays a
+    /// direct field rather than an index into a collection. Messages carrying
+    /// more than one attachment expose the remainder in
+    /// [`Self::additional_payloads`]; use [`Self::payloads`] to iterate all of
+    /// them uniformly.
     pub payload: DomainReady<Arc<[u8]>>,
+    /// Content-ID the primary payload arrived under (no `cid:` prefix).
+    pub payload_content_id: String,
+    /// Attachments beyond the first, in `xop:Include` document order.
+    ///
+    /// Empty for a single-payload message. ebMS3 permits several `eb:PartInfo`
+    /// entries per `UserMessage`, and the eDelivery conformance payload
+    /// profiles exercise up to four; every one of them is signature-verified
+    /// and decrypted on the same terms as the primary.
+    pub additional_payloads: Vec<As4ReceivedPayload>,
     /// Parsed SBDH header when inbound business payload was SBDH-wrapped.
     pub sbdh_header: Option<SbdhHeader>,
     pub user_message: ParsedAs4UserMessage,
     pub receipt: Option<ParsedAs4Receipt>,
+}
+
+impl As4ReceivePushOutput {
+    /// Every payload in `eb:PartInfo` order, primary first.
+    pub fn payloads(&self) -> impl Iterator<Item = (&str, &DomainReady<Arc<[u8]>>)> {
+        std::iter::once((self.payload_content_id.as_str(), &self.payload)).chain(
+            self.additional_payloads
+                .iter()
+                .map(|p| (p.content_id.as_str(), &p.payload)),
+        )
+    }
+
+    /// Total attachment count, always at least 1.
+    pub fn payload_count(&self) -> usize {
+        1 + self.additional_payloads.len()
+    }
+
+    /// Look up a payload by Content-ID (`cid:` prefix optional).
+    pub fn payload_by_content_id(&self, content_id: &str) -> Option<&DomainReady<Arc<[u8]>>> {
+        let wanted = content_id
+            .strip_prefix("cid:")
+            .or_else(|| content_id.strip_prefix("CID:"))
+            .unwrap_or(content_id);
+        self.payloads()
+            .find(|(cid, _)| *cid == wanted)
+            .map(|(_, payload)| payload)
+    }
+}
+
+/// A non-primary payload attachment from a multi-payload AS4 message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct As4ReceivedPayload {
+    /// Content-ID the attachment arrived under (no `cid:` prefix).
+    pub content_id: String,
+    pub payload: DomainReady<Arc<[u8]>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1501,7 +1552,7 @@ impl As4ReceivedError {
 /// A counterparty `eb:SignalMessage` carrying one or more `eb:Error` entries.
 ///
 /// Returned by [`crate::as4::verify_sync_response`] as
-/// [`As4SyncSignal::Error`] when the remote MSH rejected the message instead
+/// [`As4SyncSignal::Error`](crate::as4::As4SyncSignal::Error) when the remote MSH rejected the message instead
 /// of acknowledging it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]

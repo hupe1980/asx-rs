@@ -7,6 +7,7 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 #[cfg(test)]
+#[cfg(all(test, feature = "as4"))]
 use super::WsSecSignatureMaterial;
 use super::canonicalize::{
     SameDocumentReferenceIndex, canonicalize_reference_digest_from_doc_with_inclusive_ns_and_index,
@@ -502,18 +503,28 @@ pub fn verify_enveloped_signature(xml: &str, opts: WsSecVerifyOptions<'_>) -> Re
     verify_enveloped_signature_with_parsed_signature_borrowed(&doc, xml, parsed, opts)
 }
 
-/// Outcome of a successful WS-Security signature verification: the set of
-/// same-document element `Id`s (`wsu:Id`/`xml:id`) whose digests were verified.
+/// Outcome of a successful WS-Security signature verification: everything the
+/// signature was actually proven to cover.
 ///
-/// The AS4 receive layer uses this to defend against XML Signature Wrapping:
-/// it requires that the `eb:Messaging` element it actually consumes is one of
-/// these signed ids, so an attacker cannot relocate the signed element and feed
-/// the parser an unsigned, injected one.
+/// The AS4 receive layer uses this twice:
+///
+/// - **XML Signature Wrapping** — it requires that the `eb:Messaging` element
+///   it consumes is one of [`Self::signed_same_document_ids`], so an attacker
+///   cannot relocate the signed element and feed the parser an unsigned,
+///   injected one.
+/// - **Attachment coverage** — it requires that the payload attachment it
+///   surfaces is one of [`Self::signed_cid_references`]. Without this, a
+///   signature covering only the header and body would let the payload — the
+///   actual business document — be swapped in transit while the signature
+///   still verified.
 #[cfg(feature = "as4")]
 #[derive(Debug, Clone)]
 pub(crate) struct VerifiedSignatureCoverage {
     /// `Id` values of same-document (`#...`) references that verified.
     pub signed_same_document_ids: Vec<String>,
+    /// Normalized Content-IDs of `cid:` references that verified (no `cid:`
+    /// scheme prefix, no angle brackets).
+    pub signed_cid_references: Vec<String>,
 }
 
 #[cfg(feature = "as4")]
@@ -533,20 +544,25 @@ pub(crate) fn verify_enveloped_signature_optional_with_doc(
         return Ok(None);
     };
 
-    // Collect the same-document reference ids *before* consuming `parsed`; these
-    // are only trustworthy once verification below succeeds.
-    let signed_same_document_ids: Vec<String> = parsed
-        .references
-        .iter()
-        .filter_map(|r| match r.parsed_uri {
-            ParsedReferenceUri::SameDocument { target_id } => Some(target_id.to_string()),
-            ParsedReferenceUri::Cid { .. } => None,
-        })
-        .collect();
+    // Collect the reference targets *before* consuming `parsed`; these are only
+    // trustworthy once verification below succeeds.
+    let mut signed_same_document_ids = Vec::new();
+    let mut signed_cid_references = Vec::new();
+    for reference in &parsed.references {
+        match reference.parsed_uri {
+            ParsedReferenceUri::SameDocument { target_id } => {
+                signed_same_document_ids.push(target_id.to_string());
+            }
+            ParsedReferenceUri::Cid { normalized } => {
+                signed_cid_references.push(normalized.to_string());
+            }
+        }
+    }
 
     verify_enveloped_signature_with_parsed_signature_borrowed(doc, xml, parsed, opts)?;
     Ok(Some(VerifiedSignatureCoverage {
         signed_same_document_ids,
+        signed_cid_references,
     }))
 }
 
@@ -772,9 +788,6 @@ fn profile_with_c14n_kind(
 ) -> WsSecCanonicalizationProfile {
     let mut updated = profile.clone();
     updated.kind = kind;
-    if kind == WsSecCanonicalizationKind::Inclusive {
-        updated.strip_blank_text = false;
-    }
     updated
 }
 
@@ -1196,7 +1209,7 @@ fn verify_signature_value_with_components(
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "as4"))]
 pub(crate) fn parse_signature_material(
     xml: &str,
     profile: WsSecCanonicalizationProfile,
@@ -1281,11 +1294,74 @@ fn parse_signature_material_components_from_signature<'a>(
     parse_signature_material_components_from_signature_with_signed_info(doc, signature, signed_info)
 }
 
+/// Exclusive XML Canonicalization 1.0, with and without comments.
+const EXC_C14N_URI: &str = "http://www.w3.org/2001/10/xml-exc-c14n#";
+const EXC_C14N_WITH_COMMENTS_URI: &str = "http://www.w3.org/2001/10/xml-exc-c14n#WithComments";
+
+/// Require `ds:SignedInfo/ds:CanonicalizationMethod` to declare Exclusive C14N.
+///
+/// Verification canonicalizes `SignedInfo` with the exclusive profile
+/// unconditionally, which every AS4 profile (PEPPOL, CEF eDelivery, BDEW)
+/// mandates. Previously the declared algorithm was simply never read: a
+/// signature declaring Inclusive C14N was canonicalized as exclusive anyway and
+/// failed later with an opaque "signature value mismatch", which sends the
+/// operator hunting for a key problem that does not exist.
+///
+/// This is fail-closed either way — the point is to reject the mismatch at the
+/// place that can name it. Comment-preserving exclusive C14N is also rejected:
+/// the canonicalizer strips comments, so accepting the `WithComments` URI would
+/// mean verifying under a different algorithm than the one declared.
+fn enforce_signed_info_canonicalization_method(signed_info: roxmltree::Node<'_, '_>) -> Result<()> {
+    let method = signed_info
+        .children()
+        .find(|n| n.is_element() && is_ds_element(*n, "CanonicalizationMethod"))
+        .ok_or_else(|| {
+            AsxError::new(
+                ErrorCode::ParseFailed,
+                "ds:SignedInfo missing ds:CanonicalizationMethod",
+                ErrorContext::new("wssec_signature_material"),
+            )
+        })?;
+
+    let algorithm = method
+        .attribute("Algorithm")
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            AsxError::new(
+                ErrorCode::ParseFailed,
+                "ds:CanonicalizationMethod missing Algorithm attribute",
+                ErrorContext::new("wssec_signature_material"),
+            )
+        })?;
+
+    if algorithm == EXC_C14N_URI {
+        return Ok(());
+    }
+
+    let detail = if algorithm == EXC_C14N_WITH_COMMENTS_URI {
+        "comment-preserving canonicalization is not supported"
+    } else {
+        "only Exclusive XML Canonicalization 1.0 is supported"
+    };
+
+    Err(AsxError::new(
+        ErrorCode::InteropViolation,
+        format!(
+            "unsupported ds:CanonicalizationMethod Algorithm \"{algorithm}\": {detail} \
+             (expected \"{EXC_C14N_URI}\", as required by the AS4 profiles)"
+        ),
+        ErrorContext::new("wssec_signature_material").with_message_id(algorithm.to_string()),
+    ))
+}
+
 fn parse_signature_material_components_from_signature_with_signed_info<'a>(
     doc: &'a Document<'a>,
     signature: roxmltree::Node<'a, 'a>,
     signed_info: roxmltree::Node<'a, 'a>,
 ) -> Result<ParsedWsSecSignatureMaterialBorrowed<'a>> {
+    enforce_signed_info_canonicalization_method(signed_info)?;
+
     let signature_method_algorithm = signed_info
         .children()
         .find(|n| n.is_element() && is_ds_element(*n, "SignatureMethod"))
@@ -2104,4 +2180,271 @@ mod tests {
         verify_enveloped_signature(&dual_signed, WsSecVerifyOptions::new())
             .expect("dual-signed SOAP must verify against primary wsse:Security signature");
     }
+
+    /// `ds:CanonicalizationMethod` used to be written on send and never read on
+    /// verify. Verification always canonicalizes `SignedInfo` as exclusive
+    /// C14N, so a signature declaring anything else failed later with an opaque
+    /// "signature value mismatch". Reject it where it can be named.
+    mod canonicalization_method {
+        use super::super::enforce_signed_info_canonicalization_method;
+        use crate::core::ErrorCode;
+
+        fn signed_info(inner: &str) -> roxmltree::Document<'_> {
+            roxmltree::Document::parse(inner).expect("fixture parses")
+        }
+
+        fn check(algorithm_attr: &str) -> crate::core::Result<()> {
+            let xml = format!(
+                r#"<ds:SignedInfo xmlns:ds="http://www.w3.org/2000/09/xmldsig#">{algorithm_attr}</ds:SignedInfo>"#
+            );
+            let doc = signed_info(&xml);
+            enforce_signed_info_canonicalization_method(doc.root_element())
+        }
+
+        #[test]
+        fn exclusive_c14n_is_accepted() {
+            check(r#"<ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>"#)
+                .expect("exclusive c14n is the AS4-mandated algorithm");
+        }
+
+        #[test]
+        fn inclusive_c14n_is_rejected_by_name() {
+            let err = check(
+                r#"<ds:CanonicalizationMethod Algorithm="http://www.w3.org/TR/2001/REC-xml-c14n-20010315"/>"#,
+            )
+            .expect_err("inclusive c14n must be rejected");
+            assert_eq!(err.code, ErrorCode::InteropViolation);
+            assert!(err.message.contains("Exclusive"), "{}", err.message);
+        }
+
+        #[test]
+        fn comment_preserving_exclusive_c14n_is_rejected() {
+            // The canonicalizer strips comments, so accepting this URI would
+            // verify under a different algorithm than the one declared.
+            let err = check(
+                r#"<ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#WithComments"/>"#,
+            )
+            .expect_err("WithComments must be rejected");
+            assert_eq!(err.code, ErrorCode::InteropViolation);
+            assert!(err.message.contains("comment"), "{}", err.message);
+        }
+
+        #[test]
+        fn missing_or_empty_algorithm_is_rejected() {
+            // XMLDSig schema: SignedInfo is (CanonicalizationMethod, SignatureMethod, Reference+).
+            assert_eq!(
+                check("").expect_err("absent element").code,
+                ErrorCode::ParseFailed
+            );
+            assert_eq!(
+                check(r#"<ds:CanonicalizationMethod/>"#)
+                    .expect_err("absent attribute")
+                    .code,
+                ErrorCode::ParseFailed
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Enveloped whole-document signatures (SMP `ServiceMetadata`)
+// ---------------------------------------------------------------------------
+
+/// XMLDSig enveloped-signature transform.
+pub const ENVELOPED_SIGNATURE_URI: &str = "http://www.w3.org/2000/09/xmldsig#enveloped-signature";
+
+/// Outcome of a successful [`verify_enveloped_document_signature`].
+#[derive(Debug, Clone)]
+pub struct VerifiedEnvelopedSignature {
+    /// SHA-256 fingerprint (lowercase hex) of the signing certificate.
+    pub signer_fingerprint_sha256: String,
+    /// DER of the signing certificate, as carried in `ds:KeyInfo/ds:X509Data`.
+    pub signer_certificate_der: Vec<u8>,
+}
+
+/// Verify an **enveloped, whole-document** XML signature.
+///
+/// This is the shape used by SMP `ServiceMetadata` responses (and XML documents
+/// generally): a single `ds:Signature` inside the document it signs, with one
+/// `ds:Reference URI=""` covering the whole document and an
+/// `enveloped-signature` transform removing the signature element itself.
+///
+/// AS4/WS-Security never uses this form — it references specific elements by
+/// `wsu:Id` — which is why it lives beside, rather than inside,
+/// [`verify_enveloped_signature`].
+///
+/// The signing certificate is chain-validated against `revocation_policy`, so
+/// callers must supply the network's SMP CA as a trust anchor. Passing an empty
+/// anchor set with `require_chain_validation` fails closed.
+///
+/// # Errors
+///
+/// - [`ErrorCode::SecurityVerificationFailed`] — no signature, digest
+///   mismatch, bad signature value, or an untrusted certificate.
+/// - [`ErrorCode::InteropViolation`] — a reference shape this function does not
+///   implement (non-empty `URI`, missing enveloped-signature transform).
+pub fn verify_enveloped_document_signature(
+    xml: &str,
+    expected_cert_fingerprint_sha256: Option<&str>,
+    revocation_policy: &RevocationPolicy<'_>,
+) -> Result<VerifiedEnvelopedSignature> {
+    let doc = parse_wssec_document(
+        xml,
+        "wssec_verify_enveloped",
+        "failed to parse XML for enveloped signature verification",
+    )?;
+    enforce_wssec_document_limits(
+        xml,
+        &doc,
+        "wssec_verify_enveloped",
+        "failed to parse XML for enveloped signature verification",
+    )?;
+
+    let signature =
+        find_single_signature_node(&doc, "wssec_verify_enveloped")?.ok_or_else(|| {
+            AsxError::new(
+                ErrorCode::SecurityVerificationFailed,
+                "document carries no ds:Signature",
+                ErrorContext::new("wssec_verify_enveloped"),
+            )
+        })?;
+
+    let signed_info = signature
+        .children()
+        .find(|n| n.is_element() && is_ds_element(*n, "SignedInfo"))
+        .ok_or_else(|| {
+            AsxError::new(
+                ErrorCode::ParseFailed,
+                "ds:Signature missing ds:SignedInfo",
+                ErrorContext::new("wssec_verify_enveloped"),
+            )
+        })?;
+
+    let material = parse_signature_material_components_from_signature_with_signed_info(
+        &doc,
+        signature,
+        signed_info,
+    )?;
+
+    // Digest every reference before touching the signature value.
+    let mut reference_count = 0usize;
+    for reference in signed_info
+        .children()
+        .filter(|n| n.is_element() && is_ds_element(*n, "Reference"))
+    {
+        reference_count += 1;
+        verify_enveloped_reference(&doc, signature, reference)?;
+    }
+
+    if reference_count == 0 {
+        return Err(AsxError::new(
+            ErrorCode::ParseFailed,
+            "ds:SignedInfo contains no ds:Reference",
+            ErrorContext::new("wssec_verify_enveloped"),
+        ));
+    }
+
+    let signer_certificate_der =
+        material
+            .x509_certificates_der
+            .first()
+            .cloned()
+            .ok_or_else(|| {
+                AsxError::new(
+                    ErrorCode::SecurityVerificationFailed,
+                    "ds:KeyInfo must carry ds:X509Data/ds:X509Certificate so the signer can be \
+                 chained to a trust anchor",
+                    ErrorContext::new("wssec_verify_enveloped"),
+                )
+            })?;
+
+    verify_signature_value_with_components(
+        material,
+        WsSecCanonicalizationProfile::default(),
+        expected_cert_fingerprint_sha256,
+        revocation_policy,
+    )?;
+
+    Ok(VerifiedEnvelopedSignature {
+        signer_fingerprint_sha256: super::x509::sha256_hex_lower(&signer_certificate_der),
+        signer_certificate_der,
+    })
+}
+
+/// Check one `URI=""` + enveloped-signature reference.
+fn verify_enveloped_reference(
+    doc: &Document<'_>,
+    signature: roxmltree::Node<'_, '_>,
+    reference: roxmltree::Node<'_, '_>,
+) -> Result<()> {
+    let uri = reference.attribute("URI").unwrap_or("");
+    if !uri.is_empty() {
+        return Err(AsxError::new(
+            ErrorCode::InteropViolation,
+            format!(
+                "enveloped document signatures support only the whole-document \
+                 reference URI=\"\", got \"{uri}\""
+            ),
+            ErrorContext::new("wssec_verify_enveloped").with_message_id(uri.to_string()),
+        ));
+    }
+
+    let mut saw_enveloped = false;
+    let mut c14n_kind = WsSecCanonicalizationKind::Exclusive;
+    if let Some(transforms) = reference
+        .children()
+        .find(|n| n.is_element() && is_ds_element(*n, "Transforms"))
+    {
+        for transform in transforms
+            .children()
+            .filter(|n| n.is_element() && is_ds_element(*n, "Transform"))
+        {
+            match transform.attribute("Algorithm").unwrap_or("") {
+                ENVELOPED_SIGNATURE_URI => saw_enveloped = true,
+                XML_EXC_C14N_URI => c14n_kind = WsSecCanonicalizationKind::Exclusive,
+                XML_INC_C14N_URI => c14n_kind = WsSecCanonicalizationKind::Inclusive,
+                other => {
+                    return Err(AsxError::new(
+                        ErrorCode::InteropViolation,
+                        format!(
+                            "unsupported ds:Transform Algorithm \"{other}\" on a URI=\"\" reference"
+                        ),
+                        ErrorContext::new("wssec_verify_enveloped"),
+                    ));
+                }
+            }
+        }
+    }
+
+    if !saw_enveloped {
+        // Without it the signature would have to contain its own digest.
+        return Err(AsxError::new(
+            ErrorCode::InteropViolation,
+            format!("a URI=\"\" reference must declare the {ENVELOPED_SIGNATURE_URI} transform"),
+            ErrorContext::new("wssec_verify_enveloped"),
+        ));
+    }
+
+    let expected = reference
+        .children()
+        .find(|n| n.is_element() && is_ds_element(*n, "DigestValue"))
+        .and_then(|n| n.text())
+        .map(str::trim)
+        .unwrap_or_default();
+
+    let profile = WsSecCanonicalizationProfile {
+        kind: c14n_kind,
+        ..WsSecCanonicalizationProfile::default()
+    };
+    let actual = super::canonicalize::canonicalize_enveloped_document(doc, &profile, signature)?;
+
+    if !super::x509::secure_eq(actual.digest_value_base64.as_bytes(), expected.as_bytes()) {
+        return Err(AsxError::new(
+            ErrorCode::SecurityVerificationFailed,
+            "enveloped document digest mismatch: the document was modified after signing",
+            ErrorContext::new("wssec_verify_enveloped"),
+        ));
+    }
+
+    Ok(())
 }

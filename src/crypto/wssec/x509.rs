@@ -472,7 +472,7 @@ pub(crate) fn sha256_hex_lower(input: &[u8]) -> String {
     out
 }
 
-fn secure_eq(a: &[u8], b: &[u8]) -> bool {
+pub(crate) fn secure_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }

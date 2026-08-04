@@ -322,7 +322,7 @@ impl As4NonRepudiation {
 /// and `Content-Type` returned by the counterparty — bare
 /// `application/soap+xml` or `multipart/related` are both accepted.
 ///
-/// See the [module documentation](self) for the full list of checks. Returns
+/// See the `as4::receipt_verify` module documentation for the full list of checks. Returns
 /// [`As4SyncSignal::Error`] — not `Err` — when the counterparty replied with a
 /// well-formed `eb:Error`; call [`As4SyncSignal::into_receipt`] to collapse
 /// that into an error when the distinction does not matter.

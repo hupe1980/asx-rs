@@ -528,7 +528,7 @@ impl AsxError {
     /// }
     /// ```
     ///
-    /// **Prefer [`asx_rs::as4::As4ReceiveOutcome`] over this method** — the discriminated
+    /// **Prefer [`As4ReceiveOutcome`](crate::as4::As4ReceiveOutcome) over this method** — the discriminated
     /// outcome enum is the primary API for duplicate detection on the receive path.
     /// This method is provided for error-path scenarios (e.g., when a storage backend
     /// fails-closed and propagates a duplicate as an error rather than an outcome).
@@ -568,9 +568,36 @@ impl fmt::Display for AsxError {
 
 impl std::error::Error for AsxError {}
 
+/// How tolerant the protocol layers are of header ambiguity and non-conformant
+/// partner behaviour.
+///
+/// # This does not govern message security
+///
+/// Neither this enum nor the `interop-strict` Cargo feature has any bearing on
+/// whether messages must be signed or encrypted. The name invites the opposite
+/// inference, so to be explicit:
+///
+/// | Axis | Controlled by | Governs |
+/// |---|---|---|
+/// | Interop | `InteropMode` / `interop-strict` | Header parsing, ambiguity tolerance, scoped exception guardrails |
+/// | Security | [`SecurityPolicy`] / [`BaseProfile::security_floor`] | Whether signature and encryption are required |
+///
+/// A profile can be [`InteropMode::Strict`] and still resolve to
+/// `require_encryption: false`; conversely a relaxed profile can mandate
+/// sign-and-encrypt. Enforce the security axis with
+/// [`ProfileStack::validate_with_floor`], not by selecting a strict mode.
+///
+/// [`SecurityPolicy`]: crate::interop::SecurityPolicy
+/// [`BaseProfile::security_floor`]: crate::interop::BaseProfile::security_floor
+/// [`ProfileStack::validate_with_floor`]: crate::interop::ProfileStack::validate_with_floor
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum InteropMode {
+    /// Strict interoperability mode — RFC/spec behaviour enforced at every
+    /// decision point.
+    ///
+    /// Strict here means *strict about the wire format*. It says nothing about
+    /// the security policy; see the type-level documentation.
     #[default]
     Strict,
     /// Relaxed interoperability mode — permits deviations from strict AS2/AS4
@@ -583,7 +610,7 @@ pub enum InteropMode {
     ///
     /// ```toml
     /// [dependencies]
-    /// asx-rs = { version = "0.11", features = ["interop-relaxed"] }
+    /// asx-rs = { version = "0.12", features = ["interop-relaxed"] }
     /// ```
     #[cfg(feature = "interop-relaxed")]
     Relaxed,
@@ -1788,11 +1815,11 @@ impl SessionContext {
     /// carries the upstream trace identifier.
     ///
     /// Typically called by the embedder's HTTP handler after parsing the
-    /// inbound request with [`parse_as2_ingress_request`] or
-    /// [`parse_as4_ingress_request`]:
+    /// inbound request with [`as2_ingress_from_http`] or
+    /// [`as4_ingress_from_http`]:
     ///
     /// ```rust,ignore
-    /// let ingress = parse_as4_ingress_request(&http_request)?;
+    /// let ingress = as4_ingress_from_http(http_request)?;
     /// let session = SessionContext::new("s1", "partner", "strict")?
     ///     .with_incoming_traceparent(ingress.traceparent.as_deref());
     /// ```
@@ -1802,8 +1829,8 @@ impl SessionContext {
     /// value).
     ///
     /// [`ScopedAsxEvent`]: crate::observability::ScopedAsxEvent
-    /// [`parse_as2_ingress_request`]: crate::transport::ingress::parse_as2_ingress_request
-    /// [`parse_as4_ingress_request`]: crate::transport::ingress::parse_as4_ingress_request
+    /// [`as2_ingress_from_http`]: crate::transport::ingress::as2_ingress_from_http
+    /// [`as4_ingress_from_http`]: crate::transport::ingress::as4_ingress_from_http
     pub fn with_incoming_traceparent(mut self, traceparent: Option<&str>) -> Self {
         if let Some(tp) = traceparent {
             self.correlation_scope.traceparent = Some(Arc::from(tp));

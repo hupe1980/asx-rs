@@ -172,7 +172,7 @@ pub fn verify_smime_signed_payload(
     // from being used during chain building.  OpenSSL will only use the explicitly
     // supplied `certs` stack and the configured `store` to construct the path.
     // This closes the embedded-certificate-chain influence attack described in
-    // FINDINGS.md §5 (MEDIUM).  The explicit `certs` stack (built from
+    // the project changelog §5 (MEDIUM).  The explicit `certs` stack (built from
     // `intermediate_ca_pems`) must include any intermediate CAs required to
     // complete the path to a configured trust anchor.
     let verify_flags = Pkcs7Flags::NOINTERN;
@@ -863,7 +863,7 @@ pub fn decrypt_smime_enveloped_payload(
 
 /// Symmetric cipher used for S/MIME (CMS EnvelopedData) encryption.
 ///
-/// The cipher is negotiated per partner via [`crate::As2SendPolicy::encryption_cipher`].
+/// The cipher is negotiated per partner via [`crate::as2::As2SendPolicy::encryption_cipher`].
 /// `Aes256Cbc` is the default and is required in strict interop mode.
 ///
 /// **Security guidance:**

@@ -7,7 +7,7 @@
 //!
 //! | Type | Backing | Use case |
 //! |------|---------|----------|
-//! | [`PemSigningKeyProvider`] | In-memory PEM | Development, testing, simple deployments |
+//! | [`PemSigningKeyProvider`](crate::crypto::signing::PemSigningKeyProvider) | In-memory PEM | Development, testing, simple deployments |
 //! | `HsmSigningKeyProvider` *(user-supplied)* | PKCS#11 slot | PCI-DSS / HIPAA / eIDAS regulated |
 //! | `KmsSigningKeyProvider` *(user-supplied)* | AWS/GCP/Azure KMS | Cloud-native deployments |
 //!

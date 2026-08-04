@@ -1,12 +1,14 @@
 [package]
 name = "asx-rs"
-version = "0.11.1"
+version = "0.12.0"
 edition = "2024"
 authors = ["hupe1980"]
 description = "AS2 and AS4 B2B messaging library for Rust — signing, encryption, MDN, and ebMS3/AS4 profile support"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/hupe1980/asx"
 readme = "README.md"
+# Internal review artefacts — never published to crates.io or docs.rs.
+exclude = ["FINDINGS.md", "REVIEW.md", "artifacts/", "scripts/", "benches/"]
 
 [workspace]
 members = ["xtask"]
@@ -71,6 +73,9 @@ proptest = "1"
 tower = { version = "0.5", features = ["util"] }
 criterion = { version = "0.5", features = ["html_reports"] }
 opentelemetry-sdk = { package = "opentelemetry_sdk", version = "0.32", default-features = false, features = ["metrics"] }
+# Docker-backed interop oracle (`tests/interop_xmlsec_oracle.rs`). Those tests
+# are `#[ignore]`d, so a normal `cargo test` never starts a container.
+testcontainers = { version = "0.27", features = ["blocking"] }
 
 [[bench]]
 name = "as4_streaming_vs_buffer"

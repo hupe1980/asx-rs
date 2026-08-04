@@ -754,7 +754,7 @@ impl As4HttpTransport {
     /// Returns [`ErrorCode::TransportFailure`] when the counterparty answered
     /// with a non-2xx status and no parseable `eb:SignalMessage` — a non-2xx
     /// response that *does* carry an `eb:Error` signal is returned as
-    /// [`As4SyncSignal::Error`] instead, since the ebMS3 diagnostics are more
+    /// [`As4SyncSignal::Error`](crate::as4::As4SyncSignal::Error) instead, since the ebMS3 diagnostics are more
     /// actionable than the HTTP status.  All verification failures surface with
     /// the codes documented on [`crate::as4::verify_sync_response`].
     pub async fn send_and_verify(

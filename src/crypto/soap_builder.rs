@@ -480,7 +480,7 @@ impl WsSecurityHeaderBuilder {
     /// `ValueType="...#X509PKIPathv1"` carrying a DER-encoded PKIPath
     /// (`SEQUENCE { Certificate }`).
     ///
-    /// Used together with [`WsSecOutboundKeyInfoProfile::X509PKIPathv1`] so
+    /// Used together with [`WsSecOutboundKeyInfoProfile::X509PKIPathv1`](crate::crypto::wssec::WsSecOutboundKeyInfoProfile::X509PKIPathv1) so
     /// that the `ds:KeyInfo` `<wsse:SecurityTokenReference>` in the signature
     /// references this BST by `wsu:Id="X509PKIPathToken"`.
     ///

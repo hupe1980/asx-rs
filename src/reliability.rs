@@ -92,7 +92,7 @@ impl Eq for ReconciliationRequest {}
 impl ReconciliationRequest {
     /// Create a new `Indeterminate` request with validated IDs.
     ///
-    /// Returns `Err` with [`ErrorCode::InvalidInput`] if either ID is empty.
+    /// Returns `Err` with [`ErrorCode::InvalidInput`](crate::core::ErrorCode::InvalidInput) if either ID is empty.
     pub fn new_indeterminate(
         message_id: impl Into<String>,
         partner_id: impl Into<String>,
@@ -127,7 +127,7 @@ impl ReconciliationRequest {
 
     /// Create a new `PendingVerification` request with validated IDs.
     ///
-    /// Returns `Err` with [`ErrorCode::InvalidInput`] if either ID is empty.
+    /// Returns `Err` with [`ErrorCode::InvalidInput`](crate::core::ErrorCode::InvalidInput) if either ID is empty.
     pub fn new_pending_verification(
         message_id: impl Into<String>,
         partner_id: impl Into<String>,
@@ -560,7 +560,7 @@ impl RetryScheduler {
         Self { config }
     }
 
-    /// Compute the sleep [`Duration`](std::time::Duration) before retry
+    /// Compute the sleep [`std::time::Duration`] before retry
     /// `attempt` (0-indexed relative to the first retry).
     ///
     /// Returns `None` when `attempt >= config.max_attempts`, i.e. all retries

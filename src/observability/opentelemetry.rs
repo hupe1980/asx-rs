@@ -1,7 +1,7 @@
 //! OpenTelemetry (OTLP) [`MetricsSink`] bridge.
 //!
 //! Connects the ASX [`MetricsSink`] trait to an OpenTelemetry
-//! [`opentelemetry::metrics::Meter`], enabling metrics to be exported
+//! `opentelemetry::metrics::Meter`, enabling metrics to be exported
 //! via any configured OTLP exporter (Prometheus scrape, OTLP/gRPC,
 //! OTLP/HTTP, cloud vendor SDKs, etc.).
 //!

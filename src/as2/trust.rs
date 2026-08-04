@@ -74,9 +74,13 @@ impl TrustResult {
 /// except when the `testing` Cargo feature is enabled.  In production builds
 /// the only valid implementation is [`CmsSmimeTrustVerifier`].
 ///
-/// Enabling `testing` unlocks [`InsecureBypassTrustVerifier`] for use in
-/// integration tests.  Never enable the `testing` feature in production
-/// binaries.
+/// Unlike the AS4 side, there is **no downstream-visible bypass verifier for
+/// AS2**: `InsecureBypassTrustVerifier` is `#[cfg(test)]`, so it exists only
+/// inside this crate's own test builds and is not reachable from a dependent
+/// crate even with `testing` enabled. Downstream integration tests should
+/// implement [`As2TrustVerifier`] against a local fixture, which the `testing`
+/// feature permits via [`TrustVerifierSeal`](crate::as2::TrustVerifierSeal).
+/// Never enable the `testing` feature in production binaries.
 pub trait As2TrustVerifier: private::Sealed {
     fn verify_and_decrypt(
         &self,

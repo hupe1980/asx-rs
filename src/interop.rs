@@ -1,3 +1,5 @@
+use std::fmt;
+
 use crate::core::{AsxError, ErrorCode, ErrorContext, InteropMode, Result, SessionContext};
 use serde::{Deserialize, Serialize};
 
@@ -16,7 +18,6 @@ pub enum WsSecCanonicalizationKind {
 pub struct WsSecCanonicalizationProfile {
     pub kind: WsSecCanonicalizationKind,
     pub include_comments: bool,
-    pub strip_blank_text: bool,
     pub inclusive_ns_prefixes: Vec<String>,
 }
 
@@ -26,7 +27,6 @@ impl Default for WsSecCanonicalizationProfile {
         Self {
             kind: WsSecCanonicalizationKind::Exclusive,
             include_comments: false,
-            strip_blank_text: true,
             inclusive_ns_prefixes: Vec::new(),
         }
     }
@@ -47,18 +47,182 @@ impl Default for CanonicalizationPolicy {
     }
 }
 
+/// One of the two message-level protections a [`SecurityPolicy`] can require.
+///
+/// Used to name *which* requirement a layer dropped, so that validation
+/// diagnostics can say `require_encryption` rather than dumping two booleans.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum SecurityRequirement {
+    /// WS-Security XML Signature (AS4) / CMS signature (AS2).
+    Signature,
+    /// XML Encryption (AS4) / CMS enveloped-data (AS2).
+    Encryption,
+}
+
+impl SecurityRequirement {
+    /// Field name of this requirement on [`SecurityPolicy`].
+    ///
+    /// Chosen to match the struct field exactly so operators can grep a
+    /// validation message straight into their profile configuration.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Signature => "require_signature",
+            Self::Encryption => "require_encryption",
+        }
+    }
+
+    /// Both requirements, in declaration order.
+    pub const ALL: [Self; 2] = [Self::Signature, Self::Encryption];
+}
+
+impl fmt::Display for SecurityRequirement {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Message-level protections a profile layer requires.
+///
+/// # This is independent of [`InteropMode`]
+///
+/// Neither the `interop-strict` Cargo feature nor [`InteropMode::Strict`]
+/// implies a strict *security* policy. Interop mode governs header handling and
+/// ambiguity tolerance; `SecurityPolicy` governs whether messages must be signed
+/// and encrypted. A profile can be `InteropMode::Strict` and still resolve to
+/// `require_encryption: false` — the two axes never constrain each other.
+///
+/// What does constrain the security axis is the profile's
+/// [security floor](BaseProfile::security_floor), which
+/// [`ProfileStack::validate`] enforces against every resolved layer.
+///
+/// # Lattice ordering
+///
+/// A policy is *stronger* than another when it requires everything the other
+/// requires and possibly more. [`Self::satisfies`] is that partial order,
+/// [`Self::strengthen`] its join, and [`Self::weaken`] its meet. Both defaults
+/// are `true`, so the fail-closed policy is also the strongest one.
+///
+/// ```
+/// use asx_rs::interop::{SecurityPolicy, SecurityRequirement};
+///
+/// let floor = SecurityPolicy::SIGN_AND_ENCRYPT;
+/// let partner = SecurityPolicy::SIGN_ONLY;
+///
+/// assert!(!partner.satisfies(floor));
+/// assert_eq!(floor.unmet_by(partner), vec![SecurityRequirement::Encryption]);
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SecurityPolicy {
     pub require_signature: bool,
     pub require_encryption: bool,
 }
 
+impl SecurityPolicy {
+    /// Sign *and* encrypt — the fail-closed policy, and what
+    /// [`Default::default`] yields.
+    ///
+    /// Mandated by PEPPOL, CEF eDelivery and BDEW AS4-Profil v1.2 §2.2.6.2.2,
+    /// so it is also the default [security floor](BaseProfile::security_floor).
+    pub const SIGN_AND_ENCRYPT: Self = Self {
+        require_signature: true,
+        require_encryption: true,
+    };
+
+    /// Signature required, encryption optional.
+    pub const SIGN_ONLY: Self = Self {
+        require_signature: true,
+        require_encryption: false,
+    };
+
+    /// Encryption required, signature optional.
+    pub const ENCRYPT_ONLY: Self = Self {
+        require_signature: false,
+        require_encryption: true,
+    };
+
+    /// Neither protection required.
+    ///
+    /// Only meaningful as a *floor* (meaning "impose nothing beyond the
+    /// per-layer checks"). As an effective policy it is rejected by
+    /// [`ProfileStack::validate`] with
+    /// [`ProfileValidationCode::NoCriticalSecurityInvariant`].
+    pub const UNCONSTRAINED: Self = Self {
+        require_signature: false,
+        require_encryption: false,
+    };
+
+    /// Whether this policy requires `requirement`.
+    pub fn requires(self, requirement: SecurityRequirement) -> bool {
+        match requirement {
+            SecurityRequirement::Signature => self.require_signature,
+            SecurityRequirement::Encryption => self.require_encryption,
+        }
+    }
+
+    /// Whether this policy is at least as strong as `floor`.
+    pub fn satisfies(self, floor: Self) -> bool {
+        self.unmet_by_is_empty(floor)
+    }
+
+    fn unmet_by_is_empty(self, floor: Self) -> bool {
+        SecurityRequirement::ALL
+            .iter()
+            .all(|&req| !floor.requires(req) || self.requires(req))
+    }
+
+    /// Requirements that `self` (as a floor) demands but `candidate` does not
+    /// provide, in declaration order.
+    ///
+    /// Empty exactly when `candidate.satisfies(self)`.
+    pub fn unmet_by(self, candidate: Self) -> Vec<SecurityRequirement> {
+        SecurityRequirement::ALL
+            .into_iter()
+            .filter(|&req| self.requires(req) && !candidate.requires(req))
+            .collect()
+    }
+
+    /// Requirements that `self` demands but `next` drops — the monotonicity
+    /// violations of a `self -> next` transition, in declaration order.
+    ///
+    /// Empty exactly when `next` is at least as strong as `self`.
+    pub fn relaxations_to(self, next: Self) -> Vec<SecurityRequirement> {
+        self.unmet_by(next)
+    }
+
+    /// Lattice join: require everything either policy requires.
+    ///
+    /// Used to combine a [`BaseProfile::security_floor`] with a
+    /// deployment-imposed floor from [`ProfileValidationOptions`] — the
+    /// stricter of the two wins per requirement.
+    pub fn strengthen(self, other: Self) -> Self {
+        Self {
+            require_signature: self.require_signature || other.require_signature,
+            require_encryption: self.require_encryption || other.require_encryption,
+        }
+    }
+
+    /// Lattice meet: require only what both policies require.
+    pub fn weaken(self, other: Self) -> Self {
+        Self {
+            require_signature: self.require_signature && other.require_signature,
+            require_encryption: self.require_encryption && other.require_encryption,
+        }
+    }
+}
+
 impl Default for SecurityPolicy {
     fn default() -> Self {
-        Self {
-            require_signature: true,
-            require_encryption: true,
-        }
+        Self::SIGN_AND_ENCRYPT
+    }
+}
+
+impl fmt::Display for SecurityPolicy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "require_signature={} require_encryption={}",
+            self.require_signature, self.require_encryption
+        )
     }
 }
 
@@ -125,9 +289,64 @@ pub struct BaseProfile {
     pub mode: InteropMode,
     pub canonicalization: CanonicalizationPolicy,
     pub security: SecurityPolicy,
+    /// Minimum security policy that **no layer may relax**.
+    ///
+    /// [`ProfileStack::overrides`] and [`ProfileStack::partner_overrides`] are
+    /// public, so any overlay can rewrite [`Self::security`]. The floor is the
+    /// invariant that survives that: [`ProfileStack::validate`] resolves the
+    /// stack for the deployment baseline *and for every declared partner*, and
+    /// rejects any resolved policy that does not
+    /// [satisfy](SecurityPolicy::satisfies) this floor.
+    ///
+    /// Defaults to [`SecurityPolicy::SIGN_AND_ENCRYPT`], which is what PEPPOL,
+    /// CEF eDelivery and BDEW AS4-Profil v1.2 §2.2.6.2.2 all mandate. Lower it
+    /// only for a profile that genuinely permits sign-only or plaintext
+    /// exchange, and expect the resulting relaxation to be reported as a
+    /// [`ProfileLintCode::SecurityRelaxation`] lint at
+    /// [`ProfileLintSeverity::Critical`].
+    pub security_floor: SecurityPolicy,
     pub validation: ValidationPolicy,
     /// AS2-only validation settings.  Ignored by AS4 profiles.
     pub as2_validation: As2ValidationPolicy,
+}
+
+impl BaseProfile {
+    /// A strict, fail-closed base profile with the given name and version.
+    ///
+    /// Equivalent to [`BaseProfile::default`] with `name`/`version` set:
+    /// strict interop mode, sign-and-encrypt required, and a
+    /// [`security_floor`](Self::security_floor) that forbids any layer from
+    /// dropping either protection.
+    pub fn new(name: impl Into<String>, version: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            version: version.into(),
+            ..Self::default()
+        }
+    }
+
+    /// Replace the [`security_floor`](Self::security_floor).
+    pub fn with_security_floor(mut self, floor: SecurityPolicy) -> Self {
+        self.security_floor = floor;
+        self
+    }
+}
+
+impl Default for BaseProfile {
+    /// Strict interop mode, sign-and-encrypt required, and a matching
+    /// sign-and-encrypt floor — the fail-closed starting point.
+    fn default() -> Self {
+        Self {
+            name: "asx-base".to_string(),
+            version: "1.0".to_string(),
+            mode: InteropMode::Strict,
+            canonicalization: CanonicalizationPolicy::default(),
+            security: SecurityPolicy::default(),
+            security_floor: SecurityPolicy::default(),
+            validation: ValidationPolicy::default(),
+            as2_validation: As2ValidationPolicy::default(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -259,6 +478,11 @@ pub struct EffectiveProfile {
     pub mode: InteropMode,
     pub canonicalization: CanonicalizationPolicy,
     pub security: SecurityPolicy,
+    /// The [`BaseProfile::security_floor`] this policy was resolved under.
+    ///
+    /// Constant across resolution — the floor is deliberately not overridable,
+    /// since it is the invariant the overlays are checked against.
+    pub security_floor: SecurityPolicy,
     pub validation: ValidationPolicy,
     /// AS2-only validation settings.  Ignored by AS4 profiles.
     pub as2_validation: As2ValidationPolicy,
@@ -273,6 +497,16 @@ pub struct EffectivePolicySnapshot {
     pub resolved_mode: InteropMode,
     pub canonicalization: CanonicalizationPolicy,
     pub security: SecurityPolicy,
+    /// The [`BaseProfile::security_floor`] in force when this snapshot was
+    /// taken.
+    ///
+    /// Recorded so that [`diff_effective_policy_snapshots`] can flag a *lowered
+    /// floor* between releases. Without it a change from
+    /// [`SecurityPolicy::SIGN_AND_ENCRYPT`] to
+    /// [`SecurityPolicy::UNCONSTRAINED`] is invisible to the diff — the
+    /// resolved policy is unchanged, yet every future overlay has become free
+    /// to relax it.
+    pub security_floor: SecurityPolicy,
     pub validation: ValidationPolicy,
     #[serde(default)]
     pub as2_validation: As2ValidationPolicy,
@@ -288,10 +522,15 @@ pub enum ResolutionLayer {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum ResolutionField {
     Mode,
     Canonicalization,
     Security,
+    /// The profile's security floor. Never produced by layer resolution — the
+    /// floor is base-only — but reported by
+    /// [`diff_effective_policy_snapshots`] when it changes between releases.
+    SecurityFloor,
     Validation,
     /// AS2-only validation settings.
     As2Validation,
@@ -307,13 +546,102 @@ pub struct ResolutionDiagnostic {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum ProfileValidationCode {
+    /// A resolved layer requires neither a signature nor encryption.
+    ///
+    /// Only reachable when the [security floor](BaseProfile::security_floor)
+    /// is permissive enough not to have caught the layer first; a floor of
+    /// [`SecurityPolicy::SIGN_AND_ENCRYPT`] reports
+    /// [`Self::SecurityFloorViolation`] instead.
     NoCriticalSecurityInvariant,
+    /// A resolved layer does not satisfy the profile's
+    /// [security floor](BaseProfile::security_floor).
+    SecurityFloorViolation,
+    /// A layer relaxed a security requirement that a lower layer had enabled,
+    /// while [`ProfileValidationOptions::forbid_security_relaxation`] was set.
+    ///
+    /// Without that option the same transition is reported as a
+    /// [`ProfileLintCode::SecurityRelaxation`] lint.
+    SecurityRelaxation,
+}
+
+impl ProfileValidationCode {
+    /// Stable snake_case identifier, suitable for log fields and alert rules.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NoCriticalSecurityInvariant => "no_critical_security_invariant",
+            Self::SecurityFloorViolation => "security_floor_violation",
+            Self::SecurityRelaxation => "security_relaxation",
+        }
+    }
+}
+
+impl fmt::Display for ProfileValidationCode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum ProfileLintCode {
+    /// A layer sets a field to the value already in effect.
     DeadOverride,
+    /// A layer dropped a security requirement a lower layer had enabled, but
+    /// the result still satisfies the [security floor](BaseProfile::security_floor).
+    ///
+    /// Escalate to a hard error with
+    /// [`ProfileValidationOptions::forbid_security_relaxation`].
+    SecurityRelaxation,
+}
+
+impl ProfileLintCode {
+    /// Stable snake_case identifier, suitable for log fields and alert rules.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::DeadOverride => "dead_override",
+            Self::SecurityRelaxation => "security_relaxation",
+        }
+    }
+}
+
+impl fmt::Display for ProfileLintCode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// How much attention a [`ProfileLintFinding`] deserves.
+///
+/// Lints never block [`ProfileStack::validate`]; the severity tells a CI gate
+/// or startup log which ones to treat as blocking anyway.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Serialize, Deserialize)]
+pub enum ProfileLintSeverity {
+    /// Cosmetic — the profile behaves as intended but says something twice.
+    #[default]
+    Info,
+    /// Worth reviewing before release.
+    Warning,
+    /// Security-relevant. Blocks release in the shipped CI gates.
+    Critical,
+}
+
+impl ProfileLintSeverity {
+    /// Stable lowercase identifier, suitable for log fields and alert rules.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Info => "info",
+            Self::Warning => "warning",
+            Self::Critical => "critical",
+        }
+    }
+}
+
+impl fmt::Display for ProfileLintSeverity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -321,15 +649,55 @@ pub struct ProfileValidationIssue {
     pub code: ProfileValidationCode,
     pub message: String,
     pub remediation_hint: String,
+    /// Qualified layer identifier, e.g. `base:peppol` or
+    /// `partner_override:9900000000001:legacy`.
     pub layer: String,
+    /// Partner whose resolved policy produced this issue.
+    ///
+    /// `None` for issues found on the deployment baseline (base profile,
+    /// extensions and global overrides), which apply to every partner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partner_id: Option<String>,
 }
+
+impl fmt::Display for ProfileValidationIssue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "[{}] {}: {}", self.code, self.layer, self.message)?;
+        if !self.remediation_hint.is_empty() {
+            write!(f, " — hint: {}", self.remediation_hint)?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for ProfileValidationIssue {}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProfileLintFinding {
     pub code: ProfileLintCode,
+    pub severity: ProfileLintSeverity,
     pub message: String,
     pub remediation_hint: String,
+    /// Qualified layer identifier, e.g. `override:deployment-global`.
     pub layer: String,
+    /// Partner whose resolved policy produced this lint; `None` on the
+    /// deployment baseline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partner_id: Option<String>,
+}
+
+impl fmt::Display for ProfileLintFinding {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "[{}/{}] {}: {}",
+            self.severity, self.code, self.layer, self.message
+        )?;
+        if !self.remediation_hint.is_empty() {
+            write!(f, " — hint: {}", self.remediation_hint)?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -337,10 +705,150 @@ pub struct ProfileValidationReport {
     pub lints: Vec<ProfileLintFinding>,
 }
 
+impl ProfileValidationReport {
+    /// Highest severity across all lints, or `None` when the report is clean.
+    pub fn highest_lint_severity(&self) -> Option<ProfileLintSeverity> {
+        self.lints.iter().map(|lint| lint.severity).max()
+    }
+
+    /// Lints at or above `severity`.
+    pub fn lints_at_least(
+        &self,
+        severity: ProfileLintSeverity,
+    ) -> impl Iterator<Item = &ProfileLintFinding> {
+        self.lints.iter().filter(move |l| l.severity >= severity)
+    }
+}
+
+/// Errors (and any lints collected alongside them) from a failed
+/// [`ProfileStack::validate`].
+///
+/// Implements [`Display`](fmt::Display) and [`std::error::Error`], so it
+/// composes with `thiserror`'s `#[from]` / `#[error(transparent)]`, with `?`
+/// into `anyhow::Error`, and with `Box<dyn Error>`. [`Display`](fmt::Display)
+/// renders a bounded one-line summary suitable for a startup log; use
+/// [`Self::report`] for the full multi-line operator rendering.
+///
+/// ```
+/// use asx_rs::interop::{BaseProfile, ProfileStack, SecurityPolicy};
+///
+/// let stack = ProfileStack {
+///     base: BaseProfile {
+///         security: SecurityPolicy::UNCONSTRAINED,
+///         ..BaseProfile::new("demo", "1.0")
+///     },
+///     extensions: vec![],
+///     overrides: vec![],
+///     partner_overrides: vec![],
+/// };
+///
+/// let err = stack.validate().unwrap_err();
+/// assert!(err.to_string().starts_with("profile validation failed: 1 error"));
+/// let _boxed: Box<dyn std::error::Error> = Box::new(err);
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProfileValidationFailure {
     pub errors: Vec<ProfileValidationIssue>,
     pub lints: Vec<ProfileLintFinding>,
+}
+
+impl ProfileValidationFailure {
+    /// Number of errors rendered inline by [`Display`](fmt::Display) before the
+    /// remainder is elided as `(+N more)`.
+    ///
+    /// One, deliberately. Each issue renders its message *and* remediation
+    /// hint, so a large stack failing wholesale would otherwise produce a
+    /// multi-kilobyte "one-line" log entry. [`Self::report`] always renders
+    /// everything.
+    pub const DISPLAY_ERROR_LIMIT: usize = 1;
+
+    /// First error, if any. Always `Some` for a value returned by
+    /// [`ProfileStack::validate`], which never fails with an empty error list.
+    pub fn first_error(&self) -> Option<&ProfileValidationIssue> {
+        self.errors.first()
+    }
+
+    /// Whether any error carries `code`.
+    pub fn has_code(&self, code: ProfileValidationCode) -> bool {
+        self.errors.iter().any(|issue| issue.code == code)
+    }
+
+    /// Partners whose resolved policy produced at least one error, deduplicated
+    /// in first-seen order. Baseline errors contribute no entry.
+    pub fn affected_partners(&self) -> Vec<&str> {
+        let mut seen: Vec<&str> = Vec::new();
+        for partner in self.errors.iter().filter_map(|e| e.partner_id.as_deref()) {
+            if !seen.contains(&partner) {
+                seen.push(partner);
+            }
+        }
+        seen
+    }
+
+    /// Full multi-line rendering: every error and lint on its own indented
+    /// line, with remediation hints.
+    ///
+    /// This is what belongs in a startup failure log; [`Display`](fmt::Display)
+    /// is the bounded one-line form for error-chain composition.
+    pub fn report(&self) -> String {
+        use fmt::Write as _;
+
+        let mut out = format!(
+            "profile validation failed: {} error(s), {} lint(s)",
+            self.errors.len(),
+            self.lints.len()
+        );
+        for (index, issue) in self.errors.iter().enumerate() {
+            // `write!` into a String is infallible.
+            let _ = write!(out, "\n  error {}. {issue}", index + 1);
+        }
+        for (index, lint) in self.lints.iter().enumerate() {
+            let _ = write!(out, "\n  lint  {}. {lint}", index + 1);
+        }
+        out
+    }
+}
+
+impl fmt::Display for ProfileValidationFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "profile validation failed: {} error(s), {} lint(s)",
+            self.errors.len(),
+            self.lints.len()
+        )?;
+
+        let shown = self.errors.len().min(Self::DISPLAY_ERROR_LIMIT);
+        for (index, issue) in self.errors.iter().take(shown).enumerate() {
+            let separator = if index == 0 { ": " } else { "; " };
+            write!(f, "{separator}{issue}")?;
+        }
+        if self.errors.len() > shown {
+            write!(f, "; (+{} more)", self.errors.len() - shown)?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for ProfileValidationFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.errors
+            .first()
+            .map(|issue| issue as &(dyn std::error::Error + 'static))
+    }
+}
+
+impl From<ProfileValidationFailure> for AsxError {
+    /// Lets `stack.validate()?` be used directly inside any function returning
+    /// the crate's [`Result`], rendering through
+    /// [`ProfileValidationFailure::report`] so the full finding list survives.
+    fn from(failure: ProfileValidationFailure) -> Self {
+        AsxError::new(
+            ErrorCode::PolicyViolation,
+            failure.report(),
+            ErrorContext::new("interop_profile_validate"),
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Ord, PartialOrd)]
@@ -380,6 +888,121 @@ pub struct ProfileImpactReport {
 }
 
 pub type ProfileValidationResult<T> = std::result::Result<T, ProfileValidationFailure>;
+
+/// Knobs for [`ProfileStack::validate_with`].
+///
+/// Construct with [`Default::default`] and the `with_*` methods; the struct is
+/// `#[non_exhaustive]` so future knobs do not break callers.
+///
+/// ```
+/// use asx_rs::interop::{ProfileValidationOptions, SecurityPolicy};
+///
+/// let options = ProfileValidationOptions::default()
+///     .with_security_floor(SecurityPolicy::SIGN_AND_ENCRYPT)
+///     .forbidding_security_relaxation();
+/// # let _ = options;
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub struct ProfileValidationOptions {
+    /// Floor imposed by the deployment, on top of [`BaseProfile::security_floor`].
+    ///
+    /// The two are combined with [`SecurityPolicy::strengthen`], so the
+    /// stricter value wins per requirement and this can only tighten
+    /// validation, never loosen it.
+    pub security_floor: Option<SecurityPolicy>,
+    /// Escalate every monotonic security relaxation from a
+    /// [`ProfileLintCode::SecurityRelaxation`] lint to a
+    /// [`ProfileValidationCode::SecurityRelaxation`] error, even when the
+    /// relaxed policy still clears the floor.
+    ///
+    /// Use this when overlays are expected to specialise *non-security* policy
+    /// only, and any security change at all should fail the build.
+    pub forbid_security_relaxation: bool,
+}
+
+impl ProfileValidationOptions {
+    /// Impose a deployment-wide security floor.
+    pub fn with_security_floor(mut self, floor: SecurityPolicy) -> Self {
+        self.security_floor = Some(floor);
+        self
+    }
+
+    /// Treat any security relaxation as a hard error.
+    pub fn forbidding_security_relaxation(mut self) -> Self {
+        self.forbid_security_relaxation = true;
+        self
+    }
+
+    fn resolve_against(&self, base: &BaseProfile) -> ResolvedValidationOptions {
+        ResolvedValidationOptions {
+            security_floor: self.security_floor.map_or(base.security_floor, |floor| {
+                floor.strengthen(base.security_floor)
+            }),
+            forbid_security_relaxation: self.forbid_security_relaxation,
+        }
+    }
+}
+
+/// Effective policy for one resolution scope, computed without a live session.
+///
+/// [`ProfileStack::resolve`] needs a [`SessionContext`], which startup
+/// validation does not have. This is the session-free counterpart: it answers
+/// "what policy will partner X actually get?" before the first message.
+///
+/// ```
+/// use asx_rs::interop::{
+///     BaseProfile, PartnerProfileOverlay, ProfilePolicyOverrides, ProfileStack, SecurityPolicy,
+/// };
+///
+/// let stack = ProfileStack {
+///     base: BaseProfile::new("bdew", "1.2").with_security_floor(SecurityPolicy::SIGN_ONLY),
+///     extensions: vec![],
+///     overrides: vec![],
+///     partner_overrides: vec![PartnerProfileOverlay {
+///         name: "legacy".into(),
+///         partner_id: "9900000000001".into(),
+///         overrides: ProfilePolicyOverrides {
+///             security: Some(SecurityPolicy::SIGN_ONLY),
+///             ..Default::default()
+///         },
+///     }],
+/// };
+///
+/// let weak: Vec<_> = stack
+///     .resolve_all_partners()
+///     .into_iter()
+///     .filter(|view| !view.security.satisfies(SecurityPolicy::SIGN_AND_ENCRYPT))
+///     .map(|view| view.scope_label().to_string())
+///     .collect();
+/// assert_eq!(weak, vec!["9900000000001"]);
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedPolicyView {
+    /// Partner this policy applies to, or `None` for the deployment baseline
+    /// (base + extensions + global overrides, no partner overlay).
+    pub partner_id: Option<String>,
+    pub mode: InteropMode,
+    pub canonicalization: CanonicalizationPolicy,
+    pub security: SecurityPolicy,
+    pub validation: ValidationPolicy,
+    /// AS2-only validation settings.  Ignored by AS4 profiles.
+    pub as2_validation: As2ValidationPolicy,
+    pub resolution_trace: Vec<String>,
+    pub resolution_diagnostics: Vec<ResolutionDiagnostic>,
+}
+
+impl ResolvedPolicyView {
+    /// `"<baseline>"` or the partner id — a stable label for logs and reports.
+    pub fn scope_label(&self) -> &str {
+        self.partner_id.as_deref().unwrap_or("<baseline>")
+    }
+
+    /// Whether this resolved policy is at least as strong as `floor`.
+    pub fn satisfies(&self, floor: SecurityPolicy) -> bool {
+        self.security.satisfies(floor)
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum InteropExceptionCode {
@@ -585,6 +1208,37 @@ pub fn diff_effective_policy_snapshots(
         });
     }
 
+    if before.security_floor != after.security_floor {
+        // Lowering the floor is High even when the *resolved* policy is
+        // unchanged: it is precisely the change that makes a future overlay
+        // able to relax security without validation objecting.
+        let relaxed = before.security_floor.relaxations_to(after.security_floor);
+        let (risk, rationale) = if relaxed.is_empty() {
+            (
+                DiffRiskLevel::Medium,
+                "Security floor raised; overlays that previously validated may now be rejected"
+                    .to_string(),
+            )
+        } else {
+            (
+                DiffRiskLevel::High,
+                format!(
+                    "Security floor lowered ({} no longer enforced); overlays may now relax \
+                     security without failing validation",
+                    join_requirements(&relaxed)
+                ),
+            )
+        };
+        changes.push(EffectivePolicyDiffEntry {
+            field: ResolutionField::SecurityFloor,
+            stage: DiffStage::Security,
+            previous_value: format!("{:?}", before.security_floor),
+            new_value: format!("{:?}", after.security_floor),
+            risk,
+            rationale,
+        });
+    }
+
     if before.validation != after.validation {
         let risk = if before.validation.enforce_payload_limits
             && !after.validation.enforce_payload_limits
@@ -656,6 +1310,72 @@ struct EffectivePolicyState {
     as2_validation: As2ValidationPolicy,
 }
 
+/// Findings sink for one resolution branch (the baseline, or one partner).
+///
+/// Carrying `partner_id` here is what lets every issue name the partner whose
+/// resolved policy produced it without threading it through each call site.
+struct LayerFindings<'a> {
+    errors: &'a mut Vec<ProfileValidationIssue>,
+    lints: &'a mut Vec<ProfileLintFinding>,
+    partner_id: Option<&'a str>,
+}
+
+impl LayerFindings<'_> {
+    fn push_error(&mut self, issue: ProfileValidationIssue) {
+        self.errors.push(issue);
+    }
+
+    fn push_lint(&mut self, lint: ProfileLintFinding) {
+        self.lints.push(lint);
+    }
+
+    fn scope_label(&self) -> String {
+        self.partner_id.map_or_else(
+            || "deployment baseline".to_string(),
+            |p| format!("partner {p}"),
+        )
+    }
+}
+
+/// One validation scope in progress: the deployment baseline, or a fork of it
+/// for a single partner.
+///
+/// Tracks the layer that last assigned `security` so the scope-level floor
+/// error can point at the line to change, rather than at the base profile that
+/// was overridden three layers down.
+#[derive(Debug, Clone)]
+struct ValidationScope {
+    state: EffectivePolicyState,
+    last_security_layer: String,
+    previous_security: SecurityPolicy,
+}
+
+impl ValidationScope {
+    fn apply(&mut self, qualified_layer: &str, overrides: &ProfilePolicyOverrides) {
+        self.previous_security = self.state.security;
+        ProfileStack::apply_effective_state_overrides(&mut self.state, overrides);
+        if overrides.security.is_some() {
+            self.last_security_layer = qualified_layer.to_string();
+        }
+    }
+}
+
+/// [`ProfileValidationOptions`] with the profile's own floor already folded in.
+#[derive(Debug, Clone, Copy)]
+struct ResolvedValidationOptions {
+    security_floor: SecurityPolicy,
+    forbid_security_relaxation: bool,
+}
+
+/// Render a requirement list as `require_signature and require_encryption`.
+fn join_requirements(requirements: &[SecurityRequirement]) -> String {
+    requirements
+        .iter()
+        .map(|req| req.as_str())
+        .collect::<Vec<_>>()
+        .join(" and ")
+}
+
 impl ProfileStack {
     pub fn apply_regional_pack(&self, pack: &RegionalProfilePack) -> Result<Self> {
         pack.validate()?;
@@ -687,88 +1407,169 @@ impl ProfileStack {
         Ok(merged)
     }
 
-    fn validate_policy_layer(
-        errors: &mut Vec<ProfileValidationIssue>,
+    /// Report a layer that drops a security requirement its predecessors had
+    /// enabled.
+    ///
+    /// This is a *lint* by default, not an error: a dip that a later layer
+    /// restores has no runtime effect, so making it fatal would be a false
+    /// positive. Whether the scope actually ends up insecure is decided once,
+    /// against the resolved policy, by [`Self::validate_scope_security`].
+    /// [`ProfileValidationOptions::forbid_security_relaxation`] escalates these
+    /// to errors for deployments where overlays must not touch security at all.
+    fn lint_security_relaxation(
+        findings: &mut LayerFindings<'_>,
         layer: &str,
-        security: SecurityPolicy,
+        previous: SecurityPolicy,
+        next: SecurityPolicy,
+        options: &ResolvedValidationOptions,
     ) {
-        if !security.require_signature && !security.require_encryption {
-            errors.push(ProfileValidationIssue {
+        let relaxed = previous.relaxations_to(next);
+        if relaxed.is_empty() {
+            return;
+        }
+
+        let message = format!(
+            "{layer} relaxes {} relative to the underlying layers (was {previous}, now {next})",
+            join_requirements(&relaxed)
+        );
+        let hint = format!(
+            "Remove the relaxation, or raise BaseProfile::security_floor so the weaker \
+             policy is rejected outright rather than silently accepted for {}",
+            findings.scope_label()
+        );
+
+        if options.forbid_security_relaxation {
+            findings.push_error(ProfileValidationIssue {
+                code: ProfileValidationCode::SecurityRelaxation,
+                message,
+                remediation_hint: hint,
+                layer: layer.to_string(),
+                partner_id: findings.partner_id.map(str::to_string),
+            });
+        } else {
+            findings.push_lint(ProfileLintFinding {
+                code: ProfileLintCode::SecurityRelaxation,
+                severity: ProfileLintSeverity::Critical,
+                message,
+                remediation_hint: hint,
+                layer: layer.to_string(),
+                partner_id: findings.partner_id.map(str::to_string),
+            });
+        }
+    }
+
+    /// Check the *resolved* policy for one scope against the floor.
+    ///
+    /// Runs once per scope rather than per layer, because the resolved policy
+    /// is the only one the runtime ever applies. `layer` names the last layer
+    /// that assigned `security`, so the error points at the line to change.
+    fn validate_scope_security(
+        findings: &mut LayerFindings<'_>,
+        layer: &str,
+        resolved: SecurityPolicy,
+        options: &ResolvedValidationOptions,
+    ) {
+        let unmet = options.security_floor.unmet_by(resolved);
+        if !unmet.is_empty() {
+            let scope = findings.scope_label();
+            findings.push_error(ProfileValidationIssue {
+                code: ProfileValidationCode::SecurityFloorViolation,
+                message: format!(
+                    "{scope} resolves to a security policy below the profile floor: \
+                     missing {}; effective [{resolved}], floor [{}]; last set by {layer}",
+                    join_requirements(&unmet),
+                    options.security_floor
+                ),
+                remediation_hint: format!(
+                    "Set {} on {layer}, or lower BaseProfile::security_floor if the profile \
+                     genuinely permits the weaker policy",
+                    join_requirements(&unmet)
+                ),
+                layer: layer.to_string(),
+                partner_id: findings.partner_id.map(str::to_string),
+            });
+            return;
+        }
+
+        if resolved == SecurityPolicy::UNCONSTRAINED {
+            let scope = findings.scope_label();
+            findings.push_error(ProfileValidationIssue {
                 code: ProfileValidationCode::NoCriticalSecurityInvariant,
-                message: format!("{layer} disables both signature and encryption requirements"),
+                message: format!(
+                    "{scope} resolves with neither signature nor encryption required; \
+                     last set by {layer}"
+                ),
                 remediation_hint:
                     "Enable at least one critical security invariant: signature or encryption"
                         .to_string(),
                 layer: layer.to_string(),
+                partner_id: findings.partner_id.map(str::to_string),
             });
         }
     }
 
     fn lint_override_layer(
-        lints: &mut Vec<ProfileLintFinding>,
+        findings: &mut LayerFindings<'_>,
         layer_name: &str,
         current: &EffectivePolicyState,
         overrides: &ProfilePolicyOverrides,
     ) {
+        let mut dead = |message: String, remediation_hint: &str| {
+            findings.push_lint(ProfileLintFinding {
+                code: ProfileLintCode::DeadOverride,
+                severity: ProfileLintSeverity::Info,
+                message,
+                remediation_hint: remediation_hint.to_string(),
+                layer: layer_name.to_string(),
+                partner_id: findings.partner_id.map(str::to_string),
+            });
+        };
+
         if let Some(mode) = overrides.mode
             && mode == current.mode
         {
-            lints.push(ProfileLintFinding {
-                code: ProfileLintCode::DeadOverride,
-                message: format!(
-                    "{layer_name} sets mode to {:?}, which matches already-effective value",
-                    mode
+            dead(
+                format!(
+                    "{layer_name} sets mode to {mode:?}, which matches already-effective value"
                 ),
-                remediation_hint: "Remove redundant override or change it to a distinct value"
-                    .to_string(),
-                layer: layer_name.to_string(),
-            });
+                "Remove redundant override or change it to a distinct value",
+            );
         }
 
         if let Some(c14n) = overrides.canonicalization.as_ref()
             && *c14n == current.canonicalization
         {
-            lints.push(ProfileLintFinding {
-                code: ProfileLintCode::DeadOverride,
-                message: format!("{layer_name} sets canonicalization to current effective value"),
-                remediation_hint: "Remove redundant canonicalization override".into(),
-                layer: layer_name.to_string(),
-            });
+            dead(
+                format!("{layer_name} sets canonicalization to current effective value"),
+                "Remove redundant canonicalization override",
+            );
         }
 
         if let Some(security) = overrides.security
             && security == current.security
         {
-            lints.push(ProfileLintFinding {
-                code: ProfileLintCode::DeadOverride,
-                message: format!("{layer_name} sets security policy to current effective value"),
-                remediation_hint: "Remove redundant security override".into(),
-                layer: layer_name.to_string(),
-            });
+            dead(
+                format!("{layer_name} sets security policy to current effective value"),
+                "Remove redundant security override",
+            );
         }
 
         if let Some(validation) = overrides.validation
             && validation == current.validation
         {
-            lints.push(ProfileLintFinding {
-                code: ProfileLintCode::DeadOverride,
-                message: format!("{layer_name} sets validation policy to current effective value"),
-                remediation_hint: "Remove redundant validation override".into(),
-                layer: layer_name.to_string(),
-            });
+            dead(
+                format!("{layer_name} sets validation policy to current effective value"),
+                "Remove redundant validation override",
+            );
         }
 
         if let Some(as2_validation) = overrides.as2_validation
             && as2_validation == current.as2_validation
         {
-            lints.push(ProfileLintFinding {
-                code: ProfileLintCode::DeadOverride,
-                message: format!(
-                    "{layer_name} sets AS2 validation policy to current effective value"
-                ),
-                remediation_hint: "Remove redundant as2_validation override".into(),
-                layer: layer_name.to_string(),
-            });
+            dead(
+                format!("{layer_name} sets AS2 validation policy to current effective value"),
+                "Remove redundant as2_validation override",
+            );
         }
     }
 
@@ -793,15 +1594,19 @@ impl ProfileStack {
         }
     }
 
-    fn for_each_policy_override_layer<F>(&self, session: Option<&SessionContext>, mut f: F)
+    /// Walk the deployment-wide layers: extensions, then global overrides.
+    ///
+    /// These apply to every partner, so both [`Self::validate_with`] and
+    /// [`Self::resolve`] run them before any partner overlay.
+    fn for_each_global_layer<F>(&self, mut f: F)
     where
-        F: FnMut(ResolutionLayer, &'static str, String, &ProfilePolicyOverrides),
+        F: FnMut(ResolutionLayer, &'static str, &str, &ProfilePolicyOverrides),
     {
         for ext in &self.extensions {
             f(
                 ResolutionLayer::Extension,
                 "extension",
-                ext.name.clone(),
+                &ext.name,
                 &ext.overrides,
             );
         }
@@ -810,15 +1615,25 @@ impl ProfileStack {
             f(
                 ResolutionLayer::Override,
                 "override",
-                ov.name.clone(),
+                &ov.name,
                 &ov.overrides,
             );
         }
+    }
+
+    /// Walk the partner overlays for `partner_id`, in declaration order.
+    ///
+    /// `None` selects no overlays at all — the deployment baseline.
+    fn for_each_partner_layer<F>(&self, partner_id: Option<&str>, mut f: F)
+    where
+        F: FnMut(ResolutionLayer, &'static str, String, &ProfilePolicyOverrides),
+    {
+        let Some(partner_id) = partner_id else {
+            return;
+        };
 
         for pov in &self.partner_overrides {
-            if let Some(s) = session
-                && pov.partner_id != s.partner_id()
-            {
+            if pov.partner_id != partner_id {
                 continue;
             }
             f(
@@ -830,36 +1645,212 @@ impl ProfileStack {
         }
     }
 
+    /// Distinct partner identifiers that carry at least one overlay, in
+    /// declaration order.
+    pub fn partner_ids(&self) -> Vec<&str> {
+        let mut ids: Vec<&str> = Vec::new();
+        for pov in &self.partner_overrides {
+            if !ids.contains(&pov.partner_id.as_str()) {
+                ids.push(&pov.partner_id);
+            }
+        }
+        ids
+    }
+
+    /// Validate the stack with the default options.
+    ///
+    /// Equivalent to [`Self::validate_with`] with
+    /// [`ProfileValidationOptions::default`]: the floor comes from
+    /// [`BaseProfile::security_floor`] alone, and a relaxation that still
+    /// clears the floor is a [`ProfileLintSeverity::Critical`] lint rather than
+    /// an error.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProfileValidationFailure`] when any resolved layer — for the
+    /// deployment baseline or for any declared partner — violates the security
+    /// floor or leaves no critical security invariant in place. Lints collected
+    /// before the failure are carried in the failure value.
     pub fn validate(&self) -> ProfileValidationResult<ProfileValidationReport> {
+        self.validate_with(&ProfileValidationOptions::default())
+    }
+
+    /// Validate the stack against a deployment-imposed security floor.
+    ///
+    /// The effective floor is the stronger of `floor` and
+    /// [`BaseProfile::security_floor`], per requirement. This is the
+    /// startup-check form: a host that must guarantee sign-and-encrypt for
+    /// every partner can assert it without trusting the profile's own floor.
+    ///
+    /// ```
+    /// use asx_rs::interop::{
+    ///     BaseProfile, PartnerProfileOverlay, ProfilePolicyOverrides, ProfileStack,
+    ///     ProfileValidationCode, SecurityPolicy,
+    /// };
+    ///
+    /// let stack = ProfileStack {
+    ///     // A profile whose own floor permits sign-only …
+    ///     base: BaseProfile::new("legacy", "1.0").with_security_floor(SecurityPolicy::SIGN_ONLY),
+    ///     extensions: vec![],
+    ///     overrides: vec![],
+    ///     partner_overrides: vec![PartnerProfileOverlay {
+    ///         name: "legacy-partner".into(),
+    ///         partner_id: "9900000000001".into(),
+    ///         overrides: ProfilePolicyOverrides {
+    ///             security: Some(SecurityPolicy::SIGN_ONLY),
+    ///             ..Default::default()
+    ///         },
+    ///     }],
+    /// };
+    ///
+    /// // … still fails a host mandate of sign-and-encrypt.
+    /// let failure = stack
+    ///     .validate_with_floor(SecurityPolicy::SIGN_AND_ENCRYPT)
+    ///     .unwrap_err();
+    /// assert!(failure.has_code(ProfileValidationCode::SecurityFloorViolation));
+    /// assert_eq!(failure.affected_partners(), vec!["9900000000001"]);
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::validate`], additionally failing when any resolved layer
+    /// falls below `floor`.
+    pub fn validate_with_floor(
+        &self,
+        floor: SecurityPolicy,
+    ) -> ProfileValidationResult<ProfileValidationReport> {
+        self.validate_with(&ProfileValidationOptions::default().with_security_floor(floor))
+    }
+
+    /// Validate the stack with explicit options.
+    ///
+    /// Resolution is forked per partner: the base, extensions and global
+    /// overrides are walked once to produce the deployment baseline, then each
+    /// distinct partner in [`Self::partner_overrides`] is resolved from a copy
+    /// of that baseline. One partner's overlay therefore never contaminates
+    /// another's findings, and every issue is attributed to the partner whose
+    /// resolved policy produced it via [`ProfileValidationIssue::partner_id`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProfileValidationFailure`] when any resolved layer produces a
+    /// validation error; see [`ProfileValidationCode`] for the cases.
+    pub fn validate_with(
+        &self,
+        options: &ProfileValidationOptions,
+    ) -> ProfileValidationResult<ProfileValidationReport> {
+        let options = options.resolve_against(&self.base);
+
         let mut errors = vec![];
         let mut lints = vec![];
 
-        let mut current = EffectivePolicyState {
-            mode: self.base.mode,
-            canonicalization: self.base.canonicalization.clone(),
-            security: self.base.security,
-            validation: self.base.validation,
-            as2_validation: self.base.as2_validation,
+        // Pass 1: the deployment baseline — base + extensions + global
+        // overrides. This is also the policy any partner without an overlay
+        // receives, so it is validated as a scope in its own right.
+        let baseline = {
+            let mut findings = LayerFindings {
+                errors: &mut errors,
+                lints: &mut lints,
+                partner_id: None,
+            };
+            let baseline = self.walk_baseline_layers(&mut findings, &options);
+            Self::validate_scope_security(
+                &mut findings,
+                &baseline.last_security_layer,
+                baseline.state.security,
+                &options,
+            );
+            baseline
         };
 
-        Self::validate_policy_layer(
-            &mut errors,
-            &format!("base:{}", self.base.name),
-            current.security,
-        );
+        // Pass 2: fork the baseline once per declared partner, so one
+        // partner's overlay cannot contaminate another's findings.
+        for partner_id in self.partner_ids() {
+            let mut scope = baseline.clone();
+            let mut findings = LayerFindings {
+                errors: &mut errors,
+                lints: &mut lints,
+                partner_id: Some(partner_id),
+            };
+            self.for_each_partner_layer(
+                Some(partner_id),
+                |_, layer_kind, layer_name, overrides| {
+                    let qualified_layer = format!("{layer_kind}:{layer_name}");
+                    Self::lint_override_layer(
+                        &mut findings,
+                        &qualified_layer,
+                        &scope.state,
+                        overrides,
+                    );
+                    scope.apply(&qualified_layer, overrides);
+                    Self::lint_security_relaxation(
+                        &mut findings,
+                        &qualified_layer,
+                        scope.previous_security,
+                        scope.state.security,
+                        &options,
+                    );
+                },
+            );
 
-        self.for_each_policy_override_layer(None, |_, layer_kind, layer_name, overrides| {
-            let qualified_layer = format!("{}:{}", layer_kind, layer_name);
-            Self::lint_override_layer(&mut lints, &qualified_layer, &current, overrides);
-            Self::apply_effective_state_overrides(&mut current, overrides);
-            Self::validate_policy_layer(&mut errors, &qualified_layer, current.security);
-        });
+            // Skip the scope check when no partner overlay touched security:
+            // the resolved policy is byte-for-byte the baseline's, so any
+            // finding here would restate the baseline error once per partner.
+            // The baseline error already applies to every partner.
+            if scope.last_security_layer == baseline.last_security_layer
+                && scope.state.security == baseline.state.security
+            {
+                continue;
+            }
+
+            Self::validate_scope_security(
+                &mut findings,
+                &scope.last_security_layer,
+                scope.state.security,
+                &options,
+            );
+        }
 
         if errors.is_empty() {
             Ok(ProfileValidationReport { lints })
         } else {
             Err(ProfileValidationFailure { errors, lints })
         }
+    }
+
+    /// Walk base + extensions + global overrides, recording per-layer findings,
+    /// and return the resulting deployment baseline scope.
+    fn walk_baseline_layers(
+        &self,
+        findings: &mut LayerFindings<'_>,
+        options: &ResolvedValidationOptions,
+    ) -> ValidationScope {
+        let mut scope = ValidationScope {
+            state: EffectivePolicyState {
+                mode: self.base.mode,
+                canonicalization: self.base.canonicalization.clone(),
+                security: self.base.security,
+                validation: self.base.validation,
+                as2_validation: self.base.as2_validation,
+            },
+            last_security_layer: format!("base:{}", self.base.name),
+            previous_security: self.base.security,
+        };
+
+        self.for_each_global_layer(|_, layer_kind, layer_name, overrides| {
+            let qualified_layer = format!("{layer_kind}:{layer_name}");
+            Self::lint_override_layer(findings, &qualified_layer, &scope.state, overrides);
+            scope.apply(&qualified_layer, overrides);
+            Self::lint_security_relaxation(
+                findings,
+                &qualified_layer,
+                scope.previous_security,
+                scope.state.security,
+                options,
+            );
+        });
+
+        scope
     }
 
     fn apply_overrides(
@@ -946,7 +1937,13 @@ impl ProfileStack {
         }
     }
 
-    pub fn resolve(&self, session: &SessionContext) -> EffectiveProfile {
+    /// Resolve the stack for `partner_id`, or for the deployment baseline when
+    /// it is `None`.
+    ///
+    /// Single source of truth for layer application — [`Self::resolve`],
+    /// [`Self::resolve_baseline`] and [`Self::resolve_partner`] all go through
+    /// it, so a session-free view can never drift from what a live session gets.
+    fn resolve_state(&self, partner_id: Option<&str>) -> ResolvedPolicyState {
         let mut resolved = ResolvedPolicyState {
             mode: self.base.mode,
             canonicalization: self.base.canonicalization.clone(),
@@ -968,18 +1965,72 @@ impl ProfileStack {
             diagnostics: vec![],
         };
 
-        self.for_each_policy_override_layer(
-            Some(session),
-            |layer, layer_kind, layer_name, overrides| {
-                Self::apply_overrides(&mut resolved, layer, layer_kind, &layer_name, overrides);
-            },
-        );
+        self.for_each_global_layer(|layer, layer_kind, layer_name, overrides| {
+            Self::apply_overrides(&mut resolved, layer, layer_kind, layer_name, overrides);
+        });
+
+        self.for_each_partner_layer(partner_id, |layer, layer_kind, layer_name, overrides| {
+            Self::apply_overrides(&mut resolved, layer, layer_kind, &layer_name, overrides);
+        });
+
+        resolved
+    }
+
+    /// Effective policy with no partner overlay applied — what a partner
+    /// without its own overlay receives.
+    pub fn resolve_baseline(&self) -> ResolvedPolicyView {
+        self.resolve_view(None)
+    }
+
+    /// Effective policy for `partner_id`, resolved without a
+    /// [`SessionContext`].
+    ///
+    /// A partner with no declared overlay resolves to the baseline policy,
+    /// tagged with its id.
+    pub fn resolve_partner(&self, partner_id: &str) -> ResolvedPolicyView {
+        self.resolve_view(Some(partner_id))
+    }
+
+    /// Every effective policy this stack can produce: the deployment baseline
+    /// first, then one entry per distinct partner in
+    /// [`Self::partner_overrides`], in declaration order.
+    ///
+    /// This is the startup-audit entry point — see [`ResolvedPolicyView`] for
+    /// an example that asserts a security mandate across all partners. Prefer
+    /// [`Self::validate_with_floor`] when the mandate is a plain security
+    /// floor; use this when the assertion is over other policy fields.
+    pub fn resolve_all_partners(&self) -> Vec<ResolvedPolicyView> {
+        let mut views = Vec::with_capacity(self.partner_overrides.len() + 1);
+        views.push(self.resolve_baseline());
+        for partner_id in self.partner_ids() {
+            views.push(self.resolve_partner(partner_id));
+        }
+        views
+    }
+
+    fn resolve_view(&self, partner_id: Option<&str>) -> ResolvedPolicyView {
+        let resolved = self.resolve_state(partner_id);
+        ResolvedPolicyView {
+            partner_id: partner_id.map(str::to_string),
+            mode: resolved.mode,
+            canonicalization: resolved.canonicalization,
+            security: resolved.security,
+            validation: resolved.validation,
+            as2_validation: resolved.as2_validation,
+            resolution_trace: resolved.trace,
+            resolution_diagnostics: resolved.diagnostics,
+        }
+    }
+
+    pub fn resolve(&self, session: &SessionContext) -> EffectiveProfile {
+        let resolved = self.resolve_state(Some(session.partner_id()));
 
         EffectiveProfile {
             name: format!("{}@{}", self.base.name, session.profile_name()),
             mode: resolved.mode,
             canonicalization: resolved.canonicalization.clone(),
             security: resolved.security,
+            security_floor: self.base.security_floor,
             validation: resolved.validation,
             as2_validation: resolved.as2_validation,
             snapshot: EffectivePolicySnapshot {
@@ -989,6 +2040,7 @@ impl ProfileStack {
                 resolved_mode: resolved.mode,
                 canonicalization: resolved.canonicalization.clone(),
                 security: resolved.security,
+                security_floor: self.base.security_floor,
                 validation: resolved.validation,
                 as2_validation: resolved.as2_validation,
                 resolution_trace: resolved.trace,

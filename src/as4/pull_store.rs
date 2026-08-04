@@ -273,6 +273,26 @@ impl As4PullStore {
         Ok(outcome)
     }
 
+    /// Look up a previously served response **without** dequeuing on a miss.
+    ///
+    /// Used by the replay path: when the dedup backend reports a PullRequest
+    /// `MessageId` as already seen, the only correct answer is the response
+    /// that `MessageId` was originally served. Falling through to a dequeue
+    /// would hand the initiator a *different* message and silently consume it.
+    ///
+    /// The served cache is FIFO-bounded by
+    /// [`As4PullStoreLimits::max_served_entries`], so a replay outside that
+    /// window legitimately returns `None`.
+    pub(super) async fn cached_response(
+        &self,
+        pull_key: &PullRequestKey,
+    ) -> Option<Arc<As4ReceivePushOutput>> {
+        let st = self.served.lock().await;
+        st.served
+            .get(pull_key)
+            .map(|cached| Arc::clone(&cached.pulled))
+    }
+
     /// Atomically check the served cache and — on a cache miss — dequeue the
     /// next pending message.  Both operations happen under a single mutex
     /// acquisition, eliminating the TOCTOU window that arises when the two

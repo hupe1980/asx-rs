@@ -20,7 +20,7 @@ pub(crate) mod private {
 /// This is intentionally restricted to `testing` builds so the sealed trait
 /// cannot be bypassed in production code.
 ///
-/// Re-exported from `asx_rs::as4` as [`as4::verifier_seal`].
+/// Re-exported from `asx_rs::as4` as [`as4::verifier_seal`](crate::as4::verifier_seal).
 #[cfg(feature = "testing")]
 pub mod private {
     pub trait Sealed {}
@@ -39,7 +39,9 @@ pub trait As4Verifier: private::Sealed {
         soap_xml: &str,
         soap_doc: &Document<'_>,
         message_id: &str,
-        external_reference: Option<(&str, &[u8])>,
+        // Every payload attachment as `(content_id, bytes)`, for `cid:`
+        // reference resolution. Empty when the message has no attachments.
+        external_references: &[(&str, &[u8])],
     ) -> Result<()>;
 }
 
@@ -56,7 +58,7 @@ impl As4Verifier for As4WsSecVerifier {
         soap_xml: &str,
         soap_doc: &Document<'_>,
         message_id: &str,
-        external_reference: Option<(&str, &[u8])>,
+        external_references: &[(&str, &[u8])],
     ) -> Result<()> {
         let expected_fingerprint = expected_fingerprint_from_session(session);
         let revocation_policy = wssec_revocation_policy_from_session(session)?;
@@ -64,18 +66,11 @@ impl As4Verifier for As4WsSecVerifier {
             .with_expected_fingerprint(expected_fingerprint)
             .with_revocation(revocation_policy);
 
-        let coverage = if let Some(external_reference) = external_reference {
-            let external_references = [external_reference];
-            crate::crypto::wssec::verify::verify_enveloped_signature_optional_with_doc(
-                soap_doc,
-                soap_xml,
-                opts.with_external_references(&external_references),
-            )?
-        } else {
-            crate::crypto::wssec::verify::verify_enveloped_signature_optional_with_doc(
-                soap_doc, soap_xml, opts,
-            )?
-        };
+        let coverage = crate::crypto::wssec::verify::verify_enveloped_signature_optional_with_doc(
+            soap_doc,
+            soap_xml,
+            opts.with_external_references(external_references),
+        )?;
 
         let signature_present = coverage.is_some();
 
@@ -102,10 +97,69 @@ impl As4Verifier for As4WsSecVerifier {
         // replacement that the parser consumes.
         if let Some(coverage) = coverage {
             enforce_messaging_signature_coverage(session, soap_doc, message_id, &coverage)?;
+            enforce_attachment_signature_coverage(
+                session,
+                message_id,
+                external_references,
+                &coverage,
+            )?;
         }
 
         Ok(())
     }
+}
+
+/// Require that the payload attachment the pipeline is about to surface was
+/// covered by a verified `cid:` reference.
+///
+/// Signing `eb:Messaging` and the SOAP Body proves nothing about the payload —
+/// the actual business document travels as a detached MIME part. Without this
+/// check, a signature covering only the header and body verifies happily while
+/// an intermediary swaps the attachment, and the receive pipeline hands the
+/// substituted bytes to the application as `DomainReady`.
+fn enforce_attachment_signature_coverage(
+    session: &SessionContext,
+    message_id: &str,
+    attachments: &[(&str, &[u8])],
+    coverage: &crate::crypto::wssec::verify::VerifiedSignatureCoverage,
+) -> Result<()> {
+    // Every attachment must be covered, not just the first: a multi-payload
+    // message whose signature references only payload 1 leaves payloads 2..n
+    // swappable.
+    for (cid, _) in attachments {
+        let cid = normalize_cid(cid);
+        if coverage
+            .signed_cid_references
+            .iter()
+            .any(|signed| normalize_cid(signed) == cid)
+        {
+            continue;
+        }
+
+        return Err(AsxError::new(
+            ErrorCode::SecurityVerificationFailed,
+            format!(
+                "AS4 payload attachment cid:{cid} is not covered by the WS-Security \
+                 signature; the signature must include a ds:Reference URI=\"cid:{cid}\" \
+                 so the payload is integrity-protected alongside the eb:Messaging header"
+            ),
+            ErrorContext::for_session_with_message("as4_receive_push", session, message_id),
+        ));
+    }
+
+    Ok(())
+}
+
+/// Strip an optional `cid:` scheme prefix and angle brackets, so a reference
+/// written `cid:x@y`, `<x@y>` or `x@y` all compare equal.
+fn normalize_cid(value: &str) -> &str {
+    let value = value.trim();
+    let value = value.strip_prefix('<').unwrap_or(value);
+    let value = value.strip_suffix('>').unwrap_or(value);
+    value
+        .get(..4)
+        .filter(|prefix| prefix.eq_ignore_ascii_case("cid:"))
+        .map_or(value, |_| &value[4..])
 }
 
 /// ebMS3 core namespace.
@@ -175,7 +229,7 @@ fn enforce_messaging_signature_coverage(
 ///
 /// ```toml
 /// [dev-dependencies]
-/// asx-rs = { version = "0.11", features = ["as4", "testing"] }
+/// asx-rs = { version = "0.12", features = ["as4", "testing"] }
 /// ```
 ///
 /// [`MockAs4Endpoint`]: crate::as4::mock_endpoint::MockAs4Endpoint
@@ -195,7 +249,7 @@ impl As4Verifier for InsecureBypassAs4Verifier {
         _soap_xml: &str,
         _soap_doc: &Document<'_>,
         message_id: &str,
-        _external_reference: Option<(&str, &[u8])>,
+        _external_references: &[(&str, &[u8])],
     ) -> Result<()> {
         // Intentional no-op — bypasses ALL WS-Security checks.
         // Emit a tracing event so test logs are auditable and production
@@ -212,7 +266,10 @@ impl As4Verifier for InsecureBypassAs4Verifier {
 
 #[cfg(test)]
 mod xsw_coverage_tests {
-    use super::{EBMS3_NS, enforce_messaging_signature_coverage};
+    use super::{
+        EBMS3_NS, ErrorCode, enforce_attachment_signature_coverage,
+        enforce_messaging_signature_coverage,
+    };
     use crate::core::SessionContext;
     use crate::crypto::wssec::verify::VerifiedSignatureCoverage;
     use roxmltree::Document;
@@ -224,7 +281,107 @@ mod xsw_coverage_tests {
     fn coverage(ids: &[&str]) -> VerifiedSignatureCoverage {
         VerifiedSignatureCoverage {
             signed_same_document_ids: ids.iter().map(|s| s.to_string()).collect(),
+            signed_cid_references: Vec::new(),
         }
+    }
+
+    fn cid_coverage(cids: &[&str]) -> VerifiedSignatureCoverage {
+        VerifiedSignatureCoverage {
+            signed_same_document_ids: Vec::new(),
+            signed_cid_references: cids.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn attachment_covered_by_a_signed_cid_reference_is_accepted() {
+        enforce_attachment_signature_coverage(
+            &session(),
+            "m1",
+            &[("payload@example.com", b"bytes".as_slice())],
+            &cid_coverage(&["payload@example.com"]),
+        )
+        .expect("covered attachment must verify");
+    }
+
+    #[test]
+    fn cid_comparison_ignores_scheme_prefix_and_angle_brackets() {
+        for (attachment, signed) in [
+            ("cid:p@e.com", "p@e.com"),
+            ("p@e.com", "cid:p@e.com"),
+            ("<p@e.com>", "p@e.com"),
+            ("CID:p@e.com", "p@e.com"),
+        ] {
+            enforce_attachment_signature_coverage(
+                &session(),
+                "m1",
+                &[(attachment, b"bytes".as_slice())],
+                &cid_coverage(&[signed]),
+            )
+            .unwrap_or_else(|err| panic!("{attachment} vs {signed} must match: {err}"));
+        }
+    }
+
+    #[test]
+    fn attachment_not_covered_by_any_signed_reference_is_rejected() {
+        // The signature covers the eb:Messaging header but no attachment — the
+        // payload could be swapped in transit without breaking it.
+        let err = enforce_attachment_signature_coverage(
+            &session(),
+            "m1",
+            &[("payload@example.com", b"bytes".as_slice())],
+            &coverage(&["as4-messaging"]),
+        )
+        .expect_err("uncovered attachment must be rejected");
+        assert_eq!(err.code, ErrorCode::SecurityVerificationFailed);
+        assert!(err.message.contains("payload@example.com"));
+    }
+
+    #[test]
+    fn attachment_covered_by_a_different_cid_is_rejected() {
+        let err = enforce_attachment_signature_coverage(
+            &session(),
+            "m1",
+            &[("payload@example.com", b"bytes".as_slice())],
+            &cid_coverage(&["decoy@example.com"]),
+        )
+        .expect_err("a signed reference to a different part must not count");
+        assert_eq!(err.code, ErrorCode::SecurityVerificationFailed);
+    }
+
+    #[test]
+    fn no_attachment_needs_no_cid_coverage() {
+        enforce_attachment_signature_coverage(&session(), "m1", &[], &coverage(&["as4-messaging"]))
+            .expect("a message with no attachment has nothing to cover");
+    }
+
+    /// Every attachment must be covered — a signature referencing only the
+    /// first payload leaves payloads 2..n swappable.
+    #[test]
+    fn every_attachment_must_be_covered_not_just_the_first() {
+        let attachments: &[(&str, &[u8])] =
+            &[("xmlpayload@gitb", b"one"), ("custompayload@gitb", b"two")];
+
+        enforce_attachment_signature_coverage(
+            &session(),
+            "m1",
+            attachments,
+            &cid_coverage(&["xmlpayload@gitb", "custompayload@gitb"]),
+        )
+        .expect("both covered");
+
+        let err = enforce_attachment_signature_coverage(
+            &session(),
+            "m1",
+            attachments,
+            &cid_coverage(&["xmlpayload@gitb"]),
+        )
+        .expect_err("the second attachment is not covered");
+        assert_eq!(err.code, ErrorCode::SecurityVerificationFailed);
+        assert!(
+            err.message.contains("custompayload@gitb"),
+            "{}",
+            err.message
+        );
     }
 
     fn envelope_with(messaging_blocks: &str) -> String {

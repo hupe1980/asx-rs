@@ -41,7 +41,7 @@ pub use receipt_verify::{
 ///
 /// ```toml
 /// # Enable in dev-dependencies only
-/// asx-rs = { version = "0.11", features = ["as4", "testing"] }
+/// asx-rs = { version = "0.12", features = ["as4", "testing"] }
 /// ```
 ///
 /// ```rust,ignore
@@ -231,8 +231,123 @@ Content-ID: <{cid}>\r\n\
         .expect("multipart parse");
 
         let parsed = parsed.expect("multipart payload");
-        assert_eq!(parsed.payload_attachment, Some(b"payload-bytes".as_slice()));
-        assert_eq!(parsed.payload_content_id, Some("payload-123@example.com"));
+        assert_eq!(
+            parsed.primary().map(|p| p.bytes),
+            Some(b"payload-bytes".as_slice())
+        );
+        assert_eq!(
+            parsed.primary().map(|p| p.content_id),
+            Some("payload-123@example.com")
+        );
+    }
+
+    /// ebMS3 allows several `eb:PartInfo` entries per `UserMessage`, and the
+    /// eDelivery conformance payload profiles exercise four. All of them must
+    /// be resolved — the receive path used to surface only the first and drop
+    /// the rest silently.
+    #[test]
+    fn multipart_resolves_every_referenced_payload_in_document_order() {
+        let session = SessionContext::new("s-multipart-multi", "p1", "strict")
+            .expect("session")
+            .with_strict_runtime_bootstrap_validated(true);
+        let multipart = concat!(
+            "--b1\r\n",
+            "Content-Type: application/xop+xml; charset=UTF-8; type=\"application/soap+xml\"\r\n",
+            "Content-ID: <soap-root@example.com>\r\n",
+            "\r\n",
+            "<S12:Envelope xmlns:S12=\"http://www.w3.org/2003/05/soap-envelope\" ",
+            "xmlns:xop=\"http://www.w3.org/2004/08/xop/include\"><S12:Body>",
+            "<xop:Include href=\"cid:xmlpayload@gitb\"/>",
+            "<xop:Include href='cid:xmlpayload2@gitb'/>",
+            "<xop:Include href=\"cid:custompayload@gitb\"/>",
+            "</S12:Body></S12:Envelope>\r\n",
+            // Deliberately out of order relative to the references, and with an
+            // unreferenced part interleaved.
+            "--b1\r\n",
+            "Content-Type: application/octet-stream\r\n",
+            "Content-ID: <custompayload@gitb>\r\n",
+            "\r\n",
+            "third\r\n",
+            "--b1\r\n",
+            "Content-Type: application/octet-stream\r\n",
+            "Content-ID: <unreferenced@gitb>\r\n",
+            "\r\n",
+            "ignored\r\n",
+            "--b1\r\n",
+            "Content-Type: application/xml\r\n",
+            "Content-ID: <xmlpayload@gitb>\r\n",
+            "\r\n",
+            "first\r\n",
+            "--b1\r\n",
+            "Content-Type: application/xml\r\n",
+            "Content-ID: <xmlpayload2@gitb>\r\n",
+            "\r\n",
+            "second\r\n",
+            "--b1--\r\n"
+        )
+        .as_bytes();
+
+        let parsed = extract_multipart_related_payload_if_present(
+            multipart,
+            "multipart/related; boundary=b1",
+            &session,
+            "as4_receive_push",
+        )
+        .expect("multipart parse")
+        .expect("multipart payload");
+
+        // Ordered by xop:Include position, not by MIME part position.
+        let resolved: Vec<(&str, &[u8])> = parsed
+            .payloads
+            .iter()
+            .map(|p| (p.content_id, p.bytes))
+            .collect();
+        assert_eq!(
+            resolved,
+            vec![
+                ("xmlpayload@gitb", b"first".as_slice()),
+                ("xmlpayload2@gitb", b"second".as_slice()),
+                ("custompayload@gitb", b"third".as_slice()),
+            ]
+        );
+
+        // Every attachment is offered to WS-Security for cid: resolution.
+        assert_eq!(parsed.external_references().len(), 3);
+        assert_eq!(parsed.primary().map(|p| p.bytes), Some(b"first".as_slice()));
+    }
+
+    #[test]
+    fn multipart_rejects_a_reference_with_no_matching_part() {
+        let session = SessionContext::new("s-multipart-missing", "p1", "strict")
+            .expect("session")
+            .with_strict_runtime_bootstrap_validated(true);
+        let multipart = concat!(
+            "--b1\r\n",
+            "Content-Type: application/xop+xml; charset=UTF-8; type=\"application/soap+xml\"\r\n",
+            "Content-ID: <soap-root@example.com>\r\n",
+            "\r\n",
+            "<S12:Envelope xmlns:S12=\"http://www.w3.org/2003/05/soap-envelope\" ",
+            "xmlns:xop=\"http://www.w3.org/2004/08/xop/include\"><S12:Body>",
+            "<xop:Include href=\"cid:present@gitb\"/>",
+            "<xop:Include href=\"cid:absent@gitb\"/>",
+            "</S12:Body></S12:Envelope>\r\n",
+            "--b1\r\n",
+            "Content-Type: application/xml\r\n",
+            "Content-ID: <present@gitb>\r\n",
+            "\r\n",
+            "here\r\n",
+            "--b1--\r\n"
+        )
+        .as_bytes();
+
+        let err = extract_multipart_related_payload_if_present(
+            multipart,
+            "multipart/related; boundary=b1",
+            &session,
+            "as4_receive_push",
+        )
+        .expect_err("a dangling xop:Include must fail, not be skipped");
+        assert!(err.message.contains("absent@gitb"), "{}", err.message);
     }
 
     struct DurableTestDedup(InMemoryDedupBackend);
@@ -843,8 +958,9 @@ Content-ID: <{cid}>\r\n\
         )
         .expect("multipart parse")
         .expect("multipart payload");
-        let payload_cid = multipart.payload_content_id.expect("payload cid");
-        let payload_bytes = multipart.payload_attachment.expect("payload attachment");
+        let primary = multipart.primary().expect("payload attachment");
+        let payload_cid = primary.content_id;
+        let payload_bytes = primary.bytes;
         let payload_uri = format!("cid:{payload_cid}");
         let external_refs = [(payload_uri.as_str(), payload_bytes)];
         let xml = std::str::from_utf8(multipart.soap_xml).expect("utf8");
@@ -892,8 +1008,9 @@ Content-ID: <{cid}>\r\n\
         )
         .expect("multipart parse")
         .expect("multipart payload");
-        let payload_cid = multipart.payload_content_id.expect("payload cid");
-        let payload_bytes = multipart.payload_attachment.expect("payload attachment");
+        let primary = multipart.primary().expect("payload attachment");
+        let payload_cid = primary.content_id;
+        let payload_bytes = primary.bytes;
         let payload_uri = format!("cid:{payload_cid}");
         let external_refs = [(payload_uri.as_str(), payload_bytes)];
         let xml = std::str::from_utf8(multipart.soap_xml).expect("utf8");
@@ -945,7 +1062,8 @@ Content-ID: <{cid}>\r\n\
         .expect("multipart parse")
         .expect("multipart payload");
         let attachment = multipart
-            .payload_attachment
+            .primary()
+            .map(|p| p.bytes)
             .expect("multipart payload attachment");
         let encrypted_xml = std::str::from_utf8(attachment).expect("xml payload");
         assert!(encrypted_xml.contains("xenc:EncryptedData"));
@@ -2905,7 +3023,12 @@ Content-ID: <{cid}>\r\n\
         )
         .await
         .expect("old pull id replay");
-        assert!(!replay_old_id.duplicate_retrieval);
+        // The served-cache entry for `pull-1` has been evicted, but the dedup
+        // backend still knows the MessageId. The replay is therefore reported
+        // as a duplicate and — crucially — must not dequeue anything further.
+        // (This previously asserted `!duplicate_retrieval`, encoding the bug
+        // where an evicted replay fell through to a fresh dequeue.)
+        assert!(replay_old_id.duplicate_retrieval);
         assert!(replay_old_id.pulled.is_none());
     }
 

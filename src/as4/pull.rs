@@ -362,7 +362,16 @@ pub async fn receive_pull_with_reliability(
         mpc: Arc::clone(&mpc),
     };
 
-    check_duplicate_pull(
+    // Authorization first: `check_duplicate_pull` *writes* the MessageId into
+    // the dedup backend, so running it before this check would let an
+    // unauthorized peer insert arbitrary keys into a durable, shared store.
+    validate_pull_authorization_info(
+        session,
+        expected_authorization_info.as_deref(),
+        authorization_info.as_deref(),
+    )?;
+
+    let duplicate_pull = check_duplicate_pull(
         session,
         event_bus,
         dedup_backend.as_ref(),
@@ -371,13 +380,28 @@ pub async fn receive_pull_with_reliability(
     )
     .await?;
 
-    validate_pull_authorization_info(
-        session,
-        expected_authorization_info.as_deref(),
-        authorization_info.as_deref(),
-    )?;
+    // A replayed PullRequest must never dequeue a *second* message. Inside the
+    // served-cache window `atomic_take` already returns the original response;
+    // outside it the cache has been evicted, so the only safe answer is "no
+    // payload" — dequeuing would consume a message the initiator never learns
+    // about. The initiator must retry with a fresh MessageId.
+    let (cached_pulled, queued) = if duplicate_pull {
+        (store.cached_response(&pull_key).await, None)
+    } else {
+        store.atomic_take(&pull_key, &queue_key).await?
+    };
 
-    let (cached_pulled, queued) = store.atomic_take(&pull_key, &queue_key).await?;
+    if duplicate_pull && cached_pulled.is_none() {
+        return Ok(build_pull_output(
+            Arc::clone(&pull_message_id),
+            Arc::clone(&mpc),
+            None,
+            true,
+            None,
+            DeliveryOutcome::Indeterminate,
+            RetryDecision::from_outcome(DeliveryOutcome::Indeterminate),
+        ));
+    }
 
     if let Some(push_out) = cached_pulled {
         let pulled_mpc = push_out.user_message.mpc.as_deref().unwrap_or(DEFAULT_MPC);

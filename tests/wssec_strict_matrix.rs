@@ -50,26 +50,32 @@ fn strict_profile_accepts_spec_compliant_reference() {
     verify_signature_references_strict(&signed, &refs).expect("strict verify");
 }
 
+/// A digest computed over a differently-indented copy of the signed subtree
+/// must not verify.
+///
+/// This used to work by contrasting `strip_blank_text: true` against `false`.
+/// That knob is gone — no W3C canonicalization removes whitespace-only text
+/// nodes, and pretending otherwise is what made ASX's signatures
+/// non-interoperable (see the CHANGELOG entry on XML canonicalization). The property under test is
+/// unchanged and now expressed directly: canonicalization is whitespace-exact,
+/// so re-indenting the payload changes the digest.
 #[test]
 fn strict_mode_rejects_whitespace_digest_mismatch() {
-    let payload =
+    let indented =
         "    <eb:Payload wsu:Id=\"payload-1\">\n      <eb:Value>ABC</eb:Value>\n    </eb:Payload>";
-    let unsigned = signed_xml("#payload-1", payload, "placeholder");
+    let compact = "<eb:Payload wsu:Id=\"payload-1\"><eb:Value>ABC</eb:Value></eb:Payload>";
 
-    let whitespace_digest = canonicalize_reference(
-        &unsigned,
+    // Digest taken over the compact form …
+    let compact_digest = canonicalize_reference(
+        &signed_xml("#payload-1", compact, "placeholder"),
         "#payload-1",
-        WsSecCanonicalizationProfile {
-            kind: asx_rs::crypto::wssec::WsSecCanonicalizationKind::Exclusive,
-            include_comments: false,
-            strip_blank_text: false,
-            inclusive_ns_prefixes: Vec::new(),
-        },
+        WsSecCanonicalizationProfile::default(),
     )
     .expect("digest")
     .digest_value_base64;
 
-    let signed = signed_xml("#payload-1", payload, &whitespace_digest);
+    // … but presented against the indented document.
+    let signed = signed_xml("#payload-1", indented, &compact_digest);
     let refs = parse_signature_references(&signed).expect("refs");
 
     let err = verify_signature_references_strict(&signed, &refs)
