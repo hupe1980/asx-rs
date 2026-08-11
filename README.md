@@ -15,7 +15,7 @@ It is an **embeddable library**, not a gateway. There is no container to run, no
 database to provision, and no JVM. You get the protocol and the cryptography;
 storage, key management and deployment stay yours.
 
-📖 **[Documentation](https://hupe1980.github.io/asx)** ·
+📖 **[Documentation](https://hupe1980.github.io/asx-rs)** ·
 🦀 **[API reference](https://docs.rs/asx-rs)** ·
 📋 **[Changelog](CHANGELOG.md)**
 
@@ -80,7 +80,7 @@ one call, so that step cannot be skipped by accident.
 
 More examples — AS2 send, inbound routers, encryption enforcement, testing
 without a PKI — are in the
-**[getting-started guide](https://hupe1980.github.io/asx/docs/getting-started/)**.
+**[getting-started guide](https://hupe1980.github.io/asx-rs/docs/getting-started/)**.
 
 ## What makes it different
 
@@ -98,7 +98,7 @@ Every relaxation is a named variant you select, never a field you forgot.
 audit and spool-encryption keys are interfaces you implement against your own
 PostgreSQL, Redis, KMS or HSM. The crate does not guess at their protocols.
 
-See the **[security model](https://hupe1980.github.io/asx/docs/security/)** for
+See the **[security model](https://hupe1980.github.io/asx-rs/docs/security/)** for
 trust boundaries, defaults, and what the library does *not* protect against.
 
 ## Status
@@ -125,7 +125,7 @@ Known gaps:
 
 - **No official conformance certificate yet.** The self-hosted counterparty
   loop passes; the free EC eDelivery conformance service is the next step —
-  see the [conformance guide](https://hupe1980.github.io/asx/docs/conformance/).
+  see the [conformance guide](https://hupe1980.github.io/asx-rs/docs/conformance/).
 - **No storage backends ship in-tree.** `DedupStorage`, `ReconciliationStorage`
   and `DurableAuditSink` are trait-defined; you supply the implementation.
 

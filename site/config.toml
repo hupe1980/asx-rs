@@ -1,4 +1,4 @@
-base_url = "https://hupe1980.github.io/asx"
+base_url = "https://hupe1980.github.io/asx-rs"
 title = "asx-rs"
 description = "Async-native AS2 and AS4 (ebMS3) B2B messaging for Rust. S/MIME, WS-Security, MDN and verified receipts, with fail-closed defaults."
 default_language = "en"
@@ -19,7 +19,7 @@ insert_anchor_links = "heading"
 index_format = "elasticlunr_json"
 
 [extra]
-repo = "https://github.com/hupe1980/asx"
+repo = "https://github.com/hupe1980/asx-rs"
 crate = "https://crates.io/crates/asx-rs"
 api_docs = "https://docs.rs/asx-rs"
 # Shown in the page footer and the JSON-LD `softwareVersion`.

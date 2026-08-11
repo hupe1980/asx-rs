@@ -408,4 +408,4 @@ fn receive_as4_push(
 - [Observability](@/docs/observability.md) — EventBus, audit events, backpressure, audit sinks
 - [Interoperability](@/docs/interop.md) — profile stack, strict/relaxed modes
 - [Testing](@/docs/testing.md) — test harness, fuzz testing, interop matrix
-- [Release Process](https://github.com/hupe1980/asx/blob/main/RELEASING.md) — quality gates, CI, checklist
+- [Release Process](https://github.com/hupe1980/asx-rs/blob/main/RELEASING.md) — quality gates, CI, checklist

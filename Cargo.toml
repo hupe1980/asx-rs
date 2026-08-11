@@ -5,7 +5,7 @@ edition = "2024"
 authors = ["hupe1980"]
 description = "AS2 and AS4 B2B messaging library for Rust — signing, encryption, MDN, and ebMS3/AS4 profile support"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/hupe1980/asx"
+repository = "https://github.com/hupe1980/asx-rs"
 readme = "README.md"
 # Not part of the published crate: internal review notes, the documentation
 # website, CI scaffolding and benchmark data.
