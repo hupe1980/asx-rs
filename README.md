@@ -23,9 +23,8 @@ storage, key management and deployment stay yours.
 
 ## Install
 
-```toml
-[dependencies]
-asx-rs = { version = "0.13", features = ["as4", "client", "server"] }
+```bash
+cargo add asx-rs --features as4,client,server
 ```
 
 `as2` and `as4` are **not** on by default — enable the protocols you need.

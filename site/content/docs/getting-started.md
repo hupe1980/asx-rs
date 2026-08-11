@@ -5,28 +5,24 @@ description = "Install asx-rs, pick feature flags, build a session, and send you
 
 ## Installation
 
-Add `asx-rs` to `Cargo.toml`. Because AS2 and AS4 are feature-gated, you must select at least one protocol:
+Because AS2 and AS4 are feature-gated, select at least one protocol:
 
-```toml
-[dependencies]
+```bash
 # AS2 only
-asx-rs = { version = "0.13", features = ["as2", "async-ocsp"] }
+cargo add asx-rs --features as2
 
 # AS4 only
-asx-rs = { version = "0.13", features = ["as4", "async-ocsp"] }
+cargo add asx-rs --features as4
 
-# Both protocols
-asx-rs = { version = "0.13", features = ["as2", "as4", "async-ocsp"] }
-
-# Both protocols with payload compression (RFC 5402)
-asx-rs = { version = "0.13", features = ["as2", "as4", "compression", "async-ocsp"] }
-
-# HTTP client (outbound) + server (inbound) with both protocols
-asx-rs = { version = "0.13", features = ["as2", "as4", "client", "server", "async-ocsp"] }
+# Both protocols, with the HTTP client (outbound) and server (inbound)
+cargo add asx-rs --features as2,as4,client,server
 
 # Relaxed interop for explicitly scoped partner exceptions
-asx-rs = { version = "0.13", features = ["as2", "as4", "interop-relaxed", "async-ocsp"] }
+cargo add asx-rs --features as2,as4,interop-relaxed
 ```
+
+`compression` and `async-ocsp` are on by default; disable defaults with
+`--no-default-features` if you need a leaner build.
 
 > **Note:** The default feature set is `["interop-strict", "async-ocsp"]`. Adding `asx-rs` without explicit features gives you only the shared infrastructure — no AS2 or AS4 protocol functions are compiled.
 
