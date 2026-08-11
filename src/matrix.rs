@@ -227,6 +227,14 @@ pub fn run_interop_fixture_matrix(
     let mut records = Vec::with_capacity(catalog.fixtures.len());
 
     for fixture in &catalog.fixtures {
+        // Relaxed-mode fixtures are untestable without the `interop-relaxed`
+        // feature: `InteropMode::Relaxed` does not exist in that build. Skip
+        // them instead of treating a build-configuration fact as a bug.
+        #[cfg(not(feature = "interop-relaxed"))]
+        if fixture.mode == FixtureMode::Relaxed {
+            continue;
+        }
+
         let mut observed = Vec::with_capacity(iterations);
         for idx in 0..iterations {
             observed.push(execute_fixture(&base_dir, fixture, idx)?);
@@ -639,7 +647,12 @@ fn interop_mode_from_fixture(mode: FixtureMode) -> InteropMode {
         FixtureMode::Relaxed => InteropMode::Relaxed,
         #[cfg(not(feature = "interop-relaxed"))]
         FixtureMode::Relaxed => {
-            unreachable!("interop-relaxed feature required for relaxed fixtures")
+            // The matrix loop skips relaxed fixtures in this build; reaching
+            // here means a caller bypassed that filter.
+            unreachable!(
+                "relaxed fixture reached execution without the interop-relaxed feature; \
+                 the catalog loop must skip these"
+            )
         }
     }
 }
@@ -665,7 +678,17 @@ mod tests {
         let catalog_data = load_fixture_catalog(&catalog).expect("catalog");
 
         let summary = run_interop_fixture_matrix(&catalog, &quarantine, 2).expect("matrix summary");
-        assert_eq!(summary.total, catalog_data.fixtures.len());
+        // Relaxed fixtures are skipped in builds without `interop-relaxed`
+        // (InteropMode::Relaxed does not exist there).
+        #[cfg(feature = "interop-relaxed")]
+        let expected_total = catalog_data.fixtures.len();
+        #[cfg(not(feature = "interop-relaxed"))]
+        let expected_total = catalog_data
+            .fixtures
+            .iter()
+            .filter(|fixture| fixture.mode != FixtureMode::Relaxed)
+            .count();
+        assert_eq!(summary.total, expected_total);
         #[cfg(all(feature = "as2", feature = "as4"))]
         {
             assert_eq!(summary.passed, summary.total);
