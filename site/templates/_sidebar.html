@@ -1,0 +1,18 @@
+{# Sidebar navigation. Order comes from `extra.nav` in config.toml, because the
+   right teaching order is editorial and cannot be inferred from filenames. #}
+<nav class="sidebar" aria-label="Documentation">
+  {% for group in config.extra.nav %}
+  <p class="sidebar-group">{{ group.title }}</p>
+  <ul>
+    {% for item in group.items %}
+    {%- set href = get_url(path=item.path) -%}
+    <li>
+      <a href="{{ href | safe }}"
+         {% if current_path is defined and current_path == item.path %}aria-current="page"{% endif %}>
+        {{ item.title }}
+      </a>
+    </li>
+    {% endfor %}
+  </ul>
+  {% endfor %}
+</nav>

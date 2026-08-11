@@ -1,0 +1,82 @@
+base_url = "https://hupe1980.github.io/asx"
+title = "asx-rs"
+description = "Async-native AS2 and AS4 (ebMS3) B2B messaging for Rust. S/MIME, WS-Security, MDN and verified receipts, with fail-closed defaults."
+default_language = "en"
+compile_sass = true
+minify_html = true
+generate_sitemap = true
+generate_robots_txt = true
+build_search_index = true
+
+taxonomies = []
+
+[markdown]
+smart_punctuation = false
+render_emoji = false
+insert_anchor_links = "heading"
+
+[search]
+index_format = "elasticlunr_json"
+
+[extra]
+repo = "https://github.com/hupe1980/asx"
+crate = "https://crates.io/crates/asx-rs"
+api_docs = "https://docs.rs/asx-rs"
+# Shown in the page footer and the JSON-LD `softwareVersion`.
+version = "0.13.0"
+# Fallback social-card text when a page sets no description.
+default_description = "Async-native AS2 and AS4 (ebMS3) B2B messaging for Rust."
+
+# Ordered navigation for the documentation sidebar. Zola cannot infer a
+# teaching order from the filesystem, so it is declared once here rather than
+# scattered across per-page weights.
+[[extra.nav]]
+title = "Start here"
+[[extra.nav.items]]
+title = "Getting started"
+path = "/docs/getting-started/"
+[[extra.nav.items]]
+title = "Architecture"
+path = "/docs/architecture/"
+
+[[extra.nav]]
+title = "Protocols"
+[[extra.nav.items]]
+title = "AS2"
+path = "/docs/as2/"
+[[extra.nav.items]]
+title = "AS4"
+path = "/docs/as4/"
+[[extra.nav.items]]
+title = "Interoperability"
+path = "/docs/interop/"
+[[extra.nav.items]]
+title = "Conformance"
+path = "/docs/conformance/"
+
+[[extra.nav]]
+title = "Operating it"
+[[extra.nav.items]]
+title = "Security model"
+path = "/docs/security/"
+[[extra.nav.items]]
+title = "Transport"
+path = "/docs/transport/"
+[[extra.nav.items]]
+title = "Reliability"
+path = "/docs/reliability/"
+[[extra.nav.items]]
+title = "Observability"
+path = "/docs/observability/"
+[[extra.nav.items]]
+title = "Persistence"
+path = "/docs/persistence/"
+[[extra.nav.items]]
+title = "Incident channels"
+path = "/docs/incident-channels/"
+
+[[extra.nav]]
+title = "Contributing"
+[[extra.nav.items]]
+title = "Testing"
+path = "/docs/testing/"

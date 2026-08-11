@@ -130,6 +130,14 @@ fn signed_as4_message() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
     let (policy, credentials) = As4SendPolicyBuilder::new()
         .action("urn:test:as4:action")
         .service("urn:test:as4:service", "")
+        // xmlsec1 is a plain XMLDSig verifier: it resolves ds:X509Data but not
+        // the wsse:SecurityTokenReference of the (default) WSS BST profile
+        // ("unexpected node: SecurityTokenReference"). The oracle checks
+        // canonicalization and digests, not WSS token resolution, so pin the
+        // XMLDSig-friendly KeyInfo shape here.
+        .outbound_key_info_profile(
+            asx_rs::crypto::wssec::WsSecOutboundKeyInfoProfile::X509DataAndRsaKeyValue,
+        )
         .signing_cert_pem(cert.clone())
         .signing_key_pem(key.clone())
         .build()
@@ -144,6 +152,7 @@ fn signed_as4_message() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
             policy,
             credentials: Some(credentials),
             payload_filename: None,
+            ..As4SendRequest::default()
         },
     )
     .expect("send_sync");
@@ -204,34 +213,42 @@ fn retarget_cid_reference_to_local_file(soap: &str, filename: &str) -> String {
     format!("{}{}{}", &soap[..value_start], filename, &soap[value_end..])
 }
 
-/// Apply the harness transformation. `KeyInfo` is left intact: ASX emits
-/// `ds:X509Data/ds:X509Certificate`, which xmlsec1 resolves natively given
-/// `--trusted-pem`.
-fn prepare_for_oracle(soap: &str, attachment_file: &str) -> String {
-    retarget_cid_reference_to_local_file(soap, attachment_file)
+/// ASX declares the WSS SwA `Attachment-Content-Signature-Transform` on the
+/// `cid:` reference (mandated by the AS4 profile; consumed by WSS4J-based
+/// stacks). xmlsec1 does not implement the SwA profile, so strip that
+/// `ds:Transforms` block from the retargeted reference. For binary content the
+/// transform's digest input *is* the raw attachment octets, which is exactly
+/// what xmlsec1 digests for a file URI without transforms — the digest input
+/// is unchanged.
+fn strip_swa_transform_from_retargeted_reference(soap: &str) -> String {
+    const SWA_TRANSFORMS_BLOCK: &str = "<ds:Transforms\
+><ds:Transform Algorithm=\"http://docs.oasis-open.org/wss/oasis-wss-SwAProfile-1.1#Attachment-Content-Signature-Transform\"\
+></ds:Transform\
+></ds:Transforms>";
+    let stripped = soap.replacen(SWA_TRANSFORMS_BLOCK, "", 1);
+    assert!(
+        stripped.len() < soap.len(),
+        "expected the SwA content transform on the cid: reference"
+    );
+    stripped
 }
 
-/// # ⚠ THIS TEST CURRENTLY FAILS — see the CHANGELOG entry on XML canonicalization
+/// Apply the harness transformations. `KeyInfo` is left intact: ASX emits
+/// `ds:X509Data/ds:X509Certificate`, which xmlsec1 resolves natively given
+/// `--trusted-pem`.
 ///
-/// xmlsec1 rejects ASX-generated signatures with a `REFERENCE` (digest)
-/// failure on a same-document reference. The payload attachment's digest
-/// matches; one of `#as4-messaging` / `#as4-body` does not.
-///
-/// The likely cause is that ASX emits **no `ds:Transform` on any Reference**.
-/// Per XMLDSig §4.3.3.2 a same-document reference with no transform yields a
-/// node-set that must be serialised with *inclusive* Canonical XML, while ASX
-/// computes the digest with *exclusive* C14N. Every WS-Security stack emits an
-/// explicit `<ds:Transform Algorithm=".../xml-exc-c14n#"/>` per Reference so
-/// the algorithm is declared rather than assumed.
-///
-/// This is left failing on purpose. It is the highest-value open item in the
-/// repository and the whole reason this oracle exists: ASX verifies its own
-/// signatures happily because its verifier applies exclusive C14N
-/// unconditionally, so the disagreement is invisible to every other test here.
-/// Do not delete or `#[should_panic]` this — fix the signer, then delete this
-/// paragraph.
+/// Note that both transformations edit `ds:SignedInfo`, which the signature
+/// value covers — the overall `SignatureValue` check is therefore expected to
+/// fail against the rewritten document, and the tests deliberately assert the
+/// **reference digest tally** instead. Recomputing every reference digest is
+/// the canonicalization/digest interop question this oracle exists to answer.
+fn prepare_for_oracle(soap: &str, attachment_file: &str) -> String {
+    let retargeted = retarget_cid_reference_to_local_file(soap, attachment_file);
+    strip_swa_transform_from_retargeted_reference(&retargeted)
+}
+
 #[test]
-#[ignore = "requires Docker; ALSO currently failing — see the CHANGELOG entry on XML canonicalization"]
+#[ignore = "requires a Docker daemon; run with --ignored"]
 fn asx_signature_verifies_under_the_xmldsig_reference_implementation() {
     let (cert, soap, attachment) = signed_as4_message();
     let soap_text = String::from_utf8(soap).expect("utf8 soap");

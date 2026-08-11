@@ -2,11 +2,11 @@
 use asx_rs::as4::{enqueue_pull_with_reliability, receive_pull_with_reliability};
 
 use asx_rs::as4::{
-    As4EnqueuePullWithReliabilityRequest, As4PullEnqueueOutcome, As4PullPolicy,
-    As4PullPolicyBuilder, As4PullStore, As4QueuedPullMessage, As4ReceivePullRequest,
+    As4EnqueuePullWithReliabilityRequest, As4PullAuthorization, As4PullEnqueueOutcome,
+    As4PullPolicy, As4PullPolicyBuilder, As4PullStore, As4QueuedPullMessage, As4ReceivePullRequest,
     As4ReceivePullWithReliabilityRequest,
 };
-use asx_rs::core::SessionContext;
+use asx_rs::core::{ErrorCode, SessionContext};
 use asx_rs::observability::EventBus;
 use asx_rs::reliability::{
     DeliveryOutcome, InMemoryDedupBackend, InMemoryReconciliationHook, ReconciliationReason,
@@ -83,10 +83,56 @@ fn reliability() -> (InMemoryReconciliationHook, Arc<dyn DedupStorage>) {
 fn pull_policy(mpc: &str) -> As4PullPolicy {
     As4PullPolicyBuilder::new()
         .mpc(mpc)
+        // These tests exercise queueing and delivery, not authorization; stand
+        // in for a deployment where mTLS terminates upstream.
+        .authorization(As4PullAuthorization::EnforcedByTransport)
         .allow_unsigned_push(true)
         .fail_closed_audit_events(false)
         .build()
         .expect("policy")
+}
+
+/// Pull must refuse to serve an MPC that was never explicitly opened.
+#[tokio::test(flavor = "current_thread")]
+async fn as4_pull_is_denied_when_authorization_is_left_at_the_default() {
+    let bus = EventBus::new(32).expect("bus");
+    let _events = bus.subscribe_scoped_events();
+    let store = As4PullStore::new();
+    let s = session();
+    let (hook, dedup) = reliability();
+
+    let policy = As4PullPolicyBuilder::new()
+        .mpc("urn:mpc:default-deny")
+        .allow_unsigned_push(true)
+        .fail_closed_audit_events(false)
+        .build()
+        .expect("policy");
+    assert_eq!(policy.authorization, As4PullAuthorization::Deny);
+
+    let err = receive_pull_with_reliability(
+        &s,
+        &bus,
+        As4ReceivePullWithReliabilityRequest {
+            store: &store,
+            request: As4ReceivePullRequest {
+                pull_message_id: "pull-denied-1".to_string(),
+                policy,
+                receipt_payload: None,
+                authorization_info: Some("anything".to_string()),
+            },
+            reconciliation_hook: &hook,
+            dedup_backend: dedup.clone(),
+        },
+    )
+    .await
+    .expect_err("an unconfigured MPC must not serve messages");
+
+    assert_eq!(err.code, ErrorCode::PolicyViolation);
+    assert!(
+        err.message.contains("As4PullAuthorization"),
+        "the error must name the knob to set: {}",
+        err.message
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -576,7 +622,7 @@ async fn as4_pull_unauthorized_request_does_not_poison_the_dedup_store() {
             .mpc("urn:mpc:priority")
             .allow_unsigned_push(true)
             .fail_closed_audit_events(false)
-            .expected_authorization_info(Some("s3cret".to_string()))
+            .authorization(As4PullAuthorization::SharedSecret("s3cret".to_string()))
             .build()
             .expect("policy")
     };

@@ -6,28 +6,28 @@
 //!
 //! ## Background
 //!
-//! In strict profiles (PEPPOL, CEF), AS4 payloads are transmitted as MIME multipart/related
-//! message bodies rather than embedded in the SOAP `<Body>`. The SOAP envelope contains
-//! Content-ID references to the attachments using WS-Addressing properties.
+//! AS4 payloads are transmitted as MIME multipart/related parts (SwA
+//! packaging): the root part carries the SOAP envelope with an **empty**
+//! `<soap:Body>`, and each payload part is referenced from the signed
+//! `eb:PartInfo href="cid:…"` entries in the `eb:Messaging` header.
 //!
 //! ### Example MIME Structure
 //!
 //! ```text
-//! Content-Type: multipart/related; boundary="----boundary123"; type="application/xop+xml"
+//! Content-Type: multipart/related; boundary="----boundary123"; type="application/soap+xml"
 //!
 //! ------boundary123
-//! Content-Type: application/xop+xml; charset=UTF-8
+//! Content-Type: application/soap+xml; charset=UTF-8
 //! Content-Transfer-Encoding: 8bit
 //! Content-ID: <soap-body@example.com>
 //!
 //! <?xml version="1.0"?>
 //! <soap:Envelope xmlns:soap="http://www.w3.org/2003/05/soap-envelope">
-//!   <soap:Body>
-//!     <eb:UserMessage xmlns:eb="http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/">
-//!       <!-- payload references via xop:Include -->
-//!       <xop:Include href="cid:payload-001@example.com"/>
-//!     </eb:UserMessage>
-//!   </soap:Body>
+//!   <soap:Header>
+//!     <!-- eb:Messaging with eb:PartInfo href="cid:payload-001@example.com" -->
+//!     <!-- wsse:Security signing eb:Messaging, the Body and the attachment -->
+//!   </soap:Header>
+//!   <soap:Body/>
 //! </soap:Envelope>
 //!
 //! ------boundary123
@@ -208,7 +208,7 @@ pub const MIME_BOUNDARY_PREFIX: &str = "----boundary-asx-";
 #[derive(Debug, Clone)]
 pub struct MimeAttachment {
     /// Content-ID for this attachment (e.g., `payload-001@example.com`).
-    /// Used in xop:Include href references within the SOAP envelope.
+    /// Referenced from `eb:PartInfo href="cid:…"` in the SOAP envelope.
     pub content_id: String,
 
     /// MIME type of the attachment (e.g., `application/octet-stream`).
@@ -343,12 +343,11 @@ impl MimePackageBuilder {
 
     /// Set the SOAP envelope as the root attachment (Content-ID: `<soap-body@example.com>`).
     ///
-    /// This is typically the first attachment in a MIME package.
+    /// The root part is `application/soap+xml` — AS4 SwA packaging. (MTOM's
+    /// `application/xop+xml` root, emitted by asx through 0.12.0, makes WSS4J-based
+    /// receivers fail the security-header DOM conversion.)
     pub fn with_soap_body(mut self, soap_xml: Vec<u8>) -> Self {
-        let content_type = format!(
-            "application/xop+xml; charset=UTF-8; type=\"{}\"",
-            self.root_soap_content_type
-        );
+        let content_type = format!("{}; charset=UTF-8", self.root_soap_content_type);
         self.soap_attachment = Some(MimeAttachment::new(
             "soap-body@example.com",
             content_type,
@@ -412,10 +411,12 @@ impl MimePackageBuilder {
     /// Get the Content-Type header value for this package.
     ///
     /// Returns the multipart/related Content-Type with boundary parameter.
+    /// The `type` parameter names the root part's media type per RFC 2387 —
+    /// `application/soap+xml` for AS4 SwA packaging.
     pub fn content_type(&self) -> String {
         format!(
-            "multipart/related; boundary=\"{}\"; type=\"application/xop+xml\"",
-            self.boundary
+            "multipart/related; boundary=\"{}\"; type=\"{}\"",
+            self.boundary, self.root_soap_content_type
         )
     }
 
@@ -539,7 +540,7 @@ mod tests {
 
         assert!(content_type.starts_with("multipart/related"));
         assert!(content_type.contains("boundary="));
-        assert!(content_type.contains("type=\"application/xop+xml\""));
+        assert!(content_type.contains("type=\"application/soap+xml\""));
     }
 
     #[test]

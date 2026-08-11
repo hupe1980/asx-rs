@@ -15,6 +15,12 @@ jobs:
           - "as2,client"
           - "as4,server"
           - "as2,as4,client,server,trace"
+          # `testing` without `interop-relaxed`: this combination is reachable
+          # by any downstream integration-test build and was silently broken
+          # because every prior job enabled both together.
+          - "as2,as4,testing"
+          - "as2,as4,testing,interop-relaxed"
+          - "as2,as4,compression"
     steps:
       - uses: actions/checkout@v4
       - name: Install stable toolchain
@@ -23,6 +29,27 @@ jobs:
         run: cargo check --no-default-features --features "${{ matrix.features }}"
       - name: Cargo test
         run: cargo test --no-default-features --features "${{ matrix.features }}"
+
+  # A hand-written matrix only covers combinations someone thought of. This
+  # walks the powerset so a `#[cfg]` branch that no listed combination compiles
+  # cannot reach main unnoticed.
+  feature-powerset:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-hack
+        uses: taiki-e/install-action@cargo-hack
+      # `--at-least-one-of as2,as4` encodes the crate's own invariant: without a
+      # protocol feature there is nothing to build but shared infrastructure,
+      # and `server` deliberately `compile_error!`s in that state.
+      - name: Check feature powerset
+        run: |
+          cargo hack check --feature-powerset --depth 2 \
+            --at-least-one-of as2,as4 \
+            --exclude-features prometheus,opentelemetry \
+            --lib --tests
 
   lint:
     runs-on: ubuntu-latest
@@ -45,7 +72,7 @@ jobs:
         run: |
           cargo run --release -p xtask --no-default-features --features "as2,as4,client,server,trace,compression,async-ocsp,interop-strict" -- perf-gate \
             --iterations 2000 \
-            --check-baseline docs/perf-baseline.txt \
+            --check-baseline benches/perf-baseline.txt \
             --max-regression 0.25
 
   perf-matrix-smoke:

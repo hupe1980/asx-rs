@@ -1,4 +1,7 @@
-# Security Model
++++
+title = "Security model"
+description = "Trust boundaries, fail-closed defaults, certificate validation and revocation, XML Signature Wrapping defences, and what asx-rs does not protect against."
++++
 
 ## Design Principles
 
@@ -66,6 +69,38 @@ RevocationPolicy {
 
 When `fingerprint_sha256` is non-empty, the signer certificate's SHA-256 fingerprint is compared against this value after PKIX validation. A mismatch fails the receive.
 
+### AS4 pull authorization
+
+A `PullRequest` asks the receiver to hand over queued messages, is not signed,
+and names an MPC that is not secret. `As4PullPolicy::authorization` therefore
+defaults to `As4PullAuthorization::Deny`: an MPC that was never explicitly opened
+serves nothing. Choose `SharedSecret` (constant-time comparison against
+`eb:AuthorizationInfo`) or `EnforcedByTransport` (mTLS or an API gateway
+authorizes the caller upstream). There is no "unauthenticated" setting reachable
+by leaving a field unset.
+
+WS-Security verification always requires an X.509 signer token, and the verifying key is taken from that certificate. A signature that verifies only against an inline `ds:KeyValue/ds:RSAKeyValue` is rejected: anyone can generate a key pair and inline its public half, so such a signature is cryptographically valid while authenticating nobody. An inline `RSAKeyValue` sent alongside a certificate is still checked for consistency with it.
+
+Three KeyInfo shapes resolve to the signer certificate:
+
+| KeyInfo shape | Notes |
+|---|---|
+| `ds:X509Data/ds:X509Certificate` inline | What ASX emits by default |
+| `wsse:SecurityTokenReference` → `wsse:BinarySecurityToken` `ValueType="...#X509v3"` | Single DER certificate — the default shape of WSS4J-based stacks (phase4, Domibus, Oxalis) |
+| `wsse:SecurityTokenReference` → `wsse:BinarySecurityToken` `ValueType="...#X509PKIPathv1"` | DER certificate path, leaf first (BDEW) |
+
+Key-identifier styles that need out-of-document lookup (`wsse:KeyIdentifier`
+with SKI or thumbprint, `ds:X509IssuerSerial`) are not resolvable from the
+message alone and fail with a named error.
+
+A document carrying **multiple `ds:Signature` elements** is resolved
+fail-closed: exactly one signature directly inside `wsse:Security` is used (a
+counter-signature elsewhere in the document is tolerated but not verified);
+two or more inside `wsse:Security`, or several with none inside
+`wsse:Security`, are rejected as ambiguous rather than resolved by document
+order — which would let an attacker prepend a signature-shaped element to
+steer which signature gets verified.
+
 For AS4 push receive, `As4PushPolicy` now controls trust mode explicitly:
 1. Pinned sender mode: requires `fingerprint_sha256` to be configured for signed inbound message verification.
 
@@ -115,7 +150,7 @@ Stale or expired OCSP responses are rejected.
 |---|---|
 | Signing | S/MIME CMS — RSA + SHA-256 |
 | Encryption | S/MIME CMS — AES-256 CBC (or AES-128-GCM for newer partners) |
-| MIC computation | SHA-256 over `Content-Type: …\r\n\r\n<payload>` (RFC 4130 §7.3.1) |
+| MIC computation | SHA-256 over the signed/decrypted MIME entity, or over content alone for unprotected messages (RFC 4130 §7.3.1 — see [as2.md](@/docs/as2.md#mic-computation)) |
 
 ### AS4 (WS-Security / XML Encryption)
 
@@ -141,17 +176,24 @@ WS-Security signature computation uses XML Exclusive C14N (W3C `exc-c14n`).
 
 > **Whitespace is signed.** Exclusive and Inclusive C14N differ *only* in
 > namespace rendering; neither removes whitespace-only text nodes. ASX has no
-> option to strip them — a `strip_blank_text` knob existed until 0.12.0 and made
+> option to strip them — a `strip_blank_text` knob existed through 0.12.0 and made
 > every signature non-interoperable. Conformance is
 > now checked against xmlsec1, the XMLDSig reference implementation, by
 > `tests/interop_xmlsec_oracle.rs`.
 
 The implementation:
-- Correctly handles namespace propagation for visibly-utilized namespaces.
+- Correctly handles namespace propagation for visibly-utilized namespaces, including the `xmlns=""` undeclaration for a no-namespace element under an inherited non-empty default namespace (Exc-C14N §2.3).
 - Forwards processing instruction nodes (`<?target data?>`).
-- Implements `InclusiveNamespaces PrefixList` per W3C Exc-C14N §2.1 — ancestor namespace bindings for listed prefixes are rendered even when not directly utilized at the element.
+- Implements `InclusiveNamespaces PrefixList` per W3C Exc-C14N §2.1 — ancestor namespace bindings for listed prefixes are rendered even when not directly utilized at the element. The list is honored both on per-reference `ds:Transform`s and on the `ds:SignedInfo` `CanonicalizationMethod` itself, where WSS4J-based signers declare their SOAP envelope prefix by default.
 - Strips comments in default mode; preserves them when `include_comments = true`.
 - Sorts attributes in lexicographic order (namespace URI, local name) as required by C14N.
+
+For `cid:` attachment references, the WSS SwA profile
+`Attachment-Content-Signature-Transform` is declared on send and accepted on
+verify — the AS4 profile mandates it, and its digest input for binary content
+is the raw attachment octets. The `Attachment-Complete-Signature-Transform`
+(MIME part headers folded into the digest) is not implemented and is rejected
+by name.
 
 Validated against W3C C14N test vectors (namespace propagation, attribute ordering, text/attribute escaping, PI forwarding, comment stripping, comment preservation).
 
@@ -171,7 +213,7 @@ Two supporting rules make this enforceable:
 
 | Rule | Why |
 |---|---|
-| The SOAP body must carry an `xop:Include href="cid:…"` | Without a Content-ID there is nothing to match a `cid:` reference against, so coverage could never be proven. A multipart message without one is rejected as having no payload attachment. |
+| The envelope must reference the attachment by `href="cid:…"` — an `eb:PartInfo` in the **signed** `eb:Messaging` header (SwA, the AS4 packaging), or a legacy MTOM `xop:Include` in the Body | Without a Content-ID there is nothing to match a `cid:` reference against, so coverage could never be proven. A multipart message without one is rejected as having no payload attachment. |
 | `href` is matched in both XML quoting styles | `href='cid:…'` is legal XML; matching only the double-quoted form left the attachment unidentified. |
 
 ### Signed scope and XML Signature Wrapping defence

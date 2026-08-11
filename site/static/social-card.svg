@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" viewBox="0 0 1200 630" role="img"
+     aria-label="asx-rs — AS2 and AS4 B2B messaging for Rust">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0e1116"/>
+      <stop offset="1" stop-color="#1a1420"/>
+    </linearGradient>
+    <linearGradient id="mark" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#ff7b72"/>
+      <stop offset="1" stop-color="#a78bfa"/>
+    </linearGradient>
+  </defs>
+  <rect width="1200" height="630" fill="url(#bg)"/>
+  <rect x="80" y="86" width="72" height="72" rx="18" fill="url(#mark)"/>
+  <text x="176" y="142" font-family="system-ui,-apple-system,Segoe UI,Roboto,sans-serif"
+        font-size="46" font-weight="650" fill="#e6e9ef">asx-rs</text>
+  <text x="80" y="290" font-family="system-ui,-apple-system,Segoe UI,Roboto,sans-serif"
+        font-size="72" font-weight="700" fill="#e6e9ef">AS2 &amp; AS4 messaging</text>
+  <text x="80" y="376" font-family="system-ui,-apple-system,Segoe UI,Roboto,sans-serif"
+        font-size="72" font-weight="700" fill="#ff7b72">that fails closed.</text>
+  <text x="80" y="470" font-family="system-ui,-apple-system,Segoe UI,Roboto,sans-serif"
+        font-size="34" fill="#99a3b2">ebMS3 · S/MIME · WS-Security · verified receipts</text>
+  <text x="80" y="546" font-family="ui-monospace,SFMono-Regular,Menlo,monospace"
+        font-size="30" fill="#7aa2ff">cargo add asx-rs</text>
+</svg>

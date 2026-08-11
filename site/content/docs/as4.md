@@ -1,4 +1,7 @@
-# AS4 Protocol Reference
++++
+title = "AS4 reference"
+description = "AS4 (OASIS ebMS3) in asx-rs: WS-Security signing, XML encryption, verified receipts, push and pull MEPs, large messages, and SMP discovery."
++++
 
 Requires feature flag: `as4`
 
@@ -64,7 +67,7 @@ certificate's public key type at call time.  No configuration is needed.
 | Recipient cert key | Key transport | Key reference | Profiles |
 |---|---|---|---|
 | RSA | RSA-OAEP (SHA-256/MGF1-SHA-256) | `BinarySecurityToken` | PEPPOL, CEF eDelivery |
-| EC (NIST P-256/P-384/P-521, BrainpoolP256r1/P384r1) | ECDH-ES ephemeral + ConcatKDF (NIST SP 800-56A §5.8.1) + AES-128 Key Wrap (RFC 3394) | `X509SKI` | BDEW AS4-Profil §2.2.6.2.2, BSI TR-03116-3 §9.2 |
+| EC (NIST P-256/P-384/P-521, BrainpoolP256r1/P384r1) | ECDH-ES ephemeral + ConcatKDF (NIST SP 800-56A §5.8.1) + AES Key Wrap (RFC 3394), sized to the content key | `X509SKI` | BDEW AS4-Profil §2.2.6.2.2, BSI TR-03116-3 §9.2 |
 
 ### EC encryption XML structure
 
@@ -72,7 +75,8 @@ When the recipient has an EC key the outbound `<xenc:EncryptedKey>` uses:
 
 ```xml
 <xenc:EncryptedKey>
-  <xenc:EncryptionMethod Algorithm="http://www.w3.org/2001/04/xmlenc#kw-aes128"/>
+  <!-- kw-aes256 for an AES-256-GCM payload, kw-aes128 for AES-128-GCM -->
+  <xenc:EncryptionMethod Algorithm="http://www.w3.org/2001/04/xmlenc#kw-aes256"/>
   <ds:KeyInfo>
     <xenc:AgreementMethod Algorithm="http://www.w3.org/2009/xmlenc11#ECDH-ES">
       <xenc11:KeyDerivationMethod Algorithm="http://www.w3.org/2009/xmlenc11#ConcatKDF">
@@ -106,7 +110,7 @@ When the recipient has an EC key the outbound `<xenc:EncryptedKey>` uses:
 |---|---|---|
 | Hash | SHA-256 | XMLenc11 |
 | Counter | 1 (single round, keydatalen ≤ 256 bits) | NIST SP 800-56A §5.8.1 |
-| keydatalen | 128 bits (for kw-aes128) — output truncation only | Derived from key-wrap algorithm |
+| keydatalen | Matches the key-wrap algorithm: 128 bits for kw-aes128, 256 for kw-aes256 — output truncation only | Derived from key-wrap algorithm |
 | AlgorithmID | `""` (empty) | BDEW AS4-Profil / BSI TR-03116-3 |
 | PartyUInfo | `""` | BDEW AS4-Profil |
 | PartyVInfo | `""` | BDEW AS4-Profil |
@@ -118,12 +122,20 @@ length-prefixed form belongs to the JOSE Concat KDF, RFC 7518, and is *not* used
 here). With the empty default parameters this reduces to `SHA-256(counter ‖ Z)`,
 and the KEK is the leftmost `keydatalen/8` bytes.
 
+On receive, non-empty `ConcatKDFParams` attributes from a peer are decoded per
+XML Encryption 1.1 §5.4.1: `xs:hexBinary` **bit strings** whose first octet is
+the padding-bit count (W3C xmlenc-core1 Example 25 — `AlgorithmID="0000"` is
+the single octet `0x00`). Only byte-aligned values (padding count 0) are
+accepted; invalid hex and sub-byte bit strings are rejected with named errors
+rather than silently mis-derived into an undiagnosable AEAD failure.
+
 ---
 
 ## Multi-Payload Messages
 
 ebMS3 allows several `eb:PartInfo` entries per `UserMessage`. On receive, every
-part referenced by an `xop:Include` is resolved, in document order:
+part referenced by an `href="cid:…"` — `eb:PartInfo` in the signed header
+(SwA) or legacy MTOM `xop:Include` — is resolved, in document order:
 
 ```rust
 let out = /* As4ReceivePushOutput */;
@@ -148,16 +160,41 @@ Each attachment is treated on equal terms:
 Bounds and failure modes:
 
 - At most 16 attachments per message (`MAX_INBOUND_PAYLOADS`), so a body full of
-  `xop:Include` references cannot induce unbounded work.
-- An `xop:Include` with no matching MIME `Content-ID` is an error, not a skip.
-- MIME parts not referenced by any `xop:Include` are ignored without allocation.
-- A body with **no** `xop:Include` is rejected: with no Content-ID there is
+  `cid:` references cannot induce unbounded work.
+- A `cid:` reference with no matching MIME `Content-ID` is an error, not a skip.
+- MIME parts not referenced by any `cid:` href are ignored without allocation.
+- An envelope with **no** `cid:` reference is rejected: with no Content-ID there is
   nothing to tie a part to a `ds:Reference URI="cid:…"`, so it could never be
   shown to be signature-covered.
 
-> **Send is single-payload.** `As4SendRequest::payload` takes one payload. This
-> is the remaining gap for eDelivery conformance, whose payload profiles define
-> four parts — see [conformance.md](conformance.md).
+### Multi-payload send
+
+`As4SendRequest::additional_payloads` attaches further parts; each gets its own
+signed `eb:PartInfo`, its own `ds:Reference`, and — when the policy says so —
+per-part compression and encryption:
+
+```rust
+use asx_rs::as4::As4AdditionalPayload;
+
+As4SendRequest {
+    payload: invoice_xml,
+    payload_mime_type: Some("application/xml".into()),
+    payload_content_id: Some("xmlpayload@gitb".into()),
+    additional_payloads: vec![
+        As4AdditionalPayload::new(annex_xml, "application/xml")
+            .with_content_id("xmlpayload2@gitb"),
+        As4AdditionalPayload::new(binary, "application/octet-stream"),
+    ],
+    ..As4SendRequest::default()
+}
+```
+
+Attachment digests follow the WSS SwA transform by the part's **wire**
+content type — XML parts are digested over their Exclusive C14N form, `text/*`
+over CRLF-normalized octets, everything else raw — which is what WSS4J-based
+receivers recompute. Compressed parts travel as `application/gzip` and
+encrypted parts as `application/octet-stream` on the wire, while the signed
+`eb:PartInfo` MimeType always names the original media type.
 
 ---
 
@@ -263,7 +300,7 @@ Key fields:
 |---|---|---|
 | `sign` | `true` | Require signing in strict mode |
 | `encrypt` | `false` | Set `true` + `recipient_cert_pem` for encrypted send |
-| `outbound_key_info_profile` | `X509DataAndRsaKeyValue` | Use `X509PKIPathv1` for BDEW |
+| `outbound_key_info_profile` | `BinarySecurityTokenX509v3` (WSS 1.1.1 §7.7 STR shape; what WSS4J-based peers require) | Use `X509PKIPathv1` for BDEW; bare-`X509Data` profiles exist for plain-XMLDSig consumers |
 | `outbound_xmlenc_payload_algorithm` | `Aes128Gcm` | AES-128-GCM (eDelivery v1.15 default) |
 | `payload_packaging_mode` | `MimeAttachment` | MIME-only (strict default) |
 
@@ -306,7 +343,7 @@ pub async fn send_async(
 
 Behavior notes:
 
-1. SOAP envelope is generated and adapted for XOP/cid references.
+1. SOAP envelope is generated with SwA packaging: empty Body, payload referenced from the signed `eb:PartInfo`.
 2. MIME package is emitted as `multipart/related` output.
 3. The WS-Security signature covers three references: the whole `eb:Messaging`
    header block (`wsu:Id="as4-messaging"` — all UserMessage routing/authorization
@@ -317,7 +354,7 @@ Behavior notes:
    defence.
 4. Optional XML encryption is applied before outbound packaging.
 
-### Verify the synchronous response (Reception Awareness / NRR)
+### Verify the synchronous response
 
 ```rust
 pub fn verify_sync_response(
@@ -471,6 +508,44 @@ pub async fn receive_pull_with_reliability(
 ) -> Result<As4ReceivePullOutput>
 ```
 
+#### Authorizing a pull (required)
+
+Pull inverts the usual trust direction. In push, the sender proves who it is by
+signing a message it hands you. In pull, a peer asks you to **hand over** queued
+messages — and the ebMS3 `PullRequest` signal is unsigned. An MPC URI is not a
+secret either: it appears in P-Mode configuration, agreements and log lines. The
+authorization check is therefore the only thing between a caller and another
+party's business documents.
+
+`As4PullPolicy::authorization` must be set explicitly; it defaults to
+[`As4PullAuthorization::Deny`], which refuses every `PullRequest`:
+
+```rust
+use asx_rs::as4::{As4PullAuthorization, As4PullPolicyBuilder};
+
+// Shared secret compared against eb:AuthorizationInfo in constant time.
+let policy = As4PullPolicyBuilder::new()
+    .mpc("urn:example:mpc:invoices")
+    .authorization(As4PullAuthorization::SharedSecret(secret))
+    .build()?;
+
+// Or: mTLS terminates at the reverse proxy, which maps the client certificate
+// to this MPC before the request reaches the library.
+let policy = As4PullPolicyBuilder::new()
+    .mpc("urn:example:mpc:invoices")
+    .authorization(As4PullAuthorization::EnforcedByTransport)
+    .build()?;
+```
+
+ebMS3 §5.2.3.1 makes `eb:AuthorizationInfo` optional *at the protocol level*,
+which is why this is a policy decision rather than a wire requirement. That
+flexibility exists for deployments where the transport layer owns the boundary —
+which is what `EnforcedByTransport` states explicitly. Leaving pull open is not
+reachable by omission, only by choosing it.
+
+An empty `SharedSecret` is rejected at build time: it would compare equal to an
+absent `AuthorizationInfo` and silently authorize everyone.
+
 ### Token-enforced strict runtime sessions
 
 For regulated deployments that require explicit startup proof, bind validated
@@ -538,7 +613,7 @@ policy.
 `generate_pull_request` are available in `asx_rs::as4`.
 
 Signal *verification* on the send side is
-[`verify_sync_response`](#verify-the-synchronous-response-reception-awareness--nrr).
+[`verify_sync_response`](#verify-the-synchronous-response).
 
 ## Core Types
 
@@ -583,24 +658,37 @@ certificate from the SMP.
 Enable the `smp` module with the `client` feature:
 
 ```toml
-asx-rs = { version = "0.12", features = ["as4", "client", "async-ocsp"] }
+asx-rs = { version = "0.13", features = ["as4", "client", "async-ocsp"] }
 ```
 
 ### Lookup and Register a Runtime P-Mode
 
 ```rust
-use asx_rs::smp::{SmpClient, SmpLookupRequest};
+use asx_rs::smp::{SmpClient, SmpConfig, SmpLookupRequest, SmpSignaturePolicy};
 use asx_rs::as4::pmode::{PMode, PModeRegistry, MepType, PModeSecurity};
 use std::sync::Arc;
 
-async fn build_registry_from_smp() -> asx_rs::Result<Arc<PModeRegistry>> {
-    // 1. Look up the recipient endpoint via PEPPOL SMP.
-    let client = SmpClient::new("acc.edelivery.tech.ec.europa.eu");
+async fn build_registry_from_smp(smp_ca_pem: String) -> asx_rs::Result<Arc<PModeRegistry>> {
+    // 1. Look up the recipient endpoint via PEPPOL SMP, verifying the response.
+    //
+    //    An SMP lookup decides where the message goes and which key it is
+    //    encrypted to. TLS authenticates the SMP *host*, not the metadata it
+    //    serves, so the enveloped XMLDSig must be verified against the
+    //    network's SMP CA. `SmpSignaturePolicy` defaults to `Deny` precisely so
+    //    this cannot be skipped by omission.
+    let config = SmpConfig {
+        signature_policy: SmpSignaturePolicy::verify_with_trust_anchors(vec![smp_ca_pem]),
+        ..SmpConfig::peppol_test()
+    };
+    let client = SmpClient::with_config(config);
     let endpoint = client.lookup_endpoint(SmpLookupRequest::peppol(
         "0088:1234567890123",       // recipient participant ID
         "urn:cen.eu:en16931:2017#compliant#urn:fdc:peppol.eu:2017:poacc:billing:3.0::2.1",
         "urn:fdc:peppol.eu:2017:poacc:billing:01:1.0",
     )).await?;
+
+    // The signature verified: `endpoint.verified_signer_fingerprint_sha256` is
+    // `Some`, and the URL and certificate below really came from the network's SMP.
 
     // 2. Validate the SMP-provided certificate against your trust anchors before use.
     //    The certificate_der_b64 field holds a base64-encoded DER X.509 certificate.
@@ -636,6 +724,25 @@ async fn build_registry_from_smp() -> asx_rs::Result<Arc<PModeRegistry>> {
     Ok(Arc::new(registry))
 }
 ```
+
+### Verifying the SMP response
+
+`SmpSignaturePolicy` controls how a `ServiceMetadata` response is authenticated:
+
+| Variant | Meaning |
+|---|---|
+| `Deny` (**default**) | Refuse to use the lookup result. An unverified response does not silently become a routing decision. |
+| `Verify(..)` | Verify the enveloped `ds:Signature` and chain the signer to the supplied SMP CA. **Use this on any public network.** |
+| `RequireSignaturePresent` | Check that a `ds:Signature` element exists, nothing more. Catches an unsigned SMP and nothing else. |
+| `AllowUnsigned` | Accept unsigned responses. Closed and test networks only. |
+
+Under `Verify`, `SmpEndpoint::verified_signer_fingerprint_sha256` names the
+signer whose signature was checked; under the weaker policies it is `None` and
+the endpoint fields are unauthenticated.
+
+`SmpConfig::peppol_test()` and `peppol_production()` carry the network's
+identity — SML zone, participant scheme, transport profile — but not its trust
+anchors, which belong to your deployment. Set `signature_policy` yourself.
 
 ### SSRF Considerations
 

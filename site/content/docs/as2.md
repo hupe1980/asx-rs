@@ -1,4 +1,7 @@
-# AS2 Protocol Reference
++++
+title = "AS2 reference"
+description = "AS2 (RFC 4130) in asx-rs: send and receive, S/MIME signing and encryption, MDN generation, and how the RFC 4130 section 7.3.1 MIC is computed."
++++
 
 Requires feature flag: `as2`
 
@@ -38,9 +41,38 @@ pub async fn send_async(
 Behavior notes:
 
 1. RFC 5402 order is enforced for compression-enabled messages: `compress -> sign -> encrypt`.
-2. MIC is computed over the exact octet sequence `Content-Type: ...\r\n\r\n<payload>` (RFC 4130 section 7.3.1).
-3. MIC canonicalization does not trim, normalize, or transfer-decode bytes before hashing; both `Content-Type` and payload bytes are hashed exactly as supplied to send/ingress paths (RFC 4130 §7.3.1 / §7.4.2 alignment).
-4. Policy-controlled protocol events are emitted via `EventBus`.
+2. Compression produces a CMS `CompressedData` structure (RFC 5402 / RFC 3274, ZLIB),
+   carried as `application/pkcs7-mime; smime-type=compressed-data` — not a bare gzip stream.
+3. Policy-controlled protocol events are emitted via `EventBus`.
+
+### MIC computation
+
+The `Received-Content-MIC` a receiver returns in the MDN must digest exactly the
+octets the sender digested, and RFC 4130 §7.3.1 makes that input depend on which
+protection was applied:
+
+| Message | MIC input |
+|---|---|
+| Signed (with or without encryption) | the **signed MIME entity** — headers, blank line, content |
+| Encrypted but unsigned | the **decrypted MIME entity** — headers and content |
+| Neither signed nor encrypted | the **content only**, with no MIME headers |
+
+The last row is deliberate: unprotected messages pass through intermediaries
+that reorder and rewrite headers, so including them would make the MIC
+unreproducible.
+
+Consequences worth knowing:
+
+- `As2SendPolicy::payload_content_type` appears on the wire as the signed
+  entity's `Content-Type`, so it is part of the MIC. Setting it to the payload's
+  real media type (`application/edi-x12`, `application/edifact`, …) is required
+  for the partner to compute the same value.
+- Binary content (compressed or encrypted payloads) is transfer-encoded with
+  `base64` before signing, per RFC 5751 §3.1.1 — MIME line-ending
+  canonicalization would otherwise rewrite bytes inside the blob and break the
+  signature. Text payloads keep `binary` transfer encoding.
+- Nothing is trimmed, re-folded, or normalized before hashing; the entity is
+  digested as transmitted.
 
 ### Receive (owned payload)
 

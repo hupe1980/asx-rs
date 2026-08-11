@@ -1707,12 +1707,15 @@ xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\">\
             ref_id = sent.message_id,
         );
 
+        // KeyInfo shape is irrelevant here — the test targets the coverage
+        // binding. Use the inline-X509Data profile so the hand-built envelope
+        // needs no BinarySecurityToken.
         let signature_xml = generate_xmlsig_signature(
             &envelope,
             &["#only-body"],
             &key_pem,
             &cert_pem,
-            WsSecOutboundKeyInfoProfile::default(),
+            WsSecOutboundKeyInfoProfile::X509DataAndRsaKeyValue,
         )
         .expect("sign body only");
         let signed = envelope.replace(

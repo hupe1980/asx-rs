@@ -465,7 +465,7 @@ fn rejects_mixed_reference_signature_when_detached_payload_is_tampered() {
 }
 
 #[test]
-fn tolerates_multiple_signature_elements_during_reference_parsing() {
+fn rejects_multiple_signature_elements_without_wsse_security_parent() {
     let xml = r##"<S12:Envelope xmlns:S12="http://www.w3.org/2003/05/soap-envelope"
             xmlns:ds="http://www.w3.org/2000/09/xmldsig#"
             xmlns:eb="http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/">
@@ -494,19 +494,25 @@ fn tolerates_multiple_signature_elements_during_reference_parsing() {
         </S12:Body>
     </S12:Envelope>"##;
 
-    let refs = parse_signature_references(xml)
-        .expect("multi-sig envelope should parse references from first ds:Signature");
-    // Must pick the first signature's references (#payload-1, not the second's).
-    assert_eq!(refs.len(), 1);
-    assert_eq!(refs[0].uri, "#payload-1");
+    // Two ds:Signature elements and neither inside wsse:Security: there is no
+    // principled way to pick one, and resolving by document order would let an
+    // attacker prepend a signature-shaped element to steer which signature is
+    // verified. Fail closed.
+    let err = parse_signature_references(xml)
+        .expect_err("ambiguous multi-signature document must be rejected");
+    assert_eq!(err.code, ErrorCode::InteropViolation);
+    assert!(
+        err.message.contains("wsse:Security"),
+        "error must explain the resolution rule: {}",
+        err.message
+    );
 }
 
 #[test]
-fn tolerates_multiple_signature_elements_during_strict_verification() {
-    // With multiple ds:Signature elements and no wsse:Security parent, the
-    // resolver falls back to first-in-document-order. The envelope has a
-    // fabricated digest so verification still fails, but now with
-    // SecurityVerificationFailed rather than InteropViolation.
+fn rejects_multiple_signature_elements_during_strict_verification() {
+    // Same rule at verification time: multiple ds:Signature elements with no
+    // wsse:Security primary are ambiguous and rejected outright, before any
+    // digest or signature-value work.
     let xml = r##"<S12:Envelope xmlns:S12="http://www.w3.org/2003/05/soap-envelope"
             xmlns:ds="http://www.w3.org/2000/09/xmldsig#"
             xmlns:eb="http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/">
@@ -545,14 +551,12 @@ fn tolerates_multiple_signature_elements_during_strict_verification() {
         </S12:Body>
     </S12:Envelope>"##;
 
-    // Should no longer return InteropViolation; the first signature is selected
-    // and proceeds to crypto verification (which fails on bad digest/signature value).
     let err = verify_enveloped_signature(xml, WsSecVerifyOptions::new())
-        .expect_err("fabricated digest must still fail verification");
-    assert_ne!(
+        .expect_err("ambiguous multi-signature document must be rejected");
+    assert_eq!(
         err.code,
         ErrorCode::InteropViolation,
-        "multi-sig should not be an InteropViolation; got: {}",
+        "ambiguous multi-sig must fail closed by name: {}",
         err.message
     );
 }
@@ -902,8 +906,11 @@ fn rejects_same_document_reference_uri_with_invalid_fragment_start_during_canoni
     assert_eq!(err.code, ErrorCode::InteropViolation);
 }
 
+/// `wsu:Id` is an `xsd:ID` (an XML NCName), and NCNames may contain uppercase.
+/// WSS4J, WCF and Axis-derived stacks routinely emit IDs like `Id-4f2a`, so
+/// rejecting them would fail closed against conformant partners.
 #[test]
-fn rejects_same_document_reference_uri_with_uppercase_fragment_during_parsing() {
+fn accepts_uppercase_same_document_reference_fragments() {
     let xml = r##"<S12:Envelope xmlns:S12="http://www.w3.org/2003/05/soap-envelope"
             xmlns:ds="http://www.w3.org/2000/09/xmldsig#"
             xmlns:eb="http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/">
@@ -919,29 +926,32 @@ fn rejects_same_document_reference_uri_with_uppercase_fragment_during_parsing() 
             </ds:Signature>
         </S12:Header>
         <S12:Body>
-            <eb:Payload id="payload-1">ABC</eb:Payload>
+            <eb:Payload Id="Payload-1">ABC</eb:Payload>
         </S12:Body>
     </S12:Envelope>"##;
 
-    let err = parse_signature_references(xml)
-        .expect_err("uppercase same-document URI fragments must fail closed in strict parsing");
-    assert_eq!(err.code, ErrorCode::InteropViolation);
+    let refs = parse_signature_references(xml).expect("uppercase NCName IDs are valid xsd:ID");
+    assert_eq!(refs.len(), 1);
+    assert_eq!(refs[0].uri, "#Payload-1");
+
+    canonicalize_reference(xml, "#Payload-1", WsSecCanonicalizationProfile::default())
+        .expect("uppercase fragment must resolve during canonicalization");
 }
 
+/// ID matching stays case-*sensitive*: `#Payload-1` must not resolve to an
+/// element carrying `Id="payload-1"`.
 #[test]
-fn rejects_same_document_reference_uri_with_uppercase_fragment_during_canonicalization() {
+fn same_document_reference_resolution_is_case_sensitive() {
     let xml = r##"<S12:Envelope xmlns:S12="http://www.w3.org/2003/05/soap-envelope"
             xmlns:eb="http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/">
         <S12:Body>
-            <eb:Payload id="payload-1">ABC</eb:Payload>
+            <eb:Payload Id="payload-1">ABC</eb:Payload>
         </S12:Body>
     </S12:Envelope>"##;
 
     let err = canonicalize_reference(xml, "#Payload-1", WsSecCanonicalizationProfile::default())
-        .expect_err(
-            "uppercase same-document URI fragments must fail closed in strict canonicalization",
-        );
-    assert_eq!(err.code, ErrorCode::InteropViolation);
+        .expect_err("a case-mismatched ID must not resolve");
+    assert_eq!(err.code, ErrorCode::InvalidInput);
 }
 
 #[test]

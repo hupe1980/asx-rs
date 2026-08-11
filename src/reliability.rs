@@ -292,12 +292,30 @@ pub type InMemoryDedupBackend = crate::storage::TtlDedupStorage;
 /// Alias for convenience; production code should depend on `dyn ReconciliationStorage`.
 pub type InMemoryReconciliationHook = crate::storage::InMemoryReconciliationStorage;
 
+/// Derive a collision-resistant dedup key for an inbound message.
+///
+/// The obvious `format!("{namespace}:{protocol}:{message_id}")` is ambiguous:
+/// `message_id` arrives from the peer (an AS2 `Message-ID` or ebMS3
+/// `eb:MessageId`) and is not charset-restricted, so it may contain the
+/// delimiter. `("acme", "as4", "as4:x")` and `("acme:as4", "as4", "x")` both
+/// render `acme:as4:as4:x` — two distinct messages sharing one dedup key, which
+/// makes the second one silently vanish as a "duplicate".
+///
+/// Hashing a NUL-separated tuple removes the ambiguity, matching
+/// [`derive_reconciliation_idempotency_key`]. The protocol tag stays in the
+/// plaintext prefix so operators can still tell keys apart in a store dump.
 pub fn derive_ingress_idempotency_key(
     namespace: &str,
     protocol: &'static str,
     message_id: &str,
 ) -> String {
-    format!("{namespace}:{protocol}:{message_id}")
+    let mut hasher = Sha256::new();
+    hasher.update(namespace.as_bytes());
+    hasher.update([0]);
+    hasher.update(protocol.as_bytes());
+    hasher.update([0]);
+    hasher.update(message_id.as_bytes());
+    format!("ingress:v2:{protocol}:{}", hex_lower(&hasher.finalize()))
 }
 
 // ── Dead-letter queue ─────────────────────────────────────────────────────────
@@ -903,6 +921,34 @@ mod tests {
         let c = derive_ingress_idempotency_key("dedup:partner-a", "as4", "msg-1");
         assert_eq!(a, b);
         assert_ne!(a, c);
+    }
+
+    /// `message_id` comes from the peer and may contain the field delimiter, so
+    /// a key built by string concatenation is ambiguous: two distinct messages
+    /// would share a dedup entry and the second would silently disappear.
+    #[test]
+    fn ingress_idempotency_key_resists_delimiter_injection() {
+        let shifted = derive_ingress_idempotency_key("acme", "as4", "as4:x");
+        let other = derive_ingress_idempotency_key("acme:as4", "as4", "x");
+        assert_ne!(
+            shifted, other,
+            "a message id containing the delimiter must not collide with another namespace"
+        );
+
+        // The same holds for a colon on the namespace side.
+        assert_ne!(
+            derive_ingress_idempotency_key("a:b", "as2", "m"),
+            derive_ingress_idempotency_key("a", "as2", "b:m"),
+        );
+    }
+
+    /// Distinct partners must never share a dedup entry for the same message id.
+    #[test]
+    fn ingress_idempotency_key_separates_partners() {
+        assert_ne!(
+            derive_ingress_idempotency_key("partner-a", "as2", "msg-1"),
+            derive_ingress_idempotency_key("partner-b", "as2", "msg-1"),
+        );
     }
 
     #[test]

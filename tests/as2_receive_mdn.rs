@@ -5,8 +5,7 @@
 mod common;
 
 use asx_rs::as2::{
-    As2MdnMode, As2ReceiveMdnRequest, As2ReceivePolicy, As2RegulatedSpoolKeyProvider,
-    receive_with_mdn_with_reliability,
+    As2MdnMode, As2ReceiveMdnRequest, As2ReceivePolicy, receive_with_mdn_with_reliability,
 };
 use asx_rs::core::{ErrorCode, InteropMode, SessionContext};
 use asx_rs::interop::{InteropExceptionCode, InteropExceptionPolicy};
@@ -109,7 +108,7 @@ async fn malformed_boundary_is_rejected_in_strict_mode() {
                 interop_mode: InteropMode::Strict,
                 interop_exceptions: InteropExceptionPolicy::default(),
                 fail_closed_audit_events: false,
-                regulated_spool_key_provider: As2RegulatedSpoolKeyProvider::LocalEnv,
+                spool_key_provider: None,
                 enforce_as2_version: true,
             },
             original_message_id: None,
@@ -388,7 +387,7 @@ async fn partner_quirk_parses_in_relaxed_mode() {
                     vec![InteropExceptionCode::As2AllowMissingMdnBoundary],
                 ),
                 fail_closed_audit_events: false,
-                regulated_spool_key_provider: As2RegulatedSpoolKeyProvider::LocalEnv,
+                spool_key_provider: None,
                 enforce_as2_version: true,
             },
             original_message_id: None,
@@ -421,7 +420,7 @@ async fn relaxed_partner_quirk_without_exception_is_rejected() {
                 interop_mode: InteropMode::Relaxed,
                 interop_exceptions: InteropExceptionPolicy::default(),
                 fail_closed_audit_events: false,
-                regulated_spool_key_provider: As2RegulatedSpoolKeyProvider::LocalEnv,
+                spool_key_provider: None,
                 enforce_as2_version: true,
             },
             original_message_id: None,

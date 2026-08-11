@@ -1,7 +1,7 @@
 # asx-rs task runner — run `just` to list recipes.
 #
 # Recipes mirror .github/workflows/rust.yml and the mandatory gates in
-# docs/release.md. When a gate changes there, change it here too (and vice
+# RELEASING.md. When a gate changes there, change it here too (and vice
 # versa) so local runs and CI cannot drift apart.
 
 set shell := ["bash", "-euo", "pipefail", "-c"]
@@ -15,7 +15,7 @@ perf_features := "as2,as4,client,server,trace,compression,async-ocsp,interop-str
 
 perf_iterations := "2000"
 perf_max_regression := "0.25"
-perf_baseline := "docs/perf-baseline.txt"
+perf_baseline := "benches/perf-baseline.txt"
 
 coverage_threshold := "85"
 coverage_files := "src/interop.rs"
@@ -102,7 +102,7 @@ lint: fmt-check clippy
 
 # Hygiene scan: no TODO/FIXME/HACK markers, no code-level deprecations.
 #
-# Deprecation scanning is code-only on purpose: prose in docs/ legitimately
+# Deprecation scanning is code-only on purpose: prose in site/ legitimately
 # describes deprecated behaviour without introducing any.
 [group('lint')]
 [doc('Scan for TODO/FIXME/HACK markers and code-level deprecations')]
@@ -111,7 +111,7 @@ hygiene:
     set -euo pipefail
     if command -v rg >/dev/null 2>&1; then
         scan() { rg -n "$1" src tests docs .github scripts \
-            --glob '!docs/release.md' || true; }
+            --glob '!RELEASING.md' || true; }
         scan_code() { rg -n "$1" src tests benches || true; }
     else
         scan() { grep -rnE "$1" src tests docs .github scripts \
@@ -258,14 +258,11 @@ perf-baseline-write:
 [group('composite')]
 ci: lint check-strict test matrix
 
-# Every mandatory release gate, in the order docs/release.md lists them.
+# Every mandatory release gate, in the order RELEASING.md lists them.
 #
 # Long-running. `just ci` is the fast pre-push subset.
-#
-# Not covered here: the test-quarantine and spool-hygiene benchmark gates —
-# docs/release.md cites scripts for both that do not exist in this repository.
 [group('composite')]
-[doc('Every mandatory release gate, in docs/release.md order (slow)')]
+[doc('Every mandatory release gate, in RELEASING.md order (slow)')]
 release-gate: fmt-check check check-strict clippy test-sweep interop-matrix wssec-vectors fuzz-gate matrix perf-gate hygiene profile-lint fixtures-validate
     @echo "release-gate: all implemented gates passed"
 

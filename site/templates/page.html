@@ -1,0 +1,43 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="wrap docs-layout">
+  {% include "_sidebar.html" %}
+
+  <article class="doc">
+    <nav class="breadcrumb" aria-label="Breadcrumb">
+      <a href="{{ get_url(path='@/docs/_index.md') | safe }}">Docs</a>
+      <span aria-hidden="true">/</span>
+      <span>{{ page.title }}</span>
+    </nav>
+
+    <h1>{{ page.title }}</h1>
+    {% if page.description %}<p class="doc-lede">{{ page.description }}</p>{% endif %}
+
+    {% if page.toc | length > 1 %}
+    <details class="toc" open>
+      <summary>On this page</summary>
+      <ul>
+        {% for h in page.toc %}
+        <li><a href="{{ h.permalink | safe }}">{{ h.title }}</a>
+          {% if h.children %}
+          <ul>{% for c in h.children %}<li><a href="{{ c.permalink | safe }}">{{ c.title }}</a></li>{% endfor %}</ul>
+          {% endif %}
+        </li>
+        {% endfor %}
+      </ul>
+    </details>
+    {% endif %}
+
+    <div class="doc-body">
+      {{ page.content | safe }}
+    </div>
+
+    <footer class="doc-footer">
+      <a href="{{ config.extra.repo }}/edit/main/site/content/{{ page.relative_path | replace(from='content/', to='') }}" rel="noopener">
+        Edit this page
+      </a>
+    </footer>
+  </article>
+</div>
+{% endblock content %}

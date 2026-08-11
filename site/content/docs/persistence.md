@@ -1,4 +1,7 @@
-# Persistence How-To (Library-First)
++++
+title = "Persistence"
+description = "Implementing the storage traits — dedup, reconciliation, durable audit, and spool encryption keys — against PostgreSQL, Redis, or your own key manager."
++++
 
 This guide shows how to add production-grade persistence for:
 
@@ -54,10 +57,56 @@ pub trait ReconciliationStorage: Send + Sync {
 ## Durable, cluster-safe backends are consumer-supplied
 
 `asx-rs` deliberately ships **no** database-backed storage. `DedupStorage`,
-`ReconciliationStorage`, and `DurableAuditSink` are the integration boundary —
-you implement them against your own store (PostgreSQL, Redis, DynamoDB, SQLite,
-…). The only in-tree implementations are the in-memory ones, which are for
-testing and single-process use.
+`ReconciliationStorage`, `DurableAuditSink`, and `SpoolEncryptionKeyProvider`
+are the integration boundary — you implement them against your own store
+(PostgreSQL, Redis, DynamoDB, SQLite, …) or key manager. The only in-tree
+implementations are the in-memory / static ones, which are for testing and
+single-process use.
+
+### Spool encryption keys
+
+Profiles that mandate an encrypted payload spool (PEPPOL, CEF, BDEW) need a key.
+`As2ReceivePolicy::spool_key_provider` supplies it, and those receives **fail
+closed** when it is unset rather than spooling in the clear.
+
+Through 0.12.0 this crate shipped its own KMS/HSM HTTP client — twenty-eight
+environment variables, mTLS, retry/backoff, a circuit breaker — that spoke a
+JSON contract (`{"key_hex","key_hmac_b64"}`) no real key manager implements. It
+only ever worked against a bespoke shim, and the trait that would have let you
+skip the shim was private. All of it is gone.
+
+Implement the trait against your own SDK:
+
+```rust
+use asx_rs::as2::SpoolEncryptionKeyProvider;
+
+#[derive(Debug)]
+struct KmsSpoolKey { client: aws_sdk_kms::Client, key_id: String }
+
+impl SpoolEncryptionKeyProvider for KmsSpoolKey {
+    fn label(&self) -> &'static str { "aws-kms" }
+
+    fn resolve_key(&self, _session: &SessionContext) -> Result<Arc<[u8; 32]>> {
+        // Cache this — resolve_key is called whenever a receive decides to spool.
+        Ok(Arc::clone(&self.cached))
+    }
+}
+```
+
+For development, or when an orchestrator injects the key as a secret:
+
+```rust
+use asx_rs::as2::StaticSpoolKey;
+
+let policy = As2ReceivePolicyBuilder::new()
+    .spool_key_provider(Arc::new(StaticSpoolKey::from_env("MY_APP_SPOOL_KEY")?))
+    .build();
+```
+
+`StaticSpoolKey` resolves eagerly, so a missing or malformed key fails at
+startup rather than on the first large inbound message. An all-zero key is
+rejected outright: that is what an unset or truncated secret looks like, and it
+would "encrypt" a regulated spool while protecting nothing.
 
 A durable backend must return `true` from both `is_durable()` and
 `cluster_safe()` so it passes the strict production startup gate

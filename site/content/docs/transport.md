@@ -1,4 +1,7 @@
-# HTTP Transport
++++
+title = "Transport"
+description = "HTTP egress and ingress: the Axum router integration, the reqwest client, TLS and SSRF guards, and the inbound endpoint boundary."
++++
 
 The `transport` module provides three independent layers for HTTP integration. Each can be used without the others.
 
@@ -106,7 +109,8 @@ let ingress: As4HttpIngress = as4_ingress_from_http(&http_request)?;
 `as4_ingress_from_http` fails if:
 - Method is not `POST`
 - `Content-Type` is not SOAP-aware (`application/soap+xml` or
-    `multipart/related` carrying SOAP/XOP root content; XOP root requires
+    `multipart/related` carrying a SOAP root part (`application/soap+xml`,
+    or the legacy MTOM `application/xop+xml`); the root part requires
     `start-info="application/soap+xml"`)
 
 Parameter matching is case-insensitive; quoted and whitespace-padded `type` /
@@ -130,7 +134,7 @@ pub struct As4HttpIngress {
 ## Egress / HTTP Client (`client` feature)
 
 ```toml
-asx-rs = { version = "0.12", features = ["as2", "as4", "client"] }
+asx-rs = { version = "0.13", features = ["as2", "as4", "client"] }
 ```
 
 ### SSRF protection
@@ -214,7 +218,7 @@ match outcome.signal {
 
 Do not inspect `HttpSendOutcome::body` for `<eb:Receipt` yourself — namespace
 prefixes are arbitrary and a substring match cannot verify Non-Repudiation of
-Receipt. See [AS4 — verify the synchronous response](as4.md#verify-the-synchronous-response-reception-awareness--nrr).
+Receipt. See [AS4 — verify the synchronous response](@/docs/as4.md#verify-the-synchronous-response).
 
 A non-2xx status carrying a parseable `eb:Error` is surfaced as
 `As4SyncSignal::Error`; a non-2xx status with an unparseable body becomes
@@ -276,7 +280,7 @@ impl HttpSendOutcome {
 ## Server / Axum Integration (`server` feature)
 
 ```toml
-asx-rs = { version = "0.12", features = ["as2", "as4", "server"] }
+asx-rs = { version = "0.13", features = ["as2", "as4", "server"] }
 ```
 
 The server layer provides axum 0.7 router builders with typed handler traits. It is built on top of the framework-agnostic ingress layer — the same validation logic runs regardless of how the request arrives.

@@ -1,4 +1,7 @@
-# ASX Architecture
++++
+title = "Architecture"
+description = "How asx-rs is layered: the transport boundary, wire format, protocol modules, and the type-state lifecycle that keeps unverified bytes away from application code."
++++
 
 ## Overview
 

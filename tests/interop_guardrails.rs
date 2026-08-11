@@ -4,9 +4,7 @@
 mod common;
 
 use asx_rs::as2::receive_with_mdn_with_reliability;
-use asx_rs::as2::{
-    As2MdnMode, As2ReceiveMdnRequest, As2ReceivePolicy, As2RegulatedSpoolKeyProvider,
-};
+use asx_rs::as2::{As2MdnMode, As2ReceiveMdnRequest, As2ReceivePolicy};
 use asx_rs::as4::{
     As4PushPolicyBuilder, As4ReceivePushRequest, As4ReceivePushSyncRequest,
     receive_push_with_dedup_sync,
@@ -54,7 +52,7 @@ async fn guardrail_outcomes_include_allowed_and_denied_for_as2() {
                     vec![InteropExceptionCode::As2AllowMissingMdnBoundary],
                 ),
                 fail_closed_audit_events: false,
-                regulated_spool_key_provider: As2RegulatedSpoolKeyProvider::LocalEnv,
+                spool_key_provider: None,
                 enforce_as2_version: true,
             },
             original_message_id: None,
@@ -80,7 +78,7 @@ async fn guardrail_outcomes_include_allowed_and_denied_for_as2() {
                 interop_mode: InteropMode::Relaxed,
                 interop_exceptions: InteropExceptionPolicy::default(),
                 fail_closed_audit_events: false,
-                regulated_spool_key_provider: As2RegulatedSpoolKeyProvider::LocalEnv,
+                spool_key_provider: None,
                 enforce_as2_version: true,
             },
             original_message_id: None,

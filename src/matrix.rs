@@ -23,8 +23,8 @@ use std::path::{Path, PathBuf};
 
 #[cfg(feature = "as2")]
 use crate::as2::{
-    As2MdnMode, As2ReceiveMdnRequest, As2ReceivePolicy, As2RegulatedSpoolKeyProvider,
-    As2TrustVerifier, TrustResult, receive_with_mdn_with_reliability,
+    As2MdnMode, As2ReceiveMdnRequest, As2ReceivePolicy, As2TrustVerifier, TrustResult,
+    receive_with_mdn_with_reliability,
 };
 // `matrix` is an in-crate module so we can access the private sealing marker.
 #[cfg(feature = "as2")]
@@ -92,7 +92,7 @@ impl As2TrustVerifier for DeterministicTrustVerifier {
         Ok(TrustResult {
             signature: self.trust.signature,
             decryption: self.trust.decryption,
-            decrypted_payload: None,
+            protected_entity: None,
         })
     }
 }
@@ -372,7 +372,7 @@ fn execute_as2_fixture(
         interop_mode: interop_mode_from_fixture(fixture.mode),
         interop_exceptions: InteropExceptionPolicy::default(),
         fail_closed_audit_events: false,
-        regulated_spool_key_provider: As2RegulatedSpoolKeyProvider::LocalEnv,
+        spool_key_provider: None,
         enforce_as2_version: true,
     };
 

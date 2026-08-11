@@ -25,7 +25,7 @@ struct DurableTestAuditSink {
 impl DurableTestAuditSink {
     fn new() -> Self {
         Self {
-            inner: InMemoryAuditSink::new(),
+            inner: InMemoryAuditSink::new().expect("audit sink"),
         }
     }
 }

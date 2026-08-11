@@ -1,31 +1,22 @@
+use super::spool_key::{SpoolEncryptionKeyProvider, reject_unusable_key};
 use super::types::As2ReceivePolicy;
-use super::{AsxError, SessionContext, SpoolEncryption, SpoolLifecyclePolicy, StreamBodyPolicy};
-use super::{SpoolEncryptionKeyProvider, regulated_spool_key_provider};
-use super::{
-    as2_spool_threshold_for_profile, profile_requires_encrypted_spool,
-    validate_spool_encryption_key_startup_self_test,
-};
+use super::{AsxError, ErrorCode, ErrorContext, SessionContext, SpoolEncryption};
+use super::{SpoolLifecyclePolicy, StreamBodyPolicy};
+use super::{as2_spool_threshold_for_profile, profile_requires_encrypted_spool};
 use std::time::Instant;
 
+/// Recorded when a spool key provider answers successfully.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SpoolKeyProviderObservation {
     pub(crate) provider: &'static str,
-    pub(crate) backend: &'static str,
-    pub(crate) auth_mode: &'static str,
-    pub(crate) auth_fingerprint_label: String,
-    pub(crate) auth_rotation_hint: &'static str,
     pub(crate) health_state: &'static str,
-    pub(crate) startup_self_test_ms: u64,
     pub(crate) resolve_key_ms: u64,
 }
 
+/// Recorded when a spool key provider fails to answer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SpoolKeyProviderFailureObservation {
     pub(crate) provider: &'static str,
-    pub(crate) backend: &'static str,
-    pub(crate) auth_mode: &'static str,
-    pub(crate) auth_fingerprint_label: String,
-    pub(crate) auth_rotation_hint: &'static str,
     pub(crate) health_state: &'static str,
     pub(crate) phase: &'static str,
     pub(crate) error_code: &'static str,
@@ -47,8 +38,7 @@ pub(super) fn regulated_stream_body_policy_build_with_provider(
     spool_threshold_bytes: usize,
     provider: &dyn SpoolEncryptionKeyProvider,
 ) -> StreamBodyPolicyBuildOutcome {
-    let provider_kind = provider.provider_kind();
-    let auth_telemetry = provider.auth_telemetry(session);
+    let label = provider.label();
 
     let resolve_start = Instant::now();
     let key = match provider.resolve_key(session) {
@@ -56,11 +46,7 @@ pub(super) fn regulated_stream_body_policy_build_with_provider(
         Err(error) => {
             return StreamBodyPolicyBuildOutcome::ProviderFailure {
                 observation: SpoolKeyProviderFailureObservation {
-                    provider: provider_kind.as_str(),
-                    backend: provider_kind.backend(),
-                    auth_mode: auth_telemetry.auth_mode,
-                    auth_fingerprint_label: auth_telemetry.auth_fingerprint_label,
-                    auth_rotation_hint: auth_telemetry.auth_rotation_hint,
+                    provider: label,
                     health_state: "failing",
                     phase: "key_resolution",
                     error_code: error.code.as_str(),
@@ -71,26 +57,21 @@ pub(super) fn regulated_stream_body_policy_build_with_provider(
     };
     let resolve_key_ms = u64::try_from(resolve_start.elapsed().as_millis()).unwrap_or(u64::MAX);
 
-    let self_test_start = Instant::now();
-    if let Err(error) =
-        validate_spool_encryption_key_startup_self_test(provider_kind, session, key.as_ref())
-    {
+    // A custom provider can return anything; re-check the one property that
+    // distinguishes a key from a misconfiguration. There is deliberately no
+    // AES known-answer test here: verifying OpenSSL on every spool decision
+    // costs latency per message and has never been the failing component.
+    if let Err(error) = reject_unusable_key(key.as_ref()) {
         return StreamBodyPolicyBuildOutcome::ProviderFailure {
             observation: SpoolKeyProviderFailureObservation {
-                provider: provider_kind.as_str(),
-                backend: provider_kind.backend(),
-                auth_mode: auth_telemetry.auth_mode,
-                auth_fingerprint_label: auth_telemetry.auth_fingerprint_label,
-                auth_rotation_hint: auth_telemetry.auth_rotation_hint,
+                provider: label,
                 health_state: "failing",
-                phase: "startup_self_test",
+                phase: "key_validation",
                 error_code: error.code.as_str(),
             },
             error,
         };
     }
-    let startup_self_test_ms =
-        u64::try_from(self_test_start.elapsed().as_millis()).unwrap_or(u64::MAX);
 
     StreamBodyPolicyBuildOutcome::Ready {
         body_policy: StreamBodyPolicy {
@@ -106,13 +87,8 @@ pub(super) fn regulated_stream_body_policy_build_with_provider(
             startup_hygiene_checks: true,
         },
         provider_observation: Some(SpoolKeyProviderObservation {
-            provider: provider_kind.as_str(),
-            backend: provider_kind.backend(),
-            auth_mode: auth_telemetry.auth_mode,
-            auth_fingerprint_label: auth_telemetry.auth_fingerprint_label,
-            auth_rotation_hint: auth_telemetry.auth_rotation_hint,
+            provider: label,
             health_state: "healthy",
-            startup_self_test_ms,
             resolve_key_ms,
         }),
     }
@@ -124,8 +100,32 @@ pub(crate) fn as2_stream_body_policy_build(
 ) -> StreamBodyPolicyBuildOutcome {
     let profile_name = session.profile_name();
     let spool_threshold_bytes = as2_spool_threshold_for_profile(profile_name);
+
     if profile_requires_encrypted_spool(profile_name) {
-        let provider = regulated_spool_key_provider(policy.regulated_spool_key_provider);
+        // Fail closed: a profile that mandates encrypted spooling must not
+        // silently fall back to writing payloads to disk in the clear.
+        let Some(provider) = policy.spool_key_provider.as_ref() else {
+            let error = AsxError::new(
+                ErrorCode::PolicyViolation,
+                format!(
+                    "profile '{profile_name}' requires an encrypted payload spool, but \
+                     As2ReceivePolicy::spool_key_provider is not set. Supply a \
+                     SpoolEncryptionKeyProvider — StaticSpoolKey::from_env(\"…\") for \
+                     development, or your own KMS/HSM implementation"
+                ),
+                ErrorContext::for_session("as2_receive_stream_policy", session),
+            );
+            return StreamBodyPolicyBuildOutcome::ProviderFailure {
+                observation: SpoolKeyProviderFailureObservation {
+                    provider: "unconfigured",
+                    health_state: "failing",
+                    phase: "provider_selection",
+                    error_code: error.code.as_str(),
+                },
+                error,
+            };
+        };
+
         return regulated_stream_body_policy_build_with_provider(
             session,
             spool_threshold_bytes,

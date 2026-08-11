@@ -610,7 +610,7 @@ pub enum InteropMode {
     ///
     /// ```toml
     /// [dependencies]
-    /// asx-rs = { version = "0.12", features = ["interop-relaxed"] }
+    /// asx-rs = { version = "0.13", features = ["interop-relaxed"] }
     /// ```
     #[cfg(feature = "interop-relaxed")]
     Relaxed,
@@ -764,6 +764,33 @@ impl SessionContextBuilder {
         self.cert_handle_or_init()
             .trust_anchor_pems
             .push(pem.into());
+        self
+    }
+
+    /// Append a certificate that signature verification may use for chain
+    /// building — an intermediate CA, or the partner's leaf signing
+    /// certificate.
+    ///
+    /// See [`CertHandle::intermediate_ca_pems`] for why the leaf usually has to
+    /// be supplied here rather than being taken from the message.
+    pub fn with_intermediate_ca_pem(mut self, pem: impl Into<String>) -> Self {
+        self.cert_handle_or_init()
+            .intermediate_ca_pems
+            .push(pem.into());
+        self
+    }
+
+    /// Append several chain-building certificates at once.
+    ///
+    /// Equivalent to calling
+    /// [`with_intermediate_ca_pem`][Self::with_intermediate_ca_pem] in a loop.
+    pub fn with_intermediate_ca_pems(
+        mut self,
+        pems: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.cert_handle_or_init()
+            .intermediate_ca_pems
+            .extend(pems.into_iter().map(|p| p.into()));
         self
     }
 
@@ -1048,10 +1075,17 @@ pub struct CertHandle {
     pub key_id: String,
     pub fingerprint_sha256: String,
     pub trust_anchor_pems: Vec<String>,
-    /// Intermediate CA certificates (PEM) used for chain building during
-    /// signature verification.  Supply any CAs that issued the partner's
-    /// signing certificate when those intermediates are not embedded in
-    /// the signed payload and are not already in `trust_anchor_pems`.
+    /// Additional certificates (PEM) made available for chain building during
+    /// signature verification.
+    ///
+    /// AS2 verification runs OpenSSL with `PKCS7_NOINTERN`, so certificates
+    /// **embedded in the inbound message are not used for path building** —
+    /// otherwise a sender could influence its own chain. The practical
+    /// consequence is that this list must contain every certificate needed to
+    /// reach a trust anchor, including the partner's **leaf signing
+    /// certificate** when it is not itself a configured anchor.
+    ///
+    /// Populate it with [`SessionContextBuilder::with_intermediate_ca_pem`].
     pub intermediate_ca_pems: Vec<String>,
     pub revocation_crl_pems: Vec<String>,
     pub ocsp_mode: OcspMode,

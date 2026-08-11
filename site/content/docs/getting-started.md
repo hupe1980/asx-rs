@@ -1,4 +1,7 @@
-# Getting Started
++++
+title = "Getting started"
+description = "Install asx-rs, pick feature flags, build a session, and send your first AS2 or AS4 message."
++++
 
 ## Installation
 
@@ -7,22 +10,22 @@ Add `asx-rs` to `Cargo.toml`. Because AS2 and AS4 are feature-gated, you must se
 ```toml
 [dependencies]
 # AS2 only
-asx-rs = { version = "0.12", features = ["as2", "async-ocsp"] }
+asx-rs = { version = "0.13", features = ["as2", "async-ocsp"] }
 
 # AS4 only
-asx-rs = { version = "0.12", features = ["as4", "async-ocsp"] }
+asx-rs = { version = "0.13", features = ["as4", "async-ocsp"] }
 
 # Both protocols
-asx-rs = { version = "0.12", features = ["as2", "as4", "async-ocsp"] }
+asx-rs = { version = "0.13", features = ["as2", "as4", "async-ocsp"] }
 
 # Both protocols with payload compression (RFC 5402)
-asx-rs = { version = "0.12", features = ["as2", "as4", "compression", "async-ocsp"] }
+asx-rs = { version = "0.13", features = ["as2", "as4", "compression", "async-ocsp"] }
 
 # HTTP client (outbound) + server (inbound) with both protocols
-asx-rs = { version = "0.12", features = ["as2", "as4", "client", "server", "async-ocsp"] }
+asx-rs = { version = "0.13", features = ["as2", "as4", "client", "server", "async-ocsp"] }
 
 # Relaxed interop for explicitly scoped partner exceptions
-asx-rs = { version = "0.12", features = ["as2", "as4", "interop-relaxed", "async-ocsp"] }
+asx-rs = { version = "0.13", features = ["as2", "as4", "interop-relaxed", "async-ocsp"] }
 ```
 
 > **Note:** The default feature set is `["interop-strict", "async-ocsp"]`. Adding `asx-rs` without explicit features gives you only the shared infrastructure — no AS2 or AS4 protocol functions are compiled.
@@ -399,14 +402,14 @@ fn receive_as4_push(
 
 ## Next Steps
 
-- [Architecture](architecture.md) — module map and design decisions
-- [AS2 Protocol Reference](as2.md) — send, receive, MDN, MIC, compression
-- [AS4 Protocol Reference](as4.md) — send, receive push/pull, WS-Security, P-Mode, SBDH
-- [HTTP Transport](transport.md) — client and server integration
-- [Security Model](security.md) — trust model, certificate handling, crypto algorithms
-- [Reliability](reliability.md) — dedup, reconciliation, retry
-- [Persistence How-To](persistence-howto.md) — production persistence adapters for dedup/reconciliation/audit
-- [Observability](observability.md) — EventBus, audit events, backpressure, audit sinks
-- [Interoperability](interop.md) — profile stack, strict/relaxed modes
-- [Testing](testing.md) — test harness, fuzz testing, interop matrix
-- [Release Process](release.md) — quality gates, CI, checklist
+- [Architecture](@/docs/architecture.md) — module map and design decisions
+- [AS2 Protocol Reference](@/docs/as2.md) — send, receive, MDN, MIC, compression
+- [AS4 Protocol Reference](@/docs/as4.md) — send, receive push/pull, WS-Security, P-Mode, SBDH
+- [HTTP Transport](@/docs/transport.md) — client and server integration
+- [Security Model](@/docs/security.md) — trust model, certificate handling, crypto algorithms
+- [Reliability](@/docs/reliability.md) — dedup, reconciliation, retry
+- [Persistence How-To](@/docs/persistence.md) — production persistence adapters for dedup/reconciliation/audit
+- [Observability](@/docs/observability.md) — EventBus, audit events, backpressure, audit sinks
+- [Interoperability](@/docs/interop.md) — profile stack, strict/relaxed modes
+- [Testing](@/docs/testing.md) — test harness, fuzz testing, interop matrix
+- [Release Process](https://github.com/hupe1980/asx/blob/main/RELEASING.md) — quality gates, CI, checklist

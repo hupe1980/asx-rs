@@ -3,7 +3,7 @@ use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use std::collections::HashMap;
 
 use super::canonicalize::canonicalize_reference;
-use super::{DS_NS, SHA256_URI, XML_EXC_C14N_URI};
+use super::{DS_NS, SHA256_URI, SWA_ATTACHMENT_CONTENT_TRANSFORM_URI, XML_EXC_C14N_URI};
 use super::{
     WsSecCanonicalizationProfile, WsSecCanonicalizedReference, WsSecOutboundKeyInfoProfile,
 };
@@ -303,6 +303,21 @@ fn generate_xmlsig_signature_core(
     let cert_der_b64 = BASE64_STANDARD.encode(cert_der);
 
     let key_info_xml = match key_info_profile {
+        WsSecOutboundKeyInfoProfile::BinarySecurityTokenX509v3 => {
+            // SecurityTokenReference pointing to the wsse:BinarySecurityToken
+            // with wsu:Id="X509Token" that WsSecurityHeaderBuilder emits when
+            // built with `with_signing_cert`. WSS 1.1.1 §7.7 requires KeyInfo
+            // in a WS-Security header to carry an STR — WSS4J-based receivers
+            // reject a bare ds:X509Data with UNSUPPORTED_SECURITY_TOKEN.
+            const WSSE_NS_URI: &str =
+                "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd";
+            const X509V3_VALUE_TYPE: &str = "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-x509-token-profile-1.0#X509v3";
+            format!(
+                "<ds:KeyInfo><wsse:SecurityTokenReference xmlns:wsse=\"{WSSE_NS_URI}\">\
+                 <wsse:Reference URI=\"#X509Token\" ValueType=\"{X509V3_VALUE_TYPE}\"/>\
+                 </wsse:SecurityTokenReference></ds:KeyInfo>"
+            )
+        }
         WsSecOutboundKeyInfoProfile::X509DataAndRsaKeyValue => {
             if let Some((modulus_b64, exponent_b64)) = rsa_key_value {
                 format!(
@@ -378,13 +393,22 @@ fn build_signed_info_xml(
         // until an independent oracle was pointed at it.)
         //
         // A `cid:` reference dereferences to an octet stream, not a node-set,
-        // so no canonicalization applies and no transform is emitted — the
-        // digest is over the raw attachment bytes.
+        // so no canonicalization applies. The WSS SwA profile 1.1 transform is
+        // declared — `Attachment-Content-Signature-Transform`, whose digest
+        // input for binary content types is exactly the raw attachment bytes we
+        // digest. The AS4 profile mandates this transform on attachment
+        // references, and WSS4J-based receivers (phase4, Domibus, Oxalis)
+        // refuse a cid: reference that does not declare it.
         //
         // Schema order inside ds:Reference is `Transforms?, DigestMethod,
         // DigestValue`. Empty elements are written open+close, per C14N.
         let transforms_xml = if reference.uri.starts_with("cid:") {
-            String::new()
+            format!(
+                "<ds:Transforms\
+><ds:Transform Algorithm=\"{SWA_ATTACHMENT_CONTENT_TRANSFORM_URI}\"\
+></ds:Transform\
+></ds:Transforms>"
+            )
         } else {
             format!(
                 "<ds:Transforms\

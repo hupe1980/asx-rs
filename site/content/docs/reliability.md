@@ -1,4 +1,7 @@
-# Reliability
++++
+title = "Reliability"
+description = "Delivery outcome classification, retry decisions, deduplication and replay windows, and reconciliation after partial failure."
++++
 
 ## Overview
 
@@ -203,7 +206,7 @@ asx_rs::reliability::escalate_stale_pending_reconciliation_requests(
 )?;
 ```
 
-> **Multi-replica deployments**: `InMemoryReconciliationStorage` is single-process only. For horizontally scaled deployments, implement `ReconciliationStorage` against a persistent, consistent store (Redis with Lua atomics, DynamoDB conditional writes, PostgreSQL advisory locks). See [Persistence How-To](persistence-howto.md).
+> **Multi-replica deployments**: `InMemoryReconciliationStorage` is single-process only. For horizontally scaled deployments, implement `ReconciliationStorage` against a persistent, consistent store (Redis with Lua atomics, DynamoDB conditional writes, PostgreSQL advisory locks). See [Persistence How-To](@/docs/persistence.md).
 
 ---
 
@@ -250,6 +253,6 @@ pub enum DeliveryOutcome {
 
 ---
 
-> **See also:** [Persistence How-To](persistence-howto.md) — library-first production persistence pattern with a runnable SQLite adapter skeleton.
+> **See also:** [Persistence How-To](@/docs/persistence.md) — library-first production persistence pattern with a runnable SQLite adapter skeleton.
 >
-> **See also:** [Observability](observability.md) — `EventBus`, backpressure, per-session event routing, and durable audit sinks.
+> **See also:** [Observability](@/docs/observability.md) — `EventBus`, backpressure, per-session event routing, and durable audit sinks.

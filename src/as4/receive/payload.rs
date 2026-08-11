@@ -143,7 +143,7 @@ pub(super) fn resolve_verified_payloads<'a>(
             "AS4 message has no MIME payload attachment: inline SOAP body payloads are not \
              supported. PEPPOL/CEF require MIME multipart/related attachment packaging. \
              If the sending partner uses inline body mode, reconfigure their AS4 gateway \
-             to use SwA/XOP MIME attachment packaging.",
+             to use SwA MIME attachment packaging.",
             ErrorContext::for_session_with_message("as4_receive_push", session, message_id),
         ));
     }
@@ -180,4 +180,116 @@ pub(super) fn resolve_verified_payloads<'a>(
     }
 
     Ok(resolved)
+}
+
+/// `CompressionType` part properties from the verified `eb:Messaging` header,
+/// keyed by the referenced payload Content-ID.
+///
+/// AS4 profile §3.1 makes this the only conformant signal that a payload
+/// attachment is compressed — sniffing the gzip magic number instead would
+/// silently expand a business document that merely happens to be a gzip file.
+/// Reading it from the signed header means the flag is integrity-protected
+/// along with the rest of the ebMS3 metadata.
+pub(super) fn compression_types_by_content_id(
+    soap_bytes: &[u8],
+) -> std::collections::HashMap<String, String> {
+    const EBMS3_NS: &str = "http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/";
+    let mut out = std::collections::HashMap::new();
+
+    let Ok(xml) = std::str::from_utf8(soap_bytes) else {
+        return out;
+    };
+    let Ok(doc) = roxmltree::Document::parse(xml) else {
+        return out;
+    };
+
+    for part_info in doc.descendants().filter(|n| {
+        n.is_element()
+            && n.tag_name().name() == "PartInfo"
+            && n.tag_name().namespace() == Some(EBMS3_NS)
+    }) {
+        let Some(href) = part_info.attribute("href") else {
+            continue;
+        };
+        let content_id = normalize_content_id(href);
+
+        let compression = part_info
+            .descendants()
+            .filter(|n| {
+                n.is_element()
+                    && n.tag_name().name() == "Property"
+                    && n.tag_name().namespace() == Some(EBMS3_NS)
+            })
+            .find(|n| n.attribute("name") == Some("CompressionType"))
+            .and_then(|n| n.attribute("value").map(str::trim))
+            .filter(|v| !v.is_empty());
+
+        if let Some(compression) = compression {
+            out.insert(content_id, compression.to_string());
+        }
+    }
+
+    out
+}
+
+/// Strip a `cid:` scheme prefix and angle brackets so `cid:p@e`, `<p@e>` and
+/// `p@e` all compare equal.
+fn normalize_content_id(value: &str) -> String {
+    let value = value.trim();
+    let value = value.strip_prefix('<').unwrap_or(value);
+    let value = value.strip_suffix('>').unwrap_or(value);
+    let value = value
+        .get(..4)
+        .filter(|p| p.eq_ignore_ascii_case("cid:"))
+        .map_or(value, |_| &value[4..]);
+    value.to_string()
+}
+
+/// Reverse AS4 payload compression when the signed `eb:PartInfo` declares it.
+pub(super) fn decompress_payload_if_declared<'a>(
+    session: &SessionContext,
+    content_id: &str,
+    compression_types: &std::collections::HashMap<String, String>,
+    payload: ResolvedVerifiedPayload<'a>,
+) -> Result<ResolvedVerifiedPayload<'a>> {
+    let Some(compression_type) = compression_types.get(&normalize_content_id(content_id)) else {
+        return Ok(payload);
+    };
+
+    if !compression_type.eq_ignore_ascii_case(crate::crypto::compression::AS4_COMPRESSION_TYPE) {
+        return Err(AsxError::new(
+            ErrorCode::InteropViolation,
+            format!(
+                "AS4 payload declares unsupported CompressionType \"{compression_type}\"; \
+                 the AS4 profile defines only \"{}\"",
+                crate::crypto::compression::AS4_COMPRESSION_TYPE
+            ),
+            ErrorContext::for_session("as4_receive_decompress", session),
+        ));
+    }
+
+    #[cfg(feature = "compression")]
+    {
+        let plain =
+            crate::crypto::compression::decompress_gzip(payload.as_slice()).map_err(|err| {
+                AsxError::new(
+                    err.code,
+                    format!(
+                        "failed to decompress AS4 payload attachment: {}",
+                        err.message
+                    ),
+                    ErrorContext::for_session("as4_receive_decompress", session),
+                )
+            })?;
+        Ok(ResolvedVerifiedPayload::Owned(plain))
+    }
+    #[cfg(not(feature = "compression"))]
+    {
+        Err(AsxError::new(
+            ErrorCode::PolicyViolation,
+            "partner sent a gzip-compressed AS4 payload but the 'compression' feature \
+             is disabled",
+            ErrorContext::for_session("as4_receive_decompress", session),
+        ))
+    }
 }

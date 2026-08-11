@@ -22,6 +22,9 @@ use memchr::{memchr, memmem};
 pub(super) struct InboundAttachment<'a> {
     /// Content-ID, normalized: no `cid:` scheme, no angle brackets.
     pub content_id: &'a str,
+    /// The MIME part's `Content-Type` header value, when present. Selects the
+    /// SwA attachment digest input (XML canonicalization / CRLF / raw).
+    pub content_type: Option<&'a str>,
     pub bytes: &'a [u8],
 }
 
@@ -43,11 +46,12 @@ impl<'a> MultipartAs4Payload<'a> {
         self.payloads.first().copied()
     }
 
-    /// `(content_id, bytes)` pairs for WS-Security `cid:` reference resolution.
-    pub fn external_references(&self) -> Vec<(&'a str, &'a [u8])> {
+    /// `(content_id, part_content_type, bytes)` triples for WS-Security
+    /// `cid:` reference resolution.
+    pub fn external_references(&self) -> Vec<(&'a str, Option<&'a str>, &'a [u8])> {
         self.payloads
             .iter()
-            .map(|p| (p.content_id, p.bytes))
+            .map(|p| (p.content_id, p.content_type, p.bytes))
             .collect()
     }
 }
@@ -99,7 +103,7 @@ fn parse_multipart_boundary_from_content_type(content_type: &str) -> Result<Opti
 /// scheme prefix stripped.
 #[cfg(test)]
 pub(super) fn extract_xop_cid_href_bytes(soap_xml: &[u8]) -> Option<&str> {
-    collect_xop_cid_hrefs(soap_xml, 1).into_iter().next()
+    collect_cid_hrefs(soap_xml, 1).into_iter().next()
 }
 
 /// Collect up to `limit` distinct `cid:` hrefs, in document order.
@@ -113,7 +117,7 @@ pub(super) fn extract_xop_cid_href_bytes(soap_xml: &[u8]) -> Option<&str> {
 ///
 /// Duplicate references are collapsed — one attachment referenced twice is
 /// still one attachment.
-pub(super) fn collect_xop_cid_hrefs(soap_xml: &[u8], limit: usize) -> Vec<&str> {
+pub(super) fn collect_cid_hrefs(soap_xml: &[u8], limit: usize) -> Vec<&str> {
     let mut found: Vec<&str> = Vec::new();
     let mut search_from = 0usize;
 
@@ -442,12 +446,18 @@ pub(super) fn extract_multipart_related_payload_if_present<'a>(
                 ErrorContext::for_session(stage, session),
             )
         })?;
+    // AS4 (SwA packaging) roots are `application/soap+xml`; MTOM/XOP senders
+    // (including asx through 0.12.0) use `application/xop+xml`. Both carry the
+    // SOAP envelope as the root part; anything else is not an AS4 message.
     let media_type_str = root_content_type.split(';').next().unwrap_or("").trim();
-    if !media_type_str.eq_ignore_ascii_case("application/xop+xml") {
+    if !media_type_str.eq_ignore_ascii_case("application/soap+xml")
+        && !media_type_str.eq_ignore_ascii_case("application/xop+xml")
+    {
         return Err(AsxError::new(
             ErrorCode::ParseFailed,
             format!(
-                "multipart/related AS4 root part must be application/xop+xml, got: {root_content_type}"
+                "multipart/related AS4 root part must be application/soap+xml \
+                 (or the MTOM variant application/xop+xml), got: {root_content_type}"
             ),
             ErrorContext::for_session(stage, session),
         ));
@@ -457,14 +467,17 @@ pub(super) fn extract_multipart_related_payload_if_present<'a>(
     // only taken later if decrypt/domain boundaries require it.
     let soap_xml = root.body;
 
-    // Every `xop:Include href="cid:…"` in the body, in document order.
+    // Every `href="cid:…"` in the envelope, in document order and deduplicated.
+    // For conformant AS4 (SwA) messages these are the `eb:PartInfo/@href`
+    // entries in the **signed** `eb:Messaging` header; for MTOM senders the
+    // `xop:Include/@href` in the Body matches the same set.
     //
-    // A body with no `xop:Include` yields an empty list rather than adopting
+    // An envelope with no `cid:` href yields an empty list rather than adopting
     // "the next MIME part": with no Content-ID there is nothing to tie such a
     // part to a `ds:Reference URI="cid:…"`, so it could never be shown to be
     // signature-covered. `resolve_verified_payload` turns the empty case into
     // an actionable error.
-    let cid_hrefs = collect_xop_cid_hrefs(soap_xml, MAX_INBOUND_PAYLOADS + 1);
+    let cid_hrefs = collect_cid_hrefs(soap_xml, MAX_INBOUND_PAYLOADS + 1);
     if cid_hrefs.len() > MAX_INBOUND_PAYLOADS {
         return Err(AsxError::new(
             ErrorCode::PayloadTooLarge,
@@ -479,7 +492,7 @@ pub(super) fn extract_multipart_related_payload_if_present<'a>(
     // Single pass over the remaining MIME parts, matching each against the
     // wanted Content-ID set. Parts are examined as borrowed slices and those
     // that match no reference are skipped without materialization.
-    let mut resolved: Vec<Option<&[u8]>> = vec![None; cid_hrefs.len()];
+    let mut resolved: Vec<Option<(&[u8], Option<&str>)>> = vec![None; cid_hrefs.len()];
     if !cid_hrefs.is_empty() {
         let mut outstanding = cid_hrefs.len();
         while outstanding > 0 {
@@ -490,7 +503,7 @@ pub(super) fn extract_multipart_related_payload_if_present<'a>(
                 if resolved[index].is_none()
                     && content_id_matches_from_block(part.headers, cid.as_bytes())?
                 {
-                    resolved[index] = Some(part.body);
+                    resolved[index] = Some((part.body, content_type_from_block(part.headers)));
                     outstanding -= 1;
                     break;
                 }
@@ -500,7 +513,7 @@ pub(super) fn extract_multipart_related_payload_if_present<'a>(
 
     let mut payloads = Vec::with_capacity(cid_hrefs.len());
     for (index, cid) in cid_hrefs.iter().enumerate() {
-        let Some(bytes) = resolved[index] else {
+        let Some((bytes, content_type)) = resolved[index] else {
             let wanted = std::str::from_utf8(normalized_cid_bytes(cid.as_bytes())).unwrap_or(cid);
             return Err(AsxError::new(
                 ErrorCode::ParseFailed,
@@ -510,11 +523,34 @@ pub(super) fn extract_multipart_related_payload_if_present<'a>(
         };
         payloads.push(InboundAttachment {
             content_id: cid,
+            content_type,
             bytes,
         });
     }
 
     Ok(Some(MultipartAs4Payload { soap_xml, payloads }))
+}
+
+/// The `Content-Type` header value of a MIME part header block, if present
+/// and valid UTF-8. Folded continuation lines are joined with a single space.
+fn content_type_from_block(headers: &[u8]) -> Option<&str> {
+    let text = std::str::from_utf8(headers).ok()?;
+    let mut lines = text.lines();
+    while let Some(line) = lines.next() {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        if !name.trim().eq_ignore_ascii_case("content-type") {
+            continue;
+        }
+        let value = value.trim();
+        // Continuation lines are rare on Content-Type; when present, fall back
+        // to the unfolded first line rather than allocating — the media type
+        // (the part that selects the SwA transform) is always on it.
+        let _ = lines;
+        return Some(value);
+    }
+    None
 }
 
 fn content_id_matches_from_block(headers: &[u8], expected_cid: &[u8]) -> Result<bool> {

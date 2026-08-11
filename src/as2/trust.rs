@@ -8,6 +8,7 @@ use std::sync::Arc;
 use zeroize::Zeroize;
 
 use crate::core::{AsxError, ErrorCode, ErrorContext, ReceivedBodyHandle, Result, SessionContext};
+use crate::crypto::as2_smime::VerifiedSmimeEntity;
 #[cfg(feature = "as2")]
 use crate::crypto::as2_smime::{
     As2SmimeVerificationOptions, SmimeFormat, decrypt_smime_enveloped_payload, detect_smime_format,
@@ -32,36 +33,53 @@ pub use private::Sealed as TrustVerifierSeal;
 
 /// Result returned by [`As2TrustVerifier::verify_and_decrypt`].
 ///
-/// Separates the cryptographic verdict from optional decrypted bytes so that
-/// `EnvelopedData` payloads can carry their plaintext through the lifecycle
-/// state machine without requiring a second pass over the encrypted buffer.
+/// Carries the cryptographic verdict together with the MIME entity that the
+/// message-level security actually protected. That entity matters twice:
+///
+/// - it is the RFC 4130 §7.3.1 input for the `Received-Content-MIC` the MDN
+///   echoes back, and
+/// - its content — headers stripped — is the business document the application
+///   receives.
+///
+/// Returning the whole S/MIME envelope instead would hand the application an
+/// unparsed `multipart/signed` blob and produce a MIC no sender can reproduce.
 pub struct TrustResult {
     /// Whether S/MIME signature verification succeeded.
     pub signature: SignatureVerification,
     /// Whether decryption material was present and (if needed) applied.
     pub decryption: DecryptionMaterial,
-    /// Decrypted plaintext bytes when the verifier performed S/MIME
-    /// `EnvelopedData` unwrapping.  `None` for sign-only payloads — in that
-    /// case the original payload bytes are used as the domain payload.
-    pub decrypted_payload: Option<Arc<[u8]>>,
+    /// The protected MIME entity — exact signed/decrypted octets, headers
+    /// included. `None` only when the message carried no message-level
+    /// security, in which case the raw body is both content and MIC input.
+    pub protected_entity: Option<VerifiedSmimeEntity>,
 }
 
 impl TrustResult {
-    /// Convenience constructor: verified signature, no decryption needed.
-    pub fn signed_only() -> Self {
+    /// Verification passed over `entity`; no decryption was required.
+    pub fn signed_only(entity: VerifiedSmimeEntity) -> Self {
         Self {
             signature: SignatureVerification::Verified,
             decryption: DecryptionMaterial::Available,
-            decrypted_payload: None,
+            protected_entity: Some(entity),
         }
     }
 
-    /// Convenience constructor: verification passed and decryption was applied.
-    pub fn decrypted(plaintext: Arc<[u8]>) -> Self {
+    /// Verification passed and decryption was applied, yielding `entity`.
+    pub fn decrypted(entity: VerifiedSmimeEntity) -> Self {
         Self {
             signature: SignatureVerification::Verified,
             decryption: DecryptionMaterial::Available,
-            decrypted_payload: Some(plaintext),
+            protected_entity: Some(entity),
+        }
+    }
+
+    /// The message carried no signature and policy allowed it. `entity` is the
+    /// decrypted MIME entity for encrypted-but-unsigned messages.
+    pub fn unsigned(entity: VerifiedSmimeEntity) -> Self {
+        Self {
+            signature: SignatureVerification::NotSigned,
+            decryption: DecryptionMaterial::Available,
+            protected_entity: Some(entity),
         }
     }
 }
@@ -209,7 +227,7 @@ impl As2TrustVerifier for InsecureBypassTrustVerifier {
         Ok(TrustResult {
             signature: self.trust.signature,
             decryption: self.trust.decryption,
-            decrypted_payload: None,
+            protected_entity: None,
         })
     }
 }
@@ -239,20 +257,33 @@ pub struct CmsSmimeTrustVerifier {
     /// PEM-encoded X.509 recipient certificate matching `decryption_key_pem`.
     /// Required when inbound AS2 messages are encrypted.
     pub decryption_cert_pem: Option<Vec<u8>>,
-    /// Reject inbound messages that carry no verifiable S/MIME signature.
+    /// Whether unsigned inbound messages are acceptable.
     ///
-    /// AS2 recipient encryption certificates are exchanged with partners and
-    /// are effectively semi-public, so an *encrypted-only, unsigned* message
-    /// authenticates nothing about the sender. With `require_signed = true`, a
-    /// payload that is encrypted (or plain) but not signed is rejected with
-    /// [`ErrorCode::SecurityVerificationFailed`] instead of being surfaced as
-    /// verified — giving sender authentication / non-repudiation an
-    /// enforceable policy switch.
+    /// Defaults to [`As2SignaturePolicy::Required`] — fail-closed.
+    pub signature_policy: As2SignaturePolicy,
+}
+
+/// Whether inbound AS2 messages must carry a verifiable signature.
+///
+/// RFC 4130 permits unsigned messages, but an unsigned message authenticates
+/// nothing about its sender: AS2 recipient encryption certificates are
+/// exchanged with partners and are effectively semi-public, so even an
+/// *encrypted* message proves only that someone had the recipient's public
+/// certificate — which is not a secret.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum As2SignaturePolicy {
+    /// Every inbound message must carry a signature that verifies against a
+    /// configured trust anchor. Unsigned messages are rejected with
+    /// [`ErrorCode::SecurityVerificationFailed`]. **Default.**
+    #[default]
+    Required,
+    /// Accept unsigned messages, reporting them as
+    /// [`SignatureVerification::NotSigned`]. Signed messages are still fully
+    /// verified, and a *failed* signature is still fatal.
     ///
-    /// Default: `false` (encrypted-only messages are accepted), preserving the
-    /// RFC 4130 §7.5 "encryption without signing is legal" behaviour. Set to
-    /// `true` for deployments that require every message to be signed.
-    pub require_signed: bool,
+    /// Only appropriate when sender authenticity is established by other means
+    /// (for example mutually-authenticated TLS on a closed network).
+    Optional,
 }
 
 impl Drop for CmsSmimeTrustVerifier {
@@ -265,25 +296,29 @@ impl Drop for CmsSmimeTrustVerifier {
 
 impl CmsSmimeTrustVerifier {
     /// Create a new verifier with decryption credentials.
+    ///
+    /// Signatures are required by default; call
+    /// [`allowing_unsigned`](Self::allowing_unsigned) to relax that.
     pub fn with_decryption_credentials(key_pem: Vec<u8>, cert_pem: Vec<u8>) -> Self {
         Self {
             decryption_key_pem: Some(key_pem),
             decryption_cert_pem: Some(cert_pem),
-            require_signed: false,
+            signature_policy: As2SignaturePolicy::Required,
         }
     }
 
-    /// Require every inbound message to carry a verifiable S/MIME signature.
+    /// Accept inbound messages that carry no signature.
     ///
-    /// See [`Self::require_signed`]. Chainable:
+    /// See [`As2SignaturePolicy::Optional`] for when this is defensible.
+    /// Chainable:
     ///
     /// ```rust,ignore
     /// let verifier = CmsSmimeTrustVerifier::with_decryption_credentials(key, cert)
-    ///     .requiring_signature();
+    ///     .allowing_unsigned();
     /// ```
     #[must_use]
-    pub fn requiring_signature(mut self) -> Self {
-        self.require_signed = true;
+    pub fn allowing_unsigned(mut self) -> Self {
+        self.signature_policy = As2SignaturePolicy::Optional;
         self
     }
 
@@ -353,7 +388,7 @@ impl As2TrustVerifier for CmsSmimeTrustVerifier {
                     };
                     let decrypted = decrypt_smime_enveloped_payload(payload.as_ref(), cert, key)?;
                     // ── Optionally verify inner signature (signed-then-encrypted) ─
-                    match detect_smime_format(&decrypted) {
+                    let entity = match detect_smime_format(&decrypted) {
                         SmimeFormat::OpaqueSignedData | SmimeFormat::MultipartSigned => {
                             verify_smime_signed_payload(&decrypted, build_options()?).map_err(|err| {
                                 AsxError::new(
@@ -363,35 +398,58 @@ impl As2TrustVerifier for CmsSmimeTrustVerifier {
                                     ),
                                     ErrorContext::for_session("as2_smime_verify_inner", session),
                                 )
-                            })?;
+                            })?
                         }
                         _ => {
                             // Unsigned encrypted payload — no inner signature to
                             // verify. The recipient encryption cert is semi-public,
                             // so this authenticates nothing about the sender.
-                            if self.require_signed {
+                            if self.signature_policy == As2SignaturePolicy::Required {
                                 return Err(AsxError::new(
                                     ErrorCode::SecurityVerificationFailed,
-                                    "AS2 message is encrypted but not signed, and \
-                                     require_signed is set on CmsSmimeTrustVerifier",
-                                    ErrorContext::for_session("as2_smime_require_signed", session),
+                                    "AS2 message is encrypted but not signed; encryption alone \
+                                     does not authenticate the sender because the recipient \
+                                     certificate is not secret. Sign the message, or set \
+                                     As2SignaturePolicy::Optional to accept this",
+                                    ErrorContext::for_session("as2_smime_signature_policy", session),
                                 ));
                             }
+                            // RFC 4130 §7.3.1: for an encrypted-but-unsigned
+                            // message the MIC covers the *decrypted* MIME entity.
+                            return Ok(TrustResult::unsigned(
+                                VerifiedSmimeEntity::from_entity_bytes(decrypted),
+                            ));
                         }
-                    }
-                    let plaintext: Arc<[u8]> = decrypted.into();
-                    Ok(TrustResult::decrypted(plaintext))
+                    };
+                    Ok(TrustResult::decrypted(entity))
                 }
                 // ── Signed-only path: opaque or detached signature ───────────────
                 SmimeFormat::OpaqueSignedData | SmimeFormat::MultipartSigned => {
-                    verify_smime_signed_payload(payload.as_ref(), build_options()?)?;
-                    Ok(TrustResult::signed_only())
+                    Ok(TrustResult::signed_only(verify_smime_signed_payload(
+                        payload.as_ref(),
+                        build_options()?,
+                    )?))
                 }
+                // Not an S/MIME structure at all — a plain AS2 payload, which
+                // RFC 4130 permits. Feeding it to the CMS parser would only
+                // produce a misleading ASN.1 error, so decide on policy.
                 SmimeFormat::Unknown => {
-                    // Fall through and attempt verification anyway; OpenSSL will
-                    // reject malformed payloads with a clear error.
-                    verify_smime_signed_payload(payload.as_ref(), build_options()?)?;
-                    Ok(TrustResult::signed_only())
+                    if self.signature_policy == As2SignaturePolicy::Required {
+                        return Err(AsxError::new(
+                            ErrorCode::SecurityVerificationFailed,
+                            "AS2 message carries no S/MIME signature or encryption layer; \
+                             signatures are required. Ask the partner to sign, or set \
+                             As2SignaturePolicy::Optional to accept unsigned payloads",
+                            ErrorContext::for_session("as2_smime_signature_policy", session),
+                        ));
+                    }
+                    // Unprotected: RFC 4130 §7.3.1 MICs the content with no MIME
+                    // headers, which is what `protected_entity: None` selects.
+                    Ok(TrustResult {
+                        signature: SignatureVerification::NotSigned,
+                        decryption: DecryptionMaterial::Available,
+                        protected_entity: None,
+                    })
                 }
                 SmimeFormat::AuthenticatedData => Err(AsxError::new(
                     ErrorCode::InteropViolation,

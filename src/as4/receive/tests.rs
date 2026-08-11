@@ -1,6 +1,7 @@
 #![cfg_attr(not(feature = "interop-relaxed"), allow(unused_imports, dead_code))]
 use super::*;
 use crate::as4::conversation_gate::As4ConversationOrderGate;
+use crate::as4::send::As4SendRequest;
 #[cfg(feature = "interop-relaxed")]
 use crate::as4::send_sync_fragmented;
 use crate::as4::types::{
@@ -156,54 +157,47 @@ fn wssec_verifier_unsigned_path_requires_signature_when_missing() {
     assert!(err.message.contains("signature is required"));
 }
 
-#[cfg(feature = "interop-relaxed")]
+#[cfg(all(feature = "interop-relaxed", feature = "testing"))]
 #[tokio::test]
 async fn ordered_receive_requires_conversation_id() {
     let creds = test_as4_credentials();
     let session = session_with_trust("sess-ordered-no-conv", "partner-a", &creds);
     let bus = EventBus::new(16).expect("bus");
 
-    // Build a properly signed multipart AS4 message WITHOUT a ConversationId.
-    let (send_policy, send_creds) = As4SendPolicyBuilder::new()
-        .interop(crate::core::InteropMode::Relaxed)
-        .sign(true)
-        .encrypt(false)
-        .fail_closed_audit_events(false)
-        .action("urn:test:no-conv")
-        .service("urn:test:svc", "")
-        .signing_cert_pem(
-            creds
-                .signing_cert_pem
-                .as_ref()
-                .expect("signing cert")
-                .clone(),
-        )
-        .signing_key_pem(creds.signing_key_pem.as_ref().expect("signing key").clone())
-        .build()
-        .expect("send policy");
-
-    let send_out = crate::as4::send_sync(
-        &session,
-        &bus,
-        crate::as4::As4SendRequest {
-            message_id: "ordered-no-conv-id@test".to_string(),
-            payload: b"test payload".to_vec(),
-            policy: send_policy,
-            credentials: Some(send_creds),
-            payload_filename: None,
-        },
+    // A ConversationId-less envelope can only come from a *third-party* sender:
+    // asx's own send path always emits the schema-mandatory element (defaulting
+    // to "1"). Hand-craft the non-conformant inbound message the way such a
+    // peer would produce it.
+    let boundary = "asx-no-conv-boundary";
+    let cid = "payload-no-conv@example.com";
+    let soap = format!(
+        "<S12:Envelope xmlns:S12='http://www.w3.org/2003/05/soap-envelope' \
+xmlns:eb='http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/' \
+xmlns:wsse='http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd' \
+xmlns:xop='http://www.w3.org/2004/08/xop/include'>\
+<S12:Header><wsse:Security/><eb:Messaging S12:mustUnderstand='true'><eb:UserMessage>\
+<eb:MessageInfo><eb:MessageId>ordered-no-conv-id@test</eb:MessageId></eb:MessageInfo>\
+<eb:CollaborationInfo><eb:Service>urn:test:svc</eb:Service>\
+<eb:Action>urn:test:no-conv</eb:Action></eb:CollaborationInfo>\
+<eb:PartyInfo><eb:From><eb:PartyId>partner-a</eb:PartyId></eb:From>\
+<eb:To><eb:PartyId>sess-ordered-no-conv</eb:PartyId></eb:To></eb:PartyInfo>\
+</eb:UserMessage></eb:Messaging></S12:Header>\
+<S12:Body><xop:Include href='cid:{cid}'/></S12:Body></S12:Envelope>"
+    );
+    let mut multipart = format!(
+        "--{boundary}\r\nContent-Type: application/xop+xml; charset=UTF-8; type=\"application/soap+xml\"\r\nContent-ID: <soap-root@example.com>\r\n\r\n{soap}\r\n--{boundary}\r\nContent-Type: application/octet-stream\r\nContent-ID: <{cid}>\r\n\r\n"
     )
-    .expect("send");
+    .into_bytes();
+    multipart.extend_from_slice(b"no-conv-payload");
+    multipart.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
 
-    let policy = {
-        let builder = As4PushPolicyBuilder::new()
-            .interop(crate::core::InteropMode::Relaxed)
-            .fail_closed_audit_events(false)
-            .timestamp_freshness_window(None);
-        #[cfg(feature = "testing")]
-        let builder = builder.allow_unsigned_push(false); // signature is present — verify it
-        builder.build().expect("policy")
-    };
+    let policy = As4PushPolicyBuilder::new()
+        .interop(crate::core::InteropMode::Relaxed)
+        .fail_closed_audit_events(false)
+        .timestamp_freshness_window(None)
+        .allow_unsigned_push(true)
+        .build()
+        .expect("policy");
 
     let dedup = DurableTestDedup(InMemoryDedupBackend::new(Duration::from_secs(60)));
     let gate = As4ConversationOrderGate::new(64);
@@ -214,8 +208,8 @@ async fn ordered_receive_requires_conversation_id() {
         &bus,
         As4ReceivePushOrderedRequest {
             request: As4ReceivePushRequest {
-                http_content_type: send_out.http_content_type,
-                payload: send_out.soap_envelope.body,
+                http_content_type: format!("multipart/related; boundary={boundary}"),
+                payload: Arc::from(multipart),
                 receipt_payload: None,
                 policy,
                 authenticated_sender_scope: None,
@@ -665,6 +659,7 @@ async fn non_fragmented_message_is_accepted_with_require_authenticated_scope_and
             policy: send_policy,
             credentials: Some(send_credentials),
             payload_filename: None,
+            ..As4SendRequest::default()
         },
     )
     .expect("send_sync");

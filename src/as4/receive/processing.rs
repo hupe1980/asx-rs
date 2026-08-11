@@ -209,18 +209,31 @@ fn materialize_non_fragment_payload<'a>(
     // presents its own copy.
     let _ = &gate;
 
+    // Compression is declared in the signed eb:Messaging header, so this map is
+    // integrity-protected along with the rest of the ebMS3 metadata.
+    let compression_types = payload::compression_types_by_content_id(soap_bytes);
+
     let mut promoted: Vec<(String, DomainReady<Arc<[u8]>>)> = Vec::with_capacity(resolved.len());
     let mut sbdh_header = None;
     for (index, named) in resolved.into_iter().enumerate() {
+        // Decompress before anything inspects the bytes: SBDH detection and the
+        // application both need the business document, not the gzip stream.
+        let named_payload = payload::decompress_payload_if_declared(
+            session,
+            &named.content_id,
+            &compression_types,
+            named.payload,
+        )?;
+
         // SBDH wrapping applies to the business document, i.e. the primary
         // attachment. Additional parts travel as-is.
         let payload_bytes = if index == 0 {
             let (unwrapped, header) =
-                payload::maybe_unwrap_sbdh_payload(session, &parsed.message_id, named.payload)?;
+                payload::maybe_unwrap_sbdh_payload(session, &parsed.message_id, named_payload)?;
             sbdh_header = header;
             unwrapped
         } else {
-            named.payload
+            named_payload
         };
 
         let verified =

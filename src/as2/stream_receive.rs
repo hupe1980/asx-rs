@@ -53,7 +53,6 @@ pub async fn receive_stream_with_metrics_and_audit<R: tokio::io::AsyncRead + Unp
                 event_bus,
                 fail_closed_audit_events,
                 observation.provider,
-                observation.backend,
                 observation.health_state,
                 observation.phase,
             )?;
@@ -62,10 +61,6 @@ pub async fn receive_stream_with_metrics_and_audit<R: tokio::io::AsyncRead + Unp
                 session,
                 AsxEvent::SpoolKeyProviderHealthCheckFailed {
                     provider: observation.provider,
-                    backend: observation.backend,
-                    auth_mode: observation.auth_mode,
-                    auth_fingerprint_label: observation.auth_fingerprint_label.into(),
-                    auth_rotation_hint: observation.auth_rotation_hint,
                     health_state: observation.health_state,
                     phase: observation.phase,
                     error_code: observation.error_code,
@@ -87,7 +82,6 @@ pub async fn receive_stream_with_metrics_and_audit<R: tokio::io::AsyncRead + Unp
             event_bus,
             fail_closed_audit_events,
             observation.provider,
-            observation.backend,
             observation.health_state,
             "policy_ready",
         )?;
@@ -96,12 +90,7 @@ pub async fn receive_stream_with_metrics_and_audit<R: tokio::io::AsyncRead + Unp
             session,
             AsxEvent::SpoolKeyProviderHealthChecked {
                 provider: observation.provider,
-                backend: observation.backend,
-                auth_mode: observation.auth_mode,
-                auth_fingerprint_label: observation.auth_fingerprint_label.into(),
-                auth_rotation_hint: observation.auth_rotation_hint,
                 health_state: observation.health_state,
-                startup_self_test_ms: observation.startup_self_test_ms,
                 resolve_key_ms: observation.resolve_key_ms,
             },
             fail_closed_audit_events,
@@ -117,11 +106,10 @@ pub(super) fn maybe_emit_provider_health_state_transition(
     event_bus: &EventBus,
     fail_closed_audit_events: bool,
     provider: &'static str,
-    backend: &'static str,
     health_state: &'static str,
     reason: &'static str,
 ) -> Result<()> {
-    let key = format!("{}:{provider}:{backend}", session.partner_id());
+    let key = format!("{}:{provider}", session.partner_id());
     let states = PROVIDER_HEALTH_STATE_BY_PARTNER.get_or_init(|| Mutex::new(HashMap::new()));
     let previous_state = {
         let mut guard = states.lock().map_err(|_| {
@@ -144,7 +132,6 @@ pub(super) fn maybe_emit_provider_health_state_transition(
         session,
         AsxEvent::SpoolKeyProviderHealthStateChanged {
             provider,
-            backend,
             previous_state,
             current_state: health_state,
             reason,
@@ -231,12 +218,14 @@ async fn receive_stream_with_metrics_internal<R: tokio::io::AsyncRead + Unpin>(
         read_bounded_stream_into_handle_async(reader, limits, body_policy, "as2_receive_stream")
             .await?;
     let trust = verifier.verify_and_decrypt(session, &handle).await?;
-    let domain_bytes = match trust.decrypted_payload {
-        Some(bytes) => {
+    let domain_bytes = match trust.protected_entity {
+        // Message-level security was applied: hand the application the entity's
+        // content, not the S/MIME envelope it travelled in.
+        Some(entity) => {
             if matches!(handle, ReceivedBodyHandle::Spooled { .. }) {
                 handle.dispose("as2_receive_stream_cleanup", session)?;
             }
-            bytes
+            Arc::from(entity.decoded_content()?.as_ref())
         }
         None => {
             if matches!(handle, ReceivedBodyHandle::Spooled { .. }) {

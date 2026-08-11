@@ -15,7 +15,130 @@ Versioning follows the [SemVer policy](#semver-policy) below.
 
 ---
 
-## [0.12.0] — unreleased
+## [0.13.0] — unreleased
+
+Everything since 0.12.0. It is a **hard cut**: wire format, defaults and APIs
+changed without compatibility shims.
+
+### Wire / crypto — AS4
+
+- **Multi-payload send.** `As4SendRequest::additional_payloads` attaches
+  further parts, each with its own signed `eb:PartInfo`, `ds:Reference`, and
+  per-part compression/encryption; `payload_mime_type` / `payload_content_id`
+  control the primary part (eDelivery payload profiles pin both). Attachment
+  digests follow the WSS SwA transform by wire content type — XML parts are
+  digested over their Exclusive C14N form, `text/*` over CRLF-normalized
+  octets — matching WSS4J receivers. Compressed/encrypted parts travel as
+  `application/gzip`/`application/octet-stream` while the signed PartInfo
+  keeps the original media type.
+- **`CompressionType` survives encryption.** The property is emitted whenever
+  compression was applied — previously it was suppressed for encrypted
+  payloads, so the receiver decrypted and then delivered gzip bytes as the
+  business document.
+- **SwA packaging.** Outbound messages use the AS4 packaging: an
+  `application/soap+xml` root part, an **empty** SOAP Body, and payload
+  attachments referenced from the signed `eb:PartInfo href="cid:…"` entries.
+  The previous MTOM/XOP shape (`application/xop+xml` root, `xop:Include` in
+  the Body) is gone from send — WSS4J-based receivers reject it before
+  signature verification — but is still accepted inbound.
+- **WSS-conformant KeyInfo by default.** `ds:KeyInfo` now carries a
+  `wsse:SecurityTokenReference` to an `X509v3` `wsse:BinarySecurityToken`
+  (WSS 1.1.1 §7.7). The BST content is base64(DER) — it previously encoded the
+  PEM text, which no consumer could parse. Bare-`ds:X509Data` profiles remain
+  selectable for plain-XMLDSig consumers.
+- **Complete ebMS3 envelope.** `eb:Role` (schema-mandatory) is always emitted,
+  `eb:ConversationId` always present (default `"1"`), and `eb:AgreementRef`,
+  `eb:PartyId/@type` (including untyped) and explicit From/To party IDs are
+  configurable on the send policy.
+- **SwA attachment transform.** `cid:` references declare the WSS
+  `Attachment-Content-Signature-Transform` on send and accept it on verify;
+  the `Complete` variant is rejected by name.
+- **Verification accepts the deployed WSS4J shapes**: `X509v3` and
+  `X509PKIPathv1` BinarySecurityTokens resolved via SecurityTokenReference,
+  and the `InclusiveNamespaces PrefixList` on `ds:SignedInfo`'s own
+  `CanonicalizationMethod` is honored.
+- **Exclusive C14N hardening.** Elements and attributes are serialized with
+  their source prefixes (correct under same-URI prefix rebinding, which
+  Axiom-built envelopes produce); `xmlns=""` undeclarations are rendered per
+  Exc-C14N §2.3; whitespace-only text nodes are never stripped.
+- **Fail-closed signature resolution.** Documents with multiple `ds:Signature`
+  elements resolve to the single signature inside `wsse:Security` or are
+  rejected as ambiguous — never picked by document order.
+- **XML Encryption.** `ConcatKDFParams` attributes are decoded as hexBinary
+  bit-strings per XML Encryption 1.1 (previously base64, which silently
+  mis-decoded conformant peers' values); RFC 3394 key wrap supports
+  128/192/256-bit KEKs sized to the content key; AES-256 content keys are no
+  longer wrapped under 128-bit KEKs.
+- **Compression is integrity-protected.** The `CompressionType` part property
+  is emitted on send and consumed from the signed header on receive, both
+  directions.
+- **Pull is authorized or denied.** `As4PullAuthorization` defaults to `Deny`;
+  `SharedSecret` (constant-time) and `EnforcedByTransport` are the explicit
+  alternatives.
+
+### Wire / crypto — AS2
+
+- **MIC per RFC 4130 §7.3.1.** The MIC digests the exact protected MIME
+  entity (after compression, before signing on send; the verified entity on
+  receive). Sender and receiver MICs now round-trip; previously they were
+  digests of different byte sequences.
+- **Receive delivers the payload**, not the S/MIME envelope, with
+  content-transfer-encoding reversed and the entity's own `Content-Type`
+  surfaced.
+- **Compression is RFC 5402 CMS `CompressedData`** (RFC 3274 ZLIB) in both
+  directions, with decompression-bomb bounds — previously a bare gzip stream
+  no conformant partner could unwrap, and inbound compression was never
+  reversed.
+- **Unsigned messages are modelled, not mangled**: `As2SignaturePolicy`
+  (default `Required`, fail-closed) replaces the boolean, and legitimately
+  unsigned messages surface as `SignatureVerification::NotSigned`.
+- **Both HTTP body shapes are accepted.** Partners differ in whether the AS2
+  body repeats the outer MIME headers; asx now synthesizes them from the
+  transport `Content-Type` when absent, so `multipart/signed` content, raw
+  PKCS#7 DER under a binary content-transfer-encoding, MIME preambles, and the
+  legacy `application/x-pkcs7-*` media types all verify.
+
+### Wire / crypto — WS-Security & SMP
+
+- An X.509 signer token is required unconditionally; a signature verifying
+  only against an inline `ds:RSAKeyValue` authenticates nobody and is
+  rejected.
+- SMP results default to `SmpSignaturePolicy::Deny`; `Verify` performs full
+  enveloped-signature verification (`URI=""` + enveloped-signature transform).
+- Uppercase and mixed-case `wsu:Id` fragments are accepted (NCName-conformant
+  partners were previously rejected).
+
+### API
+
+- `As4SendPolicyBuilder`: `from_party`, `to_party`, `party_id_types`, `roles`,
+  `agreement_ref` (all new); `WsSecOutboundKeyInfoProfile` gains
+  `BinarySecurityTokenX509v3` (the new default).
+- Spool encryption keys are injected: `SpoolEncryptionKeyProvider` is public,
+  `StaticSpoolKey` is the one built-in, and the crate's environment-variable
+  surface went from 31 variables to 1. The bespoke KMS/HSM HTTP client
+  (~1.9 kLOC) is removed.
+- `InMemoryAuditSink::new()` returns `Result` instead of silently downgrading
+  to a derivable HMAC key.
+- Transport errors include the full cause chain (connection refused/reset/
+  timeout), not just reqwest's one-line summary.
+- Removed: `inject_xop_include`, the `strip_blank_text` C14N knob, the spool
+  KMS provider enum and its environment variables.
+
+### Interop verification
+
+- `tests/interop_holodeck_counterparty.rs` — live exchange with **Holodeck
+  B2B 6.1.1** (WSS4J) in Docker: asx's signed **two-payload** push is verified
+  and delivered by Holodeck; Holodeck's signed NRR receipt — echoing every
+  attachment digest — is verified by asx. Identities are generated fresh per
+  run.
+- `tests/interop_xmlsec_oracle.rs` — reference digests recomputed by
+  **xmlsec1**, the W3C XMLDSig reference implementation.
+- `tests/interop_openssl_smime_oracle.rs` — AS2 S/MIME in both directions
+  against the `openssl smime` CLI: openssl verifies/decrypts asx output, and
+  asx verifies/decrypts openssl-produced messages.
+- CI runs a `cargo hack` feature powerset in addition to the fixed matrix.
+
+## [0.12.0] — 2026-08-04
 
 Two workstreams:
 

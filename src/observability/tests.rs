@@ -286,7 +286,7 @@ fn strict_constructors_default_to_transactional_mode() {
 
     let strict_with_durable = EventBus::new_with_config_and_mode(
         16,
-        Some(Arc::new(InMemoryAuditSink::new())),
+        Some(Arc::new(InMemoryAuditSink::new().expect("audit sink"))),
         BackpressurePolicy::default(),
         EventEmissionMode::StrictTransactional,
     )
@@ -414,7 +414,7 @@ struct DurableTestAuditSink {
 impl DurableTestAuditSink {
     fn new() -> Self {
         Self {
-            inner: InMemoryAuditSink::new(),
+            inner: InMemoryAuditSink::new().expect("audit sink"),
         }
     }
 }
@@ -562,7 +562,7 @@ fn emit_rejects_reentrant_audit_sink_store_event() {
 
 #[test]
 fn emit_audit_event_persists_to_durable_sink() {
-    let sink = Arc::new(InMemoryAuditSink::new());
+    let sink = Arc::new(InMemoryAuditSink::new().expect("audit sink"));
     let bus = EventBus::new_with_config_and_mode(
         16,
         Some(sink.clone()),
@@ -739,7 +739,7 @@ fn strict_with_audit_fallback_persists_without_subscribers() {
 
 #[test]
 fn audit_replay_and_acknowledge_cursor_round_trip() {
-    let sink = Arc::new(InMemoryAuditSink::new());
+    let sink = Arc::new(InMemoryAuditSink::new().expect("audit sink"));
     let bus = EventBus::new_with_config_and_mode(
         16,
         Some(sink),
@@ -960,7 +960,7 @@ fn strict_with_audit_fallback_requires_sink() {
 fn strict_with_audit_fallback_rejects_ephemeral_sink() {
     let err = match EventBus::new_with_config_and_mode(
         16,
-        Some(Arc::new(InMemoryAuditSink::new())),
+        Some(Arc::new(InMemoryAuditSink::new().expect("audit sink"))),
         BackpressurePolicy::default(),
         EventEmissionMode::StrictWithAuditFallback,
     ) {
@@ -977,7 +977,7 @@ fn strict_with_audit_fallback_rejects_ephemeral_sink() {
 
 #[test]
 fn regulated_profile_rejects_ephemeral_audit_sink() {
-    let sink = Arc::new(InMemoryAuditSink::new());
+    let sink = Arc::new(InMemoryAuditSink::new().expect("audit sink"));
     let err = match EventBus::new_regulated(16, sink) {
         Ok(_) => panic!("ephemeral sink must be rejected"),
         Err(err) => err,
@@ -1016,7 +1016,7 @@ fn durable_sink_required_when_fail_closed_enabled() {
 fn fail_closed_requires_production_durable_sink_in_non_testing_builds() {
     let bus = EventBus::new_with_config_and_mode(
         16,
-        Some(Arc::new(InMemoryAuditSink::new())),
+        Some(Arc::new(InMemoryAuditSink::new().expect("audit sink"))),
         BackpressurePolicy::default(),
         EventEmissionMode::StrictTransactional,
     )
@@ -1034,7 +1034,7 @@ fn fail_closed_requires_production_durable_sink_in_non_testing_builds() {
 fn production_durable_sink_rejects_ephemeral_sink() {
     let bus = EventBus::new_with_config_and_mode(
         16,
-        Some(Arc::new(InMemoryAuditSink::new())),
+        Some(Arc::new(InMemoryAuditSink::new().expect("audit sink"))),
         BackpressurePolicy::default(),
         EventEmissionMode::StrictTransactional,
     )
@@ -1265,10 +1265,6 @@ fn receipt_taxonomy_outcomes_export_label_stable_metric_counter() {
 fn spool_key_provider_health_check_failed_event_metadata_is_stable() {
     let event = AsxEvent::SpoolKeyProviderHealthCheckFailed {
         provider: "kms-env",
-        backend: "env",
-        auth_mode: "env-key",
-        auth_fingerprint_label: Arc::from("not-applicable"),
-        auth_rotation_hint: "not-applicable",
         health_state: "failing",
         phase: "key_resolution",
         error_code: "policy_violation",
@@ -1286,12 +1282,7 @@ fn spool_key_provider_health_check_failed_event_metadata_is_stable() {
 fn spool_key_provider_health_checked_event_metadata_is_stable() {
     let event = AsxEvent::SpoolKeyProviderHealthChecked {
         provider: "local-env",
-        backend: "env",
-        auth_mode: "env-key",
-        auth_fingerprint_label: Arc::from("not-applicable"),
-        auth_rotation_hint: "not-applicable",
         health_state: "healthy",
-        startup_self_test_ms: 1,
         resolve_key_ms: 2,
     };
 
@@ -1317,7 +1308,6 @@ fn spool_headroom_checked_event_metadata_is_stable() {
 fn spool_key_provider_health_state_changed_event_metadata_is_stable() {
     let event = AsxEvent::SpoolKeyProviderHealthStateChanged {
         provider: "local-env",
-        backend: "env",
         previous_state: "failing",
         current_state: "healthy",
         reason: "policy_ready",
@@ -1369,7 +1359,6 @@ fn provider_health_alerts_emit_warning_and_critical_by_threshold() {
             &sess,
             AsxEvent::SpoolKeyProviderHealthStateChanged {
                 provider: "local-env",
-                backend: "env",
                 previous_state: if i == 0 { "unknown" } else { "healthy" },
                 current_state: if i < 3 { "failing" } else { "healthy" },
                 reason: "test",
@@ -1391,7 +1380,6 @@ fn provider_health_alerts_emit_warning_and_critical_by_threshold() {
             &sess,
             AsxEvent::SpoolKeyProviderHealthStateChanged {
                 provider: "local-env",
-                backend: "env",
                 previous_state: if i == 10 { "healthy" } else { "failing" },
                 current_state: "failing",
                 reason: "test",
@@ -1437,7 +1425,6 @@ fn forward_provider_health_alerts_is_deduplicated_by_cooldown_window() {
             &sess,
             AsxEvent::SpoolKeyProviderHealthStateChanged {
                 provider: "local-env",
-                backend: "env",
                 previous_state: if i == 0 { "unknown" } else { "healthy" },
                 current_state: if i < 13 { "failing" } else { "healthy" },
                 reason: "test",
@@ -1512,7 +1499,6 @@ async fn forward_provider_health_alerts_dedup_is_atomic_under_concurrency() {
             &sess,
             AsxEvent::SpoolKeyProviderHealthStateChanged {
                 provider: "local-env",
-                backend: "env",
                 previous_state: if i == 0 { "unknown" } else { "healthy" },
                 current_state: if i < 13 { "failing" } else { "healthy" },
                 reason: "atomic-dedup-test",
@@ -1594,7 +1580,6 @@ async fn run_provider_health_alert_scheduler_forwards_incidents_on_tick() {
             &sess,
             AsxEvent::SpoolKeyProviderHealthStateChanged {
                 provider: "local-env",
-                backend: "env",
                 previous_state: if i == 0 { "unknown" } else { "healthy" },
                 current_state: if i < 14 { "failing" } else { "healthy" },
                 reason: "scheduler-test",

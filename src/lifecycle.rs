@@ -1,9 +1,23 @@
 use crate::core::{AsxError, ErrorCode, ErrorContext, Result};
 
+/// Outcome of signature checking for one inbound message.
+///
+/// The three states are genuinely distinct and collapsing any two of them
+/// loses security-relevant information: "we checked a signature and it is
+/// good" is not the same claim as "there was no signature to check".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SignatureVerification {
+    /// A signature was present and verified against a trusted signer.
     Verified,
+    /// A signature was present and did **not** verify. Always fatal.
     Failed,
+    /// No signature was present, and policy permits unsigned messages.
+    ///
+    /// The payload's origin is therefore **unauthenticated** — only the
+    /// transport (TLS) says anything about who sent it. Applications that need
+    /// non-repudiation must require signatures; see
+    /// [`As2SignaturePolicy`](crate::as2::As2SignaturePolicy).
+    NotSigned,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -137,11 +151,21 @@ impl<T> StructurallyParsed<T> {
         self.payload
     }
 
+    /// Advance past signature checking.
+    ///
+    /// [`SignatureVerification::Failed`] is rejected. [`Verified`] and
+    /// [`NotSigned`] both advance — the decision of *whether* an unsigned
+    /// message is acceptable belongs to the trust verifier's policy, which is
+    /// the component that knows the partner agreement. By the time a value
+    /// reaches here that policy has already been applied.
+    ///
+    /// [`Verified`]: SignatureVerification::Verified
+    /// [`NotSigned`]: SignatureVerification::NotSigned
     pub fn verify(
         self,
         verification: SignatureVerification,
     ) -> Result<CryptographicallyVerified<T>> {
-        if verification != SignatureVerification::Verified {
+        if verification == SignatureVerification::Failed {
             return Err(AsxError::new(
                 ErrorCode::SecurityVerificationFailed,
                 "cryptographic verification failed",

@@ -645,23 +645,23 @@ mod tests {
                 "builder must carry X509PKIPathv1 from PModeSecurity"
             );
         }
-        // Without interop-relaxed the builder value is verified at pmode field level.
-        #[cfg(all(feature = "testing", not(feature = "interop-relaxed")))]
-        {
-            // to_send_policy_builder was called — just verify the call succeeds and
-            // the test compiles. Full propagation is covered in interop-relaxed builds.
-            let _ = builder;
-        }
+        // Without interop-relaxed a sign=false policy cannot be built, so assert
+        // propagation at the P-Mode field level instead.
+        assert_eq!(
+            pm.security.outbound_key_info_profile,
+            WsSecOutboundKeyInfoProfile::X509PKIPathv1,
+        );
     }
 
     #[test]
-    fn pmode_security_default_uses_x509_data_and_rsa_key_value() {
+    fn pmode_security_default_uses_binary_security_token() {
         use crate::crypto::wssec::WsSecOutboundKeyInfoProfile;
         let sec = PModeSecurity::default();
         assert_eq!(
             sec.outbound_key_info_profile,
-            WsSecOutboundKeyInfoProfile::X509DataAndRsaKeyValue,
-            "default profile must be X509DataAndRsaKeyValue for backward compat"
+            WsSecOutboundKeyInfoProfile::BinarySecurityTokenX509v3,
+            "WSS 1.1.1 requires an STR in KeyInfo; the BST token shape is what \
+             WSS4J-based counterparties accept"
         );
     }
 }

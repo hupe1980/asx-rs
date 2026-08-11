@@ -87,6 +87,47 @@ struct ValidatedEgressTarget {
     resolved_addrs: Vec<SocketAddr>,
 }
 
+/// Require an egress URL to name a loopback address literally.
+///
+/// Used by the `testing`-only transports so their documented "loopback only"
+/// contract is enforced rather than merely asserted. Deliberately refuses
+/// hostnames — including `localhost` — that would need DNS to resolve: a
+/// resolver answer can point anywhere, and a test helper is not the place to
+/// re-litigate DNS rebinding.
+#[cfg(feature = "testing")]
+fn enforce_loopback_target(url: &str, context: &'static str) -> Result<()> {
+    let parsed = reqwest::Url::parse(url).map_err(|_| {
+        AsxError::new(
+            ErrorCode::InvalidInput,
+            format!("malformed egress URL: {url}"),
+            ErrorContext::new(context),
+        )
+    })?;
+
+    let is_loopback = parsed
+        .host_str()
+        .and_then(|host| {
+            host.trim_matches(['[', ']'])
+                .parse::<std::net::IpAddr>()
+                .ok()
+        })
+        .is_some_and(|ip| ip.is_loopback());
+
+    if !is_loopback {
+        return Err(AsxError::new(
+            ErrorCode::PolicyViolation,
+            format!(
+                "localhost testing transport refuses non-loopback target {url}; \
+                 use an explicit 127.0.0.1 or [::1] address, or the production \
+                 transport for real endpoints"
+            ),
+            ErrorContext::new(context),
+        ));
+    }
+
+    Ok(())
+}
+
 async fn validate_egress_target_with_policy(
     url: &str,
     context: &'static str,
@@ -372,9 +413,20 @@ impl HttpSendOutcome {
 
 #[cfg(any(feature = "as2", feature = "as4"))]
 fn reqwest_to_asx(err: reqwest::Error, context: &'static str) -> AsxError {
+    // reqwest's Display for request errors is just "error sending request for
+    // url (…)" — the actionable part (connection refused, reset, timeout, TLS
+    // failure) lives in the source chain. Flatten it so operators see the
+    // cause without attaching a debugger.
+    let mut message = format!("HTTP transport error: {err}");
+    let mut source = std::error::Error::source(&err);
+    while let Some(cause) = source {
+        message.push_str(": ");
+        message.push_str(&cause.to_string());
+        source = cause.source();
+    }
     AsxError::new(
         ErrorCode::TransportFailure,
-        format!("HTTP transport error: {err}"),
+        message,
         ErrorContext::new(context),
     )
 }
@@ -687,6 +739,9 @@ impl As4HttpTransport {
     pub fn new_for_localhost_testing() -> Result<Self> {
         let config = TransportConfig::default();
         let client = reqwest::Client::builder()
+            // Redirects stay off even here: a loopback stub that answers 302 must
+            // not become a way to reach a non-loopback host.
+            .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(config.connect_timeout)
             .timeout(config.request_timeout)
             .user_agent(&config.user_agent)
@@ -706,7 +761,12 @@ impl As4HttpTransport {
         })
     }
 
-    /// Send to a localhost testing endpoint, bypassing SSRF validation.
+    /// Send to a loopback testing endpoint, bypassing the HTTPS and SSRF guards.
+    ///
+    /// The target **must** resolve to a loopback literal; anything else is
+    /// rejected. Without that check this would be an unrestricted plain-HTTP
+    /// sender wearing a "localhost" name, and the `testing` feature would become
+    /// a way to downgrade every egress guard at once.
     ///
     /// Only available with `feature = "testing"`.
     #[cfg(feature = "testing")]
@@ -715,6 +775,7 @@ impl As4HttpTransport {
         url: &str,
         output: &As4SendOutput,
     ) -> Result<HttpSendOutcome> {
+        enforce_loopback_target(url, "as4_transport_send_localhost")?;
         self.send_inner(url, output, false).await
     }
 
@@ -769,8 +830,11 @@ impl As4HttpTransport {
         finish_send_and_verify(session, event_bus, output, policy, http)
     }
 
-    /// [`send_and_verify`](Self::send_and_verify) against a localhost testing
+    /// [`send_and_verify`](Self::send_and_verify) against a loopback testing
     /// endpoint, bypassing the SSRF and plain-HTTP guards.
+    ///
+    /// The target must be a loopback literal — see
+    /// [`send_to_localhost`](Self::send_to_localhost).
     ///
     /// Only available with `feature = "testing"`.
     #[cfg(feature = "testing")]
@@ -782,6 +846,7 @@ impl As4HttpTransport {
         output: &As4SendOutput,
         policy: &crate::as4::As4ReceiptPolicy,
     ) -> Result<As4SendAndVerifyOutcome> {
+        enforce_loopback_target(url, "as4_transport_send_verify_localhost")?;
         let http = self.send_inner(url, output, false).await?;
         finish_send_and_verify(session, event_bus, output, policy, http)
     }
@@ -1017,6 +1082,34 @@ ok\r\n\
             .unwrap_err();
         assert_eq!(err.code, ErrorCode::InvalidInput);
         assert!(err.message.contains("ftp"));
+    }
+
+    /// The `testing` transports document a loopback-only contract; without
+    /// enforcement they were an unrestricted plain-HTTP sender, which would make
+    /// the `testing` feature a single switch that disables every egress guard.
+    #[cfg(feature = "testing")]
+    #[test]
+    fn loopback_guard_accepts_only_loopback_literals() {
+        for ok in [
+            "http://127.0.0.1:8080/as4",
+            "http://127.5.5.5/as4",
+            "http://[::1]:9090/as4",
+        ] {
+            enforce_loopback_target(ok, "test").unwrap_or_else(|e| panic!("{ok} must pass: {e}"));
+        }
+
+        for bad in [
+            "http://example.com/as4",
+            "https://partner.example/as4",
+            "http://10.0.0.5/as4",
+            "http://169.254.169.254/latest/meta-data",
+            // A hostname needs DNS to resolve, and the answer can point anywhere.
+            "http://localhost:8080/as4",
+        ] {
+            let err = enforce_loopback_target(bad, "test")
+                .expect_err("non-loopback literal must be refused");
+            assert_eq!(err.code, ErrorCode::PolicyViolation, "for {bad}");
+        }
     }
 
     #[tokio::test]

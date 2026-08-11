@@ -1,0 +1,29 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="wrap docs-layout">
+  {% include "_sidebar.html" %}
+
+  <article class="doc">
+    <h1>{{ section.title }}</h1>
+    {% if section.description %}<p class="doc-lede">{{ section.description }}</p>{% endif %}
+
+    <div class="doc-body">
+      {{ section.content | safe }}
+    </div>
+
+    <div class="grid grid-2 doc-index">
+      {% for group in config.extra.nav %}
+      <section class="card">
+        <h2>{{ group.title }}</h2>
+        <ul>
+          {% for item in group.items %}
+          <li><a href="{{ get_url(path=item.path) | safe }}">{{ item.title }}</a></li>
+          {% endfor %}
+        </ul>
+      </section>
+      {% endfor %}
+    </div>
+  </article>
+</div>
+{% endblock content %}

@@ -31,27 +31,22 @@ use crate::wire::{
 };
 use std::sync::Arc;
 
-mod auth_telemetry;
 mod ingress;
 mod mdn;
 mod mic;
 mod send_path;
-mod spool_http_helpers;
-mod spool_key_provider;
+mod spool_key;
 mod spool_policy;
-mod spool_provider_backends;
 mod spool_runtime_utils;
 mod stream_receive;
 mod trust;
 mod types;
-#[cfg(feature = "client")]
-pub use auth_telemetry::compute_http_spool_key_auth_telemetry_labels;
 pub use ingress::{As2IngressReceiveRequest, receive_from_ingress};
 pub use send_path::{
     As2SendPreparedRequest, As2SendRequest, send_async, send_async_prepared, send_sync,
     send_sync_prepared,
 };
-pub use spool_key_provider::As2RegulatedSpoolKeyProvider;
+pub use spool_key::{SpoolEncryptionKeyProvider, StaticSpoolKey};
 pub use stream_receive::{
     receive_stream, receive_stream_with_metrics, receive_stream_with_metrics_and_audit,
 };
@@ -67,8 +62,8 @@ pub use trust::TrustVerifierSeal;
 #[cfg(feature = "testing")]
 pub(crate) use trust::private;
 pub use trust::{
-    As2TrustVerifier, AsyncAs2TrustVerifier, CmsSmimeTrustVerifier, SyncToAsyncTrustVerifier,
-    TrustResult,
+    As2SignaturePolicy, As2TrustVerifier, AsyncAs2TrustVerifier, CmsSmimeTrustVerifier,
+    SyncToAsyncTrustVerifier, TrustResult,
 };
 #[cfg(feature = "as2")]
 pub use types::validate_as2_version_header;
@@ -80,25 +75,7 @@ pub use types::{
 };
 
 use mdn::{classify_mdn_outcome, extract_content_type_header, parse_mdn};
-use spool_http_helpers::fetch_spool_key_hex_over_http;
-#[cfg(all(feature = "client", test))]
-use spool_http_helpers::{
-    ensure_http_key_provider_circuit_allows_request, http_key_provider_backoff_for_attempt,
-    key_response_signing_input, note_http_key_provider_circuit_failure,
-    note_http_key_provider_circuit_success, resolve_http_key_provider_client_identity_pem,
-    validate_http_key_provider_mtls_policy,
-};
-#[cfg(test)]
-use spool_provider_backends::HttpJsonSpoolEncryptionKeyProvider;
-#[cfg(all(feature = "client", test))]
-use spool_provider_backends::HttpKeyProviderResilienceConfig;
-#[cfg(all(feature = "client", test))]
-use spool_provider_backends::HttpKeyProviderTlsConfig;
-use spool_provider_backends::{SpoolEncryptionKeyProvider, regulated_spool_key_provider};
-use spool_runtime_utils::{
-    as2_spool_threshold_for_profile, parse_spool_encryption_key_hex,
-    profile_requires_encrypted_spool, validate_spool_encryption_key_startup_self_test,
-};
+use spool_runtime_utils::{as2_spool_threshold_for_profile, profile_requires_encrypted_spool};
 #[cfg(test)]
 use stream_receive::{
     emit_stream_ingest_observations, maybe_emit_provider_health_state_transition,
@@ -118,7 +95,13 @@ pub fn receive_sync(
         session,
         InteropMode::Strict,
     )?;
-    receive_payload(session, crate::core::PayloadInput::Owned(payload), verifier)
+    Ok(receive_payload(
+        session,
+        crate::core::PayloadInput::Owned(payload),
+        None,
+        verifier,
+    )?
+    .content)
 }
 
 /// Async-safe wrapper around [`receive_sync`] that isolates synchronous verification
@@ -147,11 +130,85 @@ pub async fn receive_async(
     })?
 }
 
+/// What the AS2 receive path recovered from an inbound message.
+///
+/// `content` is the business document. `mic_input` is the exact octet sequence
+/// RFC 4130 §7.3.1 says to digest for the MDN's `Received-Content-MIC` — the
+/// protected MIME entity for signed/encrypted messages, or the bare content for
+/// unprotected ones. They differ, and using one where the other belongs is why
+/// MIC mismatches are the classic AS2 interop failure.
+pub(crate) struct ReceivedAs2Payload {
+    pub content: DomainReady<Arc<[u8]>>,
+    pub mic_input: Arc<[u8]>,
+}
+
+/// Whether the body's first line is a plausible MIME header field
+/// (`token ":" …`). Distinguishes bodies that repeat the outer MIME headers
+/// (OpenSSL `SMIME_write_*` output, asx's own emission) from bodies that start
+/// directly with content — a `multipart/signed` preamble or boundary, raw
+/// PKCS#7 DER under a binary content-transfer-encoding, or a bare payload.
+fn body_starts_with_mime_header(bytes: &[u8]) -> bool {
+    let line_end = bytes
+        .iter()
+        .position(|&b| b == b'\n')
+        .unwrap_or(bytes.len())
+        .min(998);
+    let line = &bytes[..line_end];
+    let line = line.strip_suffix(b"\r").unwrap_or(line);
+    let Some(colon) = line.iter().position(|&b| b == b':') else {
+        return false;
+    };
+    let name = &line[..colon];
+    !name.is_empty()
+        && name.iter().all(|&b| {
+            b.is_ascii_alphanumeric()
+                || matches!(b, b'!' | b'#'..=b'\'' | b'-' | b'^'..=b'`' | b'|' | b'~' | b'+' | b'.')
+        })
+}
+
+/// RFC 4130 partners differ in whether the HTTP entity body repeats the outer
+/// MIME headers. S/MIME processing needs the self-describing form, so when the
+/// body starts directly with content, synthesize the headers from the
+/// transport `Content-Type`. Without this, a conformant partner that sends
+/// `multipart/signed` content (or raw PKCS#7 DER under a binary
+/// content-transfer-encoding) with the media type only in the HTTP header is
+/// misdetected as carrying no S/MIME layer at all.
+fn body_with_mime_headers(
+    _session: &SessionContext,
+    bytes: &Arc<[u8]>,
+    body_content_type: Option<&str>,
+) -> ReceivedBodyHandle {
+    let Some(content_type) = body_content_type else {
+        return ReceivedBodyHandle::InMemory(Arc::clone(bytes));
+    };
+    if body_starts_with_mime_header(bytes) {
+        return ReceivedBodyHandle::InMemory(Arc::clone(bytes));
+    }
+    // Raw DER (a PKCS#7 ContentInfo starts with SEQUENCE, 0x30) travels under
+    // a binary content-transfer-encoding; everything else is already
+    // line-oriented MIME content.
+    let cte: &str = if bytes.first() == Some(&0x30) {
+        "Content-Transfer-Encoding: binary\r\n"
+    } else {
+        ""
+    };
+    let mut synthesized =
+        format!("MIME-Version: 1.0\r\nContent-Type: {content_type}\r\n{cte}\r\n").into_bytes();
+    synthesized.extend_from_slice(bytes);
+    ReceivedBodyHandle::InMemory(synthesized.into())
+}
+
+/// `body_content_type` is the inbound `Content-Type` header, when the caller
+/// has it. It selects the S/MIME processing shape when the body does not
+/// repeat the outer MIME headers, and — for messages carrying no
+/// message-level security — is the sole signal that the body is an RFC 5402
+/// compressed entity.
 fn receive_payload(
     session: &SessionContext,
     payload_input: crate::core::PayloadInput<'_>,
+    body_content_type: Option<&str>,
     verifier: &dyn As2TrustVerifier,
-) -> Result<DomainReady<Arc<[u8]>>> {
+) -> Result<ReceivedAs2Payload> {
     let body = ReceivedBodyHandle::from_payload_input(payload_input);
     let payload_len = body.payload_len("as2_receive_parse", session)?;
     enforce_payload_limit("as2_receive_parse", payload_len, MAX_AS2_PAYLOAD_BYTES)?;
@@ -170,14 +227,35 @@ fn receive_payload(
         "AS2 receive: verifying payload",
     );
 
+    // Keep the original body octets: for unprotected messages they are both
+    // the delivered content and, per RFC 4130 §7.3.1, the MIC input — the
+    // synthesized headers below exist only for S/MIME processing.
+    let original = body.into_arc("as2_receive_parse", session)?;
+    let body = body_with_mime_headers(session, &original, body_content_type);
     let trust = verifier.verify_and_decrypt(session, &body)?;
 
-    // When the verifier performed EnvelopedData decryption it returns the
-    // plaintext bytes directly.  For sign-only payloads the original bytes
-    // are used unchanged.
-    let domain_bytes: Arc<[u8]> = trust
-        .decrypted_payload
-        .unwrap_or(body.into_arc("as2_receive_parse", session)?);
+    // The application wants the business document, not the S/MIME envelope it
+    // arrived in — so unwrap the protected entity down to its content. The
+    // entity's own octets are kept separately as the MIC input.
+    let (domain_bytes, mic_input): (Arc<[u8]>, Arc<[u8]>) = match trust.protected_entity {
+        Some(entity) => {
+            let content: Arc<[u8]> = decode_entity_content(session, &entity)?;
+            (content, Arc::from(entity.entity()))
+        }
+        None => {
+            // No message-level security: the original body is both the content
+            // and, per RFC 4130 §7.3.1, the MIC input (headers excluded). It
+            // may still be compressed — only the transport header says so.
+            let compressed = body_content_type
+                .is_some_and(crate::crypto::compression::is_as2_compressed_content_type);
+            let content = if compressed {
+                decompress_as2_entity(session, &original)?
+            } else {
+                Arc::clone(&original)
+            };
+            (content, original)
+        }
+    };
 
     // SAFETY: structural validation (size, encoding) was performed by the
     // S/MIME verifier before this point; advancing unchecked is deliberate.
@@ -187,7 +265,52 @@ fn receive_payload(
         .decrypt(trust.decryption)?
         .into_domain_ready();
 
-    Ok(trusted)
+    Ok(ReceivedAs2Payload {
+        content: trusted,
+        mic_input,
+    })
+}
+
+/// Recover the business document from a verified MIME entity, reversing RFC
+/// 5402 compression when the entity advertises it.
+fn decode_entity_content(
+    session: &SessionContext,
+    entity: &crate::crypto::as2_smime::VerifiedSmimeEntity,
+) -> Result<Arc<[u8]>> {
+    let content_type = entity.content_type().unwrap_or_default();
+    let decoded = entity.decoded_content()?;
+    if crate::crypto::compression::is_as2_compressed_content_type(&content_type) {
+        return decompress_as2_entity(session, &decoded);
+    }
+    Ok(Arc::from(decoded.as_ref()))
+}
+
+/// Unwrap an RFC 5402 CMS `CompressedData` body.
+fn decompress_as2_entity(session: &SessionContext, compressed: &[u8]) -> Result<Arc<[u8]>> {
+    #[cfg(feature = "compression")]
+    {
+        let plain = crate::crypto::compression::decompress_cms_zlib(compressed).map_err(|err| {
+            AsxError::new(
+                err.code,
+                format!(
+                    "failed to decompress AS2 payload (RFC 5402): {}",
+                    err.message
+                ),
+                ErrorContext::for_session("as2_receive_decompress", session),
+            )
+        })?;
+        Ok(Arc::from(plain))
+    }
+    #[cfg(not(feature = "compression"))]
+    {
+        let _ = compressed;
+        Err(AsxError::new(
+            ErrorCode::PolicyViolation,
+            "partner sent an RFC 5402 compressed AS2 payload but the 'compression' \
+             feature is disabled",
+            ErrorContext::for_session("as2_receive_decompress", session),
+        ))
+    }
 }
 
 #[cfg_attr(feature = "trace", tracing::instrument(skip_all, fields(partner_id = %session.partner_id(), original_message_id = ?request.original_message_id)))]
@@ -235,8 +358,10 @@ pub fn receive_with_mdn_with_reliability(
     let payload = receive_payload(
         session,
         crate::core::PayloadInput::Shared(Arc::clone(&request.payload)),
+        None,
         verifier,
-    )?;
+    )?
+    .content;
 
     let (mdn, interop_reason_codes) = match parse_mdn(
         request.mdn_payload.as_ref(),

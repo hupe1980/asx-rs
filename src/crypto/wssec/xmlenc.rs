@@ -49,6 +49,8 @@ const DSIG11_NS: &str = "http://www.w3.org/2009/xmldsig11#";
 const XENC11_RSA_OAEP_URI: &str = "http://www.w3.org/2009/xmlenc11#rsa-oaep";
 /// AES-128 Key Wrap algorithm URI (RFC 3394).
 const KW_AES128_URI: &str = "http://www.w3.org/2001/04/xmlenc#kw-aes128";
+const KW_AES192_URI: &str = "http://www.w3.org/2001/04/xmlenc#kw-aes192";
+const KW_AES256_URI: &str = "http://www.w3.org/2001/04/xmlenc#kw-aes256";
 /// ECDH Ephemeral-Static key agreement (XMLenc 1.1).
 const ECDH_ES_URI: &str = "http://www.w3.org/2009/xmlenc11#ECDH-ES";
 /// ConcatKDF key derivation (XMLenc 1.1 / NIST SP 800-56A).
@@ -397,17 +399,22 @@ fn encrypt_xmlenc_preparsed(
                 })?
             };
 
-            // Derive 16-byte key-encryption key via ConcatKDF (SHA-256).
-            // BDEW profile: AlgorithmID = "", PartyUInfo = "", PartyVInfo = "" (all empty).
-            let kdf_output = concat_kdf_sha256(&z, 128, &[], &[], &[]);
-            let kek: [u8; 16] = kdf_output[..16].try_into().expect("16-byte slice");
+            // Derive a key-encryption key whose strength matches the content
+            // key. Wrapping a 256-bit CEK under a 128-bit KEK would cap the
+            // whole scheme at 128-bit security and silently negate the caller's
+            // choice of AES-256-GCM — the wrap is as much a part of the
+            // construction as the bulk cipher.
+            let kek_len = aes_key.len();
+            let kdf_output = concat_kdf_sha256(&z, (kek_len * 8) as u32, &[], &[], &[]);
+            let kek = kdf_output[..kek_len].to_vec();
+            let key_wrap_uri = key_wrap_uri_for_kek_len(kek_len)?;
             // Zeroize the shared secret immediately after use.
             let mut z_zeroize = z;
             use zeroize::Zeroize as _;
             z_zeroize.zeroize();
 
-            // Wrap CEK with AES-128 Key Wrap (RFC 3394).
-            let wrapped_cek = aes_128_key_wrap(&kek, &aes_key)?;
+            // Wrap CEK with AES Key Wrap (RFC 3394).
+            let wrapped_cek = aes_key_wrap(&kek, &aes_key)?;
             let wrapped_cek_b64 = BASE64_STANDARD.encode(&wrapped_cek);
 
             // Subject Key Identifier for recipient key reference.
@@ -420,7 +427,7 @@ xmlns:ds=\"{DS_NS}\" xmlns:dsig11=\"{DSIG11_NS}\" Type=\"{xmlenc_type}\">\
 <xenc:EncryptionMethod Algorithm=\"{aes_gcm_uri}\"/>\
 <ds:KeyInfo>\
 <xenc:EncryptedKey>\
-<xenc:EncryptionMethod Algorithm=\"{KW_AES128_URI}\"/>\
+<xenc:EncryptionMethod Algorithm=\"{key_wrap_uri}\"/>\
 <ds:KeyInfo>\
 <xenc:AgreementMethod Algorithm=\"{ECDH_ES_URI}\">\
 <xenc11:KeyDerivationMethod Algorithm=\"{CONCAT_KDF_URI}\">\
@@ -657,8 +664,39 @@ fn cert_subject_key_id(cert: &X509Ref) -> Result<Vec<u8>> {
 }
 
 /// AES-128 ECB single-block encrypt (no padding).  Used internally by AES Key Wrap.
-fn aes_128_ecb_encrypt_block(key: &[u8; 16], block: &[u8; 16]) -> Result<[u8; 16]> {
-    let mut c = Crypter::new(Cipher::aes_128_ecb(), Mode::Encrypt, key, None).map_err(|e| {
+/// XML Encryption key-wrap algorithm URI for a KEK of `kek_len` bytes.
+fn key_wrap_uri_for_kek_len(kek_len: usize) -> Result<&'static str> {
+    match kek_len {
+        16 => Ok(KW_AES128_URI),
+        24 => Ok(KW_AES192_URI),
+        32 => Ok(KW_AES256_URI),
+        other => Err(AsxError::new(
+            ErrorCode::SecurityVerificationFailed,
+            format!("no XML Encryption key-wrap algorithm for a {other}-byte KEK"),
+            ErrorContext::new("wssec_aes_kw"),
+        )),
+    }
+}
+
+/// Pick the AES-ECB variant matching the key-encryption key length.
+///
+/// RFC 3394 is defined for 128/192/256-bit KEKs; the wrap loop is identical and
+/// only the underlying block cipher changes.
+fn aes_ecb_cipher(key: &[u8]) -> Result<Cipher> {
+    match key.len() {
+        16 => Ok(Cipher::aes_128_ecb()),
+        24 => Ok(Cipher::aes_192_ecb()),
+        32 => Ok(Cipher::aes_256_ecb()),
+        other => Err(AsxError::new(
+            ErrorCode::SecurityVerificationFailed,
+            format!("AES-KW requires a 128/192/256-bit key-encryption key, got {other} bytes"),
+            ErrorContext::new("wssec_aes_kw"),
+        )),
+    }
+}
+
+fn aes_ecb_encrypt_block(key: &[u8], block: &[u8; 16]) -> Result<[u8; 16]> {
+    let mut c = Crypter::new(aes_ecb_cipher(key)?, Mode::Encrypt, key, None).map_err(|e| {
         AsxError::new(
             ErrorCode::SecurityVerificationFailed,
             format!("AES-KW block encrypt init: {e}"),
@@ -687,8 +725,8 @@ fn aes_128_ecb_encrypt_block(key: &[u8; 16], block: &[u8; 16]) -> Result<[u8; 16
 }
 
 /// AES-128 ECB single-block decrypt (no padding).  Used internally by AES Key Unwrap.
-fn aes_128_ecb_decrypt_block(key: &[u8; 16], block: &[u8; 16]) -> Result<[u8; 16]> {
-    let mut c = Crypter::new(Cipher::aes_128_ecb(), Mode::Decrypt, key, None).map_err(|e| {
+fn aes_ecb_decrypt_block(key: &[u8], block: &[u8; 16]) -> Result<[u8; 16]> {
+    let mut c = Crypter::new(aes_ecb_cipher(key)?, Mode::Decrypt, key, None).map_err(|e| {
         AsxError::new(
             ErrorCode::DecryptionFailed,
             format!("AES-KW block decrypt init: {e}"),
@@ -716,10 +754,10 @@ fn aes_128_ecb_decrypt_block(key: &[u8; 16], block: &[u8; 16]) -> Result<[u8; 16
         .expect("AES block is 16 bytes"))
 }
 
-/// AES-128 Key Wrap (RFC 3394) — wraps `plaintext` (must be a multiple of 8 bytes,
-/// minimum 16 bytes) with `kek` (16-byte key-encryption key).
-/// Output is `plaintext.len() + 8` bytes.
-fn aes_128_key_wrap(kek: &[u8; 16], plaintext: &[u8]) -> Result<Vec<u8>> {
+/// AES Key Wrap (RFC 3394) — wraps `plaintext` (a multiple of 8 bytes, minimum
+/// 16) under `kek`. The KEK length selects the AES variant, so a 32-byte KEK
+/// performs kw-aes256. Output is `plaintext.len() + 8` bytes.
+fn aes_key_wrap(kek: &[u8], plaintext: &[u8]) -> Result<Vec<u8>> {
     debug_assert!(plaintext.len() >= 16 && plaintext.len().is_multiple_of(8));
     let n = plaintext.len() / 8;
     // RFC 3394 default IV
@@ -734,7 +772,7 @@ fn aes_128_key_wrap(kek: &[u8; 16], plaintext: &[u8]) -> Result<Vec<u8>> {
             let mut b_in = [0u8; 16];
             b_in[..8].copy_from_slice(&a);
             b_in[8..].copy_from_slice(r_block);
-            let b_out = aes_128_ecb_encrypt_block(kek, &b_in)?;
+            let b_out = aes_ecb_encrypt_block(kek, &b_in)?;
             let t = (n as u64) * j + (i as u64 + 1);
             // A = MSB(64, B) XOR t  (t in big-endian)
             let t_be = t.to_be_bytes();
@@ -754,9 +792,9 @@ fn aes_128_key_wrap(kek: &[u8; 16], plaintext: &[u8]) -> Result<Vec<u8>> {
     Ok(result)
 }
 
-/// AES-128 Key Unwrap (RFC 3394) — inverse of [`aes_128_key_wrap`].
+/// AES Key Unwrap (RFC 3394) — inverse of [`aes_key_wrap`].
 /// Returns `DecryptionFailed` if the integrity check value does not match.
-fn aes_128_key_unwrap(kek: &[u8; 16], ciphertext: &[u8]) -> Result<Vec<u8>> {
+fn aes_key_unwrap(kek: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>> {
     if ciphertext.len() < 24 || !ciphertext.len().is_multiple_of(8) {
         return Err(AsxError::new(
             ErrorCode::DecryptionFailed,
@@ -782,7 +820,7 @@ fn aes_128_key_unwrap(kek: &[u8; 16], ciphertext: &[u8]) -> Result<Vec<u8>> {
             let mut b_in = [0u8; 16];
             b_in[..8].copy_from_slice(&a_xored);
             b_in[8..].copy_from_slice(&r[i]);
-            let b_out = aes_128_ecb_decrypt_block(kek, &b_in)?;
+            let b_out = aes_ecb_decrypt_block(kek, &b_in)?;
             a.copy_from_slice(&b_out[..8]);
             r[i].copy_from_slice(&b_out[8..]);
         }
@@ -822,8 +860,9 @@ fn aes_128_key_unwrap(kek: &[u8; 16], ciphertext: &[u8]) -> Result<Vec<u8>> {
 /// ECDH-ES peer (BDEW / BSI TR-03116-3 / eDelivery) could reproduce.
 ///
 /// `keydatalen_bits` bounds the *output* length only: the caller takes
-/// `[..keydatalen_bits / 8]` of the returned 32-byte digest. For the AES-128-KW
-/// KEK (128 bits) a single SHA-256 iteration suffices.
+/// `[..keydatalen_bits / 8]` of the returned 32-byte digest. SHA-256 yields 256
+/// bits, so a single iteration covers every KEK size AES-KW accepts
+/// (128/192/256).
 fn concat_kdf_sha256(
     z: &[u8],
     keydatalen_bits: u32,
@@ -930,18 +969,75 @@ fn decrypt_aes_gcm_payload(
     }
 }
 
-/// Decode a `ConcatKDFParams` attribute value (base64-encoded octet string or
-/// empty string) into raw bytes.  Empty string maps to empty `Vec<u8>`.
-fn decode_concat_kdf_param_bytes(raw: &[u8]) -> Vec<u8> {
+/// Decode a `ConcatKDFParams` attribute value per XML Encryption 1.1 §5.4.1.
+///
+/// The `AlgorithmID`, `PartyUInfo` and `PartyVInfo` attributes are
+/// `xs:hexBinary`-encoded **bit strings**: the first octet carries the number
+/// of padding bits in the final octet, and the remaining octets are the value
+/// (W3C xmlenc-core1, Example 25: `AlgorithmID="0000"` is the 8-bit value
+/// `00000000`).  An empty attribute is the empty bit string.
+///
+/// Only byte-aligned values (padding count 0) are accepted — no deployed AS4
+/// profile uses sub-byte KDF inputs, and deriving a key from a misparsed bit
+/// string would fail closed later with a far less diagnosable AEAD error.
+///
+/// This previously base64-decoded the value (falling back to the raw ASCII
+/// bytes when decoding failed), which happened to agree with conformant peers
+/// only for the empty string. Hex characters are a subset of the base64
+/// alphabet, so a real hexBinary value would silently mis-decode rather than
+/// error.
+fn decode_concat_kdf_param_bits(raw: &[u8]) -> Result<Vec<u8>> {
     let trimmed: Vec<u8> = raw
         .iter()
         .copied()
         .filter(|b| !b.is_ascii_whitespace())
         .collect();
     if trimmed.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
-    BASE64_STANDARD.decode(&trimmed).unwrap_or(trimmed)
+
+    let invalid = |detail: String| {
+        AsxError::new(
+            ErrorCode::ParseFailed,
+            format!("invalid ConcatKDFParams attribute: {detail}"),
+            ErrorContext::new("wssec_decrypt_payload"),
+        )
+    };
+
+    if !trimmed.len().is_multiple_of(2) {
+        return Err(invalid(format!(
+            "hexBinary value has odd length {}",
+            trimmed.len()
+        )));
+    }
+
+    let hex_nibble = |b: u8| -> Result<u8> {
+        match b {
+            b'0'..=b'9' => Ok(b - b'0'),
+            b'a'..=b'f' => Ok(b - b'a' + 10),
+            b'A'..=b'F' => Ok(b - b'A' + 10),
+            other => Err(invalid(format!(
+                "non-hex character 0x{other:02x} in hexBinary value"
+            ))),
+        }
+    };
+
+    let mut octets = Vec::with_capacity(trimmed.len() / 2);
+    for pair in trimmed.chunks_exact(2) {
+        octets.push((hex_nibble(pair[0])? << 4) | hex_nibble(pair[1])?);
+    }
+
+    // First octet: number of padding bits in the final octet.
+    let padding_bits = octets[0];
+    if padding_bits != 0 {
+        return Err(invalid(format!(
+            "bit strings with {padding_bits} padding bits are not supported \
+             (only byte-aligned KDF parameters are accepted)"
+        )));
+    }
+
+    octets.remove(0);
+    Ok(octets)
 }
 
 pub fn decrypt_payload_xmlenc(
@@ -1013,13 +1109,13 @@ pub fn decrypt_payload_xmlenc(
                     && element.local_name().as_ref() == b"ConcatKDFParams"
                 {
                     if let Some(v) = element_attribute_value(&element, b"AlgorithmID")? {
-                        concat_kdf_algid = decode_concat_kdf_param_bytes(&v);
+                        concat_kdf_algid = decode_concat_kdf_param_bits(&v)?;
                     }
                     if let Some(v) = element_attribute_value(&element, b"PartyUInfo")? {
-                        concat_kdf_party_u = decode_concat_kdf_param_bytes(&v);
+                        concat_kdf_party_u = decode_concat_kdf_param_bits(&v)?;
                     }
                     if let Some(v) = element_attribute_value(&element, b"PartyVInfo")? {
-                        concat_kdf_party_v = decode_concat_kdf_param_bytes(&v);
+                        concat_kdf_party_v = decode_concat_kdf_param_bits(&v)?;
                     }
                 }
 
@@ -1084,13 +1180,13 @@ pub fn decrypt_payload_xmlenc(
                     && element.local_name().as_ref() == b"ConcatKDFParams"
                 {
                     if let Some(v) = element_attribute_value(&element, b"AlgorithmID")? {
-                        concat_kdf_algid = decode_concat_kdf_param_bytes(&v);
+                        concat_kdf_algid = decode_concat_kdf_param_bits(&v)?;
                     }
                     if let Some(v) = element_attribute_value(&element, b"PartyUInfo")? {
-                        concat_kdf_party_u = decode_concat_kdf_param_bytes(&v);
+                        concat_kdf_party_u = decode_concat_kdf_param_bits(&v)?;
                     }
                     if let Some(v) = element_attribute_value(&element, b"PartyVInfo")? {
-                        concat_kdf_party_v = decode_concat_kdf_param_bytes(&v);
+                        concat_kdf_party_v = decode_concat_kdf_param_bits(&v)?;
                     }
                 }
 
@@ -1266,8 +1362,15 @@ pub fn decrypt_payload_xmlenc(
             decrypt_aes_gcm_payload(inbound_algo, &aes_key, &cipher_blob)
         }
 
-        KW_AES128_URI => {
-            // ECDH-ES key agreement + AES-128 Key Wrap (BSI TR-03116-3 §9.2).
+        KW_AES128_URI | KW_AES192_URI | KW_AES256_URI => {
+            // ECDH-ES key agreement + AES Key Wrap (BSI TR-03116-3 §9.2).
+            // The declared wrap algorithm fixes the KEK length; deriving a
+            // different length would silently fail the RFC 3394 integrity check.
+            let kek_len = match key_algorithm {
+                KW_AES128_URI => 16usize,
+                KW_AES192_URI => 24,
+                _ => 32,
+            };
             let agreement_alg = agreement_algorithm
                 .as_deref()
                 .and_then(|b| std::str::from_utf8(b).ok())
@@ -1276,7 +1379,7 @@ pub fn decrypt_payload_xmlenc(
                 return Err(AsxError::new(
                     ErrorCode::DecryptionFailed,
                     format!(
-                        "kw-aes128 key transport requires ECDH-ES key agreement \
+                        "AES key-wrap key transport requires ECDH-ES key agreement \
                          (xenc:AgreementMethod Algorithm=\"{ECDH_ES_URI}\") but got \"{agreement_alg}\""
                     ),
                     ErrorContext::new("wssec_decrypt_payload"),
@@ -1358,22 +1461,23 @@ pub fn decrypt_payload_xmlenc(
             // Compute ECDH shared secret: recipient private × originator public.
             let mut z = ecdh_shared_secret(&pkey, &originator_pkey)?;
 
-            // ConcatKDF (NIST SP 800-56A) → 128-bit key-encryption key.
+            // ConcatKDF (NIST SP 800-56A) → key-encryption key sized to the
+            // declared kw-aes128/192/256 algorithm.
             let kdf_output = concat_kdf_sha256(
                 &z,
-                128,
+                (kek_len * 8) as u32,
                 &concat_kdf_algid,
                 &concat_kdf_party_u,
                 &concat_kdf_party_v,
             );
-            let kek: [u8; 16] = kdf_output[..16].try_into().expect("16-byte slice");
+            let kek = kdf_output[..kek_len].to_vec();
             // Zeroize shared secret immediately after KDF.
             use zeroize::Zeroize as _;
             z.zeroize();
 
             // Unwrap the content-encryption key.
             let wrapped_key_bytes = decode_cipher_value("wrapped AES key", &wrapped_key_text)?;
-            let aes_key = aes_128_key_unwrap(&kek, &wrapped_key_bytes)?;
+            let aes_key = aes_key_unwrap(&kek, &wrapped_key_bytes)?;
 
             let cipher_blob =
                 decode_cipher_value("XML Encryption ciphertext", &payload_cipher_text)?;
@@ -1384,7 +1488,8 @@ pub fn decrypt_payload_xmlenc(
             ErrorCode::DecryptionFailed,
             format!(
                 "unsupported XML Encryption key transport algorithm: {other} \
-                 (accepted: {XENC11_RSA_OAEP_URI}, {KW_AES128_URI})"
+                 (accepted: {XENC11_RSA_OAEP_URI}, {KW_AES128_URI}, {KW_AES192_URI}, \
+                 {KW_AES256_URI})"
             ),
             ErrorContext::new("wssec_decrypt_payload"),
         )),
@@ -1394,6 +1499,38 @@ pub fn decrypt_payload_xmlenc(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// XML Encryption 1.1 §5.4.1: ConcatKDFParams attributes are hexBinary
+    /// bit-strings whose first octet is the padding-bit count (W3C
+    /// xmlenc-core1 Example 25: `AlgorithmID="0000"` is the single octet 0x00).
+    #[test]
+    fn concat_kdf_params_decode_as_hex_binary_bit_strings() {
+        // Empty attribute → empty bit string.
+        assert_eq!(decode_concat_kdf_param_bits(b"").unwrap(), Vec::<u8>::new());
+        assert_eq!(
+            decode_concat_kdf_param_bits(b"  \t").unwrap(),
+            Vec::<u8>::new()
+        );
+        // W3C example value: "0000" → padding 0, value [0x00].
+        assert_eq!(decode_concat_kdf_param_bits(b"0000").unwrap(), vec![0x00]);
+        // Mixed-case hex with a realistic value.
+        assert_eq!(
+            decode_concat_kdf_param_bits(b"00A1b2C3").unwrap(),
+            vec![0xA1, 0xB2, 0xC3]
+        );
+    }
+
+    #[test]
+    fn concat_kdf_params_reject_invalid_encodings() {
+        // Odd length is not valid hexBinary.
+        assert!(decode_concat_kdf_param_bits(b"000").is_err());
+        // Non-hex characters (this is also what a base64-encoded value looks
+        // like — the old parser mis-decoded those silently).
+        assert!(decode_concat_kdf_param_bits(b"AAA=").is_err());
+        // Non-byte-aligned bit strings are unsupported, not misparsed.
+        let err = decode_concat_kdf_param_bits(b"03D8").unwrap_err();
+        assert!(err.message.contains("padding bits"), "{}", err.message);
+    }
 
     /// Known-answer test locking the spec-conformant ConcatKDF form.
     ///
@@ -1607,15 +1744,21 @@ mod tests {
             encrypt_payload_xmlenc(plaintext, &cert_pem, XmlEncPayloadAlgorithm::Aes256Gcm)
                 .expect("encrypt");
 
-        // AES-256-GCM payload encryption, but still ECDH-ES + kw-aes128 key agreement.
+        // The key wrap must match the content key's strength: wrapping a
+        // 256-bit CEK under a 128-bit KEK would cap the construction at 128-bit
+        // security and quietly undo the caller's choice of AES-256-GCM.
         let xml = String::from_utf8(ciphertext.clone()).expect("utf8");
         assert!(
             xml.contains("aes256-gcm"),
             "payload algo must be AES-256-GCM"
         );
         assert!(
-            xml.contains("kw-aes128"),
-            "key wrap stays AES-128 regardless of payload algo"
+            xml.contains("kw-aes256"),
+            "a 256-bit content key must be wrapped with kw-aes256, got:\n{xml}"
+        );
+        assert!(
+            !xml.contains("kw-aes128"),
+            "kw-aes128 must not wrap a 256-bit content key"
         );
 
         let decrypted = decrypt_payload_xmlenc(&ciphertext, &key_pem).expect("decrypt");
@@ -1692,18 +1835,18 @@ mod tests {
     }
 
     #[test]
-    fn aes_128_key_wrap_roundtrip() {
+    fn aes_key_wrap_roundtrip() {
         let kek = [0x42u8; 16];
         let cek = [0x13u8; 16]; // 128-bit CEK
 
-        let wrapped = aes_128_key_wrap(&kek, &cek).expect("wrap");
+        let wrapped = aes_key_wrap(&kek, &cek).expect("wrap");
         assert_eq!(
             wrapped.len(),
             24,
             "wrapped 128-bit key must be 24 bytes (RFC 3394)"
         );
 
-        let unwrapped = aes_128_key_unwrap(&kek, &wrapped).expect("unwrap");
+        let unwrapped = aes_key_unwrap(&kek, &wrapped).expect("unwrap");
         assert_eq!(
             unwrapped,
             cek.as_slice(),
@@ -1712,14 +1855,14 @@ mod tests {
     }
 
     #[test]
-    fn aes_128_key_wrap_wrong_kek_fails() {
+    fn aes_key_wrap_wrong_kek_fails() {
         let kek = [0x42u8; 16];
         let wrong_kek = [0xFFu8; 16];
         let cek = [0x13u8; 16];
 
-        let wrapped = aes_128_key_wrap(&kek, &cek).expect("wrap");
-        let err = aes_128_key_unwrap(&wrong_kek, &wrapped)
-            .expect_err("wrong KEK must fail integrity check");
+        let wrapped = aes_key_wrap(&kek, &cek).expect("wrap");
+        let err =
+            aes_key_unwrap(&wrong_kek, &wrapped).expect_err("wrong KEK must fail integrity check");
         assert_eq!(err.code, ErrorCode::DecryptionFailed);
         assert!(
             err.message.contains("integrity check failed"),
@@ -1792,12 +1935,12 @@ mod tests {
     }
 
     #[test]
-    fn aes_128_key_wrap_roundtrip_brainpool_sanity() {
+    fn aes_key_wrap_roundtrip_brainpool_sanity() {
         // Duplicate-free alias used for context — the real AES-KW tests are above.
         let kek = [0xBBu8; 16];
         let cek = [0xCCu8; 16];
-        let wrapped = aes_128_key_wrap(&kek, &cek).expect("wrap");
-        let unwrapped = aes_128_key_unwrap(&kek, &wrapped).expect("unwrap");
+        let wrapped = aes_key_wrap(&kek, &cek).expect("wrap");
+        let unwrapped = aes_key_unwrap(&kek, &wrapped).expect("unwrap");
         assert_eq!(unwrapped, cek.as_slice());
     }
 }

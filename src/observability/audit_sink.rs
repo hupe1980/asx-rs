@@ -7,7 +7,7 @@ use crate::core::{AsxError, ErrorCode, ErrorContext, Result};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use hmac::{Hmac, KeyInit, Mac};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+use sha2::Sha256;
 use std::fmt;
 
 /// Audit event that will be persisted to durable sink
@@ -169,18 +169,33 @@ pub struct InMemoryAuditSink {
 }
 
 impl InMemoryAuditSink {
-    /// Create a new in-memory audit sink
-    pub fn new() -> Self {
+    /// Create a new in-memory audit sink.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the OS random number generator is unavailable. The replay
+    /// cursor's integrity tag is an HMAC, and an HMAC keyed with a constant is
+    /// not an integrity tag — anyone could recompute it. Falling back to a
+    /// hardcoded key would leave the type advertising tamper-evidence it does
+    /// not provide, so this fails instead.
+    pub fn new() -> Result<Self> {
         let mut cursor_hmac_key = [0_u8; 32];
-        if getrandom::fill(&mut cursor_hmac_key).is_err() {
-            cursor_hmac_key
-                .copy_from_slice(Sha256::digest(b"asx-replay-cursor-fallback-key").as_slice());
-        }
-        Self {
+        getrandom::fill(&mut cursor_hmac_key).map_err(|err| {
+            AsxError::new(
+                ErrorCode::ReliabilityFailure,
+                format!(
+                    "cannot key the replay-cursor HMAC: OS randomness unavailable ({err}). \
+                     Refusing to fall back to a fixed key, which would make cursor \
+                     integrity tags forgeable"
+                ),
+                ErrorContext::new("audit_sink_init"),
+            )
+        })?;
+        Ok(Self {
             events: parking_lot::Mutex::new(Vec::new()),
             acknowledged_cursor: parking_lot::Mutex::new(ReplayCursor::unsigned_start()),
             cursor_hmac_key,
-        }
+        })
     }
 
     fn sign_replay_cursor(&self, mut cursor: ReplayCursor) -> ReplayCursor {
@@ -241,11 +256,8 @@ impl InMemoryAuditSink {
     }
 }
 
-impl Default for InMemoryAuditSink {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+// No `Default` impl: construction is fallible (it needs OS randomness to key
+// the cursor HMAC), and `Default` cannot express that without panicking.
 
 impl DurableAuditSink for InMemoryAuditSink {
     fn durability(&self) -> AuditSinkDurability {
@@ -356,7 +368,7 @@ mod tests {
         // not position as a raw Vec index.  Simulates compaction by directly
         // building a sink whose internal stream no longer starts at index 0
         // relative to the original sequence.
-        let sink = InMemoryAuditSink::new();
+        let sink = InMemoryAuditSink::new().expect("audit sink");
         let make = |id: &str, code: &str| AuditEvent {
             event_id: id.to_string(),
             session_id: None,
@@ -414,7 +426,7 @@ mod tests {
 
     #[test]
     fn retrieve_events_resumes_correctly_after_known_anchor() {
-        let sink = InMemoryAuditSink::new();
+        let sink = InMemoryAuditSink::new().expect("audit sink");
         let make = |id: &str| AuditEvent {
             event_id: id.to_string(),
             session_id: None,
@@ -465,7 +477,7 @@ mod tests {
 
     #[test]
     fn acknowledge_cursor_rejects_unknown_event_id() {
-        let sink = InMemoryAuditSink::new();
+        let sink = InMemoryAuditSink::new().expect("audit sink");
         sink.store_event(&AuditEvent {
             event_id: "evt-1".into(),
             session_id: None,
@@ -495,7 +507,7 @@ mod tests {
 
     #[test]
     fn in_memory_sink_stores_and_retrieves_events() {
-        let sink = InMemoryAuditSink::new();
+        let sink = InMemoryAuditSink::new().expect("audit sink");
         let event = AuditEvent {
             event_id: "evt-1".to_string(),
             session_id: Some("sess-1".to_string()),
@@ -539,7 +551,7 @@ mod tests {
 
     #[test]
     fn in_memory_sink_clear() {
-        let sink = InMemoryAuditSink::new();
+        let sink = InMemoryAuditSink::new().expect("audit sink");
         let event = AuditEvent {
             event_id: "evt-1".to_string(),
             session_id: None,
@@ -575,7 +587,7 @@ mod tests {
 
     #[test]
     fn current_cursor_tracks_stream_head() {
-        let sink = InMemoryAuditSink::new();
+        let sink = InMemoryAuditSink::new().expect("audit sink");
         sink.store_event(&AuditEvent {
             event_id: "evt-1".into(),
             session_id: None,
@@ -615,7 +627,7 @@ mod tests {
 
     #[test]
     fn replay_cursor_integrity_rejects_tampering() {
-        let sink = InMemoryAuditSink::new();
+        let sink = InMemoryAuditSink::new().expect("audit sink");
         sink.store_event(&AuditEvent {
             event_id: "evt-1".into(),
             session_id: None,

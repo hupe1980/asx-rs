@@ -373,6 +373,12 @@ pub(crate) fn normalize_same_document_uri(uri: &str) -> Result<&str> {
             ErrorContext::new("wssec_reference_uri"),
         ));
     }
+    // `wsu:Id` is an `xsd:ID`, i.e. an XML NCName: a letter or `_` followed by
+    // letters, digits, `.`, `-` or `_`. Matching is case-*sensitive*, but
+    // uppercase is perfectly legal — WSS4J, WCF and Axis-derived stacks all emit
+    // IDs such as `Id-4f2a` or `_5DB4A5F1`. Rejecting them would fail closed on
+    // conformant partners for no security benefit, since the ID is compared
+    // byte-for-byte against the resolved element's attribute anyway.
     let mut chars = fragment.chars();
     let first = chars.next().expect("fragment is non-empty");
     let first_is_valid = first.is_ascii_alphabetic() || first == '_';
@@ -383,15 +389,6 @@ pub(crate) fn normalize_same_document_uri(uri: &str) -> Result<&str> {
             ErrorCode::InteropViolation,
             format!(
                 "non-canonical same-document URI fragment characters are not supported in strict mode: {uri}"
-            ),
-            ErrorContext::new("wssec_reference_uri"),
-        ));
-    }
-    if fragment.chars().any(|ch| ch.is_ascii_uppercase()) {
-        return Err(AsxError::new(
-            ErrorCode::InteropViolation,
-            format!(
-                "uppercase same-document URI fragments are not supported in strict mode: {uri}"
             ),
             ErrorContext::new("wssec_reference_uri"),
         ));
@@ -450,6 +447,88 @@ fn is_reference_id_attr(namespace: Option<&str>, name: &str) -> bool {
 
 pub(crate) fn is_ds_element(node: Node<'_, '_>, local_name: &str) -> bool {
     node.tag_name().namespace() == Some(DS_NS) && node.tag_name().name() == local_name
+}
+
+// ---- SwA attachment digest input (WSS SwA profile §4.4) ----
+
+/// Digest input for an attachment's content under the WSS SwA
+/// `Attachment-Content-Signature-Transform`, selected by the MIME **part**
+/// content type (matching WSS4J's `AttachmentContentSignatureTransform`):
+///
+/// - XML types (`text/xml`, `application/xml`, `*+xml`) → Exclusive C14N
+///   without comments of the parsed document;
+/// - `text/*` → CRLF line-ending normalization;
+/// - everything else → the raw octets.
+pub(crate) fn swa_attachment_digest_input<'a>(
+    content_type: Option<&str>,
+    bytes: &'a [u8],
+) -> Result<Cow<'a, [u8]>> {
+    let media = content_type
+        .map(|ct| {
+            ct.split(';')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_ascii_lowercase()
+        })
+        .unwrap_or_default();
+
+    let is_xml = media == "text/xml" || media == "application/xml" || media.ends_with("+xml");
+    if is_xml {
+        let text = std::str::from_utf8(bytes).map_err(|err| {
+            AsxError::new(
+                ErrorCode::ParseFailed,
+                format!("XML-typed attachment is not valid UTF-8: {err}"),
+                ErrorContext::new("wssec_swa_attachment"),
+            )
+        })?;
+        let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+        let doc = Document::parse(text).map_err(|err| {
+            AsxError::new(
+                ErrorCode::ParseFailed,
+                format!(
+                    "XML-typed attachment does not parse; the SwA transform requires \
+                     canonicalizing XML content: {err}"
+                ),
+                ErrorContext::new("wssec_swa_attachment"),
+            )
+        })?;
+        let profile = WsSecCanonicalizationProfile {
+            kind: WsSecCanonicalizationKind::Exclusive,
+            include_comments: false,
+            inclusive_ns_prefixes: Vec::new(),
+        };
+        let mut out = String::new();
+        try_serialize_node(doc.root(), &mut out, &profile, &EMPTY_NS_MAP).map_err(|_| {
+            AsxError::new(
+                ErrorCode::SecurityVerificationFailed,
+                "failed to canonicalize XML attachment content",
+                ErrorContext::new("wssec_swa_attachment"),
+            )
+        })?;
+        return Ok(Cow::Owned(out.into_bytes()));
+    }
+
+    if media.starts_with("text/") {
+        let mut out = Vec::with_capacity(bytes.len());
+        let mut i = 0;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'\r' => {
+                    out.extend_from_slice(b"\r\n");
+                    if bytes.get(i + 1) == Some(&b'\n') {
+                        i += 1;
+                    }
+                }
+                b'\n' => out.extend_from_slice(b"\r\n"),
+                other => out.push(other),
+            }
+            i += 1;
+        }
+        return Ok(Cow::Owned(out));
+    }
+
+    Ok(Cow::Borrowed(bytes))
 }
 
 // ---- Canonical diff helper (pub for test use) ----
@@ -703,6 +782,38 @@ pub(crate) fn try_serialize_node_omitting(
     }
 }
 
+/// Original prefix of `node`'s qualified name, read from the source document.
+///
+/// C14N serializes each node with the prefix **it was written with**. Deriving
+/// prefixes from a URI→prefix lookup instead collapses documents that bind the
+/// same URI to several prefixes — which WSS4J/Axiom-produced envelopes really
+/// do (e.g. re-declaring the SOAP namespace under a second prefix for a
+/// namespace-qualified `mustUnderstand` attribute).
+fn element_source_prefix<'a>(node: Node<'a, 'a>) -> &'a str {
+    let text = node.document().input_text();
+    let tail = &text[node.range().start + 1..]; // skip '<'
+    let end = tail
+        .find(|c: char| c.is_whitespace() || c == '>' || c == '/')
+        .unwrap_or(tail.len());
+    let qname = &tail[..end];
+    match qname.rfind(':') {
+        Some(idx) => &qname[..idx],
+        None => "",
+    }
+}
+
+/// Original prefix of an attribute's qualified name, from the source document.
+fn attribute_source_prefix<'input>(
+    doc_text: &'input str,
+    attr: &roxmltree::Attribute<'_, 'input>,
+) -> &'input str {
+    let qname = &doc_text[attr.range_qname()];
+    match qname.rfind(':') {
+        Some(idx) => &qname[..idx],
+        None => "",
+    }
+}
+
 fn serialize_element(
     node: Node<'_, '_>,
     out: &mut impl std::fmt::Write,
@@ -711,23 +822,21 @@ fn serialize_element(
     inclusive_ns_prefixes_override: Option<&[String]>,
     omit: Option<Node<'_, '_>>,
 ) -> std::fmt::Result {
-    // Build URI → prefix map from all in-scope namespace declarations at this
-    // node.  When multiple prefixes are bound to the same URI, one is kept
-    // arbitrarily; well-formed AS4/SOAP documents do not rebind URIs so this
-    // does not cause non-determinism in practice.
-    let uri_to_prefix: HashMap<&str, &str> = node
-        .namespaces()
-        .filter_map(|ns| ns.name().map(|prefix| (ns.uri(), prefix)))
-        .collect();
+    let doc_text = node.document().input_text();
 
     let tag_ns = node.tag_name().namespace();
     let tag_local = node.tag_name().name();
-    let tag_qname = build_qname(tag_ns, tag_local, &uri_to_prefix);
+    let tag_prefix = element_source_prefix(node);
+    let tag_qname: Cow<'_, str> = if tag_prefix.is_empty() {
+        Cow::Borrowed(tag_local)
+    } else {
+        Cow::Owned(format!("{tag_prefix}:{tag_local}"))
+    };
 
     // Collect namespaces visibly utilized at this element: the element's own
-    // namespace plus every attribute namespace.  Exclude the pre-defined `xml:`
-    // binding (http://www.w3.org/XML/1998/namespace) — it must never be
-    // explicitly declared per the XML spec.
+    // (prefix, namespace) binding plus every attribute's.  Exclude the
+    // pre-defined `xml:` binding (http://www.w3.org/XML/1998/namespace) — it
+    // must never be explicitly declared per the XML spec.
     let mut utilized: BTreeMap<&str, &str> = BTreeMap::new();
 
     if matches!(profile.kind, WsSecCanonicalizationKind::Inclusive) {
@@ -755,19 +864,28 @@ fn serialize_element(
         }
     } else {
         // Exclusive C14N (W3C Exc-C14N §2.1): only visibly-utilized namespace
-        // declarations are rendered.
+        // declarations are rendered — each under the prefix the node was
+        // actually written with.
         if let Some(ns_uri) = tag_ns
             && ns_uri != XML_NS
         {
-            let prefix = uri_to_prefix.get(ns_uri).copied().unwrap_or("");
-            utilized.insert(prefix, ns_uri);
+            utilized.insert(tag_prefix, ns_uri);
+        }
+        if tag_ns.is_none() {
+            // An unprefixed element with no namespace visibly utilizes the
+            // default namespace binding "no namespace" (Exc-C14N §2.3).  When
+            // the output ancestor context carries a non-empty default
+            // namespace, the emit loop below must render `xmlns=""` — omitting
+            // it would silently move this element into the inherited default
+            // namespace and produce canonical bytes no conformant
+            // implementation computes.
+            utilized.insert("", "");
         }
         for a in node.attributes() {
             if let Some(ns_uri) = a.namespace()
                 && ns_uri != XML_NS
             {
-                let prefix = uri_to_prefix.get(ns_uri).copied().unwrap_or("");
-                utilized.insert(prefix, ns_uri);
+                utilized.insert(attribute_source_prefix(doc_text, &a), ns_uri);
             }
         }
     }
@@ -781,7 +899,7 @@ fn serialize_element(
     // even if the prefix is not visibly utilized — per W3C Exc-C14N §2.1.
     // The special token "#default" represents the default (empty-string) prefix.
 
-    // Build prefix → URI map for in-scope namespaces (the inverse of uri_to_prefix).
+    // Build prefix → URI map for in-scope namespaces.
     let prefix_to_uri: HashMap<&str, &str> = node
         .namespaces()
         .map(|ns| {
@@ -847,7 +965,12 @@ fn serialize_element(
     let mut attrs: Vec<(Option<&str>, &str, String, &str)> = node
         .attributes()
         .map(|a| {
-            let qname = build_qname(a.namespace(), a.name(), &uri_to_prefix);
+            let prefix = attribute_source_prefix(doc_text, &a);
+            let qname = if prefix.is_empty() {
+                a.name().to_string()
+            } else {
+                format!("{prefix}:{}", a.name())
+            };
             (a.namespace(), a.name(), qname, a.value())
         })
         .collect();
@@ -894,24 +1017,6 @@ fn serialize_element(
     out.write_str(&tag_qname)?;
     out.write_char('>')?;
     Ok(())
-}
-
-/// Resolve a namespace URI and local name to a prefixed qualified name using
-/// the URI → prefix map built from in-scope namespace declarations.
-/// Returns `local_name` unchanged when the namespace is absent or maps to
-/// the default (empty-string) prefix.
-fn build_qname(
-    ns_uri: Option<&str>,
-    local_name: &str,
-    uri_to_prefix: &HashMap<&str, &str>,
-) -> String {
-    match ns_uri {
-        Some(uri) => match uri_to_prefix.get(uri).copied() {
-            Some(prefix) if !prefix.is_empty() => format!("{prefix}:{local_name}"),
-            _ => local_name.to_string(),
-        },
-        None => local_name.to_string(),
-    }
 }
 
 /// Escape text node content per Canonical XML 1.0 §2.2:
@@ -1517,6 +1622,38 @@ mod w3c_c14n_vectors {
             !exc.contains(r#"xmlns:b"#),
             "Exclusive: xmlns:b must NOT appear (not visibly utilized): {exc}"
         );
+    }
+
+    // ── Exc-C14N: default-namespace undeclaration ────────────────────────────
+
+    /// Per Exc-C14N §2.3, an unprefixed element with no namespace visibly
+    /// utilizes the default namespace binding "no namespace". When the output
+    /// ancestor context carries a non-empty default namespace, `xmlns=""` must
+    /// be rendered — otherwise the canonical form silently moves the element
+    /// into the inherited default namespace.
+    #[test]
+    fn exc_c14n_renders_default_ns_undeclaration_for_no_ns_child() {
+        let xml =
+            r#"<root xmlns="urn:default" id="r"><child xmlns=""><inner></inner></child></root>"#;
+        let result = canonicalize_element_by_id(xml, "r", &exc_profile());
+        assert!(
+            result.contains(r#"<child xmlns="">"#),
+            "child in no namespace under a non-empty default must emit xmlns=\"\": {result}"
+        );
+        // inner inherits the empty default from child — no re-declaration.
+        assert!(
+            result.contains("<inner></inner>"),
+            "inner must not re-declare xmlns=\"\": {result}"
+        );
+    }
+
+    /// When the apex element itself is in no namespace and no ancestor context
+    /// exists (serialization root), no xmlns="" is emitted.
+    #[test]
+    fn exc_c14n_no_ns_apex_without_context_emits_no_undeclaration() {
+        let xml = r#"<doc id="d"><leaf></leaf></doc>"#;
+        let result = canonicalize_element_by_id(xml, "d", &exc_profile());
+        assert_eq!(result, "<doc id=\"d\"><leaf></leaf></doc>");
     }
 
     // ── Exc-C14N: xml:* attrs from ancestors not propagated ──────────────────

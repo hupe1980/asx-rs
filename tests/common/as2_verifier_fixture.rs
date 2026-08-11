@@ -32,7 +32,7 @@ impl As2TrustVerifier for DeterministicTrustVerifier {
         Ok(TrustResult {
             signature: self.trust.signature,
             decryption: self.trust.decryption,
-            decrypted_payload: None,
+            protected_entity: None,
         })
     }
 }

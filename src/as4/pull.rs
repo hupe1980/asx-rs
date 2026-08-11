@@ -9,8 +9,8 @@ use super::services::{
 };
 use super::stream::{constant_time_eq, normalize_mpc};
 use super::types::{
-    As4PushPolicy, As4QueuedPullMessage, As4ReceiveOutcome, As4ReceivePullOutput,
-    As4ReceivePullRequest, As4ReceivePushOutput, As4ReceivePushRequest,
+    As4PullAuthorization, As4PushPolicy, As4QueuedPullMessage, As4ReceiveOutcome,
+    As4ReceivePullOutput, As4ReceivePullRequest, As4ReceivePushOutput, As4ReceivePushRequest,
     FragmentScopePolicy as As4FragmentScopePolicy,
 };
 use crate::core::{AsxError, ErrorCode, ErrorContext, Result, SessionContext};
@@ -111,24 +111,43 @@ fn validate_pull_request_inputs(
     Ok((Arc::from(pull_message_id), Arc::from(mpc)))
 }
 
+/// Authorize a `PullRequest` to drain an MPC (ebMS3 §5.2.3.1).
+///
+/// A `PullRequest` is unsigned and an MPC URI is not secret, so this check is
+/// the only thing between a caller and another party's queued documents.
 fn validate_pull_authorization_info(
     session: &SessionContext,
-    expected_authorization_info: Option<&str>,
+    authorization: &As4PullAuthorization,
     provided_authorization_info: Option<&str>,
 ) -> Result<()> {
-    // OASIS-4: AuthorizationInfo enforcement (ebMS3 section 5.2.3.1).
-    if let Some(expected) = expected_authorization_info {
-        let provided = provided_authorization_info.unwrap_or("");
-        if !constant_time_eq(expected.as_bytes(), provided.as_bytes()) {
-            return Err(AsxError::new(
-                ErrorCode::SecurityVerificationFailed,
-                "AS4 PullRequest AuthorizationInfo does not match expected value",
-                ErrorContext::for_session("as4_receive_pull_auth", session),
-            ));
-        }
-    }
+    match authorization {
+        As4PullAuthorization::Deny => Err(AsxError::new(
+            ErrorCode::PolicyViolation,
+            "AS4 pull is not authorized for this MPC: As4PullPolicy::authorization is \
+             As4PullAuthorization::Deny (the default). Set \
+             As4PullAuthorization::SharedSecret(secret) to check eb:AuthorizationInfo, or \
+             As4PullAuthorization::EnforcedByTransport if mTLS or an API gateway already \
+             authorizes the caller for this MPC",
+            ErrorContext::for_session("as4_receive_pull_auth", session),
+        )),
 
-    Ok(())
+        As4PullAuthorization::SharedSecret(expected) => {
+            let provided = provided_authorization_info.unwrap_or("");
+            if constant_time_eq(expected.as_bytes(), provided.as_bytes()) {
+                Ok(())
+            } else {
+                Err(AsxError::new(
+                    ErrorCode::SecurityVerificationFailed,
+                    "AS4 PullRequest AuthorizationInfo does not match expected value",
+                    ErrorContext::for_session("as4_receive_pull_auth", session),
+                ))
+            }
+        }
+
+        // The embedder asserted that an upstream control already authorized this
+        // caller for this MPC.
+        As4PullAuthorization::EnforcedByTransport => Ok(()),
+    }
 }
 
 fn build_pull_output(
@@ -319,7 +338,7 @@ pub async fn receive_pull_with_reliability(
         require_signed_receipt,
         require_signed_push,
         fail_closed_audit_events,
-        expected_authorization_info,
+        authorization,
     } = policy;
 
     crate::presets::enforce_strict_runtime_bootstrap_for_strict_interop(
@@ -365,11 +384,7 @@ pub async fn receive_pull_with_reliability(
     // Authorization first: `check_duplicate_pull` *writes* the MessageId into
     // the dedup backend, so running it before this check would let an
     // unauthorized peer insert arbitrary keys into a durable, shared store.
-    validate_pull_authorization_info(
-        session,
-        expected_authorization_info.as_deref(),
-        authorization_info.as_deref(),
-    )?;
+    validate_pull_authorization_info(session, &authorization, authorization_info.as_deref())?;
 
     let duplicate_pull = check_duplicate_pull(
         session,

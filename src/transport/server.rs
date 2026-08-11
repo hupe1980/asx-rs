@@ -58,6 +58,7 @@ use crate::core::DEFAULT_MAX_BODY_BYTES;
 use crate::http::{HttpHeaders, HttpRequest};
 #[cfg(feature = "as2")]
 use crate::transport::ingress::as2_ingress_from_http;
+#[cfg(feature = "as4")]
 use crate::transport::ingress::as4_ingress_from_http;
 
 /// Per-router configuration for the AS2/AS4 Axum server integration.

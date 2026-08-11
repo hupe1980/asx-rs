@@ -34,13 +34,28 @@ fn verify_wssec_gate(
 /// `cid:` reference material for WS-Security verification: **every** payload
 /// attachment, so each one's digest can be checked and each one can be proven
 /// signature-covered.
+///
+/// Each attachment's bytes are pre-transformed per the WSS SwA
+/// `Attachment-Content-Signature-Transform`, selected by the MIME part's
+/// `Content-Type` — XML-typed parts are digested over their Exclusive C14N
+/// form, `text/*` parts over CRLF-normalized octets (what WSS4J-based signers
+/// compute).
+type SwaExternalReference<'a> = (&'a str, std::borrow::Cow<'a, [u8]>);
+
 fn wssec_external_references<'a>(
     multipart: &'a Option<MultipartAs4Payload<'a>>,
-) -> Vec<(&'a str, &'a [u8])> {
+) -> Result<Vec<SwaExternalReference<'a>>> {
+    let Some(multipart) = multipart.as_ref() else {
+        return Ok(Vec::new());
+    };
     multipart
-        .as_ref()
-        .map(MultipartAs4Payload::external_references)
-        .unwrap_or_default()
+        .external_references()
+        .into_iter()
+        .map(|(cid, content_type, bytes)| {
+            crate::crypto::wssec::swa_attachment_digest_input(content_type, bytes)
+                .map(|input| (cid, input))
+        })
+        .collect()
 }
 
 #[allow(clippy::type_complexity)]
@@ -74,7 +89,11 @@ pub(super) fn parse_verify_and_emit_receive_push_metadata<'a>(
 
     let xml = crate::core::bytes_to_utf8_str(soap_bytes, "as4_receive_push", session)?;
     let doc = parse_as4_user_message_document(xml, session)?;
-    let wssec_external_references = wssec_external_references(&multipart);
+    let wssec_external_references = wssec_external_references(&multipart)?;
+    let wssec_external_references: Vec<(&str, &[u8])> = wssec_external_references
+        .iter()
+        .map(|(cid, input)| (*cid, input.as_ref()))
+        .collect();
 
     let parsed = parse_as4_user_message_from_doc(
         session,

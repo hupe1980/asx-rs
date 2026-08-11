@@ -7,7 +7,6 @@
 use std::sync::Arc;
 use zeroize::Zeroize;
 
-use super::spool_key_provider::As2RegulatedSpoolKeyProvider;
 use crate::core::{AsxError, ErrorCode, ErrorContext, InteropMode, Result};
 #[cfg(feature = "as2")]
 use crate::crypto::as2_smime::SmimeCipher;
@@ -347,12 +346,21 @@ pub enum As2MdnMode {
 }
 
 /// Policy governing an inbound AS2 message receive.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct As2ReceivePolicy {
     pub interop_mode: InteropMode,
     pub interop_exceptions: InteropExceptionPolicy,
     pub fail_closed_audit_events: bool,
-    pub regulated_spool_key_provider: As2RegulatedSpoolKeyProvider,
+    /// Supplies the key that encrypts spooled payloads at rest.
+    ///
+    /// Required for profiles that mandate an encrypted spool (PEPPOL, CEF,
+    /// BDEW); those receives fail closed when it is `None` rather than
+    /// spooling in the clear. Ignored by profiles that spool in plaintext.
+    ///
+    /// Use [`StaticSpoolKey`](crate::as2::StaticSpoolKey) for development, or
+    /// implement [`SpoolEncryptionKeyProvider`](crate::as2::SpoolEncryptionKeyProvider)
+    /// against your key manager.
+    pub spool_key_provider: Option<std::sync::Arc<dyn super::SpoolEncryptionKeyProvider>>,
     /// Require a valid `AS2-Version` header on every inbound message.
     ///
     /// When `true` (the default) the header must be present and must contain
@@ -367,7 +375,7 @@ impl Default for As2ReceivePolicy {
             interop_mode: InteropMode::Strict,
             interop_exceptions: InteropExceptionPolicy::default(),
             fail_closed_audit_events: true,
-            regulated_spool_key_provider: As2RegulatedSpoolKeyProvider::LocalEnv,
+            spool_key_provider: None,
             enforce_as2_version: true,
         }
     }
@@ -402,14 +410,15 @@ impl As2ReceivePolicy {
 /// - `interop_mode`: [`InteropMode::Strict`]
 /// - `interop_exceptions`: [`InteropExceptionPolicy::default()`]
 /// - `fail_closed_audit_events`: `true`
-/// - `regulated_spool_key_provider`: [`As2RegulatedSpoolKeyProvider::LocalEnv`]
+/// - `spool_key_provider`: `None` — set it for profiles that require an
+///   encrypted spool, which otherwise fail closed
 /// - `enforce_as2_version`: `true`
 ///
 /// # Example
 /// ```
 /// # #[cfg(feature = "interop-relaxed")]
 /// # {
-/// use asx_rs::as2::{As2ReceivePolicyBuilder, As2RegulatedSpoolKeyProvider};
+/// use asx_rs::as2::As2ReceivePolicyBuilder;
 /// use asx_rs::core::InteropMode;
 ///
 /// let policy = As2ReceivePolicyBuilder::new()
@@ -423,7 +432,7 @@ pub struct As2ReceivePolicyBuilder {
     interop_mode: InteropMode,
     interop_exceptions: InteropExceptionPolicy,
     fail_closed_audit_events: bool,
-    regulated_spool_key_provider: As2RegulatedSpoolKeyProvider,
+    spool_key_provider: Option<std::sync::Arc<dyn super::SpoolEncryptionKeyProvider>>,
     enforce_as2_version: bool,
 }
 
@@ -442,7 +451,7 @@ impl As2ReceivePolicyBuilder {
             interop_mode: defaults.interop_mode,
             interop_exceptions: defaults.interop_exceptions,
             fail_closed_audit_events: defaults.fail_closed_audit_events,
-            regulated_spool_key_provider: defaults.regulated_spool_key_provider,
+            spool_key_provider: defaults.spool_key_provider,
             enforce_as2_version: defaults.enforce_as2_version,
         }
     }
@@ -465,9 +474,15 @@ impl As2ReceivePolicyBuilder {
         self
     }
 
-    /// Configure the regulated spool key provider.
-    pub fn regulated_spool_key_provider(mut self, provider: As2RegulatedSpoolKeyProvider) -> Self {
-        self.regulated_spool_key_provider = provider;
+    /// Supply the key provider used to encrypt spooled payloads at rest.
+    ///
+    /// Required by profiles that mandate an encrypted spool; those receives
+    /// fail closed without it.
+    pub fn spool_key_provider(
+        mut self,
+        provider: std::sync::Arc<dyn super::SpoolEncryptionKeyProvider>,
+    ) -> Self {
+        self.spool_key_provider = Some(provider);
         self
     }
 
@@ -483,7 +498,7 @@ impl As2ReceivePolicyBuilder {
             interop_mode: self.interop_mode,
             interop_exceptions: self.interop_exceptions,
             fail_closed_audit_events: self.fail_closed_audit_events,
-            regulated_spool_key_provider: self.regulated_spool_key_provider,
+            spool_key_provider: self.spool_key_provider,
             enforce_as2_version: self.enforce_as2_version,
         }
     }
@@ -615,7 +630,7 @@ impl Drop for As2MdnSigningCredentials {
 }
 
 /// Request to correlate an inbound MDN against a previously sent message.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct As2ReceiveMdnRequest {
     /// Original outbound payload bytes being reconciled against the MDN.
     pub payload: Arc<[u8]>,

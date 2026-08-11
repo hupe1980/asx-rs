@@ -145,29 +145,26 @@ pub enum AsxEvent {
         bytes: usize,
         source: &'static str,
     },
+    /// A spool encryption key provider answered successfully.
+    ///
+    /// `provider` is the label reported by the
+    /// [`SpoolEncryptionKeyProvider`](crate::as2::SpoolEncryptionKeyProvider)
+    /// implementation, so it names whatever key manager the embedder wired up.
     SpoolKeyProviderHealthChecked {
         provider: &'static str,
-        backend: &'static str,
-        auth_mode: &'static str,
-        auth_fingerprint_label: Arc<str>,
-        auth_rotation_hint: &'static str,
         health_state: &'static str,
-        startup_self_test_ms: u64,
         resolve_key_ms: u64,
     },
+    /// A spool encryption key provider failed; the receive fails closed.
     SpoolKeyProviderHealthCheckFailed {
         provider: &'static str,
-        backend: &'static str,
-        auth_mode: &'static str,
-        auth_fingerprint_label: Arc<str>,
-        auth_rotation_hint: &'static str,
         health_state: &'static str,
         phase: &'static str,
         error_code: &'static str,
     },
+    /// A provider transitioned between healthy and failing.
     SpoolKeyProviderHealthStateChanged {
         provider: &'static str,
-        backend: &'static str,
         previous_state: &'static str,
         current_state: &'static str,
         reason: &'static str,

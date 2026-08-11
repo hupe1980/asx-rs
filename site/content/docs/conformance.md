@@ -1,4 +1,7 @@
-# eDelivery AS4 Conformance & Interop Testing
++++
+title = "Conformance"
+description = "What asx-rs implements against the eDelivery AS4 conformance profile, what it does not, and how to read the coverage table honestly."
++++
 
 Two separate things, often conflated:
 
@@ -109,6 +112,14 @@ Four parts, exercising **multi-payload** messages:
 
 ---
 
+> **Caveat on this table.** Rows marked ✅ reflect *implemented and
+> unit-tested*. For the one-way push + NRR flow there is additionally
+> third-party evidence: the [Holodeck B2B counterparty
+> test](#live-counterparty-shipped) exchanges a signed message for a signed,
+> digest-echoing receipt with an independent WSS4J-based implementation on
+> every run. The caution still applies to everything that exchange does not
+> cover.
+
 ## What ASX still needs
 
 ASX is a **library**; the conformance service tests an **access point**. The
@@ -116,10 +127,11 @@ gap is deployment scaffolding, not protocol work.
 
 | Requirement | Status |
 |---|---|
-| AS4 signing (RSA + ECDSA), XML encryption, compression | ✅ shipped |
+| AS4 signing (RSA + ECDSA), XML encryption | ✅ shipped |
+| AS4 compression (gzip + `CompressionType` part property, both directions) | ✅ shipped |
 | One-way push send + receive | ✅ shipped |
 | Verified receipts / NRR | ✅ shipped (`verify_sync_response`) |
-| **Multi-payload messages** (4 payload profiles) | ✅ shipped in 0.12.0 — receive resolves every `xop:Include`, verifies each attachment's signature coverage, and surfaces them via `As4ReceivePushOutput::payloads()`. **Send is still single-payload** ⬜ |
+| **Multi-payload messages** (4 payload profiles) | ✅ shipped, both directions — send attaches parts via `As4AdditionalPayload` (pinned Content-IDs supported); receive resolves every signed `eb:PartInfo` reference and verifies each attachment's coverage. Exercised live against Holodeck B2B with two payloads |
 | Retry with bounded interval | ✅ `reliability::RetryScheduler` |
 | Two-way push-and-push | ⬜ expressible as two correlated one-ways via `RefToMessageId`; not modelled as a MEP |
 | ebMS3 `PING` service/action | ⬜ not special-cased |
@@ -134,6 +146,51 @@ Controller. Everything else is either done or a small increment.
 > canonicalizer stripped whitespace-only text nodes, which no W3C
 > canonicalization does. Removed, plus the missing per-`ds:Reference`
 > exc-c14n `ds:Transform`. Now 3/3.
+
+---
+
+## Live counterparty — shipped
+
+`tests/interop_holodeck_counterparty.rs` exchanges a **signed AS4 push with
+Non-Repudiation of Receipt** against **Holodeck B2B 6.1.1** — an independent,
+WSS4J-based ebMS3/AS4 implementation — in a container:
+
+```bash
+cargo test --all-features --test interop_holodeck_counterparty -- --ignored --nocapture
+```
+
+Per run, the harness generates fresh RSA identities, converts party B's to
+PKCS#12 with the local `openssl`, assembles the three JKS keystores with the
+container's own `keytool`, installs a One-Way/Push NRR P-Mode by bind mount,
+and then:
+
+1. asx signs and pushes a UserMessage;
+2. Holodeck verifies the signature (WSS4J), resolves its P-Mode, delivers the
+   payload, and answers with a signed receipt carrying
+   `NonRepudiationInformation`;
+3. asx verifies the receipt — signature, `X509v3` BST signer resolution, and
+   the NRR digest echo against the sent message.
+
+This exchange is the strongest interop evidence in the suite: it exercises
+P-Mode resolution, WSS4J signature verification of asx output, and asx
+verification of WSS4J output — failure classes that neither self-tests nor a
+bare XMLDSig oracle can reach.
+
+---
+
+## AS2 S/MIME oracle — shipped
+
+`tests/interop_openssl_smime_oracle.rs` validates AS2 in both directions
+against the `openssl smime` CLI — no container required:
+
+```bash
+cargo test --all-features --test interop_openssl_smime_oracle -- --ignored
+```
+
+openssl verifies and decrypts asx-signed/encrypted messages; asx verifies and
+decrypts openssl-produced ones, which differ from asx output in ways that
+matter (MIME preambles, legacy `application/x-pkcs7-*` media types, media type
+carried only in the HTTP header).
 
 ---
 
@@ -160,10 +217,16 @@ cannot see because it shares the signer's assumptions. **It found a real defect 
 its first run** — a whitespace-stripping bug that made every ASX signature
 non-interoperable, invisible to 998 other tests.
 
-Two harness transformations are applied, neither touching signed content: the
+Three harness transformations are applied, none changing any digest input: the
 `cid:` reference is retargeted to a local file with identical octets (xmlsec1
-cannot resolve `cid:`), and `--id-attr` is given per referenced element
-(`ebms:Messaging`, `soap:Body`) because `wsu:Id` is not a schema-declared ID.
+cannot resolve `cid:`), the WSS SwA `Attachment-Content-Signature-Transform` is
+stripped from that reference (xmlsec1 has no SwA support; for binary content
+the transform's digest input *is* the raw octets), and `--id-attr` is given per
+referenced element (`ebms:Messaging`, `soap:Body`) because `wsu:Id` is not a
+schema-declared ID. The first two edit `ds:SignedInfo`, so the tests assert the
+per-reference digest tally rather than the overall `SignatureValue` verdict —
+recomputing every reference digest under an independent C14N implementation is
+the interoperability question the oracle exists to answer.
 
 ---
 

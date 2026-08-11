@@ -20,22 +20,28 @@
 //! GET {smp_base}{url_encoded_canonical}/services/{url_encoded_document_type_id}
 //! ```
 //!
-//! # ⚠ The SMP response is not cryptographically verified
+//! # Verify the SMP signature
 //!
-//! This client parses `ServiceMetadata` but does **not** verify its enveloped
-//! XMLDSig signature. The lookup result decides *where a message is sent* and
-//! *which public key it is encrypted to*, and TLS authenticates the SMP host,
-//! not the metadata it serves — so a rogue or compromised SMP can redirect
-//! traffic and substitute its own recipient certificate.
+//! An SMP lookup decides *where a message is sent* and *which public key it is
+//! encrypted to*. TLS authenticates the SMP host, not the metadata it serves, so
+//! a rogue or compromised SMP can redirect traffic and substitute its own
+//! recipient certificate. PEPPOL and CEF eDelivery both require the consumer to
+//! verify the enveloped XMLDSig and chain the signing certificate to the
+//! network's SMP CA.
 //!
-//! PEPPOL and CEF eDelivery both require the consumer to verify the signature
-//! and chain the SMP signing certificate to the network's SMP CA. Until ASX
-//! implements this (it needs whole-document `URI=""` reference support that the
-//! WS-Security verifier lacks), the embedder must do it, using the response
-//! bytes returned in [`SmpEndpoint::signed_document`].
+//! ASX does this for you. Supply the network's SMP CA:
 //!
-//! [`SmpConfig::signature_policy`] defaults to rejecting a response that
-//! carries no `ds:Signature` at all — presence, not validity.
+//! ```rust,ignore
+//! let config = SmpConfig {
+//!     signature_policy: SmpSignaturePolicy::verify_with_trust_anchors(vec![smp_ca_pem]),
+//!     ..SmpConfig::peppol_production()
+//! };
+//! ```
+//!
+//! [`SmpSignaturePolicy`] defaults to [`SmpSignaturePolicy::Deny`]: a lookup
+//! whose authenticity was never established does not silently become a routing
+//! decision. The weaker settings exist for closed and test networks and must be
+//! chosen explicitly.
 //!
 //! # SSRF protection
 //!
@@ -101,60 +107,82 @@ pub struct SmpConfig {
 
     /// Whether an unsigned `ServiceMetadata` response is accepted.
     ///
-    /// Defaults to [`SmpSignaturePolicy::RequireSignaturePresent`]. See
-    /// [`SmpEndpoint::signed_document`] — the signature is checked for
-    /// *presence* only; verifying it remains the embedder's job.
+    /// How the response is authenticated before its contents are trusted.
+    ///
+    /// Defaults to [`SmpSignaturePolicy::Deny`]; set
+    /// [`SmpSignaturePolicy::verify_with_trust_anchors`] with the network's SMP
+    /// CA for any public network.
     pub signature_policy: SmpSignaturePolicy,
 }
 
 impl SmpConfig {
     /// Config for the **PEPPOL test** network.
+    ///
+    /// Carries the network's identity, not its trust anchors — those belong to
+    /// your deployment. Set
+    /// [`signature_policy`](Self::signature_policy) before using the result for
+    /// routing.
     pub fn peppol_test() -> Self {
         Self {
             sml_zone: "acc.edelivery.tech.ec.europa.eu".to_string(),
             participant_scheme: PEPPOL_PARTICIPANT_SCHEME.to_string(),
             transport_profile: PEPPOL_AS4_TRANSPORT_PROFILE.to_string(),
-            signature_policy: SmpSignaturePolicy::RequireSignaturePresent,
+            signature_policy: SmpSignaturePolicy::Deny,
         }
     }
 
     /// Config for the **PEPPOL production** network.
+    ///
+    /// Carries the network's identity, not its trust anchors — those belong to
+    /// your deployment. Supply the PEPPOL SMP CA via
+    /// [`SmpSignaturePolicy::verify_with_trust_anchors`] before using the result
+    /// for routing.
     pub fn peppol_production() -> Self {
         Self {
             sml_zone: "edelivery.tech.ec.europa.eu".to_string(),
             participant_scheme: PEPPOL_PARTICIPANT_SCHEME.to_string(),
             transport_profile: PEPPOL_AS4_TRANSPORT_PROFILE.to_string(),
-            signature_policy: SmpSignaturePolicy::RequireSignaturePresent,
+            signature_policy: SmpSignaturePolicy::Deny,
         }
     }
 }
 
-/// Whether a lookup requires the SMP response to carry an XMLDSig signature.
+/// How an SMP `ServiceMetadata` response is authenticated before its contents
+/// are used for routing.
 ///
-/// ASX does **not** cryptographically verify the SMP signature — see
-/// [`SmpEndpoint::signed_document`] for why that matters and what to do about
-/// it. This policy controls only whether a response with *no* signature at all
-/// is accepted, which is the one part of the check the library can make
-/// unambiguously.
+/// The lookup result determines where a message is sent and which key it is
+/// encrypted to, so treating an unauthenticated response as fact hands those
+/// decisions to whoever answered the request.
 #[derive(Debug, Clone, Default)]
 #[non_exhaustive]
 pub enum SmpSignaturePolicy {
+    /// Refuse to use the lookup result. **The default.**
+    ///
+    /// An SMP response whose authenticity was never established must not
+    /// silently become a routing decision, so there is no "unverified" setting
+    /// reachable by leaving this field alone — only by choosing one below.
+    #[default]
+    Deny,
+
     /// **Verify** the enveloped `ds:Signature` and chain the SMP signing
     /// certificate to the supplied trust anchors.
     ///
-    /// This is the only setting that makes an SMP lookup trustworthy: it is
-    /// what proves the endpoint URL and recipient certificate really came from
-    /// the network's SMP and were not substituted in transit.
+    /// This is the only setting that makes an SMP lookup trustworthy: it proves
+    /// the endpoint URL and recipient certificate really came from the network's
+    /// SMP and were not substituted in transit. Use it on any public network.
     ///
-    /// Supply the network's SMP CA (PEPPOL / CEF publish these). An empty
-    /// anchor set with `require_chain_validation` fails closed.
+    /// Supply the network's SMP CA (PEPPOL / CEF publish these); construct it
+    /// with [`verify_with_trust_anchors`](Self::verify_with_trust_anchors). An
+    /// empty anchor set with `require_chain_validation` fails closed.
     Verify(Box<crate::crypto::wssec::OwnedRevocationPolicy>),
+
     /// Require a `ds:Signature` to be present but do not verify it.
     ///
     /// A stepping stone, not a destination: it catches an outright unsigned or
-    /// misconfigured SMP but nothing else. Prefer [`Self::Verify`].
-    #[default]
+    /// misconfigured SMP and nothing else — a forged response with any
+    /// signature-shaped element passes. Prefer [`Self::Verify`].
     RequireSignaturePresent,
+
     /// Accept an unsigned `ServiceMetadata` response.
     ///
     /// For closed networks and test SMPs that do not sign. Do not use against
@@ -185,27 +213,15 @@ pub struct SmpEndpoint {
     /// [`Self::certificate_der_b64`] are unauthenticated.
     pub verified_signer_fingerprint_sha256: Option<String>,
 
-    /// The exact `ServiceMetadata` bytes the SMP returned, retained so the
-    /// caller can verify the enveloped XMLDSig itself if it prefers.
+    /// The exact `ServiceMetadata` bytes the SMP returned.
     ///
-    /// # This response is not cryptographically verified by ASX
+    /// Retained so a caller can re-check the enveloped XMLDSig itself, archive
+    /// the response for audit, or verify it against a second trust store.
     ///
-    /// [`Self::url`] and [`Self::certificate_der_b64`] come straight from this
-    /// document. Everything downstream — where the message is sent, and which
-    /// public key it is encrypted to — is therefore only as trustworthy as the
-    /// SMP response, and TLS authenticates *the SMP host*, not the metadata it
-    /// serves. A rogue or compromised SMP can redirect traffic and substitute
-    /// its own recipient certificate.
-    ///
-    /// PEPPOL and CEF eDelivery both require the consumer to verify the
-    /// enveloped signature and chain the signing certificate to the network's
-    /// SMP CA. ASX does not do this yet (the WS-Security verifier cannot
-    /// process the whole-document `URI=""` reference with an enveloped-signature
-    /// transform that SMP responses use), so **the embedder must**. These bytes
-    /// are the input to that check.
-    ///
-    /// [`SmpSignaturePolicy::RequireSignaturePresent`] guarantees only that a
-    /// `ds:Signature` element exists — not that it verifies.
+    /// Under [`SmpSignaturePolicy::Verify`] these bytes have already been
+    /// verified and [`Self::verified_signer_fingerprint_sha256`] names the
+    /// signer. Under the weaker policies they are unauthenticated, and so are
+    /// [`Self::url`] and [`Self::certificate_der_b64`].
     pub signed_document: std::sync::Arc<[u8]>,
 
     /// Base64-encoded DER X.509 certificate of the receiving party's signing
@@ -270,7 +286,7 @@ impl SmpClient {
             sml_zone: sml_zone.into(),
             participant_scheme: PEPPOL_PARTICIPANT_SCHEME.to_string(),
             transport_profile: PEPPOL_AS4_TRANSPORT_PROFILE.to_string(),
-            signature_policy: SmpSignaturePolicy::RequireSignaturePresent,
+            signature_policy: SmpSignaturePolicy::Deny,
         })
     }
 
@@ -439,6 +455,15 @@ fn enforce_smp_signature_policy(
     policy: &SmpSignaturePolicy,
 ) -> Result<Option<String>> {
     match policy {
+        SmpSignaturePolicy::Deny => Err(AsxError::new(
+            ErrorCode::PolicyViolation,
+            "SMP lookup results are not authorized for use: SmpConfig::signature_policy is \
+             SmpSignaturePolicy::Deny (the default). Set \
+             SmpSignaturePolicy::verify_with_trust_anchors(smp_ca_pems) to verify the \
+             response against the network's SMP CA, or one of the weaker variants for a \
+             closed or test network",
+            ErrorContext::new("smp_signature_policy"),
+        )),
         SmpSignaturePolicy::Verify(revocation) => {
             let verified = crate::crypto::wssec::verify_enveloped_document_signature(
                 text,
@@ -732,17 +757,44 @@ mod tests {
     /// default policy rejects it rather than silently trusting the endpoint and
     /// certificate it advertises.
     #[test]
-    fn unsigned_service_metadata_is_rejected_by_default() {
+    fn unsigned_service_metadata_is_rejected_by_the_presence_gate() {
         let xml = SIGNED_FIXTURE_TEMPLATE.replace("{signature}", "");
+        let err = parse_service_metadata(
+            xml.as_bytes(),
+            "urn:test:process",
+            "peppol-transport-as4-v2_0",
+            &SmpSignaturePolicy::RequireSignaturePresent,
+        )
+        .expect_err("unsigned response must be rejected by the presence gate");
+        assert_eq!(err.code, crate::core::ErrorCode::SecurityVerificationFailed);
+        assert!(err.message.contains("ds:Signature"), "{}", err.message);
+    }
+
+    /// A lookup whose authenticity was never established must not become a
+    /// routing decision by default.
+    #[test]
+    fn lookup_results_are_denied_until_a_policy_is_chosen() {
+        let signature = r#"<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:SignatureValue>AAAA</ds:SignatureValue></ds:Signature>"#;
+        let xml = SIGNED_FIXTURE_TEMPLATE.replace("{signature}", signature);
         let err = parse_service_metadata(
             xml.as_bytes(),
             "urn:test:process",
             "peppol-transport-as4-v2_0",
             &SmpSignaturePolicy::default(),
         )
-        .expect_err("unsigned response must be rejected under the default policy");
-        assert_eq!(err.code, crate::core::ErrorCode::SecurityVerificationFailed);
-        assert!(err.message.contains("ds:Signature"), "{}", err.message);
+        .expect_err("the default policy must refuse to hand back a routing decision");
+        assert_eq!(err.code, crate::core::ErrorCode::PolicyViolation);
+        assert!(
+            err.message.contains("SmpSignaturePolicy"),
+            "the error must name the knob to set: {}",
+            err.message
+        );
+
+        // The PEPPOL presets carry network identity, not trust anchors.
+        assert!(matches!(
+            SmpConfig::peppol_production().signature_policy,
+            SmpSignaturePolicy::Deny
+        ));
     }
 
     #[test]
@@ -753,7 +805,7 @@ mod tests {
             xml.as_bytes(),
             "urn:test:process",
             "peppol-transport-as4-v2_0",
-            &SmpSignaturePolicy::default(),
+            &SmpSignaturePolicy::RequireSignaturePresent,
         )
         .expect("a signed response passes the presence gate");
 

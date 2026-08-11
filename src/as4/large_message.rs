@@ -481,7 +481,7 @@ pub fn send_sync_fragmented(
             payload,
             policy: policy.clone(),
             credentials,
-            payload_filename: None,
+            ..As4SendRequest::default()
         },
     )?;
 
@@ -605,9 +605,20 @@ fn build_fragment_envelope(
 
     let xml = SoapEnvelopeBuilder::new(
         fragment_message_id,
-        session.session_id(),
-        session.partner_id(),
+        policy
+            .from_party_id
+            .as_deref()
+            .unwrap_or_else(|| session.session_id()),
+        policy
+            .to_party_id
+            .as_deref()
+            .unwrap_or_else(|| session.partner_id()),
     )
+    .with_party_id_types(
+        policy.from_party_id_type.clone(),
+        policy.to_party_id_type.clone(),
+    )
+    .with_roles(&policy.from_role, &policy.to_role)
     .with_action(&policy.action)
     .with_service(&policy.service, &policy.service_type)
     .with_four_corner_properties(
@@ -1230,6 +1241,7 @@ mod tests {
                 policy: policy.clone(),
                 credentials: Some(credentials.clone()),
                 payload_filename: None,
+                ..As4SendRequest::default()
             },
         )
         .expect("source send");
@@ -1284,6 +1296,7 @@ mod tests {
                 policy: policy.clone(),
                 credentials: Some(credentials.clone()),
                 payload_filename: None,
+                ..As4SendRequest::default()
             },
         )
         .expect("source send");
@@ -1329,6 +1342,7 @@ mod tests {
                 policy: policy.clone(),
                 credentials: Some(credentials),
                 payload_filename: None,
+                ..As4SendRequest::default()
             },
         )
         .expect("source send");
@@ -1397,6 +1411,7 @@ mod tests {
                 policy: policy.clone(),
                 credentials: Some(credentials),
                 payload_filename: None,
+                ..As4SendRequest::default()
             },
         )
         .expect("source send");

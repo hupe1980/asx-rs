@@ -150,12 +150,18 @@ async fn mic_uses_exact_octet_boundary_without_payload_rewrite() {
     )
     .expect("send");
 
-    let mut expected_input = Vec::with_capacity(16 + content_type.len() + 4 + payload.len());
-    expected_input.extend_from_slice(b"Content-Type: ");
-    expected_input.extend_from_slice(content_type.as_bytes());
-    expected_input.extend_from_slice(b"\r\n\r\n");
-    expected_input.extend_from_slice(&payload);
-    let expected_mic = STANDARD.encode(Sha256::digest(&expected_input));
+    // RFC 4130 §7.3.1: an unsigned, unencrypted message is MIC'd over the
+    // content alone — MIME headers are deliberately excluded because
+    // intermediaries reorder and rewrite them. The payload here begins with
+    // header-looking text, which must be treated as opaque content and hashed
+    // byte-for-byte rather than reinterpreted as headers.
+    let expected_mic = STANDARD.encode(Sha256::digest(&payload));
 
     assert_eq!(out.mic_base64, expected_mic);
+    assert_eq!(
+        out.mime.body.as_ref(),
+        payload.as_slice(),
+        "an unprotected AS2 message carries the payload as the entity body, unwrapped"
+    );
+    assert_eq!(out.mime.content_type, content_type);
 }

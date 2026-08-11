@@ -1,4 +1,7 @@
-# Incident Channel Companion Guidance
++++
+title = "Incident channels"
+description = "Routing protocol incidents to an external system: the channel traits, the file-spool implementation, and delivery semantics under failure."
++++
 
 This guide documents the trait-first contract for shipping vendor-specific incident delivery adapters in a companion crate while keeping `asx-rs` core transport-agnostic.
 

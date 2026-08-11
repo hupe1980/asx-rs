@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use super::send_mime::{inject_xop_include, package_as_mime};
+use super::send_mime::package_as_mime_with_extra_attachments;
 use super::services::enforce_strict_as4_send_runtime_policy_consistency;
 use super::types::{
     As4PreparedSendCredentials, As4SendCredentials, As4SendOutput, As4SendPolicy, SoapEnvelope,
@@ -25,7 +25,7 @@ const SOAP12_NAMESPACE: &str = "http://www.w3.org/2003/05/soap-envelope";
 const SOAP12_HTTP_CONTENT_TYPE: &str = "application/soap+xml";
 const SOAP12_MUST_UNDERSTAND_TOKEN: &str = "true";
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct As4SendRequest {
     pub message_id: String,
     pub payload: Vec<u8>,
@@ -54,6 +54,59 @@ pub struct As4SendRequest {
     /// let req = As4SendRequest { payload_filename: Some(name.parse()?), .. };
     /// ```
     pub payload_filename: Option<PayloadFilename>,
+    /// `eb:PartInfo` MimeType of the primary payload — the media type
+    /// *before* compression/encryption. `None` keeps the historical defaults
+    /// (`application/octet-stream`, or `application/xml` when encrypting).
+    pub payload_mime_type: Option<String>,
+    /// Explicit Content-ID for the primary payload (bare, no `cid:` prefix).
+    /// Derived from the content digest when `None`. eDelivery conformance
+    /// payload profiles pin specific values (`xmlpayload@gitb`, …).
+    pub payload_content_id: Option<String>,
+    /// Additional payload parts for a multi-payload UserMessage. Each part is
+    /// referenced from its own signed `eb:PartInfo`, signed, and — when the
+    /// policy says so — compressed and encrypted exactly like the primary.
+    pub additional_payloads: Vec<As4AdditionalPayload>,
+}
+
+/// One additional payload part of a multi-payload AS4 UserMessage.
+///
+/// ebMS3 allows several `eb:PartInfo` entries per message; the eDelivery
+/// conformance payload profiles exercise up to four. The receive side has
+/// surfaced every part via [`As4ReceivePushOutput::payloads`] for a while —
+/// this is the sending counterpart.
+///
+/// [`As4ReceivePushOutput::payloads`]: crate::as4::As4ReceivePushOutput::payloads
+#[derive(Clone, Debug)]
+pub struct As4AdditionalPayload {
+    pub bytes: Vec<u8>,
+    /// `eb:PartInfo` MimeType — the media type *before* compression/encryption.
+    pub mime_type: String,
+    /// Explicit Content-ID (bare, no `cid:` prefix); derived from the content
+    /// digest when `None`.
+    pub content_id: Option<String>,
+    /// `Content-Disposition` filename on the MIME part.
+    pub filename: Option<PayloadFilename>,
+}
+
+impl As4AdditionalPayload {
+    pub fn new(bytes: Vec<u8>, mime_type: impl Into<String>) -> Self {
+        Self {
+            bytes,
+            mime_type: mime_type.into(),
+            content_id: None,
+            filename: None,
+        }
+    }
+
+    pub fn with_content_id(mut self, content_id: impl Into<String>) -> Self {
+        self.content_id = Some(content_id.into());
+        self
+    }
+
+    pub fn with_filename(mut self, filename: PayloadFilename) -> Self {
+        self.filename = Some(filename);
+        self
+    }
 }
 
 #[derive(Clone)]
@@ -64,6 +117,12 @@ pub struct As4SendPreparedRequest {
     pub prepared: As4PreparedSendCredentials,
     /// See [`As4SendRequest::payload_filename`].
     pub payload_filename: Option<PayloadFilename>,
+    /// See [`As4SendRequest::payload_mime_type`].
+    pub payload_mime_type: Option<String>,
+    /// See [`As4SendRequest::payload_content_id`].
+    pub payload_content_id: Option<String>,
+    /// See [`As4SendRequest::additional_payloads`].
+    pub additional_payloads: Vec<As4AdditionalPayload>,
 }
 
 #[inline]
@@ -135,6 +194,9 @@ pub fn send_sync(
         policy,
         credentials: credentials_opt,
         payload_filename,
+        payload_mime_type,
+        payload_content_id,
+        additional_payloads,
     } = request;
 
     // Resolve effective credentials: per-request `Some(c)` is merged with the
@@ -220,6 +282,9 @@ pub fn send_sync(
             policy,
             prepared,
             payload_filename,
+            payload_mime_type,
+            payload_content_id,
+            additional_payloads,
         },
     )
 }
@@ -237,6 +302,9 @@ pub fn send_sync_prepared(
         policy,
         prepared,
         payload_filename,
+        payload_mime_type,
+        payload_content_id,
+        additional_payloads,
     } = request;
     send_sync_prepared_ref(
         session,
@@ -246,9 +314,45 @@ pub fn send_sync_prepared(
         policy,
         &prepared,
         payload_filename,
+        PrimaryPartOverrides {
+            mime_type: payload_mime_type,
+            content_id: payload_content_id,
+        },
+        additional_payloads,
     )
 }
 
+/// Per-request overrides for the primary payload part.
+struct PrimaryPartOverrides {
+    mime_type: Option<String>,
+    content_id: Option<String>,
+}
+
+/// An additional part after per-part transforms, ready for signing/packaging.
+struct OutboundExtraPart {
+    content_id: String,
+    mime_type: String,
+    bytes: Vec<u8>,
+    filename: Option<PayloadFilename>,
+}
+
+/// The MIME **part** `Content-Type` on the wire. Diverges from the
+/// `eb:PartInfo` MimeType (which always names the original business media
+/// type) once transforms apply: compressed parts travel as gzip, encrypted
+/// parts as opaque octets. This is also what keeps the WSS SwA attachment
+/// transform deterministic for the receiver — WSS4J selects XML/text/binary
+/// digesting by the part's wire type.
+fn part_wire_content_type<'a>(policy: &As4SendPolicy, declared_mime: &'a str) -> &'a str {
+    if policy.compress {
+        "application/gzip"
+    } else if policy.encrypt {
+        "application/octet-stream"
+    } else {
+        declared_mime
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn send_sync_prepared_ref(
     session: &SessionContext,
     event_bus: &EventBus,
@@ -257,6 +361,8 @@ fn send_sync_prepared_ref(
     policy: As4SendPolicy,
     prepared: &As4PreparedSendCredentials,
     payload_filename: Option<PayloadFilename>,
+    primary_overrides: PrimaryPartOverrides,
+    additional_payloads: Vec<As4AdditionalPayload>,
 ) -> Result<As4SendOutput> {
     pipeline::validate_message_id(&message_id, "as4_send_validate", session)?;
 
@@ -351,15 +457,91 @@ fn send_sync_prepared_ref(
         )?;
     }
 
-    let payload_mime_type = if policy.encrypt {
-        "application/xml"
-    } else if policy.compress {
-        "application/gzip"
-    } else {
-        "application/octet-stream"
-    };
+    // AS4 profile §3.1: `MimeType` describes the payload *before* compression,
+    // and compression is advertised separately via `CompressionType`. Labelling
+    // the part `application/gzip` and stopping there would discard the original
+    // media type and leave the receiver no conformant signal to decompress.
+    let payload_mime_type: String = primary_overrides.mime_type.unwrap_or_else(|| {
+        if policy.encrypt {
+            "application/xml".to_string()
+        } else {
+            "application/octet-stream".to_string()
+        }
+    });
+    let payload_mime_type = payload_mime_type.as_str();
+    // Advertised whenever compression was applied — including under
+    // encryption: the receiver decrypts first and the signed `CompressionType`
+    // property is its only conformant signal to then decompress. Suppressing
+    // it for encrypted payloads delivered gzip bytes as the business document.
+    let payload_compression_type = policy
+        .compress
+        .then_some(crate::crypto::compression::AS4_COMPRESSION_TYPE);
 
-    let payload_content_id = MimeAttachment::content_id_from_digest(&payload_to_send);
+    let payload_content_id = primary_overrides
+        .content_id
+        .unwrap_or_else(|| MimeAttachment::content_id_from_digest(&payload_to_send));
+
+    // Additional parts get the same per-part treatment as the primary:
+    // compress when the policy says so, then encrypt. SBDH wrapping applies to
+    // the primary business document only.
+    let mut extra_parts: Vec<OutboundExtraPart> = Vec::with_capacity(additional_payloads.len());
+    for part in additional_payloads {
+        let mut bytes = part.bytes;
+        if policy.compress {
+            #[cfg(feature = "compression")]
+            {
+                bytes = crate::crypto::compression::compress_gzip(&bytes, 6)?;
+            }
+            #[cfg(not(feature = "compression"))]
+            {
+                return Err(AsxError::new(
+                    ErrorCode::PolicyViolation,
+                    "AS4 compression requested but 'compression' feature is disabled",
+                    ErrorContext::for_session("as4_send_compress", session),
+                ));
+            }
+        }
+        if policy.encrypt {
+            let recipient_cert = prepared.recipient_cert.as_ref().ok_or_else(|| {
+                AsxError::new(
+                    ErrorCode::PolicyViolation,
+                    "AS4 recipient certificate is missing",
+                    ErrorContext::for_session("as4_send_encrypt", session),
+                )
+            })?;
+            bytes = encrypt_payload_xmlenc_preparsed(
+                &bytes,
+                recipient_cert,
+                policy.outbound_xmlenc_payload_algorithm,
+            )?;
+        }
+        let content_id = part
+            .content_id
+            .unwrap_or_else(|| MimeAttachment::content_id_from_digest(&bytes));
+        extra_parts.push(OutboundExtraPart {
+            content_id,
+            mime_type: part.mime_type,
+            bytes,
+            filename: part.filename,
+        });
+    }
+
+    // Every part needs a distinct Content-ID: it is the MIME-part address, the
+    // eb:PartInfo href, and the ds:Reference URI. A duplicate would make two
+    // references resolve to one attachment and leave the other unverifiable.
+    {
+        let mut seen = std::collections::HashSet::new();
+        seen.insert(payload_content_id.as_str());
+        for part in &extra_parts {
+            if !seen.insert(part.content_id.as_str()) {
+                return Err(AsxError::new(
+                    ErrorCode::InvalidInput,
+                    format!("duplicate payload Content-ID: {}", part.content_id),
+                    ErrorContext::for_session("as4_send_validate", session),
+                ));
+            }
+        }
+    }
     let original_sender = policy
         .original_sender
         .clone()
@@ -374,24 +556,56 @@ fn send_sync_prepared_ref(
         .unwrap_or_else(|| message_id.clone());
     let conversation_id = policy.conversation_id.clone();
 
+    // Party identifiers: explicit policy values win; the session ids are a
+    // fallback for closed asx↔asx loops only — a real counterparty resolves
+    // its P-Mode against these values.
+    let from_party_id = policy
+        .from_party_id
+        .as_deref()
+        .unwrap_or_else(|| session.session_id());
+    let to_party_id = policy
+        .to_party_id
+        .as_deref()
+        .unwrap_or_else(|| session.partner_id());
+
     let build_soap_xml = |payload: Vec<u8>, ws_header: Option<String>| -> Result<String> {
-        let mut builder =
-            SoapEnvelopeBuilder::new(&message_id, session.session_id(), session.partner_id())
-                .with_action(&policy.action)
-                .with_service(&policy.service, &policy.service_type)
-                .with_four_corner_properties(
-                    &original_sender,
-                    &final_recipient,
-                    &tracking_identifier,
+        let extra_part_infos: Vec<(String, String, Option<String>)> = extra_parts
+            .iter()
+            .map(|part| {
+                (
+                    part.content_id.clone(),
+                    part.mime_type.clone(),
+                    policy
+                        .compress
+                        .then(|| crate::crypto::compression::AS4_COMPRESSION_TYPE.to_string()),
                 )
-                .with_payload_content_id(&payload_content_id)
-                .with_payload_mime_type(payload_mime_type)
-                .with_payload(payload);
+            })
+            .collect();
+        let mut builder = SoapEnvelopeBuilder::new(&message_id, from_party_id, to_party_id)
+            .with_extra_part_infos(extra_part_infos)
+            .with_party_id_types(
+                policy.from_party_id_type.clone(),
+                policy.to_party_id_type.clone(),
+            )
+            .with_roles(&policy.from_role, &policy.to_role)
+            .with_action(&policy.action)
+            .with_service(&policy.service, &policy.service_type)
+            .with_four_corner_properties(&original_sender, &final_recipient, &tracking_identifier)
+            .with_payload_content_id(&payload_content_id)
+            .with_payload_mime_type(payload_mime_type)
+            .with_detached_payload_reference()
+            .with_payload(payload);
+        if let Some(compression_type) = payload_compression_type {
+            builder = builder.with_payload_compression_type(compression_type);
+        }
         if let Some(ref_id) = &policy.ref_to_message_id {
             builder = builder.with_ref_to_message_id(ref_id);
         }
         if let Some(conv_id) = &conversation_id {
             builder = builder.with_conversation_id(conv_id);
+        }
+        if let Some(agreement) = &policy.agreement_ref {
+            builder = builder.with_agreement_ref(agreement, policy.agreement_ref_type.clone());
         }
         if let Some(wsa) = &policy.ws_addressing {
             builder = builder.with_ws_addressing(wsa.clone());
@@ -409,16 +623,12 @@ fn send_sync_prepared_ref(
         Ok(generated_xml_bytes_to_string(built))
     };
 
-    let adapt_soap_for_mime = |soap_xml: &str, payload_content_id: &str| -> Result<String> {
-        inject_xop_include(soap_xml, payload_content_id)
-    };
-
-    // MIME mode rewrites `<asx:Base64>` to `<xop:Include>` and carries
-    // bytes in the MIME attachment. Use a tiny placeholder payload to
-    // avoid cloning and base64-encoding the full payload into SOAP first.
-    let payload_for_soap = vec![0u8];
-    let unsigned_xml = build_soap_xml(payload_for_soap.clone(), None)?;
-    let unsigned_xml = adapt_soap_for_mime(&unsigned_xml, &payload_content_id)?;
+    // AS4 SwA packaging: the payload travels as a detached MIME part
+    // referenced from the signed `eb:PartInfo` header, and the SOAP Body is
+    // empty. (Through 0.12.0 asx emitted MTOM-style `xop:Include` in the Body with
+    // an `application/xop+xml` root part, which WSS4J-based receivers reject
+    // at DOM conversion.)
+    let unsigned_xml = build_soap_xml(Vec::new(), None)?;
 
     let mut soap_xml = if policy.sign {
         let signing_key = signing_key.ok_or_else(|| {
@@ -450,12 +660,41 @@ fn send_sync_prepared_ref(
         let messaging_reference = format!("#{}", crate::crypto::soap_builder::MESSAGING_WSU_ID);
         let body_reference = format!("#{}", crate::crypto::soap_builder::SOAP_BODY_WSU_ID);
         let payload_reference = format!("cid:{payload_content_id}");
-        let reference_uris = [
+        let extra_references: Vec<String> = extra_parts
+            .iter()
+            .map(|part| format!("cid:{}", part.content_id))
+            .collect();
+        let mut reference_uris: Vec<&str> = vec![
             messaging_reference.as_str(),
             body_reference.as_str(),
             payload_reference.as_str(),
         ];
-        let external_refs = [(payload_reference.as_str(), payload_to_send.as_slice())];
+        reference_uris.extend(extra_references.iter().map(String::as_str));
+        // WSS SwA §4.4: the attachment digest input depends on the part's wire
+        // content type — XML parts are digested over their Exclusive C14N
+        // form, text/* parts over CRLF-normalized octets. This must match
+        // what WSS4J-based receivers recompute.
+        let primary_digest_input = crate::crypto::wssec::swa_attachment_digest_input(
+            Some(part_wire_content_type(&policy, payload_mime_type)),
+            &payload_to_send,
+        )?;
+        let extra_digest_inputs = extra_parts
+            .iter()
+            .map(|part| {
+                crate::crypto::wssec::swa_attachment_digest_input(
+                    Some(part_wire_content_type(&policy, &part.mime_type)),
+                    &part.bytes,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut external_refs: Vec<(&str, &[u8])> =
+            vec![(payload_reference.as_str(), primary_digest_input.as_ref())];
+        external_refs.extend(
+            extra_references
+                .iter()
+                .map(String::as_str)
+                .zip(extra_digest_inputs.iter().map(|input| input.as_ref())),
+        );
         let signature_xml = generate_xmlsig_signature_with_external_references_preparsed(
             &unsigned_xml,
             &reference_uris,
@@ -494,11 +733,9 @@ fn send_sync_prepared_ref(
         })?;
         let wsse_header = generated_xml_bytes_to_string(wsse_header);
 
-        // Rebuild the SOAP envelope with the structured WS-Security header,
-        // then apply MIME adaptation. This avoids brittle string-marker
-        // insertion into generated XML.
-        let signed_xml = build_soap_xml(payload_for_soap, Some(wsse_header))?;
-        adapt_soap_for_mime(&signed_xml, &payload_content_id)?
+        // Rebuild the SOAP envelope with the structured WS-Security header.
+        // This avoids brittle string-marker insertion into generated XML.
+        build_soap_xml(Vec::new(), Some(wsse_header))?
     } else {
         unsigned_xml
     };
@@ -522,13 +759,27 @@ fn send_sync_prepared_ref(
 
     let soap_body = soap_xml.into_bytes();
 
-    let (outbound_body, http_content_type) = package_as_mime(
+    let extra_attachments: Vec<MimeAttachment> = extra_parts
+        .into_iter()
+        .map(|part| {
+            let disposition = match &part.filename {
+                Some(name) => format!("attachment; filename=\"{}\"", name.as_str()),
+                None => "attachment".to_string(),
+            };
+            let wire_content_type = part_wire_content_type(&policy, &part.mime_type).to_string();
+            MimeAttachment::new(&part.content_id, wire_content_type, part.bytes, "binary")
+                .with_disposition(disposition)
+        })
+        .collect();
+    let primary_wire_content_type = part_wire_content_type(&policy, payload_mime_type);
+    let (outbound_body, http_content_type) = package_as_mime_with_extra_attachments(
         soap_body,
         payload_to_send,
         &payload_content_id,
-        payload_mime_type,
+        primary_wire_content_type,
         SOAP12_HTTP_CONTENT_TYPE,
         payload_filename.as_ref(),
+        extra_attachments,
     )?;
 
     if policy.sign {
@@ -633,6 +884,11 @@ pub async fn send_async_prepared(
                             request.policy.clone(),
                             &request.prepared,
                             request.payload_filename.clone(),
+                            PrimaryPartOverrides {
+                                mime_type: request.payload_mime_type.clone(),
+                                content_id: request.payload_content_id.clone(),
+                            },
+                            request.additional_payloads.clone(),
                         )
                     })
                     .await

@@ -4,7 +4,7 @@ use crate::core::{AsxError, ErrorCode, ErrorContext, Result, SessionContext};
 
 use super::{
     As2GeneratedMdn, As2InboundResult, As2MdnSigningCredentials, As2MicAlgorithm, As2TrustVerifier,
-    extract_content_type_header, generate_mdn, generate_signed_mdn, mic::compute_rfc4130_mic,
+    extract_content_type_header, generate_mdn, generate_signed_mdn, mic::compute_mic,
     receive_payload,
 };
 
@@ -134,11 +134,13 @@ pub fn receive_from_ingress(request: As2IngressReceiveRequest<'_>) -> Result<As2
         ));
     }
 
-    let content = receive_payload(
+    let received = receive_payload(
         session,
         crate::core::PayloadInput::Borrowed(payload),
+        Some(content_type),
         verifier,
     )?;
+    let content = received.content;
 
     let Some(notify_to) = disposition_notification_to.filter(|s| !s.trim().is_empty()) else {
         return Ok(As2InboundResult {
@@ -154,7 +156,10 @@ pub fn receive_from_ingress(request: As2IngressReceiveRequest<'_>) -> Result<As2
         .and_then(parse_signed_receipt_micalg)
         .unwrap_or(As2MicAlgorithm::Sha256);
 
-    let (mic_base64, mic_alg_str) = compute_rfc4130_mic(payload, content_type, mic_algorithm);
+    // RFC 4130 §7.3.1: digest the protected MIME entity for signed/encrypted
+    // messages, or the bare content for unprotected ones. `receive_payload`
+    // already resolved which of the two applies.
+    let (mic_base64, mic_alg_str) = compute_mic(&received.mic_input, mic_algorithm);
     let mic_header_value = format!("{}, {mic_alg_str}", mic_base64);
 
     // Detect mailto: async MDN request — extract the address for the embedder to dispatch.

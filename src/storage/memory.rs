@@ -167,9 +167,21 @@ impl ReconciliationStorage for InMemoryReconciliationStorage {
 /// This prevents unbounded memory growth in long-running services while
 /// preserving duplicate-rejection for all keys within the window.
 ///
-/// **Choose `capacity` based on your replay-protection window**: a value
-/// of `10_000` is appropriate for most AS2/AS4 deployments that process
-/// up to tens of thousands of messages per hour.
+/// # ⚠ A peer controls when your window slides
+///
+/// Eviction is driven by *insertion*, and inbound message IDs come from the
+/// counterparty. An attacker who can push `capacity` distinct messages flushes
+/// the window and can then replay a message older than that — bounded dedup
+/// trades replay coverage for a memory bound, and the peer chooses where the
+/// boundary falls.
+///
+/// Size `capacity` against the volume an adversary could push within your
+/// replay-protection window, not against normal throughput. Where that is not
+/// tractable, prefer [`TtlDedupStorage`] (time-bounded, so a flood cannot
+/// shorten the window) or a durable backend.
+///
+/// `10_000` suits a deployment processing tens of thousands of messages per
+/// hour from *trusted* peers.
 /// Internal dedup state: queue of seen keys + set of current keys.
 type DedupState = (VecDeque<Arc<str>>, HashSet<Arc<str>>);
 
@@ -306,9 +318,13 @@ impl TtlDedupStorage {
 
     /// Create a new TTL dedup store with an explicit sweep interval.
     ///
-    /// Smaller intervals use more CPU; larger intervals allow stale entries to
-    /// accumulate until the next sweep fires.  A value of `Duration::MAX`
-    /// disables background sweeps entirely (only the fast-path eviction runs).
+    /// The sweep is the **only** eviction path: an expired entry still occupies
+    /// memory until a sweep removes it. Smaller intervals cost CPU; larger ones
+    /// let expired entries accumulate.
+    ///
+    /// `Duration::MAX` disables sweeping, which means memory grows without
+    /// bound for the lifetime of the store. That is only sensible for a
+    /// short-lived instance in a test.
     pub fn with_sweep_interval(ttl: Duration, sweep_interval: Duration) -> Self {
         Self {
             inner: Mutex::new(TtlDedupInner {
@@ -718,17 +734,45 @@ mod tests {
         assert!(!drive_dedup_future(storage.first_seen("key-b")).unwrap());
     }
 
+    /// With sweeping disabled, an expired key is still re-accepted — the
+    /// expiry *check* is per-key, so correctness does not depend on the sweep.
+    /// Only reclamation does: re-inserting overwrites one entry, but a key that
+    /// is never seen again is never removed.
     #[test]
-    fn ttl_dedup_with_sweep_interval_max_never_sweeps() {
-        // With sweep_interval = MAX, the throttled sweep never fires.
-        // Entries accumulate until the fast-path eviction handles them on re-insert.
+    fn ttl_dedup_expiry_check_is_independent_of_sweeping() {
         let storage = TtlDedupStorage::with_sweep_interval(Duration::from_nanos(1), Duration::MAX);
         assert!(drive_dedup_future(storage.first_seen("msg-nosweep")).unwrap());
         std::thread::sleep(Duration::from_millis(10));
-        // Expired key, but sweep is suppressed — fast-path still allows re-insert.
         assert!(
             drive_dedup_future(storage.first_seen("msg-nosweep")).unwrap(),
-            "expired key re-accepted even without sweep"
+            "an expired key must be re-accepted even when the sweep never fires"
+        );
+    }
+
+    /// The sweep is the only path that releases memory. Disabling it means
+    /// entries for keys that are never seen again accumulate forever — worth
+    /// pinning so the behaviour is not mistaken for an eviction policy.
+    #[test]
+    fn ttl_dedup_without_sweeping_never_releases_distinct_keys() {
+        let storage = TtlDedupStorage::with_sweep_interval(Duration::from_nanos(1), Duration::MAX);
+        for i in 0..64 {
+            assert!(drive_dedup_future(storage.first_seen(&format!("k{i}"))).unwrap());
+        }
+        assert_eq!(
+            storage.inner.lock().entries.len(),
+            64,
+            "every distinct key is retained when sweeping is disabled"
+        );
+
+        // A sweeping store reclaims them instead.
+        let sweeping =
+            TtlDedupStorage::with_sweep_interval(Duration::from_nanos(1), Duration::ZERO);
+        for i in 0..64 {
+            assert!(drive_dedup_future(sweeping.first_seen(&format!("k{i}"))).unwrap());
+        }
+        assert!(
+            sweeping.inner.lock().entries.len() < 64,
+            "a sweeping store reclaims expired entries"
         );
     }
 

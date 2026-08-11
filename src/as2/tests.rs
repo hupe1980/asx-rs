@@ -12,14 +12,16 @@ use openssl::rsa::Rsa;
 use openssl::x509::{X509, X509NameBuilder};
 use std::sync::Arc;
 
+/// A provider whose answer the test dictates, standing in for a real key manager.
+#[derive(Debug)]
 struct TestSpoolEncryptionKeyProvider {
-    provider: As2RegulatedSpoolKeyProvider,
+    label: &'static str,
     resolve: std::result::Result<Arc<[u8; 32]>, AsxError>,
 }
 
 impl SpoolEncryptionKeyProvider for TestSpoolEncryptionKeyProvider {
-    fn provider_kind(&self) -> As2RegulatedSpoolKeyProvider {
-        self.provider
+    fn label(&self) -> &'static str {
+        self.label
     }
 
     fn resolve_key(&self, _session: &SessionContext) -> Result<Arc<[u8; 32]>> {
@@ -31,30 +33,6 @@ fn session() -> SessionContext {
     SessionContext::new("s1", "p1", "strict")
         .expect("session")
         .with_strict_runtime_bootstrap_validated(true)
-}
-
-#[cfg(feature = "client")]
-fn signed_key_response_hmac(session: &SessionContext, key_hex: &str, secret: &str) -> String {
-    use base64::{Engine as _, engine::general_purpose::STANDARD};
-
-    let input = key_response_signing_input(
-        As2RegulatedSpoolKeyProvider::KmsHttp.as_str(),
-        session.session_id(),
-        session.partner_id(),
-        session.profile_name(),
-        key_hex,
-    );
-    let hmac_key = PKey::hmac(secret.as_bytes()).expect("hmac key");
-    let mut signer = openssl::sign::Signer::new(openssl::hash::MessageDigest::sha256(), &hmac_key)
-        .expect("signer");
-    signer.update(input.as_bytes()).expect("signer update");
-    let sig = signer.sign_to_vec().expect("signer finalize");
-    STANDARD.encode(sig)
-}
-
-#[cfg(feature = "client")]
-fn no_mtls_tls_config() -> HttpKeyProviderTlsConfig {
-    HttpKeyProviderTlsConfig::default()
 }
 
 struct DurableTestDedup(InMemoryDedupBackend);
@@ -111,7 +89,7 @@ fn durable_reliability() -> (DurableTestReconciliationWrapper, DurableTestDedup)
 }
 
 fn strict_bus() -> EventBus {
-    let sink = Arc::new(InMemoryAuditSink::new());
+    let sink = Arc::new(InMemoryAuditSink::new().expect("audit sink"));
     EventBus::new_with_config_and_mode(
         16,
         Some(sink),
@@ -224,328 +202,6 @@ fn test_as2_credentials() -> As2SendCredentials {
 }
 
 #[test]
-fn as2_receive_policy_defaults_to_local_env_provider_selection() {
-    assert_eq!(
-        As2ReceivePolicy::default().regulated_spool_key_provider,
-        As2RegulatedSpoolKeyProvider::LocalEnv
-    );
-}
-
-#[test]
-fn regulated_provider_selection_exposes_stable_labels() {
-    assert_eq!(As2RegulatedSpoolKeyProvider::LocalEnv.as_str(), "local-env");
-    assert_eq!(As2RegulatedSpoolKeyProvider::KmsFile.backend(), "file");
-    assert_eq!(As2RegulatedSpoolKeyProvider::KmsHttp.backend(), "http");
-}
-
-#[test]
-fn regulated_provider_selection_parses_and_formats() {
-    let parsed: As2RegulatedSpoolKeyProvider = "hsm-file".parse().expect("parse provider");
-    assert_eq!(parsed, As2RegulatedSpoolKeyProvider::HsmFile);
-    assert_eq!(parsed.to_string(), "hsm-file");
-
-    let parsed_http: As2RegulatedSpoolKeyProvider =
-        "kms-http".parse().expect("parse http provider");
-    assert_eq!(parsed_http, As2RegulatedSpoolKeyProvider::KmsHttp);
-    assert_eq!(parsed_http.to_string(), "kms-http");
-
-    let err = "not-a-provider"
-        .parse::<As2RegulatedSpoolKeyProvider>()
-        .expect_err("invalid provider should fail");
-    assert!(err.contains("unsupported AS2 regulated spool key provider"));
-}
-
-#[cfg(feature = "client")]
-#[tokio::test(flavor = "multi_thread")]
-async fn regulated_http_provider_fetches_key_from_endpoint() {
-    use std::io::{Read, Write};
-    use std::net::TcpListener;
-
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-    let addr = listener.local_addr().expect("addr");
-
-    let session =
-        SessionContext::new("s-http", "p-http", "as4_openpeppol_strict").expect("session");
-    let key_hex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-    let shared_secret = "test-kms-shared-secret";
-    let key_hmac = signed_key_response_hmac(&session, key_hex, shared_secret);
-
-    let server = std::thread::spawn(move || {
-        let (mut stream, _) = listener.accept().expect("accept");
-        let mut buf = [0u8; 4096];
-        let _ = stream.read(&mut buf).expect("read");
-        let body = format!(
-            "{{\"key_hex\":\"{}\",\"key_hmac_sha256\":\"{}\"}}",
-            key_hex, key_hmac
-        );
-        let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-            body.len(),
-            body
-        );
-        stream
-            .write_all(response.as_bytes())
-            .expect("write response");
-    });
-
-    let fetched_key_hex = fetch_spool_key_hex_over_http(
-        As2RegulatedSpoolKeyProvider::KmsHttp,
-        &session,
-        format!("http://{addr}/v1/key"),
-        None,
-        shared_secret,
-        &no_mtls_tls_config(),
-    )
-    .expect("http key fetch");
-
-    server.join().expect("server thread");
-    assert_eq!(
-        fetched_key_hex,
-        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-    );
-}
-
-#[cfg(feature = "client")]
-#[tokio::test(flavor = "multi_thread")]
-async fn regulated_http_provider_retries_transient_server_error() {
-    use std::io::{Read, Write};
-    use std::net::TcpListener;
-
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-    let addr = listener.local_addr().expect("addr");
-
-    let session = SessionContext::new("s-http-retry", "p-http-retry", "as4_openpeppol_strict")
-        .expect("session");
-    let key_hex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-    let shared_secret = "test-kms-shared-secret";
-    let key_hmac = signed_key_response_hmac(&session, key_hex, shared_secret);
-
-    let server = std::thread::spawn(move || {
-        for response_index in 0..2 {
-            let (mut stream, _) = listener.accept().expect("accept");
-            let mut buf = [0u8; 4096];
-            let _ = stream.read(&mut buf).expect("read");
-
-            if response_index == 0 {
-                stream
-                    .write_all(
-                        b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                    )
-                    .expect("write 503 response");
-                continue;
-            }
-
-            let body = format!(
-                "{{\"key_hex\":\"{}\",\"key_hmac_sha256\":\"{}\"}}",
-                key_hex, key_hmac
-            );
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                body.len(),
-                body
-            );
-            stream
-                .write_all(response.as_bytes())
-                .expect("write response");
-        }
-    });
-
-    let fetched_key_hex = fetch_spool_key_hex_over_http(
-        As2RegulatedSpoolKeyProvider::KmsHttp,
-        &session,
-        format!("http://{addr}/v1/key"),
-        None,
-        shared_secret,
-        &no_mtls_tls_config(),
-    )
-    .expect("http key fetch with retry");
-
-    server.join().expect("server thread");
-    assert_eq!(fetched_key_hex, key_hex);
-}
-
-#[cfg(feature = "client")]
-#[tokio::test(flavor = "multi_thread")]
-async fn regulated_http_provider_rejects_invalid_response_hmac() {
-    use std::io::{Read, Write};
-    use std::net::TcpListener;
-
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-    let addr = listener.local_addr().expect("addr");
-
-    let server = std::thread::spawn(move || {
-        let (mut stream, _) = listener.accept().expect("accept");
-        let mut buf = [0u8; 4096];
-        let _ = stream.read(&mut buf).expect("read");
-        let body = r#"{"key_hex":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","key_hmac_sha256":"aW52YWxpZA=="}"#;
-        let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-            body.len(),
-            body
-        );
-        stream
-            .write_all(response.as_bytes())
-            .expect("write response");
-    });
-
-    let session = SessionContext::new(
-        "s-http-bad-hmac",
-        "p-http-bad-hmac",
-        "as4_openpeppol_strict",
-    )
-    .expect("session");
-    let err = fetch_spool_key_hex_over_http(
-        As2RegulatedSpoolKeyProvider::KmsHttp,
-        &session,
-        format!("http://{addr}/v1/key"),
-        None,
-        "test-kms-shared-secret",
-        &no_mtls_tls_config(),
-    )
-    .expect_err("invalid response hmac must fail closed");
-
-    server.join().expect("server thread");
-    assert_eq!(err.code, ErrorCode::PolicyViolation);
-    assert!(
-        err.message.contains("response hmac verification failed"),
-        "expected authenticated response validation failure"
-    );
-}
-
-#[cfg(feature = "client")]
-#[test]
-fn regulated_http_provider_circuit_opens_after_repeated_failures() {
-    let session = SessionContext::new("s-http-circuit", "p-http-circuit", "as4_openpeppol_strict")
-        .expect("session");
-    let endpoint =
-        reqwest::Url::parse("https://kms.example.test/v1/key-opens").expect("endpoint url");
-    let resilience = HttpKeyProviderResilienceConfig::default();
-
-    note_http_key_provider_circuit_success(As2RegulatedSpoolKeyProvider::KmsHttp, &endpoint);
-
-    for _ in 0..resilience.circuit_failure_threshold {
-        note_http_key_provider_circuit_failure(
-            As2RegulatedSpoolKeyProvider::KmsHttp,
-            &endpoint,
-            "injected failure",
-            &resilience,
-        );
-    }
-
-    let err = ensure_http_key_provider_circuit_allows_request(
-        As2RegulatedSpoolKeyProvider::KmsHttp,
-        &session,
-        &endpoint,
-        &resilience,
-    )
-    .expect_err("circuit should be open after threshold failures");
-
-    assert_eq!(err.code, ErrorCode::PolicyViolation);
-    assert!(err.message.contains("circuit is open"));
-
-    note_http_key_provider_circuit_success(As2RegulatedSpoolKeyProvider::KmsHttp, &endpoint);
-}
-
-#[cfg(feature = "client")]
-#[test]
-fn regulated_http_provider_circuit_respects_custom_threshold() {
-    let session = SessionContext::new(
-        "s-http-circuit-custom",
-        "p-http-circuit-custom",
-        "as4_openpeppol_strict",
-    )
-    .expect("session");
-    let endpoint =
-        reqwest::Url::parse("https://kms.example.test/v1/key-custom").expect("endpoint url");
-    let resilience = HttpKeyProviderResilienceConfig {
-        circuit_failure_threshold: 2,
-        circuit_open_base_secs: 1,
-        circuit_open_jitter_secs: 0,
-        ..HttpKeyProviderResilienceConfig::default()
-    };
-
-    note_http_key_provider_circuit_success(As2RegulatedSpoolKeyProvider::KmsHttp, &endpoint);
-
-    note_http_key_provider_circuit_failure(
-        As2RegulatedSpoolKeyProvider::KmsHttp,
-        &endpoint,
-        "first failure",
-        &resilience,
-    );
-
-    ensure_http_key_provider_circuit_allows_request(
-        As2RegulatedSpoolKeyProvider::KmsHttp,
-        &session,
-        &endpoint,
-        &resilience,
-    )
-    .expect("circuit should remain closed before custom threshold");
-
-    note_http_key_provider_circuit_failure(
-        As2RegulatedSpoolKeyProvider::KmsHttp,
-        &endpoint,
-        "second failure",
-        &resilience,
-    );
-
-    let err = ensure_http_key_provider_circuit_allows_request(
-        As2RegulatedSpoolKeyProvider::KmsHttp,
-        &session,
-        &endpoint,
-        &resilience,
-    )
-    .expect_err("circuit should open at configured threshold");
-    assert_eq!(err.code, ErrorCode::PolicyViolation);
-    assert!(err.message.contains("circuit is open"));
-
-    note_http_key_provider_circuit_success(As2RegulatedSpoolKeyProvider::KmsHttp, &endpoint);
-}
-
-#[cfg(feature = "client")]
-#[test]
-fn regulated_http_provider_backoff_jitter_respects_budget() {
-    let resilience = HttpKeyProviderResilienceConfig {
-        retry_backoff_base_ms: 100,
-        retry_backoff_jitter_ms: 50,
-        ..HttpKeyProviderResilienceConfig::default()
-    };
-
-    let attempt_1 = http_key_provider_backoff_for_attempt(
-        1,
-        &resilience,
-        "kms-http",
-        "s-http-jitter",
-        "p-http-jitter",
-        "as4_openpeppol_strict",
-        "https://kms.example.test/v1/key",
-    )
-    .as_millis() as u64;
-
-    let attempt_2 = http_key_provider_backoff_for_attempt(
-        2,
-        &resilience,
-        "kms-http",
-        "s-http-jitter",
-        "p-http-jitter",
-        "as4_openpeppol_strict",
-        "https://kms.example.test/v1/key",
-    )
-    .as_millis() as u64;
-
-    assert!((100..=150).contains(&attempt_1));
-    assert!((200..=250).contains(&attempt_2));
-}
-
-#[test]
-fn parse_spool_encryption_key_hex_accepts_64_hex_chars() {
-    let key_hex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-    let key = parse_spool_encryption_key_hex(key_hex).expect("hex parse");
-    assert_eq!(key.len(), 32);
-    assert_eq!(key[0], 0x01);
-    assert_eq!(key[31], 0xef);
-}
-
-#[test]
 fn as2_receive_rejects_empty_payload() {
     let err = receive_sync(
         &session(),
@@ -578,9 +234,9 @@ fn as2_cms_smime_verifier_rejects_unsigned_payload() {
     assert_eq!(err.code, ErrorCode::SecurityVerificationFailed);
 }
 
-/// `CmsSmimeTrustVerifier::requiring_signature()` must reject an
-/// encrypted-only (unsigned) message, while the default verifier accepts it.
-/// The unsigned-encrypted message is produced via relaxed-mode send (strict
+/// The default signature policy (`As2SignaturePolicy::Required`) must reject an
+/// encrypted-only (unsigned) message; `allowing_unsigned()` opts into accepting
+/// it. The unsigned-encrypted message is produced via relaxed-mode send (strict
 /// send mandates signing).
 #[cfg(feature = "interop-relaxed")]
 #[test]
@@ -616,18 +272,19 @@ fn require_signed_rejects_encrypted_only_message() {
         .expect("recipient cert")
         .to_vec();
 
-    // With require_signed set, the unsigned-encrypted message is rejected.
+    // The default policy (signatures Required) rejects an unsigned encrypted
+    // message: encryption alone does not authenticate the sender.
     let strict_verifier =
-        CmsSmimeTrustVerifier::with_decryption_credentials(key_pem.clone(), cert_pem.clone())
-            .requiring_signature();
+        CmsSmimeTrustVerifier::with_decryption_credentials(key_pem.clone(), cert_pem.clone());
     let err = receive_sync(&session(), out.mime.body.to_vec(), &strict_verifier)
-        .expect_err("require_signed must reject an unsigned encrypted message");
+        .expect_err("the default policy must reject an unsigned encrypted message");
     assert_eq!(err.code, ErrorCode::SecurityVerificationFailed);
 
-    // Default (require_signed = false) still accepts and decrypts it.
-    let lenient_verifier = CmsSmimeTrustVerifier::with_decryption_credentials(key_pem, cert_pem);
+    // Opting in to As2SignaturePolicy::Optional accepts and decrypts it.
+    let lenient_verifier =
+        CmsSmimeTrustVerifier::with_decryption_credentials(key_pem, cert_pem).allowing_unsigned();
     receive_sync(&session(), out.mime.body.to_vec(), &lenient_verifier)
-        .expect("default verifier accepts encrypted-only message");
+        .expect("Optional policy accepts encrypted-only message");
 }
 
 #[test]
@@ -773,8 +430,7 @@ fn provider_health_state_transition_emits_degraded_then_recovered() {
         &session,
         &bus,
         true,
-        "local-env",
-        "env",
+        "static",
         "failing",
         "key_resolution",
     )
@@ -784,13 +440,11 @@ fn provider_health_state_transition_emits_degraded_then_recovered() {
     match degraded.event.as_ref() {
         AsxEvent::SpoolKeyProviderHealthStateChanged {
             provider,
-            backend,
             previous_state,
             current_state,
             reason,
         } => {
-            assert_eq!(*provider, "local-env");
-            assert_eq!(*backend, "env");
+            assert_eq!(*provider, "static");
             assert_eq!(*previous_state, "unknown");
             assert_eq!(*current_state, "failing");
             assert_eq!(*reason, "key_resolution");
@@ -802,8 +456,7 @@ fn provider_health_state_transition_emits_degraded_then_recovered() {
         &session,
         &bus,
         true,
-        "local-env",
-        "env",
+        "static",
         "healthy",
         "policy_ready",
     )
@@ -815,13 +468,11 @@ fn provider_health_state_transition_emits_degraded_then_recovered() {
     match recovered.event.as_ref() {
         AsxEvent::SpoolKeyProviderHealthStateChanged {
             provider,
-            backend,
             previous_state,
             current_state,
             reason,
         } => {
-            assert_eq!(*provider, "local-env");
-            assert_eq!(*backend, "env");
+            assert_eq!(*provider, "static");
             assert_eq!(*previous_state, "failing");
             assert_eq!(*current_state, "healthy");
             assert_eq!(*reason, "policy_ready");
@@ -844,10 +495,9 @@ async fn as2_receive_stream_emits_provider_health_check_failure_event() {
 
     let err = receive_stream_with_metrics_and_audit(
         &session,
-        &As2ReceivePolicy {
-            regulated_spool_key_provider: As2RegulatedSpoolKeyProvider::HsmFile,
-            ..As2ReceivePolicy::default()
-        },
+        // A profile that mandates an encrypted spool with no key provider
+        // configured must fail closed, not spool in the clear.
+        &As2ReceivePolicy::default(),
         &bus,
         true,
         payload.as_slice(),
@@ -871,22 +521,14 @@ async fn as2_receive_stream_emits_provider_health_check_failure_event() {
 
         if let AsxEvent::SpoolKeyProviderHealthCheckFailed {
             provider,
-            backend,
-            auth_mode,
-            auth_fingerprint_label,
-            auth_rotation_hint,
             health_state,
             phase,
             error_code,
         } = scoped.event.as_ref()
         {
-            assert_eq!(*provider, "hsm-file");
-            assert_eq!(*backend, "file");
-            assert_eq!(*auth_mode, "file-key");
-            assert_eq!(auth_fingerprint_label.as_ref(), "not-applicable");
-            assert_eq!(*auth_rotation_hint, "not-applicable");
+            assert_eq!(*provider, "unconfigured");
             assert_eq!(*health_state, "failing");
-            assert_eq!(*phase, "key_resolution");
+            assert_eq!(*phase, "provider_selection");
             assert_eq!(*error_code, "policy_violation");
             saw_failure = true;
             break;
@@ -919,7 +561,7 @@ async fn as2_receive_stream_emits_provider_health_check_failure_event() {
 }
 
 #[tokio::test]
-async fn as2_receive_stream_with_metrics_fails_on_missing_regulated_provider_config() {
+async fn as2_receive_stream_fails_closed_without_a_spool_key_provider() {
     let session = SessionContext::new("s3", "p3", "as4_openpeppol_strict").expect("session");
     let payload = vec![9u8; 64];
     let verifier = SyncToAsyncTrustVerifier::new(InsecureBypassTrustVerifier::new(
@@ -928,10 +570,7 @@ async fn as2_receive_stream_with_metrics_fails_on_missing_regulated_provider_con
 
     let err = receive_stream_with_metrics(
         &session,
-        &As2ReceivePolicy {
-            regulated_spool_key_provider: As2RegulatedSpoolKeyProvider::HsmFile,
-            ..As2ReceivePolicy::default()
-        },
+        &As2ReceivePolicy::default(),
         payload.as_slice(),
         &verifier,
         StreamLimits {
@@ -946,36 +585,10 @@ async fn as2_receive_stream_with_metrics_fails_on_missing_regulated_provider_con
 }
 
 #[test]
-fn regulated_provider_startup_self_test_failure_domain_is_reported() {
-    let session = SessionContext::new("s4", "p4", "as4_openpeppol_strict").expect("session");
-    let provider = TestSpoolEncryptionKeyProvider {
-        provider: As2RegulatedSpoolKeyProvider::KmsEnv,
-        resolve: Ok(Arc::new([0u8; 32])),
-    };
-
-    let outcome = regulated_stream_body_policy_build_with_provider(&session, 1024, &provider);
-
-    match outcome {
-        StreamBodyPolicyBuildOutcome::ProviderFailure { error, observation } => {
-            assert_eq!(error.code, ErrorCode::PolicyViolation);
-            assert!(error.message.contains("startup self-test failed"));
-            assert_eq!(observation.provider, "kms-env");
-            assert_eq!(observation.backend, "env");
-            assert_eq!(observation.health_state, "failing");
-            assert_eq!(observation.phase, "startup_self_test");
-            assert_eq!(observation.error_code, "policy_violation");
-        }
-        StreamBodyPolicyBuildOutcome::Ready { .. } => {
-            panic!("expected startup self-test provider failure")
-        }
-    }
-}
-
-#[test]
 fn regulated_provider_key_resolution_failure_domain_is_reported() {
     let session = SessionContext::new("s5", "p5", "as4_openpeppol_strict").expect("session");
     let provider = TestSpoolEncryptionKeyProvider {
-        provider: As2RegulatedSpoolKeyProvider::HsmFile,
+        label: "vault",
         resolve: Err(AsxError::new(
             ErrorCode::PolicyViolation,
             "injected key resolution failure",
@@ -989,8 +602,7 @@ fn regulated_provider_key_resolution_failure_domain_is_reported() {
         StreamBodyPolicyBuildOutcome::ProviderFailure { error, observation } => {
             assert_eq!(error.code, ErrorCode::PolicyViolation);
             assert_eq!(error.message, "injected key resolution failure");
-            assert_eq!(observation.provider, "hsm-file");
-            assert_eq!(observation.backend, "file");
+            assert_eq!(observation.provider, "vault");
             assert_eq!(observation.health_state, "failing");
             assert_eq!(observation.phase, "key_resolution");
             assert_eq!(observation.error_code, "policy_violation");
@@ -1002,234 +614,10 @@ fn regulated_provider_key_resolution_failure_domain_is_reported() {
 }
 
 #[test]
-fn regulated_http_provider_missing_endpoint_is_fail_closed() {
-    let session = SessionContext::new("s-http-missing", "p-http-missing", "as4_openpeppol_strict")
-        .expect("session");
-    let provider = HttpJsonSpoolEncryptionKeyProvider::new(As2RegulatedSpoolKeyProvider::KmsHttp);
-
-    let err = provider
-        .resolve_key(&session)
-        .expect_err("missing endpoint must fail closed");
-
-    assert_eq!(err.code, ErrorCode::PolicyViolation);
-    assert!(
-        err.message.contains("ASX_SPOOL_KMS_DATA_KEY_HTTP_URL"),
-        "expected missing endpoint env var in error message"
-    );
-}
-
-#[cfg(feature = "client")]
-#[test]
-fn regulated_http_provider_rejects_non_loopback_plain_http_endpoint() {
-    let session = SessionContext::new("s-http-policy", "p-http-policy", "as4_openpeppol_strict")
-        .expect("session");
-
-    let err = fetch_spool_key_hex_over_http(
-        As2RegulatedSpoolKeyProvider::KmsHttp,
-        &session,
-        "http://example.com/v1/key".to_string(),
-        None,
-        "test-kms-shared-secret",
-        &no_mtls_tls_config(),
-    )
-    .expect_err("non-loopback plain http must fail closed");
-
-    assert_eq!(err.code, ErrorCode::PolicyViolation);
-    assert!(err.message.contains("requires https endpoint URL"));
-}
-
-#[cfg(feature = "client")]
-#[test]
-fn regulated_http_provider_requires_mtls_for_non_loopback_https_endpoint() {
-    let session = SessionContext::new(
-        "s-http-mtls-required",
-        "p-http-mtls-required",
-        "as4_openpeppol_strict",
-    )
-    .expect("session");
-    let endpoint = reqwest::Url::parse("https://kms.example.com/v1/key").expect("endpoint");
-
-    let err = validate_http_key_provider_mtls_policy(
-        As2RegulatedSpoolKeyProvider::KmsHttp,
-        &session,
-        &endpoint,
-        &HttpKeyProviderTlsConfig::default(),
-    )
-    .expect_err("missing mTLS config must fail closed");
-
-    assert_eq!(err.code, ErrorCode::PolicyViolation);
-    assert!(
-        err.message
-            .contains("requires mTLS client certificate and key")
-    );
-}
-
-#[cfg(feature = "client")]
-#[test]
-fn regulated_http_provider_rejects_partial_mtls_configuration() {
-    let session = SessionContext::new(
-        "s-http-mtls-partial",
-        "p-http-mtls-partial",
-        "as4_openpeppol_strict",
-    )
-    .expect("session");
-    let endpoint = reqwest::Url::parse("https://kms.example.com/v1/key").expect("endpoint");
-    let tls_config = HttpKeyProviderTlsConfig {
-        client_cert_pem_path: Some("/tmp/kms-client-cert.pem".to_string()),
-        client_key_pem_path: None,
-        trust_anchor_cert_pem_paths: Vec::new(),
-    };
-
-    let err = resolve_http_key_provider_client_identity_pem(
-        As2RegulatedSpoolKeyProvider::KmsHttp,
-        &session,
-        &endpoint,
-        &tls_config,
-    )
-    .expect_err("partial mTLS config must fail closed");
-
-    assert_eq!(err.code, ErrorCode::PolicyViolation);
-    assert!(
-        err.message
-            .contains("requires both mTLS client certificate and key")
-    );
-}
-
-#[cfg(feature = "client")]
-#[test]
-fn regulated_http_provider_requires_pinned_trust_anchor_for_non_loopback_https_endpoint() {
-    let session = SessionContext::new(
-        "s-http-pinned-anchor-required",
-        "p-http-pinned-anchor-required",
-        "as4_openpeppol_strict",
-    )
-    .expect("session");
-    let endpoint = reqwest::Url::parse("https://kms.example.com/v1/key").expect("endpoint");
-    let tls_config = HttpKeyProviderTlsConfig {
-        client_cert_pem_path: Some("/tmp/kms-client-cert.pem".to_string()),
-        client_key_pem_path: Some("/tmp/kms-client-key.pem".to_string()),
-        trust_anchor_cert_pem_paths: Vec::new(),
-    };
-
-    let err = validate_http_key_provider_mtls_policy(
-        As2RegulatedSpoolKeyProvider::KmsHttp,
-        &session,
-        &endpoint,
-        &tls_config,
-    )
-    .expect_err("missing pinned trust anchor must fail closed");
-
-    assert_eq!(err.code, ErrorCode::PolicyViolation);
-    assert!(
-        err.message
-            .contains("requires pinned trust-anchor certificate")
-    );
-}
-
-#[cfg(feature = "client")]
-#[test]
-fn regulated_http_provider_accepts_multiple_pinned_trust_anchors_for_rotation() {
-    let session = SessionContext::new(
-        "s-http-pinned-anchor-rotation",
-        "p-http-pinned-anchor-rotation",
-        "as4_openpeppol_strict",
-    )
-    .expect("session");
-    let endpoint = reqwest::Url::parse("https://kms.example.com/v1/key").expect("endpoint");
-    let tls_config = HttpKeyProviderTlsConfig {
-        client_cert_pem_path: Some("/tmp/kms-client-cert.pem".to_string()),
-        client_key_pem_path: Some("/tmp/kms-client-key.pem".to_string()),
-        trust_anchor_cert_pem_paths: vec![
-            "/tmp/kms-ca-current.pem".to_string(),
-            "/tmp/kms-ca-next.pem".to_string(),
-        ],
-    };
-
-    validate_http_key_provider_mtls_policy(
-        As2RegulatedSpoolKeyProvider::KmsHttp,
-        &session,
-        &endpoint,
-        &tls_config,
-    )
-    .expect("multiple pinned trust anchors should be accepted for rotation windows");
-}
-
-#[cfg(feature = "client")]
-#[test]
-fn regulated_http_provider_loopback_http_does_not_require_pinned_trust_anchor() {
-    let session = SessionContext::new(
-        "s-http-loopback-no-pin",
-        "p-http-loopback-no-pin",
-        "as4_openpeppol_strict",
-    )
-    .expect("session");
-    let endpoint = reqwest::Url::parse("http://127.0.0.1:8080/v1/key").expect("endpoint");
-
-    validate_http_key_provider_mtls_policy(
-        As2RegulatedSpoolKeyProvider::KmsHttp,
-        &session,
-        &endpoint,
-        &HttpKeyProviderTlsConfig::default(),
-    )
-    .expect("loopback HTTP harness should not require mTLS or pinned anchor");
-}
-
-#[test]
-fn regulated_provider_startup_self_test_accepts_non_zero_key() {
-    let session = SessionContext::new("s-self-test-ok", "p-self-test-ok", "as4_openpeppol_strict")
-        .expect("session");
-    let key = [7u8; 32];
-
-    validate_spool_encryption_key_startup_self_test(
-        As2RegulatedSpoolKeyProvider::LocalEnv,
-        &session,
-        &key,
-    )
-    .expect("startup self-test should pass for usable key material");
-}
-
-#[test]
-fn regulated_http_provider_key_resolution_failure_domain_is_reported() {
-    let session = SessionContext::new(
-        "s-http-observation",
-        "p-http-observation",
-        "as4_openpeppol_strict",
-    )
-    .expect("session");
-
-    let outcome = as2_stream_body_policy_build(
-        &session,
-        &As2ReceivePolicy {
-            regulated_spool_key_provider: As2RegulatedSpoolKeyProvider::KmsHttp,
-            ..As2ReceivePolicy::default()
-        },
-    );
-
-    match outcome {
-        StreamBodyPolicyBuildOutcome::ProviderFailure { observation, .. } => {
-            assert_eq!(observation.provider, "kms-http");
-            assert_eq!(observation.backend, "http");
-            assert_eq!(observation.auth_mode, "mtls-pinned-trust-anchor");
-            assert_eq!(
-                observation.auth_fingerprint_label,
-                "client:unconfigured;anchors:unconfigured"
-            );
-            assert_eq!(observation.auth_rotation_hint, "unconfigured");
-            assert_eq!(observation.health_state, "failing");
-            assert_eq!(observation.phase, "key_resolution");
-            assert_eq!(observation.error_code, "policy_violation");
-        }
-        StreamBodyPolicyBuildOutcome::Ready { .. } => {
-            panic!("expected provider failure when HTTP endpoint is missing")
-        }
-    }
-}
-
-#[test]
 fn regulated_provider_success_observation_reports_healthy_state() {
     let session = SessionContext::new("s6", "p6", "as4_openpeppol_strict").expect("session");
     let provider = TestSpoolEncryptionKeyProvider {
-        provider: As2RegulatedSpoolKeyProvider::LocalEnv,
+        label: "aws-kms",
         resolve: Ok(Arc::new([7u8; 32])),
     };
 
@@ -1245,17 +633,101 @@ fn regulated_provider_success_observation_reports_healthy_state() {
                 SpoolEncryption::Aes256Gcm { .. }
             ));
             let observation = provider_observation.expect("provider observation");
-            assert_eq!(observation.provider, "local-env");
-            assert_eq!(observation.backend, "env");
-            assert_eq!(observation.auth_mode, "env-key");
-            assert_eq!(observation.auth_fingerprint_label, "not-applicable");
-            assert_eq!(observation.auth_rotation_hint, "not-applicable");
+            assert_eq!(observation.provider, "aws-kms");
             assert_eq!(observation.health_state, "healthy");
         }
         StreamBodyPolicyBuildOutcome::ProviderFailure { error, .. } => {
             panic!("expected successful provider resolution, got {error:?}")
         }
     }
+}
+
+/// The point of the provider trait: an embedder can wire any key manager
+/// without the crate knowing anything about it.
+#[tokio::test]
+async fn a_custom_spool_key_provider_is_used_for_regulated_profiles() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Debug)]
+    struct CountingProvider {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl SpoolEncryptionKeyProvider for CountingProvider {
+        fn label(&self) -> &'static str {
+            "counting-kms"
+        }
+
+        fn resolve_key(&self, _session: &SessionContext) -> Result<Arc<[u8; 32]>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Arc::new([0x2Au8; 32]))
+        }
+    }
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let session = SessionContext::new("s-custom", "p-custom", "as4_openpeppol_strict")
+        .expect("session")
+        .with_strict_runtime_bootstrap_validated(true);
+    let policy = As2ReceivePolicy {
+        spool_key_provider: Some(Arc::new(CountingProvider {
+            calls: Arc::clone(&calls),
+        })),
+        ..As2ReceivePolicy::default()
+    };
+    let verifier = SyncToAsyncTrustVerifier::new(InsecureBypassTrustVerifier::new(
+        TrustEvidence::verified_and_decryptable(),
+    ));
+
+    receive_stream_with_metrics(
+        &session,
+        &policy,
+        vec![3u8; 64].as_slice(),
+        &verifier,
+        StreamLimits {
+            max_body_bytes: 4096,
+            chunk_bytes: 16,
+        },
+    )
+    .await
+    .expect("a supplied provider satisfies the encrypted-spool requirement");
+
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "the custom provider must be the one consulted"
+    );
+}
+
+/// `StaticSpoolKey` is enough to run a regulated profile end to end.
+#[tokio::test]
+async fn static_spool_key_satisfies_a_regulated_profile() {
+    let session = SessionContext::new("s-static", "p-static", "as4_cef_strict")
+        .expect("session")
+        .with_strict_runtime_bootstrap_validated(true);
+    let key = StaticSpoolKey::from_hex(
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    )
+    .expect("key");
+    let policy = As2ReceivePolicy {
+        spool_key_provider: Some(Arc::new(key)),
+        ..As2ReceivePolicy::default()
+    };
+    let verifier = SyncToAsyncTrustVerifier::new(InsecureBypassTrustVerifier::new(
+        TrustEvidence::verified_and_decryptable(),
+    ));
+
+    receive_stream_with_metrics(
+        &session,
+        &policy,
+        vec![5u8; 32].as_slice(),
+        &verifier,
+        StreamLimits {
+            max_body_bytes: 4096,
+            chunk_bytes: 16,
+        },
+    )
+    .await
+    .expect("StaticSpoolKey satisfies the encrypted-spool requirement");
 }
 
 #[tokio::test]
@@ -1388,9 +860,19 @@ async fn relaxed_send_allows_empty_payload() {
     .expect("relaxed send");
 
     assert_eq!(out.message_id, "msg-1");
+    // RFC 4130 §7.3.1: a signed message is MIC'd over the signed MIME entity.
+    // Relaxed mode substitutes a single "\n" for the empty payload, so the
+    // entity is the octet-stream header block plus that byte.
+    let expected_entity =
+        b"Content-Type: application/octet-stream\r\nContent-Transfer-Encoding: binary\r\n\r\n\n";
     assert_eq!(
         out.mic_base64,
-        "8276mMbsVoT8+rLPugVLcL4l/jozb4Eu2ryV2chhR1k="
+        {
+            use base64::Engine as _;
+            use sha2::Digest;
+            base64::engine::general_purpose::STANDARD.encode(sha2::Sha256::digest(expected_entity))
+        },
+        "MIC must digest the signed entity"
     );
 }
 
@@ -1976,7 +1458,7 @@ Disposition: automatic-action/MDN-sent-automatically; processed\r\n";
                 interop_mode: InteropMode::Strict,
                 interop_exceptions: InteropExceptionPolicy::default(),
                 fail_closed_audit_events: true,
-                regulated_spool_key_provider: As2RegulatedSpoolKeyProvider::LocalEnv,
+                spool_key_provider: None,
                 enforce_as2_version: false,
             },
             original_message_id: None,
@@ -2105,4 +1587,285 @@ fn correlate_async_mdn_returns_no_original_message_id_for_empty_mdn() {
         correlate_async_mdn(mdn, "partner-a", &reconciliation).expect("correlate_async_mdn");
 
     assert_eq!(outcome, AsyncMdnCorrelationOutcome::NoOriginalMessageId);
+}
+
+// ── RFC 4130 §7.3.1 MIC round-trip ──────────────────────────────────────────
+//
+// These are the tests the suite was missing: every prior "matching MIC" test
+// asserted a hardcoded digest on both sides, so sender and receiver could
+// disagree completely and still pass.  Here the sender's MIC and the receiver's
+// `Received-Content-MIC` are computed independently and compared.
+
+/// Self-signed signer usable as its own trust anchor, plus the session that
+/// trusts it.
+fn signing_identity() -> (As2SendCredentials, String, String) {
+    let creds = test_as2_credentials();
+    let cert_pem = String::from_utf8(creds.signing_cert_pem.as_ref().unwrap().to_vec())
+        .expect("cert pem is utf-8");
+    let cert = X509::from_pem(cert_pem.as_bytes()).expect("parse cert");
+    let fingerprint = cert
+        .digest(openssl::hash::MessageDigest::sha256())
+        .expect("digest")
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+    (creds, cert_pem, fingerprint)
+}
+
+fn trusting_session(cert_pem: &str, fingerprint: &str) -> SessionContext {
+    crate::core::SessionContextBuilder::new("s-mic", "p1")
+        .with_trust_anchor_pem(cert_pem.to_string())
+        // PKCS7_NOINTERN: the signer leaf must be supplied out-of-band.
+        .with_intermediate_ca_pem(cert_pem.to_string())
+        .with_fingerprint_sha256(fingerprint.to_string())
+        // Self-signed fixture: no responder to reach, and these tests run
+        // outside a Tokio runtime.
+        .with_ocsp_mode(crate::core::OcspMode::Disabled)
+        .build()
+        .expect("session")
+        .with_strict_runtime_bootstrap_validated(true)
+}
+
+/// Drive a full send → receive cycle and return
+/// `(sender_mic, receiver_mic, delivered_payload)`.
+fn mic_round_trip(
+    payload: &[u8],
+    content_type: &'static str,
+    sign: bool,
+    encrypt: bool,
+    compress: bool,
+) -> (String, String, Vec<u8>) {
+    let bus = EventBus::new(16).expect("bus");
+    let (creds, cert_pem, fingerprint) = signing_identity();
+    let key_pem = creds.signing_key_pem.clone().expect("key");
+    let session = trusting_session(&cert_pem, &fingerprint);
+
+    let out = send_sync(
+        &session,
+        &bus,
+        As2SendRequest {
+            message_id: "mic-rt".to_string(),
+            payload: payload.to_vec(),
+            policy: As2SendPolicy {
+                interop_mode: crate::core::InteropMode::Strict,
+                fail_closed_audit_events: false,
+                sign,
+                encrypt,
+                compress,
+                payload_content_type: Some(content_type),
+                as2_from_id: "p1".to_string(),
+                mic_algorithm: As2MicAlgorithm::Sha256,
+                encryption_cipher: SmimeCipher::Aes256Cbc,
+            },
+            credentials: Some(creds),
+        },
+    )
+    .expect("send");
+
+    let mut verifier =
+        CmsSmimeTrustVerifier::with_decryption_credentials(key_pem, cert_pem.clone().into_bytes());
+    if !sign {
+        verifier = verifier.allowing_unsigned();
+    }
+
+    let inbound = receive_from_ingress(As2IngressReceiveRequest {
+        session: &session,
+        payload: &out.mime.body,
+        content_type: &out.mime.content_type,
+        original_message_id: Some("mic-rt"),
+        as2_from_header: "p1",
+        disposition_notification_to: Some("http://example.test/mdn"),
+        disposition_notification_options: Some("signed-receipt-micalg=required,sha-256"),
+        mdn_signing_credentials: None,
+        verifier: &verifier,
+    })
+    .expect("receive");
+
+    let received_mic = inbound
+        .received_content_mic
+        .expect("MDN must carry Received-Content-MIC");
+    let received_digest = received_mic
+        .split(',')
+        .next()
+        .expect("mic digest")
+        .trim()
+        .to_string();
+
+    (
+        out.mic_base64,
+        received_digest,
+        inbound.content.as_ref().to_vec(),
+    )
+}
+
+#[test]
+fn signed_body_without_embedded_mime_headers_is_verified() {
+    // RFC 4130 partners differ in whether the HTTP body repeats the outer
+    // MIME headers. asx embeds them; openssl-CLI-based stacks do too; but a
+    // partner may send the multipart content with the media type only in the
+    // HTTP Content-Type header. Strip asx's embedded headers to simulate that
+    // partner and require the receive path to synthesize them back from the
+    // transport header.
+    let payload = b"UNB+UNOC:3+SENDER+RECEIVER+240101:1200+1'";
+    let bus = EventBus::new(16).expect("bus");
+    let (creds, cert_pem, fingerprint) = signing_identity();
+    let key_pem = creds.signing_key_pem.clone().expect("key");
+    let session = trusting_session(&cert_pem, &fingerprint);
+
+    let out = send_sync(
+        &session,
+        &bus,
+        As2SendRequest {
+            message_id: "headerless".to_string(),
+            payload: payload.to_vec(),
+            policy: As2SendPolicy {
+                interop_mode: crate::core::InteropMode::Strict,
+                fail_closed_audit_events: false,
+                sign: true,
+                encrypt: false,
+                compress: false,
+                payload_content_type: Some("application/edifact"),
+                as2_from_id: "p1".to_string(),
+                mic_algorithm: As2MicAlgorithm::Sha256,
+                encryption_cipher: SmimeCipher::Aes256Cbc,
+            },
+            credentials: Some(creds),
+        },
+    )
+    .expect("send");
+
+    // Drop everything up to and including the first blank line — the embedded
+    // outer MIME headers — leaving the bare multipart content.
+    let body = out.mime.body.to_vec();
+    // Header block may use CRLF or LF line endings; take the earliest blank line.
+    let crlf = body
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|i| i + 4);
+    let lf = body.windows(2).position(|w| w == b"\n\n").map(|i| i + 2);
+    let sep = match (crlf, lf) {
+        (Some(a), Some(b)) => a.min(b),
+        (Some(a), None) => a,
+        (None, Some(b)) => b,
+        (None, None) => panic!("embedded MIME headers present in asx output"),
+    };
+    let headerless = &body[sep..];
+    assert!(
+        !headerless.starts_with(b"MIME-Version"),
+        "test must exercise the headerless shape"
+    );
+
+    let verifier =
+        CmsSmimeTrustVerifier::with_decryption_credentials(key_pem, cert_pem.clone().into_bytes());
+    let inbound = receive_from_ingress(As2IngressReceiveRequest {
+        session: &session,
+        payload: headerless,
+        content_type: &out.mime.content_type,
+        original_message_id: Some("headerless"),
+        as2_from_header: "p1",
+        disposition_notification_to: Some("http://example.test/mdn"),
+        disposition_notification_options: Some("signed-receipt-micalg=required,sha-256"),
+        mdn_signing_credentials: None,
+        verifier: &verifier,
+    })
+    .expect("headerless signed body must verify via the transport Content-Type");
+
+    assert_eq!(inbound.content.as_ref().as_ref(), payload);
+}
+
+#[test]
+fn signed_message_mic_round_trips_and_delivers_the_payload() {
+    let payload = b"ISA*00*          *00*          *ZZ*SENDER~";
+    let (sent, received, delivered) =
+        mic_round_trip(payload, "application/edi-x12", true, false, false);
+
+    assert_eq!(
+        sent, received,
+        "sender MIC and receiver Received-Content-MIC must agree for a signed message"
+    );
+    assert_eq!(
+        delivered,
+        payload.to_vec(),
+        "the application must receive the EDI payload, not the S/MIME envelope"
+    );
+}
+
+#[test]
+fn encrypted_and_signed_message_mic_round_trips() {
+    let payload = b"UNB+UNOC:3+SENDER+RECEIVER+240101:1200+1'";
+    let (sent, received, delivered) =
+        mic_round_trip(payload, "application/edifact", true, true, false);
+
+    assert_eq!(sent, received, "MIC must survive sign-then-encrypt");
+    assert_eq!(delivered, payload.to_vec());
+}
+
+#[test]
+fn unprotected_message_mic_round_trips() {
+    let payload = b"<Invoice><Id>1</Id></Invoice>";
+    let (sent, received, delivered) =
+        mic_round_trip(payload, "application/xml", false, false, false);
+
+    assert_eq!(sent, received, "MIC must agree for an unprotected message");
+    assert_eq!(delivered, payload.to_vec());
+}
+
+#[cfg(feature = "compression")]
+#[test]
+fn compressed_signed_message_mic_round_trips_and_decompresses() {
+    // Repetitive so compression actually engages.
+    let payload = b"ISA*00*SEGMENT~".repeat(64);
+    let (sent, received, delivered) =
+        mic_round_trip(&payload, "application/edi-x12", true, false, true);
+
+    assert_eq!(
+        sent, received,
+        "MIC must be computed over the compressed entity that was signed"
+    );
+    assert_eq!(
+        delivered, payload,
+        "the receive path must reverse RFC 5402 compression"
+    );
+}
+
+/// The payload's declared media type has to survive onto the wire — losing it
+/// (e.g. to OpenSSL's PKCS7_TEXT flag) both misinforms the partner and
+/// desynchronizes the MIC.
+#[test]
+fn signed_entity_carries_the_declared_payload_content_type() {
+    let bus = EventBus::new(16).expect("bus");
+    let (creds, cert_pem, fingerprint) = signing_identity();
+    let session = trusting_session(&cert_pem, &fingerprint);
+
+    let out = send_sync(
+        &session,
+        &bus,
+        As2SendRequest {
+            message_id: "ct-1".to_string(),
+            payload: b"ISA*00~".to_vec(),
+            policy: As2SendPolicy {
+                interop_mode: crate::core::InteropMode::Strict,
+                fail_closed_audit_events: false,
+                sign: true,
+                encrypt: false,
+                compress: false,
+                payload_content_type: Some("application/edi-x12"),
+                as2_from_id: "p1".to_string(),
+                mic_algorithm: As2MicAlgorithm::Sha256,
+                encryption_cipher: SmimeCipher::Aes256Cbc,
+            },
+            credentials: Some(creds),
+        },
+    )
+    .expect("send");
+
+    let wire = String::from_utf8_lossy(&out.mime.body);
+    assert!(
+        wire.contains("Content-Type: application/edi-x12"),
+        "signed part must declare the payload's real media type; got:\n{wire}"
+    );
+    assert!(
+        !wire.contains("Content-Type: text/plain"),
+        "signed part must not be relabelled text/plain; got:\n{wire}"
+    );
 }

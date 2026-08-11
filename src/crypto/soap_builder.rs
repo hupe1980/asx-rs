@@ -68,6 +68,18 @@ pub struct SoapEnvelopeBuilder {
     message_id: String,
     from_party_id: String,
     to_party_id: String,
+    /// `type` attribute on the From `<eb:PartyId>`; `None` omits the attribute.
+    from_party_id_type: Option<String>,
+    /// `type` attribute on the To `<eb:PartyId>`; `None` omits the attribute.
+    to_party_id_type: Option<String>,
+    /// `<eb:From>/<eb:Role>` — REQUIRED by the ebMS3 schema.
+    from_role: String,
+    /// `<eb:To>/<eb:Role>` — REQUIRED by the ebMS3 schema.
+    to_role: String,
+    /// Optional `<eb:AgreementRef>` (first child of `CollaborationInfo`).
+    agreement_ref: Option<String>,
+    /// `type` attribute on `<eb:AgreementRef>`.
+    agreement_ref_type: Option<String>,
     action: String,
     service: String,
     service_type: String,
@@ -79,8 +91,19 @@ pub struct SoapEnvelopeBuilder {
     final_recipient: String,
     tracking_identifier: String,
     payload: Vec<u8>,
+    /// AS4 SwA packaging: reference the payload as a detached MIME attachment
+    /// (`eb:PartInfo href="cid:…"`) and leave the SOAP Body **empty**, as the
+    /// AS4 profile requires. When false, payload bytes are embedded base64 in
+    /// the Body (asx's non-MIME test mode).
+    detached_payload_reference: bool,
     payload_mime_type: String,
+    /// `CompressionType` part property, set when the payload attachment is a
+    /// compressed stream (AS4 profile §3.1).
+    payload_compression_type: Option<String>,
     payload_content_id: String,
+    /// Additional `eb:PartInfo` entries for a multi-payload UserMessage:
+    /// `(content_id, mime_type, compression_type)`.
+    extra_part_infos: Vec<(String, String, Option<String>)>,
     ws_security_header: Option<String>,
     /// Optional WS-Addressing headers to include in the SOAP Header.
     ws_addressing: Option<WsAddressingHeaders>,
@@ -93,6 +116,17 @@ pub(crate) const SOAP_BODY_WSU_ID: &str = "as4-body";
 /// info) is covered by the WS-Security signature — not just the MessageId.
 /// Signing only MessageId leaves the routing/authorization metadata tamperable.
 pub(crate) const MESSAGING_WSU_ID: &str = "as4-messaging";
+
+/// ebMS3 Core §5.2.2.3/§5.2.2.9: the default party role when a business
+/// process defines no specific roles. `eb:Role` itself is REQUIRED — an
+/// envelope without it violates the ebMS3 schema and strict receivers
+/// (Holodeck B2B, Domibus in strict-validation mode) reject it.
+pub const EBMS_DEFAULT_ROLE: &str =
+    "http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/defaultRole";
+/// The ebCore "unregistered" party-id scheme — the `type` value eDelivery/CEF
+/// conformance setups use for party identifiers outside a registered scheme.
+pub const EBCORE_PARTY_ID_TYPE_UNREGISTERED: &str =
+    "urn:oasis:names:tc:ebcore:partyid-type:unregistered";
 
 impl SoapEnvelopeBuilder {
     /// Create a new builder.
@@ -108,6 +142,12 @@ impl SoapEnvelopeBuilder {
             message_id: message_id.into(),
             from_party_id: from_party_id.into(),
             to_party_id: to_party_id.into(),
+            from_party_id_type: Some(EBCORE_PARTY_ID_TYPE_UNREGISTERED.into()),
+            to_party_id_type: Some(EBCORE_PARTY_ID_TYPE_UNREGISTERED.into()),
+            from_role: EBMS_DEFAULT_ROLE.into(),
+            to_role: EBMS_DEFAULT_ROLE.into(),
+            agreement_ref: None,
+            agreement_ref_type: None,
             action: "http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/action".into(),
             service: "http://example.org/example".into(),
             service_type: "example".into(),
@@ -118,8 +158,11 @@ impl SoapEnvelopeBuilder {
             final_recipient: String::new(),
             tracking_identifier: String::new(),
             payload: Vec::new(),
+            detached_payload_reference: false,
             payload_mime_type: "application/octet-stream".into(),
+            payload_compression_type: None,
             payload_content_id: "payload@example.org".into(),
+            extra_part_infos: Vec::new(),
             ws_security_header: None,
             ws_addressing: None,
         }
@@ -179,8 +222,63 @@ impl SoapEnvelopeBuilder {
         self
     }
 
+    /// AS4 SwA packaging: emit `eb:PayloadInfo/eb:PartInfo` referencing the
+    /// detached MIME attachment and leave the SOAP Body empty. Combine with
+    /// [`Self::with_payload_content_id`] and [`Self::with_payload_mime_type`].
+    pub fn with_detached_payload_reference(mut self) -> Self {
+        self.detached_payload_reference = true;
+        self
+    }
+
+    /// Additional `eb:PartInfo` entries after the primary:
+    /// `(content_id, mime_type, compression_type)` per part.
+    pub fn with_extra_part_infos(mut self, parts: Vec<(String, String, Option<String>)>) -> Self {
+        self.extra_part_infos = parts;
+        self
+    }
+
     pub fn with_mpc(mut self, mpc: impl Into<String>) -> Self {
         self.mpc = Some(mpc.into());
+        self
+    }
+
+    /// Set the `type` attribute of the From/To `<eb:PartyId>` elements.
+    ///
+    /// `None` omits the attribute entirely (an *untyped* party identifier —
+    /// what Holodeck B2B's example P-Modes use). The default is the ebCore
+    /// "unregistered" scheme, which eDelivery/CEF setups expect. The value
+    /// must match the counterparty's P-Mode exactly: a typed and an untyped
+    /// identifier with the same text do **not** match.
+    pub fn with_party_id_types(
+        mut self,
+        from_type: Option<String>,
+        to_type: Option<String>,
+    ) -> Self {
+        self.from_party_id_type = from_type;
+        self.to_party_id_type = to_type;
+        self
+    }
+
+    /// Set the mandatory `<eb:Role>` values for From and To.
+    ///
+    /// Defaults to the ebMS3 default role URI for both parties. Business
+    /// processes with named roles (e.g. Holodeck's example "Sender"/"Receiver")
+    /// must set the values their counterparty's P-Mode declares.
+    pub fn with_roles(mut self, from_role: impl Into<String>, to_role: impl Into<String>) -> Self {
+        self.from_role = from_role.into();
+        self.to_role = to_role.into();
+        self
+    }
+
+    /// Emit an `<eb:AgreementRef>` (with optional `type` attribute) as the
+    /// first child of `<eb:CollaborationInfo>`, per the ebMS3 schema order.
+    pub fn with_agreement_ref(
+        mut self,
+        agreement: impl Into<String>,
+        agreement_type: Option<String>,
+    ) -> Self {
+        self.agreement_ref = Some(agreement.into());
+        self.agreement_ref_type = agreement_type;
         self
     }
 
@@ -196,6 +294,18 @@ impl SoapEnvelopeBuilder {
 
     pub fn with_payload_mime_type(mut self, mime_type: impl Into<String>) -> Self {
         self.payload_mime_type = mime_type.into();
+        self
+    }
+
+    /// Declare that the payload attachment is compressed.
+    ///
+    /// `compression_type` is the media type of the compression applied
+    /// (`application/gzip` for AS4). Per the AS4 profile the `MimeType`
+    /// property must continue to describe the *uncompressed* payload, so set
+    /// [`with_payload_mime_type`](Self::with_payload_mime_type) to the original
+    /// business media type.
+    pub fn with_payload_compression_type(mut self, compression_type: impl Into<String>) -> Self {
+        self.payload_compression_type = Some(compression_type.into());
         self
     }
 
@@ -302,24 +412,54 @@ impl SoapEnvelopeBuilder {
         }
         xml.push_str("        </ebms:MessageInfo>\n");
 
-        // PartyInfo — From and To use independent party identifiers
+        // PartyInfo — From and To use independent party identifiers. Each
+        // party carries the schema-mandatory eb:Role (ebMS3 Core §5.2.2.3).
+        let party_id_xml = |id: &str, id_type: &Option<String>| -> String {
+            match id_type {
+                Some(t) => format!(
+                    "            <ebms:PartyId type=\"{}\">{}</ebms:PartyId>\n",
+                    escape_xml(t),
+                    escape_xml(id)
+                ),
+                None => format!(
+                    "            <ebms:PartyId>{}</ebms:PartyId>\n",
+                    escape_xml(id)
+                ),
+            }
+        };
         xml.push_str("        <ebms:PartyInfo>\n");
         xml.push_str("          <ebms:From>\n");
+        xml.push_str(&party_id_xml(&self.from_party_id, &self.from_party_id_type));
         xml.push_str(&format!(
-            "            <ebms:PartyId type=\"urn:oasis:names:tc:ebcore:partyid-type:unregistered\">{}</ebms:PartyId>\n",
-            escape_xml(&self.from_party_id)
+            "            <ebms:Role>{}</ebms:Role>\n",
+            escape_xml(&self.from_role)
         ));
         xml.push_str("          </ebms:From>\n");
         xml.push_str("          <ebms:To>\n");
+        xml.push_str(&party_id_xml(&self.to_party_id, &self.to_party_id_type));
         xml.push_str(&format!(
-            "            <ebms:PartyId type=\"urn:oasis:names:tc:ebcore:partyid-type:unregistered\">{}</ebms:PartyId>\n",
-            escape_xml(&self.to_party_id)
+            "            <ebms:Role>{}</ebms:Role>\n",
+            escape_xml(&self.to_role)
         ));
         xml.push_str("          </ebms:To>\n");
         xml.push_str("        </ebms:PartyInfo>\n");
 
-        // CollaborationInfo
+        // CollaborationInfo — schema order: AgreementRef?, Service, Action,
+        // ConversationId (ebMS3 Core §5.2.2.6).
         xml.push_str("        <ebms:CollaborationInfo>\n");
+        if let Some(agreement) = &self.agreement_ref {
+            match &self.agreement_ref_type {
+                Some(t) => xml.push_str(&format!(
+                    "          <ebms:AgreementRef type=\"{}\">{}</ebms:AgreementRef>\n",
+                    escape_xml(t),
+                    escape_xml(agreement)
+                )),
+                None => xml.push_str(&format!(
+                    "          <ebms:AgreementRef>{}</ebms:AgreementRef>\n",
+                    escape_xml(agreement)
+                )),
+            }
+        }
         if self.service_type.is_empty() {
             xml.push_str(&format!(
                 "          <ebms:Service>{}</ebms:Service>\n",
@@ -336,12 +476,16 @@ impl SoapEnvelopeBuilder {
             "          <ebms:Action>{}</ebms:Action>\n",
             escape_xml(&self.action)
         ));
-        if let Some(conv_id) = &self.conversation_id {
-            xml.push_str(&format!(
-                "          <ebms:ConversationId>{}</ebms:ConversationId>\n",
-                escape_xml(conv_id)
-            ));
-        }
+        // ConversationId is REQUIRED by the ebMS3 schema (minOccurs=1).
+        // Previously it was omitted when unset, producing a schema-invalid
+        // envelope. The Peppol AS4 profile's convention for "no conversation
+        // semantics" is the literal "1", which also avoids leaking a
+        // correlatable identifier.
+        let conversation_id = self.conversation_id.as_deref().unwrap_or("1");
+        xml.push_str(&format!(
+            "          <ebms:ConversationId>{}</ebms:ConversationId>\n",
+            escape_xml(conversation_id)
+        ));
         xml.push_str("        </ebms:CollaborationInfo>\n");
 
         // MessageProperties — Four Corner topology routing metadata.
@@ -360,7 +504,7 @@ impl SoapEnvelopeBuilder {
         ));
         xml.push_str("        </ebms:MessageProperties>\n");
 
-        if !self.payload.is_empty() {
+        if !self.payload.is_empty() || self.detached_payload_reference {
             xml.push_str("        <ebms:PayloadInfo>\n");
             xml.push_str(&format!(
                 "          <ebms:PartInfo href=\"cid:{}\">\n",
@@ -371,8 +515,38 @@ impl SoapEnvelopeBuilder {
                 "              <ebms:Property name=\"MimeType\" value=\"{}\"/>\n",
                 escape_xml(&self.payload_mime_type)
             ));
+            // AS4 profile §3.1 (Compression): a compressed payload MUST be
+            // advertised with a `CompressionType` part property, and `MimeType`
+            // MUST describe the payload *before* compression. Without this the
+            // receiver has no conformant way to know it should decompress, and
+            // the original media type is lost entirely.
+            if let Some(compression_type) = &self.payload_compression_type {
+                xml.push_str(&format!(
+                    "              <ebms:Property name=\"CompressionType\" value=\"{}\"/>\n",
+                    escape_xml(compression_type)
+                ));
+            }
             xml.push_str("            </ebms:Properties>\n");
             xml.push_str("          </ebms:PartInfo>\n");
+            for (content_id, mime_type, compression_type) in &self.extra_part_infos {
+                xml.push_str(&format!(
+                    "          <ebms:PartInfo href=\"cid:{}\">\n",
+                    escape_xml(content_id)
+                ));
+                xml.push_str("            <ebms:Properties>\n");
+                xml.push_str(&format!(
+                    "              <ebms:Property name=\"MimeType\" value=\"{}\"/>\n",
+                    escape_xml(mime_type)
+                ));
+                if let Some(compression_type) = compression_type {
+                    xml.push_str(&format!(
+                        "              <ebms:Property name=\"CompressionType\" value=\"{}\"/>\n",
+                        escape_xml(compression_type)
+                    ));
+                }
+                xml.push_str("            </ebms:Properties>\n");
+                xml.push_str("          </ebms:PartInfo>\n");
+            }
             xml.push_str("        </ebms:PayloadInfo>\n");
         }
 
@@ -385,11 +559,16 @@ impl SoapEnvelopeBuilder {
 
         xml.push_str("  </soap:Header>\n");
 
-        // SOAP Body
+        // SOAP Body. With SwA packaging (`detached_payload_reference`) the Body
+        // is EMPTY per the AS4 profile — payloads travel as MIME parts
+        // referenced from the signed `eb:PartInfo` header. An MTOM-style
+        // `xop:Include` in the Body is exactly what makes WSS4J-based
+        // receivers (Holodeck B2B, phase4, Domibus) fail DOM conversion.
         xml.push_str(&format!("  <soap:Body wsu:Id=\"{}\">\n", SOAP_BODY_WSU_ID));
 
-        // Payload bytes are carried in SOAP body as base64 to keep XML valid.
-        if !self.payload.is_empty() {
+        // Payload bytes are carried in SOAP body as base64 to keep XML valid
+        // (non-MIME test mode only).
+        if !self.payload.is_empty() && !self.detached_payload_reference {
             xml.push_str("    <asx:Payload xmlns:asx=\"urn:asx:payload\">\n");
             xml.push_str(&format!(
                 "      <asx:MimeType>{}</asx:MimeType>\n",
@@ -524,9 +703,22 @@ impl WsSecurityHeaderBuilder {
         ));
 
         if let Some(cert_pem) = self.signing_cert_pem {
+            // The BST carries base64(DER). Encoding the PEM text instead
+            // produces a token no consumer can parse — invisible while KeyInfo
+            // embedded the certificate inline, and an immediate
+            // UNSUPPORTED_SECURITY_TOKEN once KeyInfo references the BST.
+            let cert_der = openssl::x509::X509::from_pem(&cert_pem)
+                .and_then(|cert| cert.to_der())
+                .map_err(|err| {
+                    crate::core::AsxError::new(
+                        crate::core::ErrorCode::ParseFailed,
+                        format!("signing certificate PEM could not be converted to DER: {err}"),
+                        crate::core::ErrorContext::new("wssec_header_builder"),
+                    )
+                })?;
             xml.push_str("      <wsse:BinarySecurityToken wsu:Id=\"X509Token\" EncodingType=\"http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-soap-message-security-1.0#Base64Binary\" ValueType=\"http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-x509-token-profile-1.0#X509v3\">\n");
             xml.push_str("        ");
-            xml.push_str(&STANDARD.encode(cert_pem));
+            xml.push_str(&STANDARD.encode(cert_der));
             xml.push('\n');
             xml.push_str("      </wsse:BinarySecurityToken>\n");
         }
@@ -590,6 +782,57 @@ mod tests {
         );
     }
 
+    /// ebMS3 schema conformance of PartyInfo/CollaborationInfo:
+    /// mandatory eb:Role on both parties, optional PartyId type attribute,
+    /// AgreementRef ordered before Service, and an always-present
+    /// ConversationId (defaulting to "1", the Peppol convention).
+    #[test]
+    fn soap_envelope_emits_schema_mandatory_party_and_collaboration_elements() {
+        // Defaults: unregistered party-id type, ebMS3 default role, conv "1".
+        let default_envelope = String::from_utf8(
+            SoapEnvelopeBuilder::new("m-1", "pa", "pb")
+                .build()
+                .expect("build"),
+        )
+        .expect("utf8");
+        assert!(default_envelope.contains(
+            "<ebms:PartyId type=\"urn:oasis:names:tc:ebcore:partyid-type:unregistered\">pa</ebms:PartyId>"
+        ));
+        assert_eq!(
+            default_envelope
+                .matches(&format!("<ebms:Role>{EBMS_DEFAULT_ROLE}</ebms:Role>"))
+                .count(),
+            2,
+            "both From and To must carry the mandatory eb:Role: {default_envelope}"
+        );
+        assert!(
+            default_envelope.contains("<ebms:ConversationId>1</ebms:ConversationId>"),
+            "ConversationId is schema-mandatory and must default to \"1\": {default_envelope}"
+        );
+
+        // Explicit overrides: untyped party ids, named roles, agreement ref.
+        let envelope = String::from_utf8(
+            SoapEnvelopeBuilder::new("m-2", "org:example:company:A", "org:example:company:B")
+                .with_party_id_types(None, None)
+                .with_roles("Sender", "Receiver")
+                .with_agreement_ref("http://agreements.example.org/a0", None)
+                .build()
+                .expect("build"),
+        )
+        .expect("utf8");
+        assert!(envelope.contains("<ebms:PartyId>org:example:company:A</ebms:PartyId>"));
+        assert!(envelope.contains("<ebms:Role>Sender</ebms:Role>"));
+        assert!(envelope.contains("<ebms:Role>Receiver</ebms:Role>"));
+        let agreement_pos = envelope
+            .find("<ebms:AgreementRef>http://agreements.example.org/a0</ebms:AgreementRef>")
+            .expect("AgreementRef present");
+        let service_pos = envelope.find("<ebms:Service").expect("Service present");
+        assert!(
+            agreement_pos < service_pos,
+            "schema order: AgreementRef must precede Service"
+        );
+    }
+
     #[test]
     fn soap_envelope_builder_allows_overriding_four_corner_properties() {
         let builder = SoapEnvelopeBuilder::new("msg-abc", "ap-sender", "ap-receiver")
@@ -630,7 +873,28 @@ mod tests {
 
     #[test]
     fn wssecurity_header_includes_certificate_structure_when_provided() {
-        let cert_pem = b"-----BEGIN CERTIFICATE-----\nMIIC...".to_vec();
+        // A real certificate is required: the BST carries base64(DER), so the
+        // builder converts the PEM — garbage input is now a build error
+        // instead of a silently unparseable token.
+        let rsa = openssl::rsa::Rsa::generate(2048).expect("rsa");
+        let pkey = openssl::pkey::PKey::from_rsa(rsa).expect("pkey");
+        let mut name = openssl::x509::X509NameBuilder::new().expect("name");
+        name.append_entry_by_nid(openssl::nid::Nid::COMMONNAME, "bst-test")
+            .expect("cn");
+        let name = name.build();
+        let mut cert = openssl::x509::X509::builder().expect("builder");
+        cert.set_subject_name(&name).expect("subject");
+        cert.set_issuer_name(&name).expect("issuer");
+        cert.set_pubkey(&pkey).expect("pubkey");
+        let not_before = openssl::asn1::Asn1Time::days_from_now(0).expect("nb");
+        let not_after = openssl::asn1::Asn1Time::days_from_now(1).expect("na");
+        cert.set_not_before(&not_before).expect("nb");
+        cert.set_not_after(&not_after).expect("na");
+        cert.sign(&pkey, openssl::hash::MessageDigest::sha256())
+            .expect("sign");
+        let cert = cert.build();
+        let cert_pem = cert.to_pem().expect("pem");
+
         let builder = WsSecurityHeaderBuilder::new()
             .with_signing_cert(cert_pem)
             .with_signature_placeholder(true);
@@ -639,5 +903,14 @@ mod tests {
 
         assert!(header_str.contains("wsse:BinarySecurityToken"));
         assert!(header_str.contains("ds:Signature"));
+        // The token content must be base64(DER), not base64(PEM).
+        let der_b64 = base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            cert.to_der().expect("der"),
+        );
+        assert!(
+            header_str.contains(&der_b64),
+            "BinarySecurityToken must carry base64(DER)"
+        );
     }
 }

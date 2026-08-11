@@ -21,7 +21,7 @@ use super::x509::{
 };
 use super::{
     ECDSA_SHA256_URI, ECDSA_SHA384_URI, ECDSA_SHA512_URI, RSA_SHA256_URI, RSA_SHA384_URI,
-    RSA_SHA512_URI, XML_EXC_C14N_URI, XML_INC_C14N_URI,
+    RSA_SHA512_URI, SWA_ATTACHMENT_CONTENT_TRANSFORM_URI, XML_EXC_C14N_URI, XML_INC_C14N_URI,
 };
 use super::{
     RevocationPolicy, WsSecCanonicalizationKind, WsSecCanonicalizationProfile, WsSecDigestMethod,
@@ -34,6 +34,7 @@ const WSSE_NS: &str =
 const WSU_NS: &str =
     "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd";
 const WSSE_X509_PKIPATHV1_VALUE_TYPE_SUFFIX: &str = "#X509PKIPathv1";
+const WSSE_X509_V3_VALUE_TYPE_SUFFIX: &str = "#X509v3";
 
 struct WsSecSignatureReferenceBorrowed<'a> {
     uri: &'a str,
@@ -48,6 +49,12 @@ struct WsSecSignatureReferenceBorrowed<'a> {
 
 struct ParsedWsSecSignatureMaterialBorrowed<'a> {
     signed_info: roxmltree::Node<'a, 'a>,
+    /// `InclusiveNamespaces/@PrefixList` declared on the
+    /// `ds:SignedInfo/ds:CanonicalizationMethod`. Exc-C14N of `SignedInfo`
+    /// itself must render these prefixes; WSS4J-based stacks (phase4, Domibus,
+    /// Oxalis) routinely declare their SOAP envelope prefix here, and ignoring
+    /// the list makes every such signature fail with a bare value mismatch.
+    signed_info_inclusive_ns_prefixes: Vec<String>,
     signature_value: Vec<u8>,
     signature_method_algorithm: String,
     rsa_modulus: Option<Vec<u8>>,
@@ -243,7 +250,8 @@ fn parse_signature_references_from_signed_info_borrowed<'a>(
             ));
         }
 
-        let (c14n_kind, inclusive_ns_prefixes) = parse_reference_transform_profile(node, uri)?;
+        let (c14n_kind, inclusive_ns_prefixes) =
+            parse_reference_transform_profile(node, uri, &parsed_uri)?;
 
         let digest_method_uri = node
             .children()
@@ -294,19 +302,24 @@ fn parse_signature_references_from_signed_info_borrowed<'a>(
 
 /// Return the single relevant `ds:Signature` node for WS-Security verification.
 ///
-/// Resolution order:
-/// 1. If exactly one `ds:Signature` is present anywhere in the document → use it.
-/// 2. If multiple `ds:Signature` elements are present, prefer the first one that
-///    is a direct child of a `wsse:Security` element (the AS4/WS-Security primary
-///    signature).  This gracefully handles gateways that produce dual-signing
-///    (e.g. an application-layer counter-signature alongside the transport signature).
-/// 3. If none of the above resolves to a single candidate, fall back to the first
-///    `ds:Signature` found in document order.
+/// Resolution rules (fail-closed — an ambiguous document is rejected rather
+/// than resolved by document order):
+///
+/// 1. Exactly one `ds:Signature` anywhere in the document → use it.
+/// 2. Multiple `ds:Signature` elements, of which **exactly one** is a direct
+///    child of a `wsse:Security` element → use that one (the AS4/WS-Security
+///    primary signature).  This tolerates gateways that add an
+///    application-layer counter-signature elsewhere in the document; the
+///    counter-signature is not verified.
+/// 3. Multiple `ds:Signature` elements directly inside `wsse:Security`, or
+///    multiple signatures with none inside `wsse:Security` → error.  Silently
+///    picking one by document order would let an attacker prepend a
+///    signature-shaped element and steer which signature gets verified.
 ///
 /// Returns `Ok(None)` when no `ds:Signature` is present at all.
 fn find_single_signature_node<'a>(
     doc: &'a Document<'a>,
-    _stage: &'static str,
+    stage: &'static str,
 ) -> Result<Option<roxmltree::Node<'a, 'a>>> {
     let all: Vec<_> = doc
         .descendants()
@@ -317,31 +330,62 @@ fn find_single_signature_node<'a>(
         0 => Ok(None),
         1 => Ok(Some(all[0])),
         _ => {
-            // Prefer the first ds:Signature that is a direct child of wsse:Security.
-            let preferred = all.iter().find(|sig| {
+            let mut security_children = all.iter().filter(|sig| {
                 sig.parent().is_some_and(|p| {
                     p.is_element()
                         && p.tag_name().name() == "Security"
                         && p.tag_name().namespace() == Some(WSSE_NS)
                 })
             });
-            Ok(Some(*preferred.unwrap_or(&all[0])))
+            match (security_children.next(), security_children.next()) {
+                (Some(primary), None) => Ok(Some(*primary)),
+                (Some(_), Some(_)) => Err(AsxError::new(
+                    ErrorCode::InteropViolation,
+                    "multiple ds:Signature elements inside wsse:Security; refusing to choose \
+                     one — a document must carry exactly one WS-Security primary signature",
+                    ErrorContext::new(stage),
+                )),
+                (None, _) => Err(AsxError::new(
+                    ErrorCode::InteropViolation,
+                    format!(
+                        "{} ds:Signature elements found and none is a direct child of \
+                         wsse:Security; refusing to resolve the ambiguity by document order",
+                        all.len()
+                    ),
+                    ErrorContext::new(stage),
+                )),
+            }
         }
     }
 }
 
-/// Parse the `exc-c14n:InclusiveNamespaces/@PrefixList` from the `<ds:Transforms>`
-/// of a `<ds:Reference>` element.
+/// SwA transform that additionally covers selected MIME part headers.
+/// Not supported — AS4 mandates the content-only transform.
+const SWA_ATTACHMENT_COMPLETE_TRANSFORM_URI: &str = "http://docs.oasis-open.org/wss/oasis-wss-SwAProfile-1.1#Attachment-Complete-Signature-Transform";
+
+/// Parse the `<ds:Transforms>` of a `<ds:Reference>` element.
 ///
-/// Accepts both the Exclusive C14N (`http://www.w3.org/2001/10/xml-exc-c14n#`) and
-/// the Inclusive C14N (`http://www.w3.org/TR/2001/REC-xml-c14n-20010315`) transform
-/// algorithms.  Any other transform algorithm causes an `InteropViolation` error.
+/// For **same-document** (`#id`) references: accepts Exclusive C14N
+/// (`http://www.w3.org/2001/10/xml-exc-c14n#`, optionally with an
+/// `InclusiveNamespaces/@PrefixList`) and Inclusive C14N
+/// (`http://www.w3.org/TR/2001/REC-xml-c14n-20010315`).
+///
+/// For **`cid:` attachment** references: accepts the WSS SwA profile
+/// `Attachment-Content-Signature-Transform` (the digest input is the raw
+/// attachment content, which is exactly what the verification path digests) and
+/// the absence of any transform.  C14N transforms make no sense on an octet
+/// stream and are rejected; the `Attachment-Complete-Signature-Transform`
+/// (which folds MIME part headers into the digest) is not implemented and is
+/// rejected by name.
+///
+/// Any other transform algorithm causes an `InteropViolation` error.
 ///
 /// Returns the inclusive prefix list (empty for Inclusive C14N which has no such
 /// concept, and the common case of Exclusive C14N without an InclusiveNamespaces element).
 fn parse_reference_transform_profile(
     reference: roxmltree::Node<'_, '_>,
     uri: &str,
+    parsed_uri: &ParsedReferenceUri<'_>,
 ) -> Result<(WsSecCanonicalizationKind, Vec<String>)> {
     const EXC_C14N_NS: &str = "http://www.w3.org/2001/10/xml-exc-c14n#";
     const INCLUSIVE_NS_LOCAL: &str = "InclusiveNamespaces";
@@ -353,6 +397,36 @@ fn parse_reference_transform_profile(
     let Some(transforms) = transforms else {
         return Ok((WsSecCanonicalizationKind::Exclusive, Vec::new()));
     };
+
+    if matches!(parsed_uri, ParsedReferenceUri::Cid { .. }) {
+        // A cid: reference dereferences to an octet stream. The only transform
+        // with defined semantics here is the SwA content transform, whose
+        // digest input equals the raw attachment bytes we digest anyway.
+        for transform in transforms
+            .children()
+            .filter(|n| n.is_element() && is_ds_element(*n, "Transform"))
+        {
+            let alg = transform.attribute("Algorithm").unwrap_or("");
+            if alg == SWA_ATTACHMENT_CONTENT_TRANSFORM_URI {
+                continue;
+            }
+            let detail = if alg == SWA_ATTACHMENT_COMPLETE_TRANSFORM_URI {
+                "the Attachment-Complete-Signature-Transform (MIME headers included in the \
+                 digest) is not supported; AS4 mandates the content-only transform"
+            } else {
+                "the only supported transform for attachment references is the WSS SwA \
+                 Attachment-Content-Signature-Transform"
+            };
+            return Err(AsxError::new(
+                ErrorCode::InteropViolation,
+                format!(
+                    "unsupported ds:Transform Algorithm \"{alg}\" on cid: Reference {uri}: {detail}"
+                ),
+                ErrorContext::new("wssec_parse_references").with_message_id(uri.to_string()),
+            ));
+        }
+        return Ok((WsSecCanonicalizationKind::Exclusive, Vec::new()));
+    }
 
     let mut c14n_kind = WsSecCanonicalizationKind::Exclusive;
     let mut inclusive_prefixes = Vec::new();
@@ -1053,12 +1127,19 @@ fn verify_signature_value_with_components(
 ) -> Result<()> {
     let ParsedWsSecSignatureMaterialBorrowed {
         signed_info,
+        signed_info_inclusive_ns_prefixes,
         signature_value,
         signature_method_algorithm,
         rsa_modulus,
         rsa_exponent,
         x509_certificates_der,
     } = mat;
+    // Exc-C14N of SignedInfo must honor the InclusiveNamespaces PrefixList the
+    // signer declared on ds:CanonicalizationMethod — the listed prefixes are
+    // part of the canonical bytes the signature was computed over.
+    let mut profile = profile;
+    profile.inclusive_ns_prefixes = signed_info_inclusive_ns_prefixes;
+    let profile = profile;
     let is_rsa = signature_method_algorithm == RSA_SHA256_URI
         || signature_method_algorithm == RSA_SHA384_URI
         || signature_method_algorithm == RSA_SHA512_URI;
@@ -1078,61 +1159,65 @@ fn verify_signature_value_with_components(
         ));
     }
 
-    let signer_cert_der = x509_certificates_der.first().map(Vec::as_slice);
-    if let Some(cert_der) = signer_cert_der {
-        validate_x509_certificate(cert_der)?;
-
-        if let Some(expected) = expected_cert_fingerprint_sha256 {
-            let expected = normalize_fingerprint(expected).ok_or_else(|| {
-                AsxError::new(
-                    ErrorCode::ParseFailed,
-                    "expected certificate fingerprint is empty or invalid",
-                    ErrorContext::new("wssec_verify_signature_value"),
-                )
-            })?;
-            let actual = sha256_hex_lower(cert_der);
-            if actual != expected {
-                return Err(AsxError::new(
-                    ErrorCode::SecurityVerificationFailed,
-                    "signer certificate fingerprint does not match expected fingerprint",
-                    ErrorContext::new("wssec_verify_signature_value"),
-                ));
-            }
-        }
-
-        // RSA-only: validate that the inline ds:RSAKeyValue matches the certificate
-        if is_rsa
-            && let (Some(modulus), Some(exponent)) =
-                (rsa_modulus.as_deref(), rsa_exponent.as_deref())
-        {
-            validate_cert_public_key_matches_rsa_keyvalue(cert_der, modulus, exponent)?;
-        }
-
-        if revocation_policy.require_chain_validation {
-            validate_pkix_chain_and_revocation(&x509_certificates_der, revocation_policy)?;
-        }
-    } else if expected_cert_fingerprint_sha256.is_some()
-        || revocation_policy.require_chain_validation
-    {
-        return Err(AsxError::new(
-            ErrorCode::SecurityVerificationFailed,
-            "ds:Signature does not include an X509 certificate required for verification policy",
-            ErrorContext::new("wssec_verify_signature_value"),
-        ));
-    }
-
-    // Build a PKey from available material:
-    // - ECDSA: always from certificate (no inline key value in XML)
-    // - RSA: prefer inline ds:RSAKeyValue; fall back to certificate
-    let pkey = if is_ecdsa {
-        let cert_der = signer_cert_der.ok_or_else(|| {
+    // A signature is only evidence of *identity* if the verifying key is bound
+    // to a certificate. A bare `ds:KeyValue/ds:RSAKeyValue` is attacker-supplied
+    // material: anyone can mint a key pair, sign the envelope, and inline the
+    // public half, and the signature verifies while proving nothing. WS-Security
+    // and the AS4 profile both carry the signer as an X.509 token, so require
+    // one unconditionally rather than leaving it to caller policy.
+    let signer_cert_der = x509_certificates_der
+        .first()
+        .map(Vec::as_slice)
+        .ok_or_else(|| {
             AsxError::new(
-                ErrorCode::ParseFailed,
-                "ECDSA-SHA256 ds:Signature requires an X509 certificate in ds:KeyInfo",
+                ErrorCode::SecurityVerificationFailed,
+                "ds:KeyInfo carries no X.509 certificate; a signature verified against an inline \
+             ds:RSAKeyValue authenticates nobody. The signer must be identified by a \
+             wsse:BinarySecurityToken or ds:X509Data/ds:X509Certificate",
                 ErrorContext::new("wssec_verify_signature_value"),
             )
         })?;
-        let cert = openssl::x509::X509::from_der(cert_der).map_err(|err| {
+
+    validate_x509_certificate(signer_cert_der)?;
+
+    if let Some(expected) = expected_cert_fingerprint_sha256 {
+        let expected = normalize_fingerprint(expected).ok_or_else(|| {
+            AsxError::new(
+                ErrorCode::ParseFailed,
+                "expected certificate fingerprint is empty or invalid",
+                ErrorContext::new("wssec_verify_signature_value"),
+            )
+        })?;
+        let actual = sha256_hex_lower(signer_cert_der);
+        if actual != expected {
+            return Err(AsxError::new(
+                ErrorCode::SecurityVerificationFailed,
+                "signer certificate fingerprint does not match expected fingerprint",
+                ErrorContext::new("wssec_verify_signature_value"),
+            ));
+        }
+    }
+
+    // An inline ds:RSAKeyValue is redundant with the certificate. It is not
+    // trusted as a key source, but if a partner sends one it must agree with the
+    // certificate — a mismatch means the two halves of KeyInfo disagree about
+    // who signed, which is never benign.
+    if is_rsa
+        && let (Some(modulus), Some(exponent)) = (rsa_modulus.as_deref(), rsa_exponent.as_deref())
+    {
+        validate_cert_public_key_matches_rsa_keyvalue(signer_cert_der, modulus, exponent)?;
+    }
+
+    if revocation_policy.require_chain_validation {
+        validate_pkix_chain_and_revocation(&x509_certificates_der, revocation_policy)?;
+    }
+
+    // The verifying key always comes from the certificate — the same object the
+    // fingerprint pin and PKIX chain validation above were applied to. Deriving
+    // it from anywhere else would let those checks and the actual verification
+    // disagree about which key mattered.
+    let pkey = if is_ecdsa {
+        let cert = openssl::x509::X509::from_der(signer_cert_der).map_err(|err| {
             AsxError::new(
                 ErrorCode::ParseFailed,
                 format!("failed to parse X509 certificate for ECDSA verification: {err}"),
@@ -1148,19 +1233,9 @@ fn verify_signature_value_with_components(
                 ErrorContext::new("wssec_verify_signature_value"),
             )
         })?
-    } else if let (Some(modulus), Some(exponent)) =
-        (rsa_modulus.as_deref(), rsa_exponent.as_deref())
-    {
-        pkey_from_rsa_components(modulus, exponent)?
-    } else if let Some(cert_der) = signer_cert_der {
-        let (modulus, exponent) = extract_rsa_keyvalue_from_cert(cert_der)?;
-        pkey_from_rsa_components(&modulus, &exponent)?
     } else {
-        return Err(AsxError::new(
-            ErrorCode::ParseFailed,
-            "ds:Signature missing both ds:RSAKeyValue and signer certificate",
-            ErrorContext::new("wssec_verify_signature_value"),
-        ));
+        let (modulus, exponent) = extract_rsa_keyvalue_from_cert(signer_cert_der)?;
+        pkey_from_rsa_components(&modulus, &exponent)?
     };
 
     let digest = match signature_method_algorithm.as_str() {
@@ -1243,6 +1318,7 @@ fn parse_signature_material_from_doc(
 
     let ParsedWsSecSignatureMaterialBorrowed {
         signed_info,
+        signed_info_inclusive_ns_prefixes,
         signature_value,
         signature_method_algorithm,
         rsa_modulus,
@@ -1250,6 +1326,8 @@ fn parse_signature_material_from_doc(
         x509_certificates_der,
     } = parse_signature_material_components_from_signature(doc, signature)?;
 
+    let mut profile = profile;
+    profile.inclusive_ns_prefixes = signed_info_inclusive_ns_prefixes;
     let mut signed_info_xml = String::new();
     try_serialize_node(
         signed_info,
@@ -1298,20 +1376,32 @@ fn parse_signature_material_components_from_signature<'a>(
 const EXC_C14N_URI: &str = "http://www.w3.org/2001/10/xml-exc-c14n#";
 const EXC_C14N_WITH_COMMENTS_URI: &str = "http://www.w3.org/2001/10/xml-exc-c14n#WithComments";
 
-/// Require `ds:SignedInfo/ds:CanonicalizationMethod` to declare Exclusive C14N.
+/// Require `ds:SignedInfo/ds:CanonicalizationMethod` to declare Exclusive C14N,
+/// and return the `InclusiveNamespaces/@PrefixList` it carries (if any).
 ///
-/// Verification canonicalizes `SignedInfo` with the exclusive profile
-/// unconditionally, which every AS4 profile (PEPPOL, CEF eDelivery, BDEW)
-/// mandates. Previously the declared algorithm was simply never read: a
-/// signature declaring Inclusive C14N was canonicalized as exclusive anyway and
-/// failed later with an opaque "signature value mismatch", which sends the
-/// operator hunting for a key problem that does not exist.
+/// Verification canonicalizes `SignedInfo` with the exclusive profile, which
+/// every AS4 profile (PEPPOL, CEF eDelivery, BDEW) mandates. The declared
+/// algorithm is checked so a signature declaring Inclusive C14N is rejected at
+/// the place that can name the mismatch, instead of failing later with an
+/// opaque "signature value mismatch" that sends the operator hunting for a key
+/// problem that does not exist.
 ///
-/// This is fail-closed either way — the point is to reject the mismatch at the
-/// place that can name it. Comment-preserving exclusive C14N is also rejected:
-/// the canonicalizer strips comments, so accepting the `WithComments` URI would
+/// The `InclusiveNamespaces/@PrefixList` child is **honored**, not ignored:
+/// Exc-C14N §2.1 requires the listed prefixes to be rendered on the canonical
+/// `SignedInfo` even when not visibly utilized, and WSS4J-based signers
+/// (phase4, Domibus, Oxalis) declare their SOAP envelope prefix here by
+/// default. Any other child element of `ds:CanonicalizationMethod` is rejected
+/// — silently skipping a child that changes the canonical form would verify
+/// under a different algorithm than the one declared.
+///
+/// Comment-preserving exclusive C14N is rejected for the same reason: the
+/// canonicalizer strips comments, so accepting the `WithComments` URI would
 /// mean verifying under a different algorithm than the one declared.
-fn enforce_signed_info_canonicalization_method(signed_info: roxmltree::Node<'_, '_>) -> Result<()> {
+fn parse_signed_info_canonicalization_method(
+    signed_info: roxmltree::Node<'_, '_>,
+) -> Result<Vec<String>> {
+    const EXC_C14N_NS: &str = "http://www.w3.org/2001/10/xml-exc-c14n#";
+
     let method = signed_info
         .children()
         .find(|n| n.is_element() && is_ds_element(*n, "CanonicalizationMethod"))
@@ -1335,24 +1425,46 @@ fn enforce_signed_info_canonicalization_method(signed_info: roxmltree::Node<'_, 
             )
         })?;
 
-    if algorithm == EXC_C14N_URI {
-        return Ok(());
+    if algorithm != EXC_C14N_URI {
+        let detail = if algorithm == EXC_C14N_WITH_COMMENTS_URI {
+            "comment-preserving canonicalization is not supported"
+        } else {
+            "only Exclusive XML Canonicalization 1.0 is supported"
+        };
+
+        return Err(AsxError::new(
+            ErrorCode::InteropViolation,
+            format!(
+                "unsupported ds:CanonicalizationMethod Algorithm \"{algorithm}\": {detail} \
+                 (expected \"{EXC_C14N_URI}\", as required by the AS4 profiles)"
+            ),
+            ErrorContext::new("wssec_signature_material").with_message_id(algorithm.to_string()),
+        ));
     }
 
-    let detail = if algorithm == EXC_C14N_WITH_COMMENTS_URI {
-        "comment-preserving canonicalization is not supported"
-    } else {
-        "only Exclusive XML Canonicalization 1.0 is supported"
-    };
+    let mut inclusive_prefixes = Vec::new();
+    for child in method.children().filter(roxmltree::Node::is_element) {
+        let child_ns = child.tag_name().namespace().unwrap_or("");
+        let child_local = child.tag_name().name();
+        if child_ns == EXC_C14N_NS && child_local == "InclusiveNamespaces" {
+            if let Some(prefix_list) = child.attribute("PrefixList") {
+                for tok in prefix_list.split_ascii_whitespace() {
+                    inclusive_prefixes.push(tok.to_string());
+                }
+            }
+        } else {
+            return Err(AsxError::new(
+                ErrorCode::InteropViolation,
+                format!(
+                    "unsupported child element {{{child_ns}}}{child_local} inside \
+                     ds:CanonicalizationMethod"
+                ),
+                ErrorContext::new("wssec_signature_material"),
+            ));
+        }
+    }
 
-    Err(AsxError::new(
-        ErrorCode::InteropViolation,
-        format!(
-            "unsupported ds:CanonicalizationMethod Algorithm \"{algorithm}\": {detail} \
-             (expected \"{EXC_C14N_URI}\", as required by the AS4 profiles)"
-        ),
-        ErrorContext::new("wssec_signature_material").with_message_id(algorithm.to_string()),
-    ))
+    Ok(inclusive_prefixes)
 }
 
 fn parse_signature_material_components_from_signature_with_signed_info<'a>(
@@ -1360,7 +1472,7 @@ fn parse_signature_material_components_from_signature_with_signed_info<'a>(
     signature: roxmltree::Node<'a, 'a>,
     signed_info: roxmltree::Node<'a, 'a>,
 ) -> Result<ParsedWsSecSignatureMaterialBorrowed<'a>> {
-    enforce_signed_info_canonicalization_method(signed_info)?;
+    let signed_info_inclusive_ns_prefixes = parse_signed_info_canonicalization_method(signed_info)?;
 
     let signature_method_algorithm = signed_info
         .children()
@@ -1450,10 +1562,10 @@ fn parse_signature_material_components_from_signature_with_signed_info<'a>(
     }
 
     if x509_certificates_der.is_empty()
-        && let Some(pkipath_certs_der) =
-            extract_x509_pkipath_certificates_from_security_token_reference(doc, key_info)?
+        && let Some(token_certs_der) =
+            extract_x509_certificates_from_security_token_reference(doc, key_info)?
     {
-        x509_certificates_der = pkipath_certs_der;
+        x509_certificates_der = token_certs_der;
     }
 
     let signature_value = BASE64_STANDARD.decode(signature_value_b64).map_err(|err| {
@@ -1501,6 +1613,7 @@ fn parse_signature_material_components_from_signature_with_signed_info<'a>(
 
     Ok(ParsedWsSecSignatureMaterialBorrowed {
         signed_info,
+        signed_info_inclusive_ns_prefixes,
         signature_value,
         signature_method_algorithm,
         rsa_modulus,
@@ -1509,7 +1622,20 @@ fn parse_signature_material_components_from_signature_with_signed_info<'a>(
     })
 }
 
-fn extract_x509_pkipath_certificates_from_security_token_reference(
+/// Resolve `ds:KeyInfo/wsse:SecurityTokenReference/wsse:Reference` to the
+/// certificate(s) of the in-document `wsse:BinarySecurityToken` it points at.
+///
+/// Two token shapes are supported:
+///
+/// - **`#X509v3`** — a single DER certificate. This is the default KeyInfo
+///   shape of WSS4J-based stacks (phase4, Domibus, Oxalis).
+/// - **`#X509PKIPathv1`** — a DER `SEQUENCE` of certificates (leaf first).
+///
+/// Key-identifier styles that require out-of-document lookup
+/// (`wsse:KeyIdentifier` with SKI/thumbprint, `ds:X509IssuerSerial`) are not
+/// resolvable from the message alone and surface as errors upstream when no
+/// certificate can be found.
+fn extract_x509_certificates_from_security_token_reference(
     doc: &Document<'_>,
     key_info: roxmltree::Node<'_, '_>,
 ) -> Result<Option<Vec<Vec<u8>>>> {
@@ -1545,10 +1671,16 @@ fn extract_x509_pkipath_certificates_from_security_token_reference(
     })?;
 
     let referenced_value_type = token_ptr.attribute("ValueType").unwrap_or("");
-    if !referenced_value_type.ends_with(WSSE_X509_PKIPATHV1_VALUE_TYPE_SUFFIX) {
+    if !referenced_value_type.is_empty()
+        && !referenced_value_type.ends_with(WSSE_X509_PKIPATHV1_VALUE_TYPE_SUFFIX)
+        && !referenced_value_type.ends_with(WSSE_X509_V3_VALUE_TYPE_SUFFIX)
+    {
         return Err(AsxError::new(
             ErrorCode::ParseFailed,
-            "wsse:SecurityTokenReference ValueType must be X509PKIPathv1",
+            format!(
+                "unsupported wsse:Reference ValueType \"{referenced_value_type}\" \
+                 (supported: X509v3 and X509PKIPathv1)"
+            ),
             ErrorContext::new("wssec_signature_material"),
         ));
     }
@@ -1590,10 +1722,15 @@ fn extract_x509_pkipath_certificates_from_security_token_reference(
         })?;
 
     let token_value_type = binary_token.attribute("ValueType").unwrap_or("");
-    if !token_value_type.ends_with(WSSE_X509_PKIPATHV1_VALUE_TYPE_SUFFIX) {
+    let token_is_pkipath = token_value_type.ends_with(WSSE_X509_PKIPATHV1_VALUE_TYPE_SUFFIX);
+    let token_is_x509v3 = token_value_type.ends_with(WSSE_X509_V3_VALUE_TYPE_SUFFIX);
+    if !token_is_pkipath && !token_is_x509v3 {
         return Err(AsxError::new(
             ErrorCode::ParseFailed,
-            "wsse:BinarySecurityToken ValueType must be X509PKIPathv1",
+            format!(
+                "unsupported wsse:BinarySecurityToken ValueType \"{token_value_type}\" \
+                 (supported: X509v3 and X509PKIPathv1)"
+            ),
             ErrorContext::new("wssec_signature_material"),
         ));
     }
@@ -1617,6 +1754,13 @@ fn extract_x509_pkipath_certificates_from_security_token_reference(
             ErrorContext::new("wssec_signature_material"),
         )
     })?;
+
+    if token_is_x509v3 {
+        // Single DER certificate — the standard WSS4J/phase4/Domibus token
+        // shape (`ValueType="...#X509v3"`). The chain, if any, must come from
+        // configured trust material.
+        return Ok(Some(vec![token_der]));
+    }
 
     split_x509_pkipath_der_certificates(&token_der).map(Some)
 }
@@ -1749,502 +1893,8 @@ pub(crate) fn secure_eq(a: &[u8], b: &[u8]) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{
-        WsSecCanonicalizationProfile, WsSecDigestMethod, WsSecVerifyOptions,
-        build_external_reference_cid_index, parse_signature_material_from_doc,
-        parse_signature_references, resolve_external_reference_bytes, verify_enveloped_signature,
-    };
-    use crate::crypto::wssec::canonicalize::canonicalize_reference_digest_base64_from_doc_with_inclusive_ns;
-    use base64::Engine;
-    use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
-    use openssl::asn1::Asn1Time;
-    use openssl::hash::MessageDigest;
-    use openssl::pkey::PKey;
-    use openssl::sign::Signer;
-    use openssl::x509::X509;
-    use roxmltree::Document;
-
-    fn encode_der_sequence(elements: &[Vec<u8>]) -> Vec<u8> {
-        let payload_len = elements.iter().map(Vec::len).sum::<usize>();
-        let mut out = Vec::with_capacity(payload_len + 8);
-        out.push(0x30);
-        if payload_len < 0x80 {
-            out.push(payload_len as u8);
-        } else {
-            let mut len_bytes = Vec::new();
-            let mut value = payload_len;
-            while value > 0 {
-                len_bytes.push((value & 0xFF) as u8);
-                value >>= 8;
-            }
-            len_bytes.reverse();
-            out.push(0x80 | (len_bytes.len() as u8));
-            out.extend_from_slice(&len_bytes);
-        }
-        for element in elements {
-            out.extend_from_slice(element);
-        }
-        out
-    }
-
-    fn signed_xml_with_pkipath_token(
-        reference_uri: &str,
-        payload_xml: &str,
-        digest_value_base64: &str,
-        signature_value_base64: &str,
-        token_id: &str,
-        pki_path_der_base64: &str,
-    ) -> String {
-        format!(
-            r##"<S12:Envelope xmlns:S12="http://www.w3.org/2003/05/soap-envelope"
-        xmlns:eb="http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/"
-        xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd"
-        xmlns:wsu="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd"
-        xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
-    <S12:Header>
-        <wsse:Security>
-            <ds:Signature>
-                <ds:SignedInfo>
-                    <ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>
-                    <ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/>
-                    <ds:Reference URI="{reference_uri}">
-                        <ds:Transforms>
-                            <ds:Transform Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>
-                        </ds:Transforms>
-                        <ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/>
-                        <ds:DigestValue>{digest_value_base64}</ds:DigestValue>
-                    </ds:Reference>
-                </ds:SignedInfo>
-                <ds:SignatureValue>{signature_value_base64}</ds:SignatureValue>
-                <ds:KeyInfo>
-                    <wsse:SecurityTokenReference>
-                        <wsse:Reference URI="#{token_id}" ValueType="http://docs.oasis-open.org/wss/oasis-wss-x509-token-profile-1.1#X509PKIPathv1"/>
-                    </wsse:SecurityTokenReference>
-                </ds:KeyInfo>
-            </ds:Signature>
-            <wsse:BinarySecurityToken EncodingType="http://docs.oasis-open.org/wss/oasis-wss-soap-message-security-1.1#Base64Binary" ValueType="http://docs.oasis-open.org/wss/oasis-wss-x509-token-profile-1.1#X509PKIPathv1" wsu:Id="{token_id}">{pki_path_der_base64}</wsse:BinarySecurityToken>
-        </wsse:Security>
-    </S12:Header>
-    <S12:Body>
-{payload_xml}
-    </S12:Body>
-</S12:Envelope>"##
-        )
-    }
-
-    #[cfg(feature = "as4")]
-    #[test]
-    fn verify_enveloped_signature_rejects_malformed_xml() {
-        let err = verify_enveloped_signature("<not-xml", WsSecVerifyOptions::new())
-            .expect_err("malformed XML must be rejected");
-
-        assert_eq!(err.code, crate::core::ErrorCode::ParseFailed);
-        assert!(
-            err.message
-                .contains("failed to parse XML for wssec verification")
-        );
-    }
-
-    #[test]
-    fn verify_enveloped_signature_accepts_x509pkipathv1_binary_security_token() {
-        let rsa = openssl::rsa::Rsa::generate(2048).expect("rsa");
-        let pkey = PKey::from_rsa(rsa).expect("pkey");
-
-        let mut name = openssl::x509::X509NameBuilder::new().expect("name builder");
-        name.append_entry_by_nid(openssl::nid::Nid::COMMONNAME, "asx-wssec-pkipath-test")
-            .expect("cn");
-        let name = name.build();
-
-        let mut serial = openssl::bn::BigNum::new().expect("serial");
-        serial
-            .pseudo_rand(64, openssl::bn::MsbOption::MAYBE_ZERO, false)
-            .expect("serial rand");
-        let serial = serial.to_asn1_integer().expect("serial asn1");
-
-        let mut cert_builder = X509::builder().expect("x509 builder");
-        cert_builder.set_version(2).expect("version");
-        cert_builder.set_serial_number(&serial).expect("serial");
-        cert_builder.set_subject_name(&name).expect("subject");
-        cert_builder.set_issuer_name(&name).expect("issuer");
-        cert_builder.set_pubkey(&pkey).expect("pubkey");
-        let not_before = Asn1Time::days_from_now(0).expect("not_before");
-        let not_after = Asn1Time::days_from_now(365).expect("not_after");
-        cert_builder.set_not_before(&not_before).expect("nb");
-        cert_builder.set_not_after(&not_after).expect("na");
-        cert_builder
-            .sign(&pkey, MessageDigest::sha256())
-            .expect("cert sign");
-        let cert_der = cert_builder.build().to_der().expect("cert der");
-
-        let pki_path_der = encode_der_sequence(&[cert_der]);
-        let pki_path_der_b64 = BASE64_STANDARD.encode(pki_path_der);
-
-        let token_id = "bst-pkipath-1";
-        let reference_uri = "#payload-1";
-        let payload_xml = "    <eb:Payload wsu:Id=\"payload-1\">ABC</eb:Payload>";
-
-        let unsigned = signed_xml_with_pkipath_token(
-            reference_uri,
-            payload_xml,
-            "placeholder",
-            "AA==",
-            token_id,
-            &pki_path_der_b64,
-        );
-        let unsigned_doc = Document::parse(&unsigned).expect("unsigned doc");
-        let digest = canonicalize_reference_digest_base64_from_doc_with_inclusive_ns(
-            &unsigned_doc,
-            reference_uri,
-            &WsSecCanonicalizationProfile::default(),
-            None,
-            WsSecDigestMethod::Sha256,
-        )
-        .expect("digest");
-
-        let unsigned_with_digest = signed_xml_with_pkipath_token(
-            reference_uri,
-            payload_xml,
-            &digest,
-            "AA==",
-            token_id,
-            &pki_path_der_b64,
-        );
-        let material_doc = Document::parse(&unsigned_with_digest).expect("material doc");
-        let material = parse_signature_material_from_doc(
-            &material_doc,
-            WsSecCanonicalizationProfile::default(),
-        )
-        .expect("signature material");
-
-        let mut signer = Signer::new(MessageDigest::sha256(), &pkey).expect("signer");
-        signer
-            .update(&material.signed_info_c14n)
-            .expect("signer update");
-        let signature_base64 = BASE64_STANDARD.encode(signer.sign_to_vec().expect("signature"));
-
-        let signed = signed_xml_with_pkipath_token(
-            reference_uri,
-            payload_xml,
-            &digest,
-            &signature_base64,
-            token_id,
-            &pki_path_der_b64,
-        );
-
-        verify_enveloped_signature(&signed, WsSecVerifyOptions::new())
-            .expect("verification should pass with X509PKIPathv1 token");
-    }
-
-    #[test]
-    fn split_x509_pkipath_rejects_inner_length_overrun_without_panicking() {
-        // Outer SEQUENCE (len 4) whose single inner element declares a 65535-byte
-        // content length with zero bytes present. Before the bounds check this
-        // sliced out of range and panicked the worker thread on attacker input.
-        let malicious = [0x30u8, 0x04, 0x30, 0x82, 0xFF, 0xFF];
-        let err = super::split_x509_pkipath_der_certificates(&malicious)
-            .expect_err("over-declared inner DER length must be rejected, not panic");
-        assert_eq!(err.code, crate::core::ErrorCode::ParseFailed);
-    }
-
-    #[test]
-    fn resolve_external_reference_bytes_normalizes_cid_wrappers() {
-        let alpha = b"alpha";
-        let beta = b"beta";
-        let refs: [(&str, &[u8]); 2] = [
-            ("<payload@example.com>", alpha.as_slice()),
-            ("cid:other@example.com", beta.as_slice()),
-        ];
-
-        let resolved = resolve_external_reference_bytes("cid:payload@example.com", &refs)
-            .expect("cid URI should match angle-bracket wrapped candidate");
-        assert_eq!(resolved, alpha.as_slice());
-
-        let resolved = resolve_external_reference_bytes("CID:<payload@example.com>", &refs)
-            .expect("CID + angle-bracket wrapped URI should normalize");
-        assert_eq!(resolved, alpha.as_slice());
-
-        let resolved = resolve_external_reference_bytes("<other@example.com>", &refs)
-            .expect("angle-bracket URI should match cid-prefixed candidate");
-        assert_eq!(resolved, beta.as_slice());
-    }
-
-    #[test]
-    fn parse_signature_references_rejects_unsupported_transform_algorithm() {
-        let xml = r##"<?xml version="1.0" encoding="UTF-8"?>
-<soap:Envelope xmlns:soap="http://www.w3.org/2003/05/soap-envelope" xmlns:ds="http://www.w3.org/2000/09/xmldsig#"> 
-    <soap:Header>
-        <ds:Signature>
-            <ds:SignedInfo>
-                <ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>
-                <ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/>
-                <ds:Reference URI="#body">
-                    <ds:Transforms>
-                        <ds:Transform Algorithm="http://www.w3.org/TR/1999/REC-xslt-19991116"/>
-                    </ds:Transforms>
-                    <ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/>
-                    <ds:DigestValue>ZmFrZQ==</ds:DigestValue>
-                </ds:Reference>
-            </ds:SignedInfo>
-            <ds:SignatureValue>ZmFrZQ==</ds:SignatureValue>
-        </ds:Signature>
-    </soap:Header>
-    <soap:Body Id="body"/>
-</soap:Envelope>"##;
-
-        let err = parse_signature_references(xml)
-            .expect_err("unsupported transform algorithm must fail closed");
-
-        assert_eq!(err.code, crate::core::ErrorCode::InteropViolation);
-        assert!(err.message.contains("unsupported ds:Transform Algorithm"));
-    }
-
-    #[test]
-    fn parse_signature_references_rejects_unsupported_transform_child_element() {
-        let xml = r##"<?xml version="1.0" encoding="UTF-8"?>
-<soap:Envelope xmlns:soap="http://www.w3.org/2003/05/soap-envelope" xmlns:ds="http://www.w3.org/2000/09/xmldsig#"> 
-    <soap:Header>
-        <ds:Signature>
-            <ds:SignedInfo>
-                <ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>
-                <ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/>
-                <ds:Reference URI="#body">
-                    <ds:Transforms>
-                        <ds:Transform Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#">
-                            <ds:Bogus/>
-                        </ds:Transform>
-                    </ds:Transforms>
-                    <ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/>
-                    <ds:DigestValue>ZmFrZQ==</ds:DigestValue>
-                </ds:Reference>
-            </ds:SignedInfo>
-            <ds:SignatureValue>ZmFrZQ==</ds:SignatureValue>
-        </ds:Signature>
-    </soap:Header>
-    <soap:Body Id="body"/>
-</soap:Envelope>"##;
-
-        let err = parse_signature_references(xml)
-            .expect_err("unsupported transform child must fail closed");
-
-        assert_eq!(err.code, crate::core::ErrorCode::InteropViolation);
-        assert!(err.message.contains("unsupported child element"));
-    }
-
-    #[test]
-    fn parse_signature_references_rejects_percent_encoded_cid_uri() {
-        let xml = r##"<?xml version="1.0" encoding="UTF-8"?>
-<soap:Envelope xmlns:soap="http://www.w3.org/2003/05/soap-envelope" xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
-    <soap:Header>
-        <ds:Signature>
-            <ds:SignedInfo>
-                <ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>
-                <ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/>
-                <ds:Reference URI="cid:payload%40example.com">
-                    <ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/>
-                    <ds:DigestValue>ZmFrZQ==</ds:DigestValue>
-                </ds:Reference>
-            </ds:SignedInfo>
-            <ds:SignatureValue>ZmFrZQ==</ds:SignatureValue>
-        </ds:Signature>
-    </soap:Header>
-    <soap:Body Id="body"/>
-</soap:Envelope>"##;
-
-        let err =
-            parse_signature_references(xml).expect_err("percent-encoded cid URI must fail closed");
-
-        assert_eq!(err.code, crate::core::ErrorCode::InteropViolation);
-        assert!(err.message.contains("percent-encoded cid reference URIs"));
-    }
-
-    #[test]
-    fn parse_signature_references_rejects_unsupported_reference_uri_scheme() {
-        let xml = r##"<?xml version="1.0" encoding="UTF-8"?>
-<soap:Envelope xmlns:soap="http://www.w3.org/2003/05/soap-envelope" xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
-    <soap:Header>
-        <ds:Signature>
-            <ds:SignedInfo>
-                <ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>
-                <ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/>
-                <ds:Reference URI="https://example.invalid/object.xml">
-                    <ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/>
-                    <ds:DigestValue>ZmFrZQ==</ds:DigestValue>
-                </ds:Reference>
-            </ds:SignedInfo>
-            <ds:SignatureValue>ZmFrZQ==</ds:SignatureValue>
-        </ds:Signature>
-    </soap:Header>
-    <soap:Body Id="body"/>
-</soap:Envelope>"##;
-
-        let err =
-            parse_signature_references(xml).expect_err("unsupported URI scheme must fail closed");
-
-        assert_eq!(err.code, crate::core::ErrorCode::InteropViolation);
-        assert!(err.message.contains("unsupported ds:Reference URI scheme"));
-    }
-
-    #[test]
-    fn build_external_reference_cid_index_rejects_semantically_equivalent_cid_aliases() {
-        let alpha = b"alpha";
-        let beta = b"beta";
-        let refs = [
-            ("cid:payload@example.com", alpha.as_slice()),
-            ("CID:<payload@example.com>", beta.as_slice()),
-        ];
-
-        let err = build_external_reference_cid_index(&refs)
-            .expect_err("semantically equivalent cid aliases must fail closed");
-
-        assert_eq!(err.code, crate::core::ErrorCode::InteropViolation);
-        assert!(
-            err.message
-                .contains("duplicate or semantically equivalent external cid reference provided")
-        );
-    }
-
-    /// A second `ds:Signature` in the document (e.g. a gateway counter-signature)
-    /// must not prevent verification of the primary WS-Security signature.
-    #[test]
-    fn verify_tolerates_extra_ds_signature_outside_wssec_security_header() {
-        use super::super::WsSecOutboundKeyInfoProfile;
-        use super::super::sign::generate_xmlsig_signature;
-        use openssl::asn1::Asn1Time;
-
-        // Build a self-signed cert/key pair for this test.
-        let rsa = openssl::rsa::Rsa::generate(2048).expect("rsa");
-        let pkey = PKey::from_rsa(rsa).expect("pkey");
-        let mut name = openssl::x509::X509NameBuilder::new().expect("name");
-        name.append_entry_by_nid(openssl::nid::Nid::COMMONNAME, "asx-multisig-test")
-            .expect("cn");
-        let name = name.build();
-        let mut serial = openssl::bn::BigNum::new().expect("bn");
-        serial
-            .pseudo_rand(64, openssl::bn::MsbOption::MAYBE_ZERO, false)
-            .expect("rand");
-        let serial = serial.to_asn1_integer().expect("asn1 serial");
-        let mut builder = X509::builder().expect("x509 builder");
-        builder.set_version(2).expect("v2");
-        builder.set_serial_number(&serial).expect("serial");
-        builder.set_subject_name(&name).expect("subject");
-        builder.set_issuer_name(&name).expect("issuer");
-        builder.set_pubkey(&pkey).expect("pubkey");
-        builder
-            .set_not_before(&Asn1Time::days_from_now(0).expect("nb"))
-            .expect("nb");
-        builder
-            .set_not_after(&Asn1Time::days_from_now(365).expect("na"))
-            .expect("na");
-        builder
-            .sign(&pkey, MessageDigest::sha256())
-            .expect("sign cert");
-        let cert = builder.build();
-        let cert_pem = cert.to_pem().expect("cert pem");
-        let key_pem = pkey.private_key_to_pem_pkcs8().expect("key pem");
-
-        let body_id = "body-multisig";
-        // Build an unsigned SOAP envelope with a wsse:Security placeholder.
-        let envelope = format!(
-            r##"<?xml version="1.0" encoding="UTF-8"?><soap:Envelope xmlns:soap="http://www.w3.org/2003/05/soap-envelope" xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd" xmlns:wsu="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd"><soap:Header><wsse:Security soap:mustUnderstand="1"></wsse:Security></soap:Header><soap:Body wsu:Id="{body_id}"><data>hello</data></soap:Body></soap:Envelope>"##
-        );
-
-        // Generate <ds:Signature> referencing the body.
-        let sig_xml = generate_xmlsig_signature(
-            &envelope,
-            &[&format!("#{body_id}")],
-            &key_pem,
-            &cert_pem,
-            WsSecOutboundKeyInfoProfile::X509DataAndRsaKeyValue,
-        )
-        .expect("sign");
-
-        // Insert signature inside the wsse:Security block.
-        let signed_envelope = envelope.replace(
-            "<wsse:Security soap:mustUnderstand=\"1\"></wsse:Security>",
-            &format!("<wsse:Security soap:mustUnderstand=\"1\">{sig_xml}</wsse:Security>"),
-        );
-        assert!(
-            signed_envelope.contains("<ds:Signature"),
-            "signature must be present in assembled envelope"
-        );
-
-        // Inject a second irrelevant ds:Signature in the SOAP header (outside
-        // wsse:Security) to simulate a gateway or application-layer counter-signer.
-        // It must NOT be inside the signed body element or the digest will change.
-        let extra_sig = r#"<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:SignedInfo><ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/></ds:SignedInfo><ds:SignatureValue>AAAA</ds:SignatureValue></ds:Signature>"#;
-        let dual_signed =
-            signed_envelope.replace("</soap:Header>", &format!("{extra_sig}</soap:Header>"));
-
-        // Verification must succeed: resolver prefers the wsse:Security-hosted ds:Signature.
-        verify_enveloped_signature(&dual_signed, WsSecVerifyOptions::new())
-            .expect("dual-signed SOAP must verify against primary wsse:Security signature");
-    }
-
-    /// `ds:CanonicalizationMethod` used to be written on send and never read on
-    /// verify. Verification always canonicalizes `SignedInfo` as exclusive
-    /// C14N, so a signature declaring anything else failed later with an opaque
-    /// "signature value mismatch". Reject it where it can be named.
-    mod canonicalization_method {
-        use super::super::enforce_signed_info_canonicalization_method;
-        use crate::core::ErrorCode;
-
-        fn signed_info(inner: &str) -> roxmltree::Document<'_> {
-            roxmltree::Document::parse(inner).expect("fixture parses")
-        }
-
-        fn check(algorithm_attr: &str) -> crate::core::Result<()> {
-            let xml = format!(
-                r#"<ds:SignedInfo xmlns:ds="http://www.w3.org/2000/09/xmldsig#">{algorithm_attr}</ds:SignedInfo>"#
-            );
-            let doc = signed_info(&xml);
-            enforce_signed_info_canonicalization_method(doc.root_element())
-        }
-
-        #[test]
-        fn exclusive_c14n_is_accepted() {
-            check(r#"<ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>"#)
-                .expect("exclusive c14n is the AS4-mandated algorithm");
-        }
-
-        #[test]
-        fn inclusive_c14n_is_rejected_by_name() {
-            let err = check(
-                r#"<ds:CanonicalizationMethod Algorithm="http://www.w3.org/TR/2001/REC-xml-c14n-20010315"/>"#,
-            )
-            .expect_err("inclusive c14n must be rejected");
-            assert_eq!(err.code, ErrorCode::InteropViolation);
-            assert!(err.message.contains("Exclusive"), "{}", err.message);
-        }
-
-        #[test]
-        fn comment_preserving_exclusive_c14n_is_rejected() {
-            // The canonicalizer strips comments, so accepting this URI would
-            // verify under a different algorithm than the one declared.
-            let err = check(
-                r#"<ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#WithComments"/>"#,
-            )
-            .expect_err("WithComments must be rejected");
-            assert_eq!(err.code, ErrorCode::InteropViolation);
-            assert!(err.message.contains("comment"), "{}", err.message);
-        }
-
-        #[test]
-        fn missing_or_empty_algorithm_is_rejected() {
-            // XMLDSig schema: SignedInfo is (CanonicalizationMethod, SignatureMethod, Reference+).
-            assert_eq!(
-                check("").expect_err("absent element").code,
-                ErrorCode::ParseFailed
-            );
-            assert_eq!(
-                check(r#"<ds:CanonicalizationMethod/>"#)
-                    .expect_err("absent attribute")
-                    .code,
-                ErrorCode::ParseFailed
-            );
-        }
-    }
-}
+#[path = "verify_tests.rs"]
+mod tests;
 
 // ---------------------------------------------------------------------------
 // Enveloped whole-document signatures (SMP `ServiceMetadata`)

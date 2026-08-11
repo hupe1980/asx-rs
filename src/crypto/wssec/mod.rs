@@ -11,6 +11,8 @@
 // These sub-modules depend on roxmltree / quick-xml which are as4-only deps.
 #[cfg(feature = "as4")]
 pub(crate) mod canonicalize;
+#[cfg(feature = "as4")]
+pub(crate) use canonicalize::swa_attachment_digest_input;
 pub(crate) mod ocsp;
 #[cfg(feature = "as4")]
 pub(crate) mod sign;
@@ -43,6 +45,11 @@ pub(crate) const RSA_SHA512_URI: &str = "http://www.w3.org/2001/04/xmldsig-more#
 pub(crate) const ECDSA_SHA256_URI: &str = "http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha256";
 pub(crate) const ECDSA_SHA384_URI: &str = "http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha384";
 pub(crate) const ECDSA_SHA512_URI: &str = "http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha512";
+/// WSS SOAP-with-Attachments profile 1.1: digest covers the attachment
+/// **content octets** only. Mandated by the AS4 profile for `cid:` payload
+/// references; emitted by asx on sign and accepted on verify.
+#[cfg(feature = "as4")]
+pub(crate) const SWA_ATTACHMENT_CONTENT_TRANSFORM_URI: &str = "http://docs.oasis-open.org/wss/oasis-wss-SwAProfile-1.1#Attachment-Content-Signature-Transform";
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -219,8 +226,20 @@ impl<'a> From<&'a OwnedRevocationPolicy> for RevocationPolicy<'a> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[non_exhaustive]
 pub enum WsSecOutboundKeyInfoProfile {
+    /// WS-Security X.509 v3 token (`wsse:BinarySecurityToken` with
+    /// `ValueType="...#X509v3"`), referenced from `ds:KeyInfo` via
+    /// `wsse:SecurityTokenReference`. **The default**, and the shape WSS 1.1.1
+    /// §7.7 requires — `ds:KeyInfo` in a WS-Security header MUST contain a
+    /// `SecurityTokenReference`. WSS4J-based receivers (Holodeck B2B, phase4,
+    /// Domibus) reject a bare `ds:X509Data` KeyInfo with
+    /// `UNSUPPORTED_SECURITY_TOKEN`.
     #[default]
+    BinarySecurityTokenX509v3,
+    /// Bare `ds:X509Data` + `ds:RSAKeyValue` KeyInfo. Not WSS-conformant —
+    /// use only for consumers that verify with plain XMLDSig tooling.
     X509DataAndRsaKeyValue,
+    /// Bare `ds:X509Data` KeyInfo. Not WSS-conformant — see
+    /// [`Self::X509DataAndRsaKeyValue`].
     X509DataOnly,
     /// WS-Security X.509 PKI path token (`wsse:BinarySecurityToken` with
     /// `ValueType="...#X509PKIPathv1"`).  The `ds:KeyInfo` inside the signature
@@ -447,6 +466,50 @@ mod tests {
         let exponent_b64 = BASE64_STANDARD.encode(rsa.e().to_vec());
         let pkey = openssl::pkey::PKey::from_rsa(rsa).expect("pkey from rsa");
         (pkey, modulus_b64, exponent_b64)
+    }
+
+    /// An RSA key plus a self-signed certificate that carries it.
+    ///
+    /// Verification requires an X.509 signer token — a bare `ds:RSAKeyValue`
+    /// authenticates nobody — so positive tests need a certificate whose public
+    /// key really is the signing key.
+    fn make_test_rsa_key_and_cert() -> (
+        openssl::pkey::PKey<openssl::pkey::Private>,
+        String,
+        String,
+        String,
+    ) {
+        let (pkey, modulus_b64, exponent_b64) = make_test_rsa_key();
+
+        let mut name = openssl::x509::X509NameBuilder::new().expect("name builder");
+        name.append_entry_by_nid(openssl::nid::Nid::COMMONNAME, "asx-wssec-test")
+            .expect("cn");
+        let name = name.build();
+
+        let mut builder = openssl::x509::X509::builder().expect("x509 builder");
+        builder.set_version(2).expect("version");
+        let mut serial = openssl::bn::BigNum::new().expect("serial");
+        serial
+            .pseudo_rand(64, openssl::bn::MsbOption::MAYBE_ZERO, false)
+            .expect("serial rand");
+        builder
+            .set_serial_number(&serial.to_asn1_integer().expect("serial asn1"))
+            .expect("serial");
+        builder.set_subject_name(&name).expect("subject");
+        builder.set_issuer_name(&name).expect("issuer");
+        builder.set_pubkey(&pkey).expect("pubkey");
+        builder
+            .set_not_before(&openssl::asn1::Asn1Time::days_from_now(0).expect("nb"))
+            .expect("nb");
+        builder
+            .set_not_after(&openssl::asn1::Asn1Time::days_from_now(365).expect("na"))
+            .expect("na");
+        builder
+            .sign(&pkey, openssl::hash::MessageDigest::sha256())
+            .expect("sign cert");
+        let cert_b64 = BASE64_STANDARD.encode(builder.build().to_der().expect("cert der"));
+
+        (pkey, modulus_b64, exponent_b64, cert_b64)
     }
 
     /// Sign `data` with the given PKey using RSA-SHA256; return base64 signature.
@@ -682,19 +745,18 @@ mod tests {
 
     #[test]
     fn verify_enveloped_signature_strict_accepts_valid_rsa_signature_value() {
-        let rsa_key = openssl::rsa::Rsa::generate(2048).expect("rsa key generation");
-        let modulus_base64 = BASE64_STANDARD.encode(rsa_key.n().to_vec());
-        let exponent_base64 = BASE64_STANDARD.encode(rsa_key.e().to_vec());
-        let test_pkey = PKey::from_rsa(rsa_key).expect("pkey from rsa");
+        let (test_pkey, modulus_base64, exponent_base64, cert_base64) =
+            make_test_rsa_key_and_cert();
 
         let payload = "    <eb:Payload wsu:Id=\"payload-1\">ABC</eb:Payload>";
-        let unsigned = signed_xml_with_rsa_keyvalue(
+        let unsigned = signed_xml_with_rsa_keyvalue_and_x509(
             "#payload-1",
             payload,
             "placeholder",
             "AA==",
             &modulus_base64,
             &exponent_base64,
+            &cert_base64,
         );
 
         let digest = canonicalize_reference(
@@ -706,13 +768,14 @@ mod tests {
         .digest_value_base64;
 
         let material = parse_signature_material(
-            &signed_xml_with_rsa_keyvalue(
+            &signed_xml_with_rsa_keyvalue_and_x509(
                 "#payload-1",
                 payload,
                 &digest,
                 "AA==",
                 &modulus_base64,
                 &exponent_base64,
+                &cert_base64,
             ),
             WsSecCanonicalizationProfile::default(),
         )
@@ -725,13 +788,14 @@ mod tests {
         let signature_bytes = signer.sign_to_vec().expect("sign");
         let signature_base64 = BASE64_STANDARD.encode(&signature_bytes);
 
-        let signed = signed_xml_with_rsa_keyvalue(
+        let signed = signed_xml_with_rsa_keyvalue_and_x509(
             "#payload-1",
             payload,
             &digest,
             &signature_base64,
             &modulus_base64,
             &exponent_base64,
+            &cert_base64,
         );
 
         verify_enveloped_signature(&signed, WsSecVerifyOptions::new())
@@ -813,22 +877,21 @@ mod tests {
 
     #[test]
     fn verify_enveloped_signature_rejects_tampered_external_reference_bytes() {
-        let rsa_key = openssl::rsa::Rsa::generate(2048).expect("rsa key generation");
-        let modulus_base64 = BASE64_STANDARD.encode(rsa_key.n().to_vec());
-        let exponent_base64 = BASE64_STANDARD.encode(rsa_key.e().to_vec());
-        let test_pkey = PKey::from_rsa(rsa_key).expect("pkey from rsa");
+        let (test_pkey, modulus_base64, exponent_base64, cert_base64) =
+            make_test_rsa_key_and_cert();
 
         let payload = b"payload-attachment";
         let payload_digest = openssl::hash::hash(MessageDigest::sha256(), payload).expect("digest");
         let payload_digest_b64 = BASE64_STANDARD.encode(payload_digest);
 
-        let unsigned = signed_xml_with_rsa_keyvalue(
+        let unsigned = signed_xml_with_rsa_keyvalue_and_x509(
             "cid:payload-1@example.com",
             "    <eb:Payload>Attachment</eb:Payload>",
             &payload_digest_b64,
             "AA==",
             &modulus_base64,
             &exponent_base64,
+            &cert_base64,
         );
 
         let material = parse_signature_material(&unsigned, WsSecCanonicalizationProfile::default())
@@ -840,13 +903,14 @@ mod tests {
             .expect("signer update");
         let signature_base64 = BASE64_STANDARD.encode(signer.sign_to_vec().expect("sign"));
 
-        let signed = signed_xml_with_rsa_keyvalue(
+        let signed = signed_xml_with_rsa_keyvalue_and_x509(
             "cid:payload-1@example.com",
             "    <eb:Payload>Attachment</eb:Payload>",
             &payload_digest_b64,
             &signature_base64,
             &modulus_base64,
             &exponent_base64,
+            &cert_base64,
         );
 
         let good_refs: [(&str, &[u8]); 1] = [("cid:payload-1@example.com", payload.as_slice())];
@@ -867,6 +931,65 @@ mod tests {
         assert!(
             err.message
                 .contains("digest mismatch for reference cid:payload-1@example.com")
+        );
+    }
+
+    /// A signature that verifies against a key the message itself supplied
+    /// proves nothing: an attacker can generate a key pair, sign the envelope,
+    /// and inline the public half. Verification must demand an X.509 signer
+    /// token regardless of what the caller's policy asks for.
+    #[test]
+    fn bare_rsa_keyvalue_without_a_certificate_is_rejected() {
+        let (test_pkey, modulus_base64, exponent_base64) = make_test_rsa_key();
+
+        let payload = "    <eb:Payload wsu:Id=\"payload-1\">ABC</eb:Payload>";
+        let unsigned = signed_xml_with_rsa_keyvalue(
+            "#payload-1",
+            payload,
+            "placeholder",
+            "AA==",
+            &modulus_base64,
+            &exponent_base64,
+        );
+        let digest = canonicalize_reference(
+            &unsigned,
+            "#payload-1",
+            WsSecCanonicalizationProfile::default(),
+        )
+        .expect("digest")
+        .digest_value_base64;
+
+        let material = parse_signature_material(
+            &signed_xml_with_rsa_keyvalue(
+                "#payload-1",
+                payload,
+                &digest,
+                "AA==",
+                &modulus_base64,
+                &exponent_base64,
+            ),
+            WsSecCanonicalizationProfile::default(),
+        )
+        .expect("signature material");
+        let signature_base64 = rsa_sha256_sign(&test_pkey, &material.signed_info_c14n);
+
+        // Cryptographically this signature is perfectly valid over SignedInfo.
+        let signed = signed_xml_with_rsa_keyvalue(
+            "#payload-1",
+            payload,
+            &digest,
+            &signature_base64,
+            &modulus_base64,
+            &exponent_base64,
+        );
+
+        let err = verify_enveloped_signature(&signed, WsSecVerifyOptions::new())
+            .expect_err("a self-asserted RSAKeyValue must never satisfy verification");
+        assert_eq!(err.code, crate::core::ErrorCode::SecurityVerificationFailed);
+        assert!(
+            err.message.contains("no X.509 certificate"),
+            "error must name the cause: {}",
+            err.message
         );
     }
 

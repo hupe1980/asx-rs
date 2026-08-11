@@ -1,0 +1,134 @@
+{% extends "base.html" %}
+
+{% block content %}
+<section class="hero">
+  <div class="wrap">
+    <p class="eyebrow">AS2 &amp; AS4 · ebMS3 · Rust</p>
+    <h1>B2B messaging that fails closed by default.</h1>
+    <p class="lede">
+      <strong>asx-rs</strong> is an async-native Rust library for the AS2 (RFC 4130) and
+      AS4 (OASIS ebMS3 / eDelivery) protocols. S/MIME and WS-Security, MDN and
+      cryptographically verified receipts — as an embeddable crate, not a gateway
+      you have to operate.
+    </p>
+
+    <div class="cta">
+      <a class="btn btn-primary" href="{{ get_url(path='@/docs/getting-started.md') | safe }}">Get started</a>
+      <a class="btn" href="{{ config.extra.repo }}" rel="noopener">View source</a>
+    </div>
+
+    <div class="install">
+      <code>cargo add asx-rs --features as4,client,server</code>
+    </div>
+  </div>
+</section>
+
+<section class="wrap section">
+  <h2>Why another AS2/AS4 stack?</h2>
+  <div class="grid grid-3">
+    <article class="card">
+      <h3>The type system enforces trust</h3>
+      <p>
+        Payloads move through <code>UntrustedBytes → StructurallyParsed →
+        CryptographicallyVerified → ContentDecrypted → DomainReady</code>. Application
+        code cannot receive bytes that skipped a gate, because the state that would
+        let it does not exist.
+      </p>
+    </article>
+    <article class="card">
+      <h3>Insecure configurations are unreachable</h3>
+      <p>
+        Signatures are required, pull is denied, SMP results are not trusted, and
+        encrypted-spool profiles refuse to run without a key — until you say
+        otherwise. There is no unsafe setting you reach by forgetting a field.
+      </p>
+    </article>
+    <article class="card">
+      <h3>A library, not a platform</h3>
+      <p>
+        No container, no database requirement, no JVM. Dedup, reconciliation, audit
+        sinks and key management are traits you implement against your own
+        infrastructure.
+      </p>
+    </article>
+  </div>
+</section>
+
+<section class="wrap section">
+  <h2>What it implements</h2>
+  <div class="grid grid-2">
+    <article class="card">
+      <h3>AS2 — RFC 4130</h3>
+      <ul>
+        <li>CMS/S/MIME signing and encryption (RSA, ECDSA)</li>
+        <li>Synchronous and asynchronous MDN</li>
+        <li>RFC 4130 §7.3.1 MIC over the signed MIME entity</li>
+        <li>RFC 5402 compression as CMS <code>CompressedData</code></li>
+        <li>Streaming receive with a bounded, encrypted spool</li>
+      </ul>
+      <a class="more" href="{{ get_url(path='@/docs/as2.md') | safe }}">AS2 reference →</a>
+    </article>
+    <article class="card">
+      <h3>AS4 — OASIS ebMS3</h3>
+      <ul>
+        <li>WS-Security XMLDSig with XML Signature Wrapping defences</li>
+        <li>XML Encryption: AES-GCM, RSA-OAEP, ECDH-ES</li>
+        <li>Verified receipts with Non-Repudiation Information</li>
+        <li>One-Way/Push and One-Way/Pull with MPC authorization</li>
+        <li>Large-message splitting and joining</li>
+      </ul>
+      <a class="more" href="{{ get_url(path='@/docs/as4.md') | safe }}">AS4 reference →</a>
+    </article>
+  </div>
+</section>
+
+<section class="wrap section">
+  <h2>Send a signed AS4 message</h2>
+  <pre><code class="language-rust">use asx_rs::as4::{send_async, As4SendRequest, As4SendPolicyBuilder};
+use asx_rs::transport::egress::{As4HttpTransport, TransportConfig};
+
+let (policy, credentials) = As4SendPolicyBuilder::new()
+    .action("urn:example:action")
+    .service("urn:example:service", "")
+    .signing_cert_pem(cert)
+    .signing_key_pem(key)
+    .build()?;
+
+let sent = send_async(&amp;session, &amp;bus, As4SendRequest {
+    message_id: message_id.clone(),
+    payload,
+    policy,
+    credentials: Some(credentials),
+    payload_filename: None,
+}).await?;
+
+// Send, then verify the counterparty's receipt — signature and
+// non-repudiation digests — in one call.
+let outcome = As4HttpTransport::new(TransportConfig::default())?
+    .send_and_verify(&amp;url, &amp;session, &amp;bus, &amp;sent, &amp;As4ReceiptPolicy::regulated())
+    .await?;</code></pre>
+  <p class="note">
+    A receipt is only evidence of delivery once its signature and digests are checked
+    against the message you sent. <code>send_and_verify</code> does both, so that step
+    cannot be skipped by accident.
+  </p>
+</section>
+
+<section class="wrap section">
+  <h2>Start reading</h2>
+  <div class="grid grid-3">
+    <a class="tile" href="{{ get_url(path='@/docs/getting-started.md') | safe }}">
+      <h3>Getting started</h3>
+      <p>Feature flags, a session, and your first message in either protocol.</p>
+    </a>
+    <a class="tile" href="{{ get_url(path='@/docs/security.md') | safe }}">
+      <h3>Security model</h3>
+      <p>Trust boundaries, defaults, and what the library does and does not promise.</p>
+    </a>
+    <a class="tile" href="{{ get_url(path='@/docs/interop.md') | safe }}">
+      <h3>Interoperability</h3>
+      <p>Strict and relaxed modes, partner profiles, and known deviations.</p>
+    </a>
+  </div>
+</section>
+{% endblock content %}

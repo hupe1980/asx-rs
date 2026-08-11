@@ -3,7 +3,9 @@ use std::sync::Arc;
 use super::{
     As2PreparedSendCredentials, As2SendCredentials, As2SendOutput, As2SendPolicy, AsxError,
     AsxEvent, ErrorCode, ErrorContext, EventBus, InteropMode, MimeEnvelope, Result, SessionContext,
-    emit_protocol_event, extract_content_type_header, mic::compute_rfc4130_mic, pipeline,
+    emit_protocol_event, extract_content_type_header,
+    mic::{build_outbound_entity, compute_mic},
+    pipeline,
 };
 use crate::http::HttpHeaders;
 use crate::reliability::{RetryConfig, RetryScheduler};
@@ -230,14 +232,12 @@ fn send_sync_prepared_ref(
     policy: As2SendPolicy,
     prepared: &As2PreparedSendCredentials,
 ) -> Result<As2SendOutput> {
+    // Relaxed interop normalizes these in place below; strict builds never
+    // mutate them, so the rebinding exists only under the feature.
     #[cfg(feature = "interop-relaxed")]
     let mut message_id = message_id;
-    #[cfg(not(feature = "interop-relaxed"))]
-    let message_id = message_id;
     #[cfg(feature = "interop-relaxed")]
     let mut payload = payload;
-    #[cfg(not(feature = "interop-relaxed"))]
-    let payload = payload;
     pipeline::validate_message_id(&message_id, "as2_send_validate", session)?;
     crate::presets::enforce_strict_runtime_bootstrap_for_strict_interop(
         "as2_send_validate",
@@ -293,7 +293,26 @@ fn send_sync_prepared_ref(
         policy.fail_closed_audit_events,
     )?;
 
-    let (mic_base64, digest_alg_str) = compute_mic(&payload, &policy);
+    // RFC 4130 §7.3.1 fixes the MIC input, and it depends on what protection is
+    // applied. Build the MIME entity *after* compression, because the entity
+    // that gets signed is the compressed one — MIC'ing the uncompressed payload
+    // would produce a value the receiver can never reproduce.
+    let mut payload_to_send = payload;
+    #[cfg(feature = "compression")]
+    if policy.compress {
+        payload_to_send = compress_payload(&payload_to_send)?;
+    }
+
+    let entity_content_type = payload_entity_content_type(&policy);
+    let mic_input: Vec<u8> = if policy.sign || policy.encrypt {
+        // Signed/encrypted: the MIC covers the MIME entity — headers included.
+        build_outbound_entity(entity_content_type, &payload_to_send)
+    } else {
+        // Unsigned and unencrypted: content only, no MIME headers at all.
+        payload_to_send.clone()
+    };
+
+    let (mic_base64, digest_alg_str) = compute_mic(&mic_input, policy.mic_algorithm);
     emit_protocol_event(
         event_bus,
         session,
@@ -306,10 +325,10 @@ fn send_sync_prepared_ref(
         "as2_send_mic_computed",
     )?;
 
-    let mut payload_to_send = payload;
-    #[cfg(feature = "compression")]
-    if policy.compress {
-        payload_to_send = compress_payload(&payload_to_send)?;
+    if policy.sign || policy.encrypt {
+        // Sign/encrypt the entity, not the bare payload, so the receiver
+        // recovers the payload's real media type and digests the same octets.
+        payload_to_send = mic_input.clone();
     }
 
     if policy.sign {
@@ -353,7 +372,7 @@ fn send_sync_prepared_ref(
         )?;
     }
 
-    let mime = build_mime_envelope(&message_id, payload_to_send, &policy);
+    let mime = build_mime_envelope(payload_to_send, &policy);
     let http_headers = build_as2_http_headers(session, &policy, &message_id, &mime);
 
     let traceparent = generate_traceparent(&session.correlation_scope().root_id, &message_id);
@@ -452,22 +471,25 @@ pub async fn send_async_prepared(
         .await
 }
 
-fn compute_mic(payload: &[u8], policy: &As2SendPolicy) -> (String, &'static str) {
-    let mic_content_type = policy
+/// Media type stamped on the outbound MIME entity.
+///
+/// When compression is applied the entity carries the compressed octets, so it
+/// is labelled as such rather than as the original business media type.
+fn payload_entity_content_type(policy: &As2SendPolicy) -> &'static str {
+    #[cfg(feature = "compression")]
+    if policy.compress {
+        return crate::crypto::compression::AS2_COMPRESSED_CONTENT_TYPE;
+    }
+    policy
         .payload_content_type
-        .unwrap_or("application/octet-stream");
-
-    compute_rfc4130_mic(payload, mic_content_type, policy.mic_algorithm)
+        .unwrap_or("application/octet-stream")
 }
 
-fn build_mime_envelope(
-    message_id: &str,
-    payload_to_send: Vec<u8>,
-    policy: &As2SendPolicy,
-) -> MimeEnvelope {
+fn build_mime_envelope(payload_to_send: Vec<u8>, policy: &As2SendPolicy) -> MimeEnvelope {
     if policy.encrypt {
         return MimeEnvelope {
-            content_type: "application/pkcs7-mime; smime-type=enveloped-data".to_string(),
+            content_type: "application/pkcs7-mime; smime-type=enveloped-data; name=\"smime.p7m\""
+                .to_string(),
             body: payload_to_send.into(),
         };
     }
@@ -481,16 +503,12 @@ fn build_mime_envelope(
         };
     }
 
-    let boundary = format!("asx-{message_id}");
-    let mut mime_body = Vec::with_capacity(boundary.len() * 2 + payload_to_send.len() + 64);
-    mime_body.extend_from_slice(
-        format!("--{boundary}\r\nContent-Type: application/edi-x12\r\n\r\n").as_bytes(),
-    );
-    mime_body.extend_from_slice(&payload_to_send);
-    mime_body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+    // RFC 4130 §5: an unprotected AS2 message carries the payload directly as
+    // the HTTP entity body under its own media type. There is no multipart
+    // wrapper — inventing one would change the octets the receiver MICs.
     MimeEnvelope {
-        content_type: format!("multipart/mixed; boundary=\"{boundary}\""),
-        body: Arc::from(mime_body),
+        content_type: payload_entity_content_type(policy).to_string(),
+        body: payload_to_send.into(),
     }
 }
 
@@ -536,7 +554,9 @@ fn encrypt_payload(
     )
 }
 
+/// RFC 5402 AS2 compression: CMS `CompressedData` (ZLIB), not a bare gzip
+/// stream — see [`crate::crypto::compression`].
 #[cfg(feature = "compression")]
 fn compress_payload(payload: &[u8]) -> Result<Vec<u8>> {
-    crate::crypto::compression::compress_gzip(payload, 6)
+    crate::crypto::compression::compress_cms_zlib(payload, 6)
 }

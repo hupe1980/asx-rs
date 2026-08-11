@@ -8,7 +8,7 @@ Before tagging a release candidate:
 2. No unquarantined flaky tests in the interop matrix.
 3. [`CHANGELOG.md`](../CHANGELOG.md) has an entry for the release, and the
    version bump matches the [SemVer policy](../CHANGELOG.md#semver-policy) — see
-   [gate 14](#14-changelog-and-version-classification).
+   [gate 12](#12-changelog-and-version-classification).
 
 ---
 
@@ -18,17 +18,18 @@ Before tagging a release candidate:
 just release-gate
 ```
 
-This runs every implemented mandatory gate in sequence. Individual gates can be
-run independently — `just --list` shows them all, and each section below names
-the recipe alongside the raw command.
+This runs every mandatory gate in sequence. Individual gates can be run
+independently — `just --list` shows them all, and each section below names the
+recipe alongside the raw command.
 
 `just ci` is the faster pre-push subset (lint + strict check + tests + feature
 matrix), matching what the CI `lint` and `check-test` jobs run.
 
-Two gates below are **not** implemented: the test-quarantine gate (gate 5) and
-the spool hygiene benchmark gate (gate 13). Both cite scripts that do not exist
-in this repository. Until they are written, `just release-gate` skips them and
-says so.
+Every gate documented below exists and runs. Two aspirational gates — a
+test-quarantine validator and a spool-hygiene benchmark regression check — were
+described here in full, including tunable environment variables, while their
+scripts had never been written. They were removed in 0.13.0: a checklist that
+lists gates nobody can run teaches readers to skip the checklist.
 
 ---
 
@@ -61,18 +62,7 @@ just test-sweep
 
 This preserves full integration coverage while emitting per-suite output that makes failures easier to localize than a single broad `cargo test --all-features` invocation.
 
-### 5. Test quarantine validation — **not implemented**
-
-```bash
-bash scripts/check_test_quarantine.sh docs/test-quarantine.txt   # script does not exist
-```
-
-Intended to validate that all entries in the quarantine file are still
-referenced in the test suite. Neither `scripts/check_test_quarantine.sh` nor
-`docs/test-quarantine.txt` exists; no `just` recipe wraps it. Either write both
-or drop this gate.
-
-### 6. Interop matrix gate
+### 5. Interop matrix gate
 
 ```bash
 just interop-matrix   # bash scripts/run_interop_matrix.sh
@@ -80,7 +70,7 @@ just interop-matrix   # bash scripts/run_interop_matrix.sh
 
 Runs the full interop fixture corpus. Exits non-zero if any fixture fails or any flaky fixture lacks a quarantine entry.
 
-### 7. WS-Security vector gate
+### 6. WS-Security vector gate
 
 ```bash
 just wssec-vectors    # bash scripts/run_wssec_vector_gate.sh
@@ -88,7 +78,7 @@ just wssec-vectors    # bash scripts/run_wssec_vector_gate.sh
 
 Validates all C14N golden vectors and strict WS-Security matrix scenarios.
 
-### 8. Profile / interop coverage gate
+### 7. Profile / interop coverage gate
 
 ```bash
 just profile-coverage # bash scripts/check_profile_coverage.sh 85 src/interop.rs
@@ -96,7 +86,7 @@ just profile-coverage # bash scripts/check_profile_coverage.sh 85 src/interop.rs
 
 Enforces ≥85% line coverage on `src/interop.rs` using `cargo llvm-cov`.
 
-### 9. Adversarial fuzz gate
+### 8. Adversarial fuzz gate
 
 ```bash
 just fuzz-gate        # bash scripts/run_fuzz_gate.sh 4000 2500 artifacts/fuzz
@@ -104,7 +94,7 @@ just fuzz-gate        # bash scripts/run_fuzz_gate.sh 4000 2500 artifacts/fuzz
 
 Arguments: `[iterations] [budget_ms] [output_dir]`. Runs 4000 iterations with a 2500 ms budget per target.
 
-### 10. Feature matrix compile checks
+### 9. Feature matrix compile checks
 
 ```bash
 just matrix
@@ -112,7 +102,7 @@ just matrix
 
 Compiles **and tests** each combination from the CI matrix.
 
-### 11. Performance gate
+### 10. Performance gate
 
 ```bash
 just perf-gate
@@ -125,7 +115,7 @@ to compile a `--release` build with the `testing` feature (it disables
 WS-Security enforcement gates), so `cargo run --release -p xtask --all-features`
 fails to build. `just perf-gate` uses the same feature set as CI.
 
-### 12. Hygiene scan
+### 11. Hygiene scan
 
 ```bash
 just hygiene
@@ -138,26 +128,9 @@ file, which names the markers to describe the gate) and `src tests benches` for
 Any matches are blocking. Deprecation scanning is intentionally code-focused to
 avoid false positives from descriptive documentation text.
 
-### 13. Spool hygiene benchmark regression gate — **not implemented**
-
-```bash
-bash scripts/check_spool_hygiene_bench.sh 20 0.2 0.6   # script does not exist
-```
-
-Runs the dedicated startup-heavy and steady-state spool hygiene Criterion lanes,
-then validates broad, anti-flaky regression invariants from
-`target/criterion/.../new/estimates.json` slope estimates.
-
-Default thresholds can be tuned via environment variables:
-`ASX_SPOOL_HYGIENE_MAX_ENABLED_UNIQUE_NS`,
-`ASX_SPOOL_HYGIENE_MAX_DISABLED_UNIQUE_NS`,
-`ASX_SPOOL_HYGIENE_MAX_STEADY_STATE_NS`,
-`ASX_SPOOL_HYGIENE_MIN_ENABLED_DISABLED_RATIO`, and
-`ASX_SPOOL_HYGIENE_MIN_ENABLED_STEADY_RATIO`.
-
 ---
 
-### 14. CHANGELOG and version classification
+### 12. CHANGELOG and version classification
 
 Every release adds a [`CHANGELOG.md`](../CHANGELOG.md) entry that separates the
 two kinds of change an integrator has to reason about:
@@ -189,7 +162,7 @@ Checklist for the entry:
 
 ## CI Workflow
 
-File: `.github/workflows/rust.yml`
+File: `.github/workflows/ci.yml`
 
 Required jobs (all must be green for `release-candidate-gate` to pass):
 
@@ -227,7 +200,6 @@ There is no manual override path in the release workflow. All jobs must pass.
 - [ ] `just matrix` — every CI feature combination compiles and tests
 - [ ] `just perf-gate` — no operation regresses >25%
 - [ ] `just hygiene` — no TODO/FIXME/HACK and no code-level deprecated markers
-- [ ] ~~Spool hygiene benchmark gate~~ — gate 13 is not implemented
 - [ ] `docs/perf-baseline.txt` updated if performance characteristics changed
 - [ ] `Cargo.toml` version bumped per the [SemVer policy](../CHANGELOG.md#semver-policy)
 - [ ] `CHANGELOG.md` entry written, wire/crypto changes labelled separately from API changes

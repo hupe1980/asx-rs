@@ -1,4 +1,7 @@
-# Observability
++++
+title = "Observability"
+description = "The event bus, emission modes and backpressure, durable audit sinks, metrics, and how to wire asx-rs into your telemetry stack."
++++
 
 The `observability` module provides structured audit event emission, per-session event routing, configurable backpressure, and a durable audit sink trait for external persistence.
 
@@ -191,7 +194,7 @@ High-level APIs now default to strict subscriber requirements. Use explicit mode
 
 ## AuditEvent Reference
 
-All protocol operations emit a subset of the following events. See [AS2 Protocol Reference](as2.md#audit-events) and [AS4 Protocol Reference](as4.md#audit-events) for per-protocol tables.
+All protocol operations emit a subset of the following events. The list below is canonical; [the AS2 reference](@/docs/as2.md#audit-events) additionally maps them to AS2 send and receive stages.
 
 ```rust
 pub struct AuditEvent {
@@ -347,7 +350,7 @@ Library scope note:
 
 ### Companion adapter guidance
 
-Use [incident-channel-companion-guidance.md](incident-channel-companion-guidance.md) when building vendor-specific paging/webhook adapters in a companion crate.
+Use [incident-channel-companion-guidance.md](@/docs/incident-channels.md) when building vendor-specific paging/webhook adapters in a companion crate.
 
 It includes:
 1. Trait-first adapter patterns for `As4ReceiptTaxonomyIncidentChannel` and `As2ProviderHealthIncidentChannel`.

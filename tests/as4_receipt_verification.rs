@@ -92,6 +92,7 @@ fn send_request(
         policy,
         credentials: Some(credentials),
         payload_filename: None,
+        ..As4SendRequest::default()
     }
 }
 

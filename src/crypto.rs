@@ -1,6 +1,7 @@
 #[cfg(feature = "as2")]
 pub mod as2_smime;
-#[cfg(feature = "compression")]
+// Always available: a receiver must be able to *detect* a compressed payload and
+// fail with a clear message even when the `compression` feature is off.
 pub mod compression;
 #[cfg(any(feature = "as2", feature = "as4", feature = "async-ocsp"))]
 pub mod ocsp_client;

@@ -731,6 +731,35 @@ pub struct As4SendPolicy {
     /// unregistered services or a specific scheme URI for Peppol/CEF networks.
     /// Defaults to `"example"`.
     pub service_type: String,
+    /// Explicit `<eb:From>/<eb:PartyId>` value.
+    ///
+    /// When `None`, the session id is used — acceptable for closed loops where
+    /// both ends are asx, but a real counterparty resolves its P-Mode against
+    /// this value, so production sends should always set it to the party
+    /// identifier from the trading-partner agreement.
+    pub from_party_id: Option<String>,
+    /// Explicit `<eb:To>/<eb:PartyId>` value. Defaults to the session's
+    /// partner id when `None`; same caveat as [`Self::from_party_id`].
+    pub to_party_id: Option<String>,
+    /// `type` attribute of the From `<eb:PartyId>`. `None` omits the
+    /// attribute (an *untyped* identifier). Defaults to the ebCore
+    /// "unregistered" scheme. Typed and untyped identifiers with identical
+    /// text do **not** match during P-Mode resolution — this must mirror the
+    /// counterparty's P-Mode exactly.
+    pub from_party_id_type: Option<String>,
+    /// `type` attribute of the To `<eb:PartyId>`; see [`Self::from_party_id_type`].
+    pub to_party_id_type: Option<String>,
+    /// `<eb:From>/<eb:Role>` — REQUIRED by the ebMS3 schema. Defaults to the
+    /// ebMS3 default-role URI.
+    pub from_role: String,
+    /// `<eb:To>/<eb:Role>` — REQUIRED by the ebMS3 schema. Defaults to the
+    /// ebMS3 default-role URI.
+    pub to_role: String,
+    /// Optional `<eb:AgreementRef>` naming the trading-partner agreement this
+    /// exchange runs under (first child of `CollaborationInfo`).
+    pub agreement_ref: Option<String>,
+    /// `type` attribute of `<eb:AgreementRef>`.
+    pub agreement_ref_type: Option<String>,
     /// Optional `<eb:RefToMessageId>` for **Two-Way/Push-and-Push MEP**.
     ///
     /// When `Some(id)`, the outbound SOAP envelope includes
@@ -775,7 +804,7 @@ impl Default for As4SendPolicy {
     fn default() -> Self {
         Self {
             interop: InteropMode::Strict,
-            outbound_key_info_profile: WsSecOutboundKeyInfoProfile::X509DataAndRsaKeyValue,
+            outbound_key_info_profile: WsSecOutboundKeyInfoProfile::BinarySecurityTokenX509v3,
             fail_closed_audit_events: true,
             sign: true,
             encrypt: false,
@@ -785,6 +814,18 @@ impl Default for As4SendPolicy {
             action: "urn:example:action".into(),
             service: "http://example.org/example".into(),
             service_type: "example".into(),
+            from_party_id: None,
+            to_party_id: None,
+            from_party_id_type: Some(
+                crate::crypto::soap_builder::EBCORE_PARTY_ID_TYPE_UNREGISTERED.into(),
+            ),
+            to_party_id_type: Some(
+                crate::crypto::soap_builder::EBCORE_PARTY_ID_TYPE_UNREGISTERED.into(),
+            ),
+            from_role: crate::crypto::soap_builder::EBMS_DEFAULT_ROLE.into(),
+            to_role: crate::crypto::soap_builder::EBMS_DEFAULT_ROLE.into(),
+            agreement_ref: None,
+            agreement_ref_type: None,
             ref_to_message_id: None,
             original_sender: None,
             final_recipient: None,
@@ -814,7 +855,7 @@ impl As4SendPolicy {
     pub fn regulated() -> Self {
         Self {
             interop: InteropMode::Strict,
-            outbound_key_info_profile: WsSecOutboundKeyInfoProfile::X509DataAndRsaKeyValue,
+            outbound_key_info_profile: WsSecOutboundKeyInfoProfile::BinarySecurityTokenX509v3,
             fail_closed_audit_events: true,
             sign: true,
             encrypt: false,
@@ -824,6 +865,18 @@ impl As4SendPolicy {
             action: "urn:example:action".into(),
             service: "http://example.org/example".into(),
             service_type: "example".into(),
+            from_party_id: None,
+            to_party_id: None,
+            from_party_id_type: Some(
+                crate::crypto::soap_builder::EBCORE_PARTY_ID_TYPE_UNREGISTERED.into(),
+            ),
+            to_party_id_type: Some(
+                crate::crypto::soap_builder::EBCORE_PARTY_ID_TYPE_UNREGISTERED.into(),
+            ),
+            from_role: crate::crypto::soap_builder::EBMS_DEFAULT_ROLE.into(),
+            to_role: crate::crypto::soap_builder::EBMS_DEFAULT_ROLE.into(),
+            agreement_ref: None,
+            agreement_ref_type: None,
             ref_to_message_id: None,
             original_sender: None,
             final_recipient: None,
@@ -928,6 +981,52 @@ impl As4SendPolicyBuilder {
     pub fn service(mut self, service: impl Into<String>, service_type: impl Into<String>) -> Self {
         self.policy.service = service.into();
         self.policy.service_type = service_type.into();
+        self
+    }
+
+    /// Set the `<eb:From>/<eb:PartyId>` value explicitly.
+    ///
+    /// A real counterparty resolves its P-Mode against this identifier, so
+    /// production sends should always set it (the fallback — the session id —
+    /// only works when both ends are asx).
+    pub fn from_party(mut self, id: impl Into<String>) -> Self {
+        self.policy.from_party_id = Some(id.into());
+        self
+    }
+
+    /// Set the `<eb:To>/<eb:PartyId>` value explicitly.
+    pub fn to_party(mut self, id: impl Into<String>) -> Self {
+        self.policy.to_party_id = Some(id.into());
+        self
+    }
+
+    /// Set the `type` attribute of both `<eb:PartyId>` elements.
+    ///
+    /// `None` omits the attribute (an *untyped* identifier, e.g. for Holodeck
+    /// B2B's example P-Modes). The default is the ebCore "unregistered"
+    /// scheme. Must mirror the counterparty's P-Mode exactly — typed and
+    /// untyped identifiers with the same text do not match.
+    pub fn party_id_types(mut self, from_type: Option<String>, to_type: Option<String>) -> Self {
+        self.policy.from_party_id_type = from_type;
+        self.policy.to_party_id_type = to_type;
+        self
+    }
+
+    /// Set the mandatory `<eb:Role>` values (default: ebMS3 default-role URI).
+    pub fn roles(mut self, from_role: impl Into<String>, to_role: impl Into<String>) -> Self {
+        self.policy.from_role = from_role.into();
+        self.policy.to_role = to_role.into();
+        self
+    }
+
+    /// Emit `<eb:AgreementRef>` naming the trading-partner agreement.
+    pub fn agreement_ref(
+        mut self,
+        agreement: impl Into<String>,
+        agreement_type: Option<String>,
+    ) -> Self {
+        self.policy.agreement_ref = Some(agreement.into());
+        self.policy.agreement_ref_type = agreement_type;
         self
     }
 
@@ -1703,26 +1802,56 @@ pub struct As4PullPolicy {
     /// When `true` (the default), protocol event emission failures fail the
     /// pull receive operation (fail-closed audit semantics).
     pub fail_closed_audit_events: bool,
-    /// When `Some`, the pull receive path enforces that the incoming
-    /// `<eb:AuthorizationInfo>` element matches this exact value (constant-time
-    /// comparison).  A mismatch yields [`ErrorCode::SecurityVerificationFailed`].
+    /// How a `PullRequest` proves it may drain this MPC.
     ///
-    /// When `None`, no `AuthorizationInfo` check is performed — **any caller
-    /// can pull messages from this MPC partition without authentication**.
+    /// Defaults to [`As4PullAuthorization::Deny`] — see that type for why there
+    /// is no "unauthenticated" default.
+    pub authorization: As4PullAuthorization,
+}
+
+/// How the pull receive path authorizes a `PullRequest` for an MPC.
+///
+/// Pull inverts the usual trust direction. In push, the sender proves who it is
+/// by signing a message it hands you. In pull, a peer asks you to *hand over*
+/// queued messages, and the ebMS3 `PullRequest` signal carries no signature —
+/// so the only thing standing between a caller and another party's business
+/// documents is this check. An MPC URI is not a secret: it appears in P-Mode
+/// configuration, agreements, and log lines.
+///
+/// ebMS3 §5.2.3.1 makes `eb:AuthorizationInfo` optional *at the protocol
+/// level*, which is why this is a policy decision rather than a wire
+/// requirement. It is not an invitation to skip it: the flexibility exists for
+/// deployments where the transport layer owns the boundary, and that is
+/// [`EnforcedByTransport`](Self::EnforcedByTransport) — a choice you make
+/// explicitly, not one you fall into.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum As4PullAuthorization {
+    /// Reject every `PullRequest`. **The default.**
     ///
-    /// # ⚠ Security: unauthenticated pull access
+    /// An MPC with no configured authorization must not serve messages. This
+    /// makes the insecure configuration unreachable by omission: you cannot
+    /// leave pull open by forgetting to set a field, only by choosing one of
+    /// the variants below.
+    #[default]
+    Deny,
+
+    /// Compare `eb:AuthorizationInfo` against a shared secret in constant time.
     ///
-    /// Per ebMS3 §5.2.3.1, `eb:PullRequest/eb:AuthorizationInfo` is optional
-    /// at the protocol level, but that flexibility was designed for deployments
-    /// where the transport layer (e.g., mTLS) owns the pull authorisation
-    /// boundary.  Without mTLS or `expected_authorization_info`, the pull
-    /// endpoint is effectively open to any party that knows the MPC URI.
+    /// Use a random, high-entropy value agreed with the pulling party — this is
+    /// a bearer credential travelling in the SOAP body, so treat it like a
+    /// password, not like an identifier.
+    SharedSecret(String),
+
+    /// Authorization happens before the request reaches this library.
     ///
-    /// **Regulated networks (PEPPOL, CEF eDelivery) require pull authentication.**
-    /// Set this field to a random, high-entropy secret shared with the pulling
-    /// party, or enforce pull access via mTLS at the reverse proxy / load
-    /// balancer before the request reaches this library.
-    pub expected_authorization_info: Option<String>,
+    /// Select this only when something upstream — mutually-authenticated TLS
+    /// terminating at a reverse proxy, an API gateway mapping client
+    /// certificates to MPCs — has already established that this caller may
+    /// drain this MPC. The library then performs no check of its own.
+    ///
+    /// Choosing this without such a control in place makes the endpoint open to
+    /// anyone who knows the MPC URI.
+    EnforcedByTransport,
 }
 
 const DEFAULT_MPC: &str =
@@ -1737,7 +1866,7 @@ impl Default for As4PullPolicy {
             require_signed_receipt: true,
             require_signed_push: true,
             fail_closed_audit_events: true,
-            expected_authorization_info: None,
+            authorization: As4PullAuthorization::Deny,
         }
     }
 }
@@ -1760,7 +1889,7 @@ impl As4PullPolicy {
             require_signed_receipt: true,
             require_signed_push: true,
             fail_closed_audit_events: true,
-            expected_authorization_info: None,
+            authorization: As4PullAuthorization::Deny,
         }
     }
 
@@ -1816,8 +1945,12 @@ impl As4PullPolicyBuilder {
         self
     }
 
-    pub fn expected_authorization_info(mut self, auth: Option<String>) -> Self {
-        self.0.expected_authorization_info = auth;
+    /// Set how `PullRequest`s are authorized for this MPC.
+    ///
+    /// Without this call the policy denies every pull — see
+    /// [`As4PullAuthorization`].
+    pub fn authorization(mut self, authorization: As4PullAuthorization) -> Self {
+        self.0.authorization = authorization;
         self
     }
 
@@ -1841,12 +1974,15 @@ impl As4PullPolicyBuilder {
             ));
         }
 
-        if let Some(ref auth) = self.0.expected_authorization_info
-            && auth.trim().is_empty()
+        // An empty shared secret would compare equal to an absent
+        // AuthorizationInfo, silently degrading SharedSecret into "allow all".
+        if let As4PullAuthorization::SharedSecret(ref secret) = self.0.authorization
+            && secret.trim().is_empty()
         {
             return Err(AsxError::new(
                 ErrorCode::InvalidInput,
-                "As4PullPolicy.expected_authorization_info must not be empty when set",
+                "As4PullAuthorization::SharedSecret must not be empty — an empty secret \
+                 matches an absent eb:AuthorizationInfo and would authorize every caller",
                 ErrorContext::new(stage),
             ));
         }
@@ -1860,9 +1996,9 @@ pub struct As4ReceivePullRequest {
     pub pull_message_id: String,
     pub policy: As4PullPolicy,
     pub receipt_payload: Option<Vec<u8>>,
-    /// The `<eb:AuthorizationInfo>` value extracted from the incoming `<eb:PullRequest>`
-    /// element, if present.  Matched against `policy.expected_authorization_info` when
-    /// that field is `Some`.
+    /// The `<eb:AuthorizationInfo>` value extracted from the incoming
+    /// `<eb:PullRequest>` element, if present. Checked according to
+    /// [`As4PullPolicy::authorization`].
     pub authorization_info: Option<String>,
 }
 

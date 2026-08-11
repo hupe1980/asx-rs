@@ -1,3 +1,5 @@
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use openssl::asn1::Asn1Time;
 use openssl::hash::MessageDigest;
 use openssl::nid::Nid;
@@ -7,6 +9,7 @@ use openssl::pkey::PKey;
 use openssl::stack::Stack;
 use openssl::x509::store::X509StoreBuilder;
 use openssl::x509::{X509, X509Crl, X509Ref};
+use std::borrow::Cow;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::core::{AsxError, ErrorCode, ErrorContext, OcspFailureMode, OcspMode, Result};
@@ -36,7 +39,7 @@ pub struct As2SmimeVerificationOptions<'a> {
 pub fn verify_smime_signed_payload(
     payload: &[u8],
     options: As2SmimeVerificationOptions<'_>,
-) -> Result<()> {
+) -> Result<VerifiedSmimeEntity> {
     if options.revocation_policy.trust_anchor_pems.is_empty() {
         return Err(AsxError::new(
             ErrorCode::SecurityVerificationFailed,
@@ -258,7 +261,149 @@ pub fn verify_smime_signed_payload(
         options.revocation_policy.ocsp_cache_namespace,
     )?;
 
-    Ok(())
+    // For a detached (`multipart/signed`) signature OpenSSL hands back the exact
+    // octets that were signed; for opaque `signed-data` it writes the
+    // encapsulated content into `verified_payload`.  Either way this is the MIME
+    // entity RFC 4130 §7.3.1 requires the MIC to be computed over — return it
+    // instead of discarding it.
+    let entity = detached_content.unwrap_or(verified_payload);
+    Ok(VerifiedSmimeEntity::from_entity_bytes(entity))
+}
+
+/// The MIME entity a CMS `SignedData` actually covered.
+///
+/// AS2 signs a complete MIME entity — headers *and* content — so both halves
+/// matter downstream:
+///
+/// - [`entity`](Self::entity) is the exact signed octet sequence and is the
+///   input to the RFC 4130 §7.3.1 MIC. It must not be re-serialized or
+///   normalized, or the MIC will not match the sender's.
+/// - [`content`](Self::content) is the business document with the entity's MIME
+///   headers stripped — what the application actually wants.
+#[derive(Debug, Clone)]
+pub struct VerifiedSmimeEntity {
+    entity: Vec<u8>,
+    content_start: usize,
+}
+
+impl VerifiedSmimeEntity {
+    /// Split a signed MIME entity into its header block and content.
+    ///
+    /// A MIME entity separates headers from content with a blank line. If no
+    /// separator is present the whole buffer is treated as content, matching
+    /// how partners that sign bare payloads (no headers) behave.
+    pub fn from_entity_bytes(entity: Vec<u8>) -> Self {
+        let content_start = find_mime_header_break(&entity).unwrap_or(0);
+        Self {
+            entity,
+            content_start,
+        }
+    }
+
+    /// Exact signed octets (headers + content) — the RFC 4130 §7.3.1 MIC input.
+    pub fn entity(&self) -> &[u8] {
+        &self.entity
+    }
+
+    /// The entity content with MIME headers stripped, still transfer-encoded.
+    ///
+    /// Prefer [`decoded_content`](Self::decoded_content) unless you specifically
+    /// need the wire form.
+    pub fn content(&self) -> &[u8] {
+        &self.entity[self.content_start..]
+    }
+
+    /// The entity content with its `Content-Transfer-Encoding` reversed.
+    ///
+    /// Signed entities carrying binary payloads are base64-encoded per RFC 5751
+    /// §3.1.1; handing that back undecoded would give the application base64
+    /// text where it expected its document.
+    pub fn decoded_content(&self) -> Result<Cow<'_, [u8]>> {
+        let encoding = header_value(self.headers(), "content-transfer-encoding")
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+
+        match encoding.trim() {
+            "base64" => {
+                // Line breaks are folding artefacts, not data.
+                let compact: Vec<u8> = self
+                    .content()
+                    .iter()
+                    .copied()
+                    .filter(|b| !b.is_ascii_whitespace())
+                    .collect();
+                let decoded = BASE64_STANDARD.decode(&compact).map_err(|err| {
+                    AsxError::new(
+                        ErrorCode::ParseFailed,
+                        format!("signed MIME entity has invalid base64 content: {err}"),
+                        ErrorContext::new("as2_smime_entity_decode"),
+                    )
+                })?;
+                Ok(Cow::Owned(decoded))
+            }
+            // `binary`, `8bit`, `7bit`, and an absent header all mean the
+            // content is already the payload octets.
+            _ => Ok(Cow::Borrowed(self.content())),
+        }
+    }
+
+    /// The entity's MIME header block (empty when the entity carried no headers).
+    pub fn headers(&self) -> &[u8] {
+        &self.entity[..self.content_start]
+    }
+
+    /// Value of the entity's `Content-Type` header, if present.
+    pub fn content_type(&self) -> Option<String> {
+        header_value(self.headers(), "content-type")
+    }
+
+    /// Consume the entity, returning the signed octets and the content offset.
+    pub fn into_parts(self) -> (Vec<u8>, usize) {
+        (self.entity, self.content_start)
+    }
+}
+
+/// Byte offset just past the `CRLF CRLF` (or `LF LF`) that ends a MIME header
+/// block. Returns `None` when the buffer contains no header/body separator.
+fn find_mime_header_break(bytes: &[u8]) -> Option<usize> {
+    let crlf = memchr::memmem::find(bytes, b"\r\n\r\n").map(|i| i + 4);
+    let lf = memchr::memmem::find(bytes, b"\n\n").map(|i| i + 2);
+    match (crlf, lf) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    }
+}
+
+/// Read a header value out of a raw MIME header block, unfolding continuation
+/// lines. Header names are matched case-insensitively per RFC 5322.
+fn header_value(headers: &[u8], wanted_lower: &str) -> Option<String> {
+    let text = String::from_utf8_lossy(headers);
+    let mut lines: Vec<String> = Vec::new();
+    for raw in text.split('\n') {
+        let line = raw.strip_suffix('\r').unwrap_or(raw);
+        if line.is_empty() {
+            continue;
+        }
+        // A leading space or tab continues the previous header (RFC 5322 §2.2.3
+        // folding); unfold it rather than treating it as a new header.
+        if let Some(last) = lines.last_mut()
+            && (line.starts_with(' ') || line.starts_with('\t'))
+        {
+            last.push(' ');
+            last.push_str(line.trim());
+            continue;
+        }
+        lines.push(line.to_string());
+    }
+
+    lines.iter().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name.trim()
+            .eq_ignore_ascii_case(wanted_lower)
+            .then(|| value.trim().to_string())
+    })
 }
 
 fn is_revoked(cert: &X509Ref, crls: &[X509Crl]) -> Result<bool> {
@@ -628,7 +773,12 @@ fn normalize_fingerprint(value: Option<&str>) -> Option<String> {
     })
 }
 
-/// Sign an AS2 payload with S/MIME (CMS) using the provided certificate and key
+/// Sign a prepared AS2 MIME entity with S/MIME (CMS).
+///
+/// `entity` must be the complete MIME entity to sign — headers, a blank line,
+/// then content — because that is exactly what RFC 4130 §7.3.1 makes the MIC
+/// input. Build it with [`crate::as2::build_mime_entity`] so the payload's real
+/// `Content-Type` travels on the wire.
 pub fn sign_smime_message(
     payload: &[u8],
     signing_key_pem: &[u8],
@@ -673,30 +823,29 @@ pub fn sign_smime_message_preparsed(
         )
     })?;
 
-    let pkcs7 = Pkcs7::sign(
-        signing_cert,
-        signing_key,
-        &certs,
-        payload,
-        Pkcs7Flags::DETACHED | Pkcs7Flags::TEXT,
-    )
-    .map_err(|err| {
-        AsxError::new(
-            ErrorCode::SecurityVerificationFailed,
-            format!("failed to create S/MIME signed message: {err}"),
-            ErrorContext::new("as2_smime_sign"),
-        )
-    })?;
+    // No `Pkcs7Flags::TEXT`: that flag makes OpenSSL prepend its own
+    // `Content-Type: text/plain` to the signed content, which would overwrite
+    // the payload's real media type (application/edi-x12, EDIFACT, XML, …) and
+    // desynchronize the MIC from what the caller believes it sent. The caller
+    // supplies a fully-formed MIME entity instead.
+    let sign_flags = Pkcs7Flags::DETACHED | Pkcs7Flags::BINARY;
 
-    let signed_data = pkcs7
-        .to_smime(payload, Pkcs7Flags::DETACHED | Pkcs7Flags::TEXT)
-        .map_err(|err| {
+    let pkcs7 =
+        Pkcs7::sign(signing_cert, signing_key, &certs, payload, sign_flags).map_err(|err| {
             AsxError::new(
                 ErrorCode::SecurityVerificationFailed,
-                format!("failed to encode S/MIME signed message: {err}"),
-                ErrorContext::new("as2_smime_sign_encode"),
+                format!("failed to create S/MIME signed message: {err}"),
+                ErrorContext::new("as2_smime_sign"),
             )
         })?;
+
+    let signed_data = pkcs7.to_smime(payload, sign_flags).map_err(|err| {
+        AsxError::new(
+            ErrorCode::SecurityVerificationFailed,
+            format!("failed to encode S/MIME signed message: {err}"),
+            ErrorContext::new("as2_smime_sign_encode"),
+        )
+    })?;
 
     Ok(signed_data)
 }

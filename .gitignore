@@ -28,3 +28,5 @@ CONCEPT.md
 FINDINGS.md
 REVIEW.md
 .DS_Store
+# Zola build output
+site/public/
