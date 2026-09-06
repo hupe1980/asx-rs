@@ -147,9 +147,8 @@ fn multipart_content_id_matching_accepts_mixed_case_cid_prefix() {
 }
 
 /// ebMS3 allows several `eb:PartInfo` entries per `UserMessage`, and the
-/// eDelivery conformance payload profiles exercise four. All of them must
-/// be resolved — the receive path used to surface only the first and drop
-/// the rest silently.
+/// eDelivery conformance payload profiles exercise four. Every one must be
+/// resolved; surfacing only the first drops business documents silently.
 #[test]
 fn multipart_resolves_every_referenced_payload_in_document_order() {
     let session = SessionContext::new("s-multipart-multi", "p1", "strict")
@@ -3298,10 +3297,9 @@ async fn pull_store_served_cache_limit_evicts_oldest_pull_id() {
     .await
     .expect("old pull id replay");
     // The served-cache entry for `pull-1` has been evicted, but the dedup
-    // backend still knows the MessageId. The replay is therefore reported
-    // as a duplicate and — crucially — must not dequeue anything further.
-    // (This previously asserted `!duplicate_retrieval`, encoding the bug
-    // where an evicted replay fell through to a fresh dequeue.)
+    // backend still knows the MessageId. The replay is therefore a duplicate
+    // and must not dequeue anything further: an evicted replay falling through
+    // to a fresh dequeue hands the caller someone else's next message.
     assert!(replay_old_id.duplicate_retrieval);
     assert!(replay_old_id.pulled.is_none());
 }

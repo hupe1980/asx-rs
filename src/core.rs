@@ -1317,8 +1317,8 @@ pub struct CorrelationScope {
 
 /// Payload bytes supplied to AS2/AS4 send/receive operations.
 ///
-/// Consolidates the previously separate `As2PayloadInput` and `PushPayloadInput` types.
-/// `Shared` avoids a copy when the caller already holds an `Arc<[u8]>`.
+/// One payload type for both protocols. `Shared` avoids a copy when the caller
+/// already holds an `Arc<[u8]>`.
 #[non_exhaustive]
 #[derive(Debug)]
 pub enum PayloadInput<'a> {

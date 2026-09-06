@@ -361,9 +361,9 @@ fn build_signed_info_xml(
     sig_algo_uri: &str,
     c14n_algo_uri: &str,
 ) -> String {
-    // Build the Exclusive-C14N canonical form of ds:SignedInfo directly, without
-    // the costly format-string → roxmltree-parse → serialize round-trip that was
-    // previously used.
+    // Build the Exclusive-C14N canonical form of ds:SignedInfo directly, rather
+    // than round-tripping through a format string, a roxmltree parse and a
+    // serialize.
     //
     // The generated SignedInfo has a fixed, fully-determined structure:
     //   - `xmlns:ds` is declared on the root element and NOT re-declared on
@@ -469,12 +469,12 @@ mod tests {
     use crate::crypto::wssec::RSA_SHA256_URI;
     use std::collections::BTreeMap;
 
-    /// Verify that `build_signed_info_xml` + trivial `.as_bytes()` produces
-    /// byte-for-byte identical output to the old `roxmltree`-based round-trip
-    /// that was previously inside `canonicalize_signed_info_xml`.
+    /// `build_signed_info_xml` must produce byte-for-byte what a
+    /// `roxmltree` parse-and-serialize round-trip produces.
     ///
-    /// This test is the correctness guard that justifies the elimination of the
-    /// format→parse→serialize round-trip (P-R5 fix).
+    /// The direct construction is only safe while that holds: `ds:SignedInfo`
+    /// is what the signature is computed over, so a one-byte divergence is an
+    /// unverifiable signature.
     #[test]
     fn signed_info_canonical_bytes_match_roundtrip() {
         use roxmltree::Document;

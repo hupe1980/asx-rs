@@ -5,8 +5,10 @@
 #
 #   as2,as4,client,server,trace,compression,async-ocsp,interop-strict
 #
-# Local macOS runs come out faster; the gate allows a 25 % regression, so a
-# local check passing says little and a local check failing is worth reading.
+# Local macOS runs come out faster, but `as2_sign_encrypt` (RSA-2048 sign plus
+# encrypt) is load-sensitive: it has been observed between 1.0 ms and 7.0 ms on
+# one machine depending on what else was compiling. Measure on a quiet machine,
+# or a local failure will be the other work rather than the code.
 #
 # Only benchmarks this configuration compiles may appear here: an entry with no
 # matching measurement is a gate failure, not a skip. The receive-path

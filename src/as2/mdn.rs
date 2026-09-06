@@ -528,84 +528,123 @@ fn is_signed_mdn(parsed_mail: &ParsedMail<'_>) -> bool {
         .eq_ignore_ascii_case("multipart/signed")
 }
 
+/// The `message/disposition-notification` parts of a `multipart/report`.
+///
+/// Selected by media type. RFC 3798 §3 puts the machine-readable part second,
+/// but the type is what identifies it — picking by position means parsing
+/// whatever happens to sit there as the delivery verdict.
+fn disposition_notification_parts<'a>(report: &'a ParsedMail<'a>) -> Vec<&'a ParsedMail<'a>> {
+    report
+        .subparts
+        .iter()
+        .filter(|part| {
+            part.ctype
+                .mimetype
+                .eq_ignore_ascii_case("message/disposition-notification")
+        })
+        .collect()
+}
+
+/// Resolve the machine-readable part of a `multipart/report` MDN.
+///
+/// Two reports carrying two disposition notifications are ambiguous about the
+/// delivery outcome, so the ambiguity is refused rather than resolved by
+/// document order (D5).
+fn report_notification_part<'a>(
+    report: &'a ParsedMail<'a>,
+    policy: &As2ReceivePolicy,
+    session: &SessionContext,
+) -> Result<Option<&'a ParsedMail<'a>>> {
+    if report.subparts.is_empty() {
+        return Ok(None);
+    }
+
+    let strict = policy.interop_mode == InteropMode::Strict;
+
+    if strict && report.subparts.len() > 3 {
+        return Err(AsxError::new(
+            ErrorCode::InteropViolation,
+            "strict AS2 policy requires multipart/report to contain only the human-readable part, machine-readable part, and optional returned content",
+            super::ErrorContext::for_session("as2_receive_mdn_parse", session),
+        ));
+    }
+
+    let candidates = disposition_notification_parts(report);
+    if candidates.len() > 1 {
+        return Err(AsxError::new(
+            ErrorCode::InteropViolation,
+            "AS2 MDN multipart/report carries more than one message/disposition-notification \
+             part; refusing to choose one — the delivery outcome would be decided by document \
+             order",
+            super::ErrorContext::for_session("as2_receive_mdn_parse", session),
+        ));
+    }
+
+    match candidates.first().copied() {
+        // RFC 3798 §3 places the machine-readable part second.
+        Some(part) if strict && report.subparts.get(1).map(std::ptr::from_ref) != Some(part) => {
+            Err(AsxError::new(
+                ErrorCode::InteropViolation,
+                "strict AS2 policy requires multipart/report body part 2 to be message/disposition-notification",
+                super::ErrorContext::for_session("as2_receive_mdn_parse", session),
+            ))
+        }
+        Some(part) => Ok(Some(part)),
+        None if strict => Err(AsxError::new(
+            ErrorCode::InteropViolation,
+            "strict AS2 policy requires multipart/report body part 2 to be message/disposition-notification",
+            super::ErrorContext::for_session("as2_receive_mdn_parse", session),
+        )),
+        // Relaxed widens the *absent* case only: no machine-readable part means
+        // no verdict, never a verdict read out of another part (D12).
+        None => Ok(None),
+    }
+}
+
+/// Locate the part carrying the MDN's machine-readable fields.
+///
+/// A signed MDN gets the same treatment as an unsigned one. The signed content
+/// must itself be a disposition notification or a report; anything else is not
+/// an MDN, and reading a `Disposition:` line out of it would let a counterparty
+/// choose the delivery outcome by putting the header in a human-readable part.
 fn resolve_mdn_notification_part<'a>(
     parsed_mail: &'a ParsedMail<'a>,
     policy: &As2ReceivePolicy,
     session: &SessionContext,
 ) -> Result<Option<&'a ParsedMail<'a>>> {
     if is_report_mdn(parsed_mail) {
-        if parsed_mail.subparts.is_empty() {
-            return Ok(None);
-        }
-
-        if policy.interop_mode == InteropMode::Strict && parsed_mail.subparts.len() > 3 {
-            return Err(AsxError::new(
-                ErrorCode::InteropViolation,
-                "strict AS2 policy requires multipart/report to contain only the human-readable part, machine-readable part, and optional returned content",
-                super::ErrorContext::for_session("as2_receive_mdn_parse", session),
-            ));
-        }
-
-        if policy.interop_mode == InteropMode::Strict && parsed_mail.subparts.len() < 2 {
-            return Err(AsxError::new(
-                ErrorCode::InteropViolation,
-                "strict AS2 policy requires multipart/report body part 2 to be message/disposition-notification",
-                super::ErrorContext::for_session("as2_receive_mdn_parse", session),
-            ));
-        }
-
-        let notification_part = parsed_mail.subparts.get(1).filter(|part| {
-            part.ctype
-                .mimetype
-                .eq_ignore_ascii_case("message/disposition-notification")
-        });
-
-        if notification_part.is_none() && policy.interop_mode == InteropMode::Strict {
-            return Err(AsxError::new(
-                ErrorCode::InteropViolation,
-                "strict AS2 policy requires multipart/report body part 2 to be message/disposition-notification",
-                super::ErrorContext::for_session("as2_receive_mdn_parse", session),
-            ));
-        }
-
-        return Ok(notification_part.or_else(|| {
-            parsed_mail.subparts.iter().find(|part| {
-                part.ctype
-                    .mimetype
-                    .eq_ignore_ascii_case("message/disposition-notification")
-            })
-        }));
+        return report_notification_part(parsed_mail, policy, session);
     }
 
     if is_signed_mdn(parsed_mail) {
-        let first = parsed_mail.subparts.first();
-        if let Some(first) = first {
-            if first
-                .ctype
-                .mimetype
-                .eq_ignore_ascii_case("message/disposition-notification")
-            {
-                return Ok(Some(first));
-            }
+        let Some(signed) = parsed_mail.subparts.first() else {
+            return Ok(None);
+        };
 
-            if first
-                .ctype
-                .mimetype
-                .eq_ignore_ascii_case("multipart/report")
-            {
-                return Ok(first
-                    .subparts
-                    .iter()
-                    .find(|part| {
-                        part.ctype
-                            .mimetype
-                            .eq_ignore_ascii_case("message/disposition-notification")
-                    })
-                    .or_else(|| first.subparts.get(1)));
-            }
-
-            return Ok(Some(first));
+        if signed
+            .ctype
+            .mimetype
+            .eq_ignore_ascii_case("message/disposition-notification")
+        {
+            return Ok(Some(signed));
         }
+
+        if is_report_mdn(signed) {
+            return report_notification_part(signed, policy, session);
+        }
+
+        if policy.interop_mode == InteropMode::Strict {
+            return Err(AsxError::new(
+                ErrorCode::InteropViolation,
+                format!(
+                    "AS2 signed MDN content is '{}'; a disposition notification must be \
+                     message/disposition-notification or multipart/report",
+                    signed.ctype.mimetype
+                ),
+                super::ErrorContext::for_session("as2_receive_mdn_parse", session),
+            ));
+        }
+        return Ok(None);
     }
 
     Ok(None)
@@ -647,5 +686,164 @@ mod mic_match_tests {
             &format!("{digest}, sha-256"),
             &format!("{digest}, md5")
         ));
+    }
+}
+
+#[cfg(test)]
+mod notification_part_tests {
+    use super::*;
+
+    fn policy(mode: InteropMode) -> As2ReceivePolicy {
+        As2ReceivePolicy {
+            interop_mode: mode,
+            ..As2ReceivePolicy::default()
+        }
+    }
+
+    fn session() -> SessionContext {
+        SessionContext::new("s", "p", "strict").expect("session")
+    }
+
+    /// The interop modes this build compiles. `Relaxed` exists only under the
+    /// `interop-relaxed` feature.
+    fn modes() -> Vec<InteropMode> {
+        #[cfg(feature = "interop-relaxed")]
+        {
+            vec![InteropMode::Strict, InteropMode::Relaxed]
+        }
+        #[cfg(not(feature = "interop-relaxed"))]
+        {
+            vec![InteropMode::Strict]
+        }
+    }
+
+    fn signed_mdn(inner: &str) -> String {
+        format!(
+            "Content-Type: multipart/signed; protocol=\"application/pkcs7-signature\"; \
+             micalg=sha-256; boundary=SIG\r\n\r\n\
+             --SIG\r\n{inner}\r\n\
+             --SIG\r\n\
+             Content-Type: application/pkcs7-signature\r\n\r\n\
+             signature-bytes\r\n\
+             --SIG--\r\n"
+        )
+    }
+
+    /// A report with no `message/disposition-notification` part yields no
+    /// verdict. Falling back to the part at index 1 lets a counterparty put a
+    /// forged `Disposition:` line in a human-readable part and have it read as
+    /// the delivery outcome.
+    #[test]
+    fn signed_report_without_a_machine_readable_part_yields_no_verdict() {
+        let raw = signed_mdn(concat!(
+            "Content-Type: multipart/report; report-type=disposition-notification; ",
+            "boundary=REP\r\n\r\n",
+            "--REP\r\n",
+            "Content-Type: text/plain\r\n\r\n",
+            "The message was rejected.\r\n",
+            "--REP\r\n",
+            "Content-Type: text/plain\r\n\r\n",
+            "Disposition: automatic-action/MDN-sent-automatically; processed\r\n",
+            "--REP--"
+        ));
+        let parsed = mailparse::parse_mail(raw.as_bytes()).expect("parse");
+
+        let err = resolve_mdn_notification_part(&parsed, &policy(InteropMode::Strict), &session())
+            .expect_err("strict must refuse a report with no machine-readable part");
+        assert_eq!(err.code, ErrorCode::InteropViolation);
+
+        // Relaxed widens the absent case only — no verdict, not a wrong one.
+        #[cfg(feature = "interop-relaxed")]
+        {
+            let relaxed =
+                resolve_mdn_notification_part(&parsed, &policy(InteropMode::Relaxed), &session())
+                    .expect("relaxed tolerates the absence");
+            assert!(
+                relaxed.is_none(),
+                "a forged Disposition in a text/plain part must never become the verdict"
+            );
+        }
+    }
+
+    /// Signed content that is not an MDN at all is not an MDN.
+    #[test]
+    fn signed_content_that_is_not_an_mdn_is_refused() {
+        let raw = signed_mdn(concat!(
+            "Content-Type: text/html\r\n\r\n",
+            "<p>Disposition: automatic-action/MDN-sent-automatically; processed</p>"
+        ));
+        let parsed = mailparse::parse_mail(raw.as_bytes()).expect("parse");
+
+        let err = resolve_mdn_notification_part(&parsed, &policy(InteropMode::Strict), &session())
+            .expect_err("strict must refuse non-MDN signed content");
+        assert!(err.message.contains("text/html"), "{}", err.message);
+        #[cfg(feature = "interop-relaxed")]
+        assert!(
+            resolve_mdn_notification_part(&parsed, &policy(InteropMode::Relaxed), &session())
+                .expect("relaxed does not error")
+                .is_none()
+        );
+    }
+
+    /// The well-formed shape still resolves, signed and unsigned alike.
+    #[test]
+    fn a_conformant_signed_report_resolves_its_machine_readable_part() {
+        let raw = signed_mdn(concat!(
+            "Content-Type: multipart/report; report-type=disposition-notification; ",
+            "boundary=REP\r\n\r\n",
+            "--REP\r\n",
+            "Content-Type: text/plain\r\n\r\n",
+            "The message was processed.\r\n",
+            "--REP\r\n",
+            "Content-Type: message/disposition-notification\r\n\r\n",
+            "Disposition: automatic-action/MDN-sent-automatically; processed\r\n",
+            "--REP--"
+        ));
+        let parsed = mailparse::parse_mail(raw.as_bytes()).expect("parse");
+        for mode in modes() {
+            let part = resolve_mdn_notification_part(&parsed, &policy(mode), &session())
+                .expect("conformant MDN resolves")
+                .expect("machine-readable part present");
+            assert_eq!(part.ctype.mimetype, "message/disposition-notification");
+        }
+    }
+
+    /// Signed content that is *directly* a disposition notification is the
+    /// other conformant shape.
+    #[test]
+    fn signed_bare_disposition_notification_resolves() {
+        let raw = signed_mdn(concat!(
+            "Content-Type: message/disposition-notification\r\n\r\n",
+            "Disposition: automatic-action/MDN-sent-automatically; processed"
+        ));
+        let parsed = mailparse::parse_mail(raw.as_bytes()).expect("parse");
+        let part = resolve_mdn_notification_part(&parsed, &policy(InteropMode::Strict), &session())
+            .expect("resolves")
+            .expect("part present");
+        assert_eq!(part.ctype.mimetype, "message/disposition-notification");
+    }
+
+    /// Two machine-readable parts are two verdicts. Refuse rather than let
+    /// document order pick (D5).
+    #[test]
+    fn two_disposition_notification_parts_are_refused() {
+        let raw = concat!(
+            "Content-Type: multipart/report; report-type=disposition-notification; ",
+            "boundary=REP\r\n\r\n",
+            "--REP\r\n",
+            "Content-Type: message/disposition-notification\r\n\r\n",
+            "Disposition: automatic-action/MDN-sent-automatically; processed\r\n",
+            "--REP\r\n",
+            "Content-Type: message/disposition-notification\r\n\r\n",
+            "Disposition: automatic-action/MDN-sent-automatically; failed\r\n",
+            "--REP--\r\n"
+        );
+        let parsed = mailparse::parse_mail(raw.as_bytes()).expect("parse");
+        for mode in modes() {
+            let err = resolve_mdn_notification_part(&parsed, &policy(mode), &session())
+                .expect_err("two verdicts are ambiguous in every mode");
+            assert_eq!(err.code, ErrorCode::InteropViolation);
+            assert!(err.message.contains("more than one"), "{}", err.message);
+        }
     }
 }

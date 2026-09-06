@@ -188,6 +188,23 @@ changed without compatibility shims.
   not a shape that exists in this codebase; it was in the test guarding ordered
   delivery.
 
+### Wire / crypto — AS2 MDN
+
+- **A signed MDN could be made to report the wrong delivery outcome.** The
+  machine-readable part of a `multipart/report` was located positionally: if no
+  `message/disposition-notification` part existed, the code took whatever sat at
+  index 1. A counterparty placing `Disposition: … processed` in a human-readable
+  `text/plain` part therefore got that read as the verdict. Signed content of any
+  media type at all — `text/html`, anything — was likewise returned as the
+  notification part. Both were accepted in `InteropMode::Strict`: the signed
+  path, which carries non-repudiation of receipt, had none of the guards the
+  unsigned path had.
+
+  The part is now selected by media type, the signed content must itself be a
+  disposition notification or a report, and a report carrying two disposition
+  notifications is refused rather than resolved by document order. Relaxed mode
+  widens only the absent case: no machine-readable part means no verdict.
+
 ### Wire / crypto — HTTP ingress
 
 - **A repeated HTTP header was resolved first-wins.** `AS2-From` names the
@@ -382,6 +399,14 @@ changed without compatibility shims.
   renamed to `signature_policy`; and `EventBus::builder()` documented a return
   type that had lost its `pub use`, so the builder was unnameable by callers.
   `cargo doc` with `-D warnings` is now a CI job and a `just doc-links` gate.
+- **Two feature combinations did not build or test.** `transport::egress` was
+  gated on `client`, but the OCSP fetcher calls into it for the validate-and-pin
+  helper under `async-ocsp`, so `as2,async-ocsp` failed to compile. And the
+  ordered-receive tests disabled `fail_closed_audit_events`, which the policy
+  builder refuses outside `testing` builds, so they failed on every combination
+  without that feature. Both were invisible to `--all-features`, where `testing`
+  is always on; `just ci` now mirrors the CI matrix exactly and runs the feature
+  powerset, which is the gate that sees them.
 - **A test that could not fail.** `handler_outcome_constructors_build_expected_variants`
   wrote `matches!(..)` as a bare statement four times. `matches!` returns a
   `bool`, and a discarded `bool` is not `#[must_use]`, so the test passed

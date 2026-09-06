@@ -1022,11 +1022,10 @@ fn decrypt_aes_gcm_payload(
 /// profile uses sub-byte KDF inputs, and deriving a key from a misparsed bit
 /// string would fail closed later with a far less diagnosable AEAD error.
 ///
-/// This previously base64-decoded the value (falling back to the raw ASCII
-/// bytes when decoding failed), which happened to agree with conformant peers
-/// only for the empty string. Hex characters are a subset of the base64
-/// alphabet, so a real hexBinary value would silently mis-decode rather than
-/// error.
+/// Decoding it as base64 is the plausible reading and the wrong one: hex
+/// characters are a subset of the base64 alphabet, so a real hexBinary value
+/// mis-decodes silently instead of erroring, and agrees with a conformant peer
+/// only for the empty string.
 fn decode_concat_kdf_param_bits(raw: &[u8]) -> Result<Vec<u8>> {
     let trimmed: Vec<u8> = raw
         .iter()

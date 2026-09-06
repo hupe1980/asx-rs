@@ -31,6 +31,10 @@ impl DedupStorage for DurableTestDedup {
         true
     }
 
+    fn cluster_safe(&self) -> bool {
+        true
+    }
+
     fn first_seen<'a>(&'a self, idempotency_key: &'a str) -> BoxFuture<'a, Result<bool>> {
         self.0.first_seen(idempotency_key)
     }
@@ -266,6 +270,106 @@ impl As4Verifier for SlowVerifier {
     }
 }
 
+/// Durable audit sink for the ordered-receive tests.
+///
+/// The strict AS4 receive policy is fail-closed on audit events and the builder
+/// refuses `fail_closed_audit_events(false)` outside `testing` builds, so these
+/// tests supply a sink that satisfies the guard instead of disabling it.
+#[derive(Debug)]
+struct DurableTestAuditSink(crate::observability::audit_sink::InMemoryAuditSink);
+
+impl crate::observability::audit_sink::DurableAuditSink for DurableTestAuditSink {
+    fn durability(&self) -> crate::observability::audit_sink::AuditSinkDurability {
+        crate::observability::audit_sink::AuditSinkDurability::Durable
+    }
+    fn has_replay_cursor_integrity_protection(&self) -> bool {
+        true
+    }
+    fn store_event(
+        &self,
+        event: &crate::observability::audit_sink::AuditEvent,
+    ) -> crate::core::Result<()> {
+        self.0.store_event(event)
+    }
+    fn retrieve_events_from(
+        &self,
+        cursor: &crate::observability::audit_sink::ReplayCursor,
+        limit: usize,
+    ) -> crate::core::Result<Vec<crate::observability::audit_sink::AuditEvent>> {
+        self.0.retrieve_events_from(cursor, limit)
+    }
+    fn current_cursor(
+        &self,
+    ) -> crate::core::Result<crate::observability::audit_sink::ReplayCursor> {
+        self.0.current_cursor()
+    }
+    fn acknowledge_cursor(
+        &self,
+        cursor: &crate::observability::audit_sink::ReplayCursor,
+    ) -> crate::core::Result<()> {
+        self.0.acknowledge_cursor(cursor)
+    }
+    fn clear(&self) -> crate::core::Result<()> {
+        self.0.clear()
+    }
+}
+
+/// A bus the strict receive path can emit on with no live subscriber.
+#[derive(Debug, Default)]
+struct DurableTestReconciliation;
+
+impl crate::storage::ReconciliationStorage for DurableTestReconciliation {
+    fn is_durable(&self) -> bool {
+        true
+    }
+    fn cluster_safe(&self) -> bool {
+        true
+    }
+    fn enqueue<'a>(
+        &'a self,
+        _request: crate::reliability::ReconciliationRequest,
+    ) -> BoxFuture<'a, Result<bool>> {
+        Box::pin(async { Ok(true) })
+    }
+    fn queued_requests(
+        &self,
+    ) -> BoxFuture<'_, Result<Vec<crate::reliability::ReconciliationRequest>>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+    fn resolve<'a>(&'a self, _idempotency_key: &'a str) -> BoxFuture<'a, Result<bool>> {
+        Box::pin(async { Ok(true) })
+    }
+}
+
+/// A session carrying a real strict-runtime bootstrap token.
+///
+/// The strict receive entry points refuse a session without one, so these tests
+/// mint the token the same way a deployment does rather than reaching for the
+/// `testing` escape hatch — which would make them pass only in builds that
+/// enable that feature.
+fn ordered_test_session(session_id: &str, bus: &EventBus) -> SessionContext {
+    let dedup = DurableTestDedup(InMemoryDedupBackend::new(Duration::from_secs(60)));
+    let reconciliation = DurableTestReconciliation;
+    let token = crate::presets::StrictRuntimeBootstrap::new("as4_ordered_tests")
+        .event_bus(bus)
+        .dedup(&dedup)
+        .reconciliation(&reconciliation)
+        .validate()
+        .expect("strict runtime bootstrap");
+    token.bind(&SessionContext::new(session_id, "partner-a", "strict").expect("session"))
+}
+
+fn ordered_test_bus() -> EventBus {
+    EventBus::builder()
+        .capacity(16)
+        .audit_sink(Arc::new(DurableTestAuditSink(
+            crate::observability::audit_sink::InMemoryAuditSink::new().expect("audit sink"),
+        )))
+        .emission_mode(crate::observability::EventEmissionMode::StrictWithAuditFallback)
+        .build()
+        .expect("ordered test bus")
+}
+
 fn ordered_test_multipart_payload(
     message_id: &str,
     ref_to_message_id: Option<&str>,
@@ -300,12 +404,9 @@ fn ordered_test_multipart_payload(
 /// the gate is (D54).
 #[tokio::test]
 async fn ordered_receive_still_holds_the_turn_when_it_returns() {
-    let session = SessionContext::new("sess-ordered-hold", "partner-a", "strict").expect("session");
-    let bus = EventBus::new(16).expect("bus");
-    let policy = As4PushPolicyBuilder::new()
-        .fail_closed_audit_events(false)
-        .build()
-        .expect("policy");
+    let bus = ordered_test_bus();
+    let session = ordered_test_session("sess-ordered-hold", &bus);
+    let policy = As4PushPolicyBuilder::new().build().expect("policy");
     let dedup: Arc<dyn crate::storage::DedupStorage> = Arc::new(DurableTestDedup(
         InMemoryDedupBackend::new(Duration::from_secs(60)),
     ));
@@ -344,10 +445,7 @@ async fn ordered_receive_still_holds_the_turn_when_it_returns() {
     let dedup2: Arc<dyn crate::storage::DedupStorage> = Arc::new(DurableTestDedup(
         InMemoryDedupBackend::new(Duration::from_secs(60)),
     ));
-    let policy2 = As4PushPolicyBuilder::new()
-        .fail_closed_audit_events(false)
-        .build()
-        .expect("policy");
+    let policy2 = As4PushPolicyBuilder::new().build().expect("policy");
     let blocked = tokio::spawn(async move {
         ordered_async::receive_push_ordered_with_verifier(
             &session2,
@@ -391,12 +489,9 @@ async fn ordered_receive_still_holds_the_turn_when_it_returns() {
 /// happily accepted the decoy.
 #[tokio::test]
 async fn ordered_receive_rejects_a_duplicated_conversation_id() {
-    let session = SessionContext::new("sess-ordered-swap", "partner-a", "strict").expect("session");
-    let bus = EventBus::new(16).expect("bus");
-    let policy = As4PushPolicyBuilder::new()
-        .fail_closed_audit_events(false)
-        .build()
-        .expect("policy");
+    let bus = ordered_test_bus();
+    let session = ordered_test_session("sess-ordered-swap", &bus);
+    let policy = As4PushPolicyBuilder::new().build().expect("policy");
     let dedup: Arc<dyn crate::storage::DedupStorage> = Arc::new(DurableTestDedup(
         InMemoryDedupBackend::new(Duration::from_secs(60)),
     ));
@@ -436,16 +531,9 @@ async fn ordered_receive_rejects_a_duplicated_conversation_id() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ordered_receive_reserves_arrival_order_but_allows_parallel_heavy_verify() {
-    let session =
-        SessionContext::new("sess-ordered-stage-e", "partner-a", "strict").expect("session");
-    let bus = EventBus::new(16).expect("bus");
-    let policy = As4PushPolicyBuilder::new()
-        // Without this the receive fails on the very first emission and the
-        // whole ordering scenario below never runs — which is how this test
-        // passed for a long time while asserting nothing (R15).
-        .fail_closed_audit_events(false)
-        .build()
-        .expect("policy");
+    let bus = ordered_test_bus();
+    let session = ordered_test_session("sess-ordered-stage-e", &bus);
+    let policy = As4PushPolicyBuilder::new().build().expect("policy");
     let dedup: Arc<dyn crate::storage::DedupStorage> = Arc::new(DurableTestDedup(
         InMemoryDedupBackend::new(Duration::from_secs(60)),
     ));

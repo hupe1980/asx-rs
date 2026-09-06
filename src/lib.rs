@@ -21,6 +21,8 @@ AS4 (OASIS ebMS3 + eDelivery) EDI transport protocols. The crate is published as
 | `interop-relaxed` | Relaxed mode helpers available alongside strict | Legacy partner interop |
 | `trace` | Experimental `tracing` instrumentation for selected protocol paths | Observability |
 | `prometheus` | Built-in Prometheus/OpenMetrics text `MetricsSink` adapter (`observability::PrometheusMetricsSink`) | Native metrics export |
+| `opentelemetry` | OpenTelemetry `MetricsSink` adapter (`observability::OtelMetricsSink`) | Native metrics export |
+| `dns` | Built-in BDXL resolver (`smp::HickoryBdxlResolver`) for Peppol/CEF participant discovery | `SmlDiscovery::Naptr` without a custom `BdxlResolver` |
 | `testing` | Exposes `fixtures` and `matrix` test-scaffold modules | Integration test harness |
 | `server` | Axum router integration (`as2_router`, `as4_router`, `As2AxumHandler`, `As4AxumHandler`) | HTTP receive |
 | `client` | Async HTTP egress transport via `reqwest` (`As2HttpTransport`, `As4HttpTransport`) | HTTP send |
@@ -41,6 +43,9 @@ asx-rs = { version = "0.14", features = ["as4", "async-ocsp"] }
 
 # Both protocols with compression:
 asx-rs = { version = "0.14", features = ["as2", "as4", "compression", "async-ocsp"] }
+
+# AS4 with Peppol/CEF dynamic discovery:
+asx-rs = { version = "0.14", features = ["as4", "client", "dns"] }
 
 # Both protocols, relaxed interop for legacy partners:
 asx-rs = { version = "0.14", features = ["as2", "as4", "interop-relaxed", "async-ocsp"] }

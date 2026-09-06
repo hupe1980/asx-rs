@@ -158,6 +158,28 @@ pub fn receive_with_mdn_with_reliability_mdn_ref(
 ) -> Result<As2ReceiveMdnOutput>
 ```
 
+### Which MDN part carries the verdict
+
+The machine-readable fields (`Disposition`, `Received-Content-MIC`,
+`Original-Message-ID`) live in a `message/disposition-notification` part, and
+that part is found by **media type** — RFC 3798 §3 places it second in a
+`multipart/report`, but position is a convention, not the identifier.
+
+The same rules apply signed and unsigned, and the signed case is the one that
+matters because it is the non-repudiation evidence:
+
+| Shape | Result |
+|---|---|
+| `multipart/report` with one `message/disposition-notification` part | that part |
+| Signed content that *is* a `message/disposition-notification` | that part |
+| Report with **no** machine-readable part | strict: rejected · relaxed: **no verdict** |
+| Signed content of any other media type | strict: rejected · relaxed: no verdict |
+| Report with **two** machine-readable parts | rejected in both modes |
+
+Relaxed mode widens only the absent case: it never produces a verdict read out
+of a human-readable part, which is where a counterparty would put a forged
+`Disposition:` line.
+
 ### MDN generation
 
 ```rust

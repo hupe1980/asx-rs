@@ -35,7 +35,7 @@
 pub mod ingress;
 pub mod trace_context;
 
-#[cfg(feature = "client")]
+#[cfg(any(feature = "client", feature = "async-ocsp"))]
 pub mod egress;
 
 #[cfg(feature = "server")]
@@ -43,7 +43,7 @@ pub mod server;
 
 pub use ingress::{As2HttpIngress, As4HttpIngress, as2_ingress_from_http, as4_ingress_from_http};
 
-#[cfg(feature = "client")]
+#[cfg(any(feature = "client", feature = "async-ocsp"))]
 pub use egress::{HttpSendOutcome, TransportConfig};
 
 #[cfg(all(feature = "client", feature = "as2"))]

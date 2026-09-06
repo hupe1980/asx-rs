@@ -459,28 +459,38 @@ Fail conditions:
 
 ## Performance Gate
 
-Reference baseline values (ns/op):
+The authoritative baseline is [`benches/perf-baseline.txt`](https://github.com/hupe1980/asx-rs/blob/main/benches/perf-baseline.txt),
+measured on the CI Linux runner in release. It is not restated here: two copies
+of the same numbers drift, and the file is the one the gate reads.
 
-| Operation | Baseline (ns/op) |
-|---|---|
-| `as2_sign_encrypt` | 8 262 |
-| `as2_mdn_generation` | 200 |
-| `as2_verify_decrypt_mdn` | 2 072 |
-| `as4_verify_decrypt` | 42 |
-| `as4_verify_decrypt_receipt` | 5 962 |
-| `as4_receipt_generation` | 59 |
+Only benchmarks the gate's feature set compiles may appear in it — an entry with
+no matching measurement is a gate failure, not a skip. The receive-path
+benchmarks sit behind `testing`, which is a `compile_error!` in release, so they
+run under a debug `just perf-gate` and are not baselined.
 
-These values are environment-relative. CI enforces a **25% maximum regression** threshold. Do not use them for absolute hardware claims.
+CI enforces a **25 % maximum regression**. The values are environment-relative;
+they are not hardware claims.
 
 Run the performance gate:
-```bash
-# Write new baseline:
-cargo run --release -p xtask --all-features -- \
-  perf-gate --iterations 2000 --write-baseline benches/perf-baseline.txt
 
-# Check against baseline (fails if any operation regresses >25%):
-cargo run --release -p xtask --all-features -- \
+```bash
+just perf-gate
+```
+
+The feature list is explicit rather than `--all-features`, because the crate
+refuses to compile a `--release` build with `testing` — so
+`cargo run --release -p xtask --all-features` does not build:
+
+```bash
+FEATURES="as2,as4,client,server,trace,compression,async-ocsp,interop-strict"
+
+# Check against the baseline (fails on a >25% regression):
+cargo run --release -p xtask --no-default-features --features "$FEATURES" -- \
   perf-gate --iterations 2000 --check-baseline benches/perf-baseline.txt --max-regression 0.25
+
+# Record a new one:
+cargo run --release -p xtask --no-default-features --features "$FEATURES" -- \
+  perf-gate --iterations 2000 --write-baseline benches/perf-baseline.txt
 ```
 
 ---

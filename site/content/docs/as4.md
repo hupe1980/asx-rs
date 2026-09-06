@@ -527,6 +527,35 @@ verified `eb:ConversationId` after parsing; a mismatch is a
 `SecurityVerificationFailed`. A `UserMessage` carrying two `eb:ConversationId`
 elements is rejected rather than resolved by document order.
 
+#### A distributed gate
+
+`As4ConversationOrderGate` is in-process. Multi-replica deployments implement
+`ConversationOrderGate` over a shared primitive (a Redis lock, a database
+advisory lock, a ZooKeeper node), and it is a **two-phase** trait:
+
+```rust
+impl ConversationOrderGate for RedisOrderGate {
+    // Take a sequence number. Returns immediately — this is arrival order.
+    fn reserve_ordered_turn<'a>(&'a self, conversation_id: &'a str, _s: &'a SessionContext)
+        -> ReserveTurnFuture<'a> { /* … */ }
+
+    fn record_message_ordering<'a>(/* … */) -> /* … */ { /* … */ }
+}
+
+impl ConversationTurnHandle for RedisTicket {
+    // Wait for the number's turn. This is where the blocking belongs.
+    fn wait_for_turn(self: Box<Self>) -> TurnFuture<'static> { /* … */ }
+}
+```
+
+Reserving and waiting must be separable, because everything expensive happens
+between them. `acquire_ordered_turn` (reserve + wait in one call) is provided
+for callers with nothing to overlap.
+
+Mutual exclusion alone is not sequencing: unless all messages for a
+`ConversationId` reach the same replica, or the primitive enforces a global
+sequence, replicas that receive out of order still deliver out of order.
+
 ### Receive pull with reliability
 
 ```rust

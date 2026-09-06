@@ -31,6 +31,7 @@ cargo add asx-rs --features as4,client,server
 
 | Flag | Enables | Default |
 |------|---------|---------|
+| `crypto` | Shared OpenSSL gate (RSA/ECDSA, X.509, CMS, OCSP) — pulled in by `as2`/`as4` | via protocol |
 | `as2` | AS2 send/receive, S/MIME, MDN | ❌ |
 | `as4` | AS4 send/receive, pull store, WS-Security, XML encryption | ❌ |
 | `client` | HTTP egress via `reqwest` | ❌ |

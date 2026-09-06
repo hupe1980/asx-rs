@@ -47,7 +47,7 @@ description = "How asx-rs is layered: the transport boundary, wire format, proto
 | Module | Responsibility |
 |---|---|
 | `core` | Shared types, errors (`AsxError`), session context (`SessionContext`), interop mode |
-| `wire` | Bounded I/O (`read_bounded_stream`), content-type classification, HTTP header normalization, streaming frame limits |
+| `wire` | Bounded I/O (`read_bounded_stream_into_memory_async`, `read_bounded_stream_into_handle_async`), content-type classification, HTTP header normalization, streaming frame limits |
 | `http` | HTTP binding types (`HttpRequest`), header policy, governance |
 | `transport` | Framework-agnostic ingress (`As2HttpIngress`, `As4HttpIngress`); async egress clients (`client` feature); axum server routers (`server` feature) |
 | `crypto` | S/MIME, WS-Security XML signatures, XML encryption/decryption, OCSP, compression |
@@ -96,7 +96,7 @@ Each layer can add, override, or restrict policy fields. The effective policy fo
 
 ### Bounded streaming
 
-All inbound reads use `read_bounded_stream` with a hard ceiling (default 256 MiB, configurable per session). Unbounded reads are not possible through the public API. The streaming crypto pipeline avoids materialising the full payload in memory before processing.
+All inbound reads go through the bounded readers with a hard ceiling (default 256 MiB, configurable per session). Unbounded reads are not possible through the public API. The streaming crypto pipeline avoids materialising the full payload in memory before processing.
 
 ### Transport layer separation
 

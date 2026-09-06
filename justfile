@@ -7,7 +7,9 @@
 set shell := ["bash", "-euo", "pipefail", "-c"]
 
 # Feature sets kept in sync with the CI `check-test` matrix.
-ci_feature_matrix := "as2,client as4,server as2,as4,client,server,trace"
+# Mirrors the `check-test` matrix in `.github/workflows/ci.yml`. Keep the two
+# in step: a combination only CI builds is one only CI can break.
+ci_feature_matrix := "as2,client as4,server as2,as4,client,server,trace as2,as4,testing as2,as4,testing,interop-relaxed as2,as4,compression as4,client,dns"
 
 # Perf gate deliberately omits `testing` — the crate refuses to build release
 # artefacts with that feature (it disables WS-Security enforcement gates).
@@ -168,7 +170,7 @@ matrix:
     set -euo pipefail
     for features in {{ ci_feature_matrix }}; do
         echo "── features: ${features}"
-        cargo check --no-default-features --features "$features"
+        RUSTFLAGS='-D warnings' cargo check --no-default-features --features "$features"
         cargo test --no-default-features --features "$features"
     done
 
@@ -218,6 +220,22 @@ profile-lint:
 [doc('Fail on broken rustdoc intra-doc links')]
 doc-links:
     RUSTDOCFLAGS='-D warnings' cargo doc --all-features --no-deps
+
+# Walk the feature powerset.
+#
+# A hand-written matrix only covers combinations someone thought of. This is
+# the gate that catches a `#[cfg]` whose callee is gated on a different
+# feature, and a guard that only applies outside `testing` builds — neither of
+# which `--all-features` can see.
+#
+# Requires cargo-hack: `cargo install cargo-hack`.
+[group('gate')]
+[doc('Check the feature powerset (depth 2)')]
+powerset:
+    cargo hack check --feature-powerset --depth 2 \
+        --at-least-one-of as2,as4 \
+        --exclude-features prometheus,opentelemetry \
+        --lib --tests
 
 # Ratchet on uncompiled doctests.
 #
@@ -501,14 +519,14 @@ specs:
 
 # Pre-push check: everything CI's `lint` and `check-test` jobs run.
 [group('composite')]
-ci: lint check-strict test matrix
+ci: lint check-strict test matrix powerset
 
 # Every mandatory release gate, in the order RELEASING.md lists them.
 #
 # Long-running. `just ci` is the fast pre-push subset.
 [group('composite')]
 [doc('Every mandatory release gate, in RELEASING.md order (slow)')]
-release-gate: fmt-check check check-strict clippy doc-links test-sweep interop-matrix wssec-vectors fuzz-gate matrix perf-gate hygiene profile-lint fixtures-validate doctest-ratchet site
+release-gate: fmt-check check check-strict clippy doc-links test-sweep powerset interop-matrix wssec-vectors fuzz-gate matrix perf-gate hygiene profile-lint fixtures-validate doctest-ratchet site
     @echo "release-gate: all implemented gates passed"
 
 # Verify the crate packages cleanly for crates.io.

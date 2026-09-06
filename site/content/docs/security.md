@@ -468,22 +468,12 @@ This mixed model has several implications:
 - **Vulnerability management**: OpenSSL and `aes-gcm` have separate CVE
   timelines and patch cadences. Both must be tracked independently.
 
-### Migration Path: Full Pure-Rust Crypto
+### Removing the OpenSSL dependency
 
-The long-term goal is to eliminate the OpenSSL C-FFI dependency and converge
-on a single pure-Rust crypto stack. The planned migration path is:
-
-1. **Phase 1 (in progress)**: Symmetric crypto is already pure Rust (`aes-gcm`).
-2. **Phase 2**: Replace OpenSSL X.509 parsing with `x509-cert` + `rustls-pki-types`.
-3. **Phase 3**: Replace OpenSSL RSA operations (CMS key wrap, WS-Security signing)
-   with `rsa` (pure Rust) or `aws-lc-rs` (FIPS-validated pure-Rust interface).
-4. **Phase 4**: Remove the `openssl` crate dependency entirely. Provide an
-   optional `openssl-fips` feature gate for regulated environments that require
-   FIPS 140-2 validated modules.
-
-> **Note**: Phases 2–4 are pre-1.0 roadmap items and will be treated as
-> breaking-dependency changes. Subscribe to the GitHub releases feed or
-> `CHANGELOG.md` for status.
+Converging on a single pure-Rust crypto stack is a direction this project is
+committed to, not a dated plan: the symmetric layer already is pure Rust, and
+X.509, RSA and CMS are not. It will land as a breaking-dependency change and be
+announced in `CHANGELOG.md`.
 
 ### FIPS Deployment Today
 
@@ -494,7 +484,7 @@ If you need FIPS-validated crypto today, use the following configuration:
    outbound; for inbound, `As4PushPolicy::default()` already allows unencrypted payloads
    when none arrive encrypted), since the `aes-gcm` symmetric layer is not FIPS
    140-2 validated.
-3. Contact your compliance officer before enabling AS4 payload encryption in
-   a regulated deployment until Phase 3 is complete.
+3. Contact your compliance officer before enabling AS4 payload encryption in a
+   regulated deployment: the symmetric layer it uses is not FIPS-validated.
 
 

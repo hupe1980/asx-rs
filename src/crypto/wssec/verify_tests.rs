@@ -1,8 +1,6 @@
 //! Tests for WS-Security signature verification.
 //!
-//! Split out of `verify.rs`: the module previously sat wedged between two
-//! halves of the implementation, so the file read as code, tests, then more
-//! code.
+//! Kept out of `verify.rs` so the implementation reads as one piece.
 
 use super::{
     WsSecCanonicalizationProfile, WsSecDigestMethod, WsSecVerifyOptions,
@@ -455,11 +453,9 @@ fn split_x509_pkipath_rejects_inner_length_overrun_without_panicking() {
 
 /// `cid:` reference matching is normalization-insensitive.
 ///
-/// Exercised through `build_external_reference_cid_index`, which is what the
-/// verification path actually uses. These assertions used to run against a
-/// linear-scan helper that production had already been replaced with, so the
-/// normalization they check and the normalization that runs were only
-/// incidentally the same function.
+/// Exercised through `build_external_reference_cid_index` — the function the
+/// verification path actually calls, so the normalization asserted here is the
+/// normalization that runs.
 #[test]
 fn external_reference_cid_index_normalizes_cid_wrappers() {
     let alpha = b"alpha";
