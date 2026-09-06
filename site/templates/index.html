@@ -4,7 +4,7 @@
 <section class="hero">
   <div class="wrap">
     <p class="eyebrow">AS2 &amp; AS4 · ebMS3 · Rust</p>
-    <h1>B2B messaging that fails closed by default.</h1>
+    <h1>AS2 and AS4 messaging for Rust that fails closed by default.</h1>
     <p class="lede">
       <strong>asx-rs</strong> is an async-native Rust library for the AS2 (RFC 4130) and
       AS4 (OASIS ebMS3 / eDelivery) protocols. S/MIME and WS-Security, MDN and
@@ -76,6 +76,7 @@
         <li>Verified receipts with Non-Repudiation Information</li>
         <li>One-Way/Push and One-Way/Pull with MPC authorization</li>
         <li>Large-message splitting and joining</li>
+            <li>Peppol/CEF dynamic discovery (BDXL, SMP)</li>
       </ul>
       <a class="more" href="{{ get_url(path='@/docs/as4.md') | safe }}">AS4 reference →</a>
     </article>
@@ -84,7 +85,7 @@
 
 <section class="wrap section">
   <h2>Send a signed AS4 message</h2>
-  <pre><code class="language-rust">use asx_rs::as4::{send_async, As4SendRequest, As4SendPolicyBuilder};
+  <pre><code class="language-rust">use asx_rs::as4::{send_async, As4ReceiptPolicy, As4SendPolicyBuilder, As4SendRequest};
 use asx_rs::transport::egress::{As4HttpTransport, TransportConfig};
 
 let (policy, credentials) = As4SendPolicyBuilder::new()
@@ -112,6 +113,62 @@ let outcome = As4HttpTransport::new(TransportConfig::default())?
     against the message you sent. <code>send_and_verify</code> does both, so that step
     cannot be skipped by accident.
   </p>
+</section>
+
+<section class="wrap section" id="faq">
+  <h2>Questions people arrive with</h2>
+  <div class="faq">
+    <details>
+      <summary>Is this a gateway I have to run?</summary>
+      <p>
+        No. It is a crate you link into a service you already run. There is no
+        container, no database requirement and no JVM. Dedup, reconciliation,
+        audit sinks and key management are traits you implement against your own
+        infrastructure — and a
+        <a href="{{ get_url(path='@/docs/persistence.md') | safe }}">conformance suite</a>
+        ships so your backend can demonstrate durability rather than declare it.
+      </p>
+    </details>
+    <details>
+      <summary>Which networks use AS4?</summary>
+      <p>
+        Peppol (e-invoicing across some 40 countries), CEF eDelivery (EU sector
+        networks such as customs and e-Justice), the German energy market's BDEW
+        MaKo profile — where AS4 has been mandatory for electricity since April
+        2024 and gas since April 2025 — and ENTSOG for gas transmission. Each is
+        a different profile of the same protocol; see
+        <a href="{{ get_url(path='@/docs/interop.md') | safe }}">interoperability</a>.
+      </p>
+    </details>
+    <details>
+      <summary>Does it do AS2 as well?</summary>
+      <p>
+        Yes — RFC 4130 in full: S/MIME signing and encryption, RFC 5402 CMS
+        compression, synchronous and asynchronous MDN, and the MIC computed over
+        exactly the octets RFC 4130 §7.3.1 specifies. AS2 remains the backbone of
+        North American retail and logistics EDI and is not going anywhere.
+      </p>
+    </details>
+    <details>
+      <summary>Is it conformance-certified?</summary>
+      <p>
+        Not yet, and the <a href="{{ get_url(path='@/docs/conformance.md') | safe }}">conformance page</a>
+        says exactly what is missing: a runnable access point and a SUT
+        Controller, neither of which is a library concern. What does exist is
+        continuous third-party evidence — every signature is checked against
+        xmlsec1, AS2 against the <code>openssl</code> CLI, and a full signed
+        exchange against Holodeck B2B in a container.
+      </p>
+    </details>
+    <details>
+      <summary>What does it need to build?</summary>
+      <p>
+        Rust 1.88 or newer and a working OpenSSL. <code>as2</code> and
+        <code>as4</code> are not default features — enable the protocols you
+        need. The library contains no <code>unsafe</code> and cannot gain any.
+      </p>
+    </details>
+  </div>
 </section>
 
 <section class="wrap section">

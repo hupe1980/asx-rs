@@ -8,16 +8,14 @@ use asx_rs::observability::EventBus;
 use asx_rs::observability::audit_sink::{
     AuditEvent, AuditSinkDurability, DurableAuditSink, InMemoryAuditSink, ReplayCursor,
 };
-use asx_rs::presets::{
-    DeploymentTopology, issue_strict_runtime_bootstrap_token_with_as4_topology,
-    strict_production_event_bus,
-};
+use asx_rs::presets::{DeploymentTopology, StrictRuntimeBootstrap};
 use asx_rs::reliability::{InMemoryDedupBackend, ReconciliationRequest};
 use asx_rs::storage::{BoxFuture, DedupStorage, ReconciliationStorage};
 use asx_rs::transport::ingress::As4IngressReceivePushSyncRequest;
 use asx_rs::transport::ingress::as4_ingress_from_http;
 use std::sync::Arc;
 
+#[derive(Debug)]
 struct DurableTestAuditSink {
     inner: InMemoryAuditSink,
 }
@@ -68,6 +66,7 @@ impl DurableAuditSink for DurableTestAuditSink {
     }
 }
 
+#[derive(Debug)]
 struct DurableClusterSafeDedup;
 
 impl DedupStorage for DurableClusterSafeDedup {
@@ -87,6 +86,7 @@ impl DedupStorage for DurableClusterSafeDedup {
     }
 }
 
+#[derive(Debug)]
 struct ClusterSafeCoordination {
     component: &'static str,
 }
@@ -101,6 +101,7 @@ impl As4TopologyCoordination for ClusterSafeCoordination {
     }
 }
 
+#[derive(Debug)]
 struct DurableClusterSafeReconciliation;
 
 impl ReconciliationStorage for DurableClusterSafeReconciliation {
@@ -132,7 +133,7 @@ impl ReconciliationStorage for DurableClusterSafeReconciliation {
 }
 
 fn strict_runtime_token() -> asx_rs::presets::StrictRuntimeBootstrapToken {
-    let event_bus = strict_production_event_bus(16, Arc::new(DurableTestAuditSink::new()))
+    let event_bus = EventBus::new_regulated(16, Arc::new(DurableTestAuditSink::new()))
         .expect("strict production event bus");
     let pull_store = ClusterSafeCoordination {
         component: "as4_pull_store",
@@ -140,16 +141,15 @@ fn strict_runtime_token() -> asx_rs::presets::StrictRuntimeBootstrapToken {
     let conversation_gate = ClusterSafeCoordination {
         component: "as4_conversation_order_gate",
     };
-    issue_strict_runtime_bootstrap_token_with_as4_topology(
-        "transport_as4_ingress_helper",
-        &event_bus,
-        &DurableClusterSafeReconciliation,
-        &DurableClusterSafeDedup,
-        DeploymentTopology::Clustered,
-        Some(&pull_store),
-        Some(&conversation_gate),
-    )
-    .expect("strict runtime token")
+    StrictRuntimeBootstrap::new("transport_as4_ingress_helper")
+        .event_bus(&event_bus)
+        .reconciliation(&DurableClusterSafeReconciliation)
+        .dedup(&DurableClusterSafeDedup)
+        .topology(DeploymentTopology::Clustered)
+        .as4_pull_store(&pull_store)
+        .as4_conversation_gate(&conversation_gate)
+        .validate()
+        .expect("strict runtime token")
 }
 
 fn strict_session() -> asx_rs::core::SessionContext {
@@ -185,8 +185,9 @@ fn as4_transport_helper_without_token_fails_closed_in_strict_mode() {
 
     assert_eq!(err.code, ErrorCode::PolicyViolation);
     assert!(
+        err.message.contains("strict-runtime bootstrap token"),
+        "message points at the startup gate: {}",
         err.message
-            .contains("strict-runtime bootstrap token binding")
     );
 }
 
@@ -194,12 +195,7 @@ fn as4_transport_helper_without_token_fails_closed_in_strict_mode() {
 fn as4_transport_helper_with_token_reaches_protocol_validation() {
     let ingress = invalid_as4_ingress();
     let token = strict_runtime_token();
-    let strict_session = asx_rs::presets::session_with_strict_runtime_bootstrap_token(
-        "transport_as4_ingress_helpers",
-        &token,
-        &strict_session(),
-    )
-    .expect("strict session");
+    let strict_session = token.bind(&strict_session());
 
     let err = ingress
         .receive_push_with_dedup_sync(As4IngressReceivePushSyncRequest {

@@ -21,11 +21,19 @@ jobs:
           - "as2,as4,testing"
           - "as2,as4,testing,interop-relaxed"
           - "as2,as4,compression"
+          # Participant discovery pulls a DNS client; it is off by default, so
+          # nothing else in this matrix compiles it.
+          - "as4,client,dns"
     steps:
       - uses: actions/checkout@v4
       - name: Install stable toolchain
         uses: dtolnay/rust-toolchain@stable
+      # `-D warnings` here and not only at `--all-features`: dead code behind a
+      # feature gate is invisible to a build that enables every feature, which
+      # is exactly where a `#[cfg]` drifts out of step with its callers.
       - name: Cargo check
+        env:
+          RUSTFLAGS: "-D warnings"
         run: cargo check --no-default-features --features "${{ matrix.features }}"
       - name: Cargo test
         run: cargo test --no-default-features --features "${{ matrix.features }}"
@@ -61,6 +69,12 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Cargo clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      # A broken intra-doc link ships to docs.rs as a dead reference. Four of
+      # them were live, one pointing at a bypass verifier that is not exported.
+      - name: Rustdoc links
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+        run: cargo doc --all-features --no-deps
 
   perf-gate:
     runs-on: ubuntu-latest
@@ -164,3 +178,32 @@ jobs:
         uses: taiki-e/install-action@cargo-llvm-cov
       - name: Enforce Profile/Interop Coverage Threshold
         run: bash scripts/check_profile_coverage.sh 85 src/interop.rs
+
+  # `rust-version` in Cargo.toml is a promise to embedders pinned to an older
+  # toolchain. It was declared and unchecked; a build on the exact floor is what
+  # makes it a fact rather than a claim.
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Read declared MSRV
+        id: msrv
+        run: |
+          echo "version=$(grep -m1 '^rust-version' Cargo.toml | cut -d'"' -f2)" >> "$GITHUB_OUTPUT"
+      - name: Install the declared toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+      - name: Build on the MSRV floor
+        run: cargo check --all-features --all-targets
+
+  # An example that does not compile is worse than none: it looks checked.
+  # The budget only ever goes down.
+  doctest-ratchet:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Ratchet uncompiled doctests
+        run: bash scripts/check_doctest_ratchet.sh 39

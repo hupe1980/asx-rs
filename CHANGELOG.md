@@ -15,7 +15,540 @@ Versioning follows the [SemVer policy](#semver-policy) below.
 
 ---
 
-## [0.13.0] — unreleased
+## [0.14.0] — unreleased
+
+Everything since 0.13.0. It is a **hard cut**: wire format, defaults and APIs
+changed without compatibility shims.
+
+### Added
+
+- **Peppol/CEF participant discovery actually works** (`asx_rs::smp::bdxl`).
+  `SmlDiscovery` selects BDXL U-NAPTR (the default), the withdrawn legacy CNAME
+  construction, or a statically configured SMP. `BdxlResolver` is the DNS seam,
+  with `StaticBdxlResolver` for tests and a `hickory`-backed
+  `HickoryBdxlResolver` behind the new **`dns`** feature. `bdxl_dns_name` and
+  `legacy_cname_host` are public pure functions so a deployment can check what
+  a lookup will ask for; `SmpClient::discovery_dns_name` reports it for a
+  configured client. See the wire section below for what this replaced.
+- **A live-network oracle for discovery** (`tests/interop_peppol_sml_discovery.rs`,
+  `#[ignore]`d). It queries the real Peppol production SML and requires the name
+  this crate computes to be the name the network answers on — the one assertion
+  no offline test can make, and the one that would have caught all four defects
+  below.
+- **OASIS SMP 2.0 `ServiceMetadata` is parsed** — for real this time. The
+  version is detected from the document element and each generation is read by
+  its own rules.
+- **`SmpLookupRequest::new` / `with_transport_profile`.** The struct was
+  literal-only, and the documented example called a constructor that did not
+  exist.
+- **`asx_rs::storage::conformance` — a conformance suite for storage
+  backends** (`testing` feature). `is_durable()` and `cluster_safe()` are
+  self-declarations, and the strict startup gate can only check that a claim was
+  made. Implement one factory trait returning a *fresh handle onto the same
+  store*, and `DedupConformance` / `ReconciliationConformance` drive the
+  properties the protocol paths depend on — above all that **`first_seen` is
+  atomic under concurrency**, which a `SELECT`-then-`INSERT` backend fails only
+  in production. Returns a printable report rather than panicking, and its own
+  tests require a lying backend and a non-atomic backend to fail. Every in-tree
+  backend runs against it in CI. **`AuditSinkConformance`** covers the third
+  trait: an event that was stored is readable, replay resumes from a cursor
+  instead of restarting, the cursor advances, state survives a fresh handle,
+  and a sink claiming cursor integrity protection refuses an edited cursor.
+  Its own tests require a sink that forgets on reconnect and one that accepts a
+  forged cursor to fail.
+- **`As4ReceivePushOutput::is_test_service_ping()`** — ebMS3 Core §5.2.2 says a
+  Test Service message is acknowledged and **not delivered**, and the receive
+  path previously gave the caller no way to tell, so an empty connectivity ping
+  reached the business pipeline as a document. Derived from the parsed
+  `eb:Service` and `eb:Action`, and both must match.
+- `SoapEnvelopeBuilder::with_ws_security_placeholder` and
+  `splice_ws_security_header`.
+
+### Security
+
+- **Private keys no longer leak through `Debug`.** Nine public types carried
+  key material or a shared secret behind a derived `Debug`:
+  `As2SendCredentials`, `As2MdnSigningCredentials`, `As4SendCredentials`,
+  `As4PullRequestCredentials`, `As4ReceiptCredentials`, `PartnerCredentials`,
+  `CmsSmimeTrustVerifier`, and `As4PullAuthorization::SharedSecret`. A single
+  `tracing::debug!(?credentials)` or a `{:?}` in a panic message wrote the
+  private key into the log. Each now has a hand-written `Debug` that renders
+  secret fields as `<redacted>`; `CertHandle` already did, which is what made
+  the omission visible.
+- **SSRF via an attacker-supplied OCSP responder URL.** The responder URL comes
+  out of the certificate's AIA extension, so on an inbound AS2/AS4 message it is
+  chosen by whoever presented the certificate — and revocation checking runs
+  *while* trust is being established, i.e. before that party is trusted at all.
+  `ReqwestOcspTransport` performed **no** URL validation: a peer could point the
+  responder at `169.254.169.254`, `127.0.0.1` or any internal address and have
+  the process issue an HTTP POST to it. Responder URLs are now validated against
+  the private/loopback/link-local ranges and the connection is pinned to the
+  addresses that were checked. Plain HTTP stays permitted here and nowhere else,
+  because RFC 6960 responses are signed and public PKIs publish `http://`
+  responders.
+- **DNS-rebinding hole in SMP lookup.** `SmpClient` validated the lookup URL —
+  resolving DNS to check for private ranges — and then issued the request
+  through a long-lived client that resolved DNS **again**. An attacker
+  controlling the response answers the check with a public address and the
+  connection with a private one. The lookup now validates and pins in one step,
+  as the AS2/AS4 egress path already did; the unpinned `validate_egress_url`
+  helper that made this mistake possible is deleted rather than documented.
+- **The strict-runtime bootstrap marker is unforgeable.**
+  `SessionContext::set_strict_runtime_bootstrap_validated` and
+  `with_strict_runtime_bootstrap_validated` were public, and
+  `SessionMetadata::strict_runtime_bootstrap_validated` was a public field — so
+  the entire startup-validation gate was one assignment away from being
+  bypassed while still reporting itself as enforced. The marker is now
+  crate-private and can only be raised by
+  [`StrictRuntimeBootstrapToken::bind`], which needs a token that only
+  `StrictRuntimeBootstrap::validate` can mint. Tests use
+  `SessionContext::test_only_mark_strict_runtime_bootstrap_validated`, gated
+  behind `testing` (a `compile_error!` in release builds).
+- **One constant-time comparison.** Two hand-rolled XOR-accumulate `secure_eq`
+  copies were replaced by a single `subtle::ConstantTimeEq`-backed
+  `core::constant_time_eq`. A hand-rolled loop has no defence against the
+  optimiser turning it back into an early-exit compare; `subtle` does.
+
+### Wire / crypto — participant discovery
+
+- **Peppol discovery was broken in four independent ways at once, and the only
+  test asserted that an MD5 hex string is 32 characters long.** `SmpClient`
+  built `https://B-<hash>.<sml_zone>/` and issued a `GET` at it. Every input was
+  wrong: the hash covered `"{scheme}::{value}"` where the specification hashes
+  the **identifier value alone**; the mandatory `<scheme>` DNS label was absent;
+  and both SML zone constants (`edelivery.tech.ec.europa.eu`,
+  `acc.edelivery.tech.ec.europa.eu`) were decommissioned on 31 August 2026 when
+  OpenPeppol took the SML in-house. Peppol had also already migrated from CNAME
+  to **NAPTR**, so the `B-…` name resolves to nothing even in the zone that
+  still answers.
+
+  Discovery is now BDXL as specified — `strip-trailing(base32(sha256(lowercase(
+  ID-VALUE))), "=") + "." + ID-SCHEME + "." + ZONE`, resolved as a `Meta:SMP`
+  U-NAPTR — against `participant.sml.prod.tech.peppol.org` and
+  `participant.sml.test.tech.peppol.org`. The DNS name computation is pinned to
+  the specification's own worked example and to the record the live production
+  SML returns.
+
+  **This is not backward compatible and is not meant to be**: the old behaviour
+  found nothing. `SmpClient` now needs a `BdxlResolver` for NAPTR discovery and
+  says so, rather than silently falling back to a scheme the network withdrew.
+
+- **A U-NAPTR replacement is now constrained.** The SMP URL is read out of a DNS
+  record, so the record decides where a message goes. Backreferences are
+  refused (RFC 4848 §2.2 forbids them; one would splice part of the queried name
+  into the address), and a non-`https` replacement is refused rather than used,
+  so a DNS answer cannot downgrade the metadata fetch.
+
+- **SMP 2.0 support was a namespace constant and a comment.** The endpoint's
+  transport profile was read only from the SMP 1.0 `transportProfile`
+  *attribute*, but SMP 2.0 carries it in a `TransportProfileID` *element* — and
+  renames the address to `AddressURI`, the process id to `Process/ID`, and nests
+  the certificate. No 2.0 endpoint could ever match. Both generations are now
+  detected and parsed by their own rules, and an SMP offering two endpoints for
+  one process and transport profile is **refused** rather than resolved by
+  document order.
+
+### Wire / crypto — ordered delivery
+
+- **Ordered AS4 delivery ordered nothing.** `receive_push_ordered` is documented
+  as serializing concurrent receives that share an `eb:ConversationId`
+  (ebMS3 §5.1.5). It did the entire receive — parse, verify, decrypt, dedup —
+  and *then* acquired the conversation turn, so the queue recorded **completion**
+  order rather than arrival order: a small message that arrived second overtook
+  a large one that arrived first. It then **released the turn before returning**,
+  so the application delivered with no turn held at all and nothing about
+  delivery was serialized.
+
+  The gate already had the right shape. `reserve_turn` / `wait_turn` is a
+  two-phase ticket API whose own documentation calls early reservation "the
+  optimization of early reservation (before full parse)" — and nothing outside
+  the gate module called it. Early reservation is not an optimization; it is the
+  property. `extract_conversation_id_for_gate`, the bounded byte scan written to
+  get the key before parsing, was orphaned behind `#[cfg(test)]` with ten tests
+  exercising a function production did not compile.
+
+  Now: the turn is reserved from the raw bytes on arrival, the expensive work
+  runs while holding only a ticket, and `receive_push_ordered` returns
+  **`As4Ordered<As4ReceiveOutcome>`** — a guard that holds the turn until the
+  caller drops it. The scanned id is compared against the verified
+  `eb:ConversationId` afterwards, so an unauthenticated scan can only mis-order
+  or reject the sender's own traffic.
+
+- **A repeated `eb:ConversationId` was accepted, first-wins.** It is
+  `maxOccurs="1"` in ebMS3 Core and it is the key the ordering gate queues on, so
+  document order was deciding which conversation a message belonged to. Now
+  rejected, like the `eb:MessageInfo` children already were.
+
+- **The test guarding all of this exercised none of it.** It discarded the
+  receive result with `let _ =`, failed on the first event emission because the
+  bus had no durable audit sink, declared `application/soap+xml` for a multipart
+  body, and satisfied its ordering assertion from the 10 ms `sleep` between two
+  spawns — in 0.07 s, with the 120 ms verify it was built around never running.
+  Made real, it failed immediately. `SECURITY.md` says `let _ = verify(...)` is
+  not a shape that exists in this codebase; it was in the test guarding ordered
+  delivery.
+
+### Wire / crypto — HTTP ingress
+
+- **A repeated HTTP header was resolved first-wins.** `AS2-From` names the
+  partner a session is bound to, `Message-ID` is the dedup key,
+  `Disposition-Notification-To` is where a receipt gets sent, and `Content-Type`
+  decides how the body is parsed — and the ingress layer took the first
+  occurrence of each and ignored the rest. `axum`'s `HeaderMap::iter` yields one
+  entry per duplicate value, so a peer sending two `AS2-From` headers bound the
+  session to one partner while a proxy or the partner's own gateway could read
+  the other. Now an `InvalidInput` error. The crate applied this rule
+  meticulously to repeated `eb:MessageId` and `eb:Messaging` elements (D5) and
+  not at all to the headers carrying the same identities.
+
+### Wire / crypto — canonicalization and key derivation
+
+- **Inclusive C14N of a document subset dropped the ancestors' `xml:*`
+  attributes.** Canonical XML 1.0 §2.3 gives the apex element of a subset every
+  in-scope `xml:*` attribute from ancestors outside the node-set; Exclusive
+  C14N deliberately does not, and the crate had generalised the exclusive
+  behaviour to both. A conformant peer signing an element nested under an
+  `xml:lang` or `xml:space` had its signature reported as a forgery.
+
+- **A reference declaring no transform was canonicalized exclusively.** XMLDSig
+  §4.3.3.2 makes **inclusive** Canonical XML the default when converting a
+  node-set to octets. The signing path already knew this — it *states* the
+  exclusive algorithm precisely because the default is not exclusive — and the
+  verify path did not. Same fail-closed, undiagnosable outcome.
+
+- **Processing-instruction data was trimmed.** C14N 1.0 §2.3 emits it verbatim;
+  `<?t d  ?>` canonicalized to `<?t d?>`, a digest nothing else computes.
+
+- **ConcatKDF ignored `SuppPubInfo` and `SuppPrivInfo`.** SP 800-56A §5.8.1.2
+  concatenates all five `ConcatKDFParams` fields. Two were parsed by nobody, so
+  an ECDH-ES peer supplying either derived a key-encryption key this crate could
+  not reproduce — surfacing as "AES Key Unwrap integrity check failed", which
+  names the KEK rather than the dropped parameter.
+
+### Wire / crypto — AS4 envelope determinism
+
+- **About one signed AS4 message in a thousand shipped a signature nothing
+  could verify.** `eb:MessageInfo/eb:Timestamp` lives inside the signed
+  `eb:Messaging` block, and the send path builds the envelope **twice** for one
+  message — once unsigned to compute that block's `ds:Reference` digest, once
+  again with the `wsse:Security` header. `SoapEnvelopeBuilder::build()` read
+  `SystemTime::now()` on each call, so whenever the two builds straddled a
+  whole-second boundary the envelope that went on the wire was not the one that
+  had been digested. The receiver computed a different digest for
+  `#as4-messaging` and rejected the message with
+  `SecurityVerificationFailed` — indistinguishable from a flaky partner.
+
+  `SoapEnvelopeBuilder::with_message_timestamp` is now **required**: `build()`
+  returns `InvalidInput` without it, naming the setter. A caller that would
+  have raced gets a deterministic error at its first build instead of a bad
+  message on the wire once in a thousand. Found by a single failing run of the
+  test suite that had passed a dozen times before it.
+
+  The send path no longer builds the envelope twice at all: it reserves the
+  `wsse:Security` slot with a placeholder and splices the finished header in
+  after signing. The placeholder is outside both signed subtrees, so it cannot
+  move a digest, and `splice_ws_security_header` refuses unless it finds
+  exactly one — which is the safety the rebuild had been chosen for, without
+  the race the rebuild introduced.
+
+### Wire / crypto — base64 in XML
+
+- **Line-wrapped base64 is accepted.** XML Signature §6.1 and XML Encryption
+  define their base64 content by reference to RFC 2045, which line-wraps, and
+  any XML pretty-printer folds a long `ds:DigestValue` or `ds:SignatureValue`
+  anyway. The `base64` crate's standard engine rejects embedded whitespace, so
+  a conformant counterparty was rejected: an inbound signature failed to parse,
+  and — worse — an `eb:Receipt` whose NRR digests were line-wrapped was reported
+  as `SecurityVerificationFailed` with "the acknowledgement refers to different
+  bytes than were sent". Every base64 value that arrives inside an XML document
+  now goes through `core::decode_xml_base64`, which strips ASCII whitespace
+  first. `xenc:CipherValue` already did this; nothing else did.
+- **NRR digests are compared as decoded bytes, in constant time**, rather than
+  as base64 strings. Same root cause as above, plus consistency with the
+  reference-digest check, which already used a constant-time comparison.
+- **AS2: a folded `Received-Content-MIC` header no longer reports a mismatch.**
+  RFC 5322 §2.2.3 lets a MIME header fold across lines, so a conformant
+  partner's digest can arrive with a CRLF and a space inside the base64. Strict
+  decoding failed on that and the comparison fell back to raw string equality —
+  declaring a delivered message undelivered. Whitespace is now stripped before
+  decoding and the digests are compared in constant time.
+
+### Removed — scope
+
+- **`incident_channels` is gone** (~2,900 lines). The module shipped a webhook
+  HTTP client with retry, a circuit breaker, bounded queues and metrics, a
+  file-spool writer, and a sizing advisor — plus **its own process-global
+  multi-threaded Tokio runtime**, built inside a library. No protocol path
+  depended on any of it. (The `…IncidentChannel` traits and incident structs it
+  left behind are gone too — see **The alerting engine is gone**, below.) This is
+  the same boundary the 0.13.0 removal of the built-in KMS/HSM client drew,
+  applied consistently.
+- **`recommend_event_bus_capacity`** and `EventBusCapacitySizingInput` removed:
+  a multiplication with a hard-coded 25 % headroom constant is not something a
+  protocol library should assert about someone else's workload. The alerting
+  thresholds removed below are the same mistake in a different file.
+- **`As2StrictProductionPreset` / `As4StrictProductionPreset`** removed. They
+  wrapped `As2SendPolicy::regulated()` and friends and had no users.
+
+### API — hard cuts
+
+- **The alerting engine is gone** (~1,200 lines). `asx_rs::alerting` and the
+  `EventBus` alert methods carried 22 public types in two parallel families that
+  differed only in the noun — `As4ReceiptTaxonomyAlert{,Category,Severity,Policy,
+  DispatchPolicy,Incident}`, `As2ProviderHealth…`, both `…IncidentChannel`
+  traits, both `…SchedulerRequest`s — plus a threshold evaluator with hard-coded
+  percentages, `runbook_hint` strings about a deployment this crate has never
+  seen, a dedup-cooldown map, and `run_…_alert_scheduler` polling loops with
+  their own shutdown channels, inside a library. No protocol path referenced any
+  of it, and the two `AsxEvent` alert variants it defined were emitted **only by
+  itself**, so the metric counting alerts counted this module exporting them.
+
+  What remains is what only the crate can supply: `EventBusMetrics::
+  as4_receipt_taxonomy_snapshot()` and `as2_provider_health_snapshot()`, the
+  exhaustive event taxonomy, and the durable audit trail. A failure-rate
+  threshold is a partner-SLA question; the monitoring stack already scraping
+  these counters is where it belongs. Same boundary as the KMS/HSM client (D14)
+  and `incident_channels` (D38), drawn a third time.
+- **`receive_push_ordered` and `receive_push_ordered_fragment_aware` return
+  `As4Ordered<T>`** instead of the bare outcome — see the ordered-delivery
+  section above. `ConversationOrderGate` gains `reserve_ordered_turn` returning
+  a `ConversationTurnHandle`; `acquire_ordered_turn` remains as a provided
+  method for callers with nothing to overlap with the wait. A distributed gate
+  implementation must split its lock acquisition into the two phases.
+- **Test-only shadows of production code deleted**: a single-pass marker scanner
+  documented as avoiding scans the precheck still performs, and a linear `cid:`
+  reference resolver superseded by a hash index. Their assertions now run against
+  the code that executes.
+- **Unused public types removed**: `crypto::CryptoPolicy` (a confusing duplicate
+  of `interop::SecurityPolicy`), `crypto::CertificateRef`, `http::HttpResponse`,
+  `http::ClientRuntime`.
+- **MSRV raised to 1.88** — required by the `dns` feature's DNS client, and a
+  split MSRV per feature is a worse promise than one honest number.
+- **`EventBus` has one builder instead of six constructors.**
+  `EventBus::builder()` replaces `new_with_config_and_mode` and
+  `new_with_config_and_mode_and_metrics` (four and five positional arguments);
+  `new_strict_with_audit_fallback` is expressible as
+  `.emission_mode(EventEmissionMode::StrictWithAuditFallback)`. `new`,
+  `new_regulated` and `new_for_testing` stay as named presets.
+- **`presets` collapsed to one entry point.** `StrictRuntimeBootstrap` (a
+  builder) replaces `issue_strict_runtime_bootstrap_token`,
+  `issue_strict_runtime_bootstrap_token_with_as4_topology`,
+  `validate_strict_production_startup_readiness`,
+  `validate_strict_production_as4_topology_readiness`,
+  `require_strict_runtime_bootstrap_token`,
+  `session_with_strict_runtime_bootstrap_token`,
+  `strict_production_event_bus`, `require_durable_dedup_backend` and
+  `require_durable_reconciliation_backend`. Bind a session with
+  `token.bind(&session)`.
+- **`AsxError::context` is now `Box<ErrorContext>`.** `AsxError` was 120 bytes,
+  so *every* `Result` in the crate — including `Result<()>` — was 120 bytes
+  wide on the success path too. It is now 40. Field access
+  (`err.context.session_id`) is unchanged through `Deref`.
+- **`DedupStorage`, `ReconciliationStorage`, `DurableAuditSink`,
+  `OcspResponseCache`, `ConversationOrderGate` and `As2TrustVerifier` now
+  require `Debug`.** Implementors add `#[derive(Debug)]`. This is what makes
+  the request and policy types that hold them printable.
+- Every public type implements `Debug`; `missing_debug_implementations` is a
+  lint the crate now passes.
+
+### Fixed
+
+- **The strict startup gate rejected the mode its own documentation
+  recommends.** `StrictWithAuditFallback` cannot be constructed without a
+  production-durable audit sink and persists every event to it when no
+  subscriber is live — it is a strict mode. The readiness check demanded
+  `StrictTransactional` exactly, so a regulated deployment that followed the
+  advice in `EventBus::new_strict_with_audit_fallback` could not start. The gate
+  now rejects only `BestEffort`.
+- **The performance gate ran four of its six benchmarks and said nothing.**
+  `as2_verify_decrypt_mdn` and `as4_verify_decrypt` are behind `testing`, and
+  `testing` is a `compile_error!` in release builds — which is exactly why the
+  gate is invoked without it. Both baseline lines therefore checked nothing, for
+  as long as they existed, while the file read as though six benchmarks were
+  gated. `--check-baseline` now **fails** on a baseline entry with no matching
+  measurement, and the baseline lists only what that configuration compiles.
+
+  Underneath, all four of the receive-path benchmarks were broken and had been
+  masked by the same gap: they built an `EventBus` with no durable audit sink
+  while running fail-closed receive policies (every call returned
+  `ReliabilityFailure`), held an event subscription nothing drained (emission
+  failed once the channel filled), passed `multipart/related` with no `boundary`
+  parameter (rejected before any protocol work), and omitted the ebMS3 routing
+  properties strict interop requires. Fixed; the benchmarked paths are the ones
+  production takes again.
+- **Four broken intra-doc links**, shipping to docs.rs as dead references: one
+  pointed at `lifecycle::InsecureBypassTrustVerifier`, which is in `as2::trust`
+  and not exported at all; one at a `pub(super)` MIME builder; one at a field
+  renamed to `signature_policy`; and `EventBus::builder()` documented a return
+  type that had lost its `pub use`, so the builder was unnameable by callers.
+  `cargo doc` with `-D warnings` is now a CI job and a `just doc-links` gate.
+- **A test that could not fail.** `handler_outcome_constructors_build_expected_variants`
+  wrote `matches!(..)` as a bare statement four times. `matches!` returns a
+  `bool`, and a discarded `bool` is not `#[must_use]`, so the test passed
+  whatever the constructors returned. Now wrapped in `assert!`.
+- **`just hygiene` scanned a directory that does not exist.** The gate globbed
+  `docs`, which became `site/content`, so every pattern it enforces was checked
+  against the source tree minus the documentation for however long.
+- **Dead code behind feature gates was invisible.** `-D warnings` ran only at
+  `--all-features`, which is precisely the build where a stale `#[cfg]` cannot
+  show up. The CI feature matrix now denies warnings too, and the four functions
+  that were dead in narrower feature sets are gated correctly.
+- **MSRV was declared but never checked.** Three `usize::is_multiple_of` calls
+  (stable 1.87) meant the crate did not build on the edition-2024 floor, and
+  `concepts/` claimed CI verified the declared version while no such job
+  existed. `rust-version` is now `1.88` and a CI job builds on that exact
+  toolchain. (The `is_multiple_of` workaround is reverted: it is below the new
+  floor.) The doctest ratchet the justfile defines is likewise now a CI job
+  rather than a recipe someone had to remember to run.
+- **The mandatory ebMS3 Test Service was unreachable in production.**
+  `asx_rs::as4::test_service` was gated behind the `testing` feature — which
+  raises a `compile_error!` in release builds — so no production deployment
+  could implement a protocol feature ebMS3 Core §5.2.2 requires of a conformant
+  MSH, and which the eDelivery conformance suite exercises as `PING`. It is
+  protocol, not scaffolding; the gate is removed.
+- **docs.rs would have published an almost empty crate.** `as2` and `as4` are
+  not default features and there was no `[package.metadata.docs.rs]`, so the
+  published documentation covered only the shared infrastructure. Now
+  `all-features = true`.
+
+### Quality
+
+- `#![forbid(unsafe_code)]` on the library (it already contained none).
+- `keywords`, `categories` and `rust-version` added for crates.io.
+- Working directories excluded from the published package.
+- `clippy::todo`, `unimplemented` and `dbg_macro` denied; the crate is clippy
+  clean at `--all-features --all-targets`.
+- `DedupStorage`'s implementation example is a compiling doctest instead of a
+  `rust,ignore` sketch, and the stale `asx-rs = "=0.5.0"` pin in the
+  `ReconciliationStorage` docs is corrected.
+- **A ratchet on uncompiled doctests** (`just doctest-ratchet`, in the release
+  gate). A ```` ```ignore ```` block is never compiled, so it renders as checked
+  Rust while being free to rot. The gate does not demand zero; it demands the
+  count never grows. Converting the two receipt-generation examples immediately
+  surfaced a wrong type in one of them — which is the point.
+- The perf gate and the AS2 golden tests now mint a **real** bootstrap token
+  through `StrictRuntimeBootstrap` instead of setting the marker directly, so
+  they measure and exercise the path production takes.
+
+### Wire / crypto — AS4
+
+- **Multi-payload send.** `As4SendRequest::additional_payloads` attaches
+  further parts, each with its own signed `eb:PartInfo`, `ds:Reference`, and
+  per-part compression/encryption; `payload_mime_type` / `payload_content_id`
+  control the primary part (eDelivery payload profiles pin both). Attachment
+  digests follow the WSS SwA transform by wire content type — XML parts are
+  digested over their Exclusive C14N form, `text/*` over CRLF-normalized
+  octets — matching WSS4J receivers. Compressed/encrypted parts travel as
+  `application/gzip`/`application/octet-stream` while the signed PartInfo
+  keeps the original media type.
+- **`CompressionType` survives encryption.** The property is emitted whenever
+  compression was applied — previously it was suppressed for encrypted
+  payloads, so the receiver decrypted and then delivered gzip bytes as the
+  business document.
+- **SwA packaging.** Outbound messages use the AS4 packaging: an
+  `application/soap+xml` root part, an **empty** SOAP Body, and payload
+  attachments referenced from the signed `eb:PartInfo href="cid:…"` entries.
+  The previous MTOM/XOP shape (`application/xop+xml` root, `xop:Include` in
+  the Body) is gone from send — WSS4J-based receivers reject it before
+  signature verification — but is still accepted inbound.
+- **WSS-conformant KeyInfo by default.** `ds:KeyInfo` now carries a
+  `wsse:SecurityTokenReference` to an `X509v3` `wsse:BinarySecurityToken`
+  (WSS 1.1.1 §7.7). The BST content is base64(DER) — it previously encoded the
+  PEM text, which no consumer could parse. Bare-`ds:X509Data` profiles remain
+  selectable for plain-XMLDSig consumers.
+- **Complete ebMS3 envelope.** `eb:Role` (schema-mandatory) is always emitted,
+  `eb:ConversationId` always present (default `"1"`), and `eb:AgreementRef`,
+  `eb:PartyId/@type` (including untyped) and explicit From/To party IDs are
+  configurable on the send policy.
+- **SwA attachment transform.** `cid:` references declare the WSS
+  `Attachment-Content-Signature-Transform` on send and accept it on verify;
+  the `Complete` variant is rejected by name.
+- **Verification accepts the deployed WSS4J shapes**: `X509v3` and
+  `X509PKIPathv1` BinarySecurityTokens resolved via SecurityTokenReference,
+  and the `InclusiveNamespaces PrefixList` on `ds:SignedInfo`'s own
+  `CanonicalizationMethod` is honored.
+- **Exclusive C14N hardening.** Elements and attributes are serialized with
+  their source prefixes (correct under same-URI prefix rebinding, which
+  Axiom-built envelopes produce); `xmlns=""` undeclarations are rendered per
+  Exc-C14N §2.3; whitespace-only text nodes are never stripped.
+- **Fail-closed signature resolution.** Documents with multiple `ds:Signature`
+  elements resolve to the single signature inside `wsse:Security` or are
+  rejected as ambiguous — never picked by document order.
+- **XML Encryption.** `ConcatKDFParams` attributes are decoded as hexBinary
+  bit-strings per XML Encryption 1.1 (previously base64, which silently
+  mis-decoded conformant peers' values); RFC 3394 key wrap supports
+  128/192/256-bit KEKs sized to the content key; AES-256 content keys are no
+  longer wrapped under 128-bit KEKs.
+- **Compression is integrity-protected.** The `CompressionType` part property
+  is emitted on send and consumed from the signed header on receive, both
+  directions.
+- **Pull is authorized or denied.** `As4PullAuthorization` defaults to `Deny`;
+  `SharedSecret` (constant-time) and `EnforcedByTransport` are the explicit
+  alternatives.
+
+### Wire / crypto — AS2
+
+- **MIC per RFC 4130 §7.3.1.** The MIC digests the exact protected MIME
+  entity (after compression, before signing on send; the verified entity on
+  receive). Sender and receiver MICs now round-trip; previously they were
+  digests of different byte sequences.
+- **Receive delivers the payload**, not the S/MIME envelope, with
+  content-transfer-encoding reversed and the entity's own `Content-Type`
+  surfaced.
+- **Compression is RFC 5402 CMS `CompressedData`** (RFC 3274 ZLIB) in both
+  directions, with decompression-bomb bounds — previously a bare gzip stream
+  no conformant partner could unwrap, and inbound compression was never
+  reversed.
+- **Unsigned messages are modelled, not mangled**: `As2SignaturePolicy`
+  (default `Required`, fail-closed) replaces the boolean, and legitimately
+  unsigned messages surface as `SignatureVerification::NotSigned`.
+- **Both HTTP body shapes are accepted.** Partners differ in whether the AS2
+  body repeats the outer MIME headers; asx now synthesizes them from the
+  transport `Content-Type` when absent, so `multipart/signed` content, raw
+  PKCS#7 DER under a binary content-transfer-encoding, MIME preambles, and the
+  legacy `application/x-pkcs7-*` media types all verify.
+
+### Wire / crypto — WS-Security & SMP
+
+- An X.509 signer token is required unconditionally; a signature verifying
+  only against an inline `ds:RSAKeyValue` authenticates nobody and is
+  rejected.
+- SMP results default to `SmpSignaturePolicy::Deny`; `Verify` performs full
+  enveloped-signature verification (`URI=""` + enveloped-signature transform).
+- Uppercase and mixed-case `wsu:Id` fragments are accepted (NCName-conformant
+  partners were previously rejected).
+
+### API
+
+- `As4SendPolicyBuilder`: `from_party`, `to_party`, `party_id_types`, `roles`,
+  `agreement_ref` (all new); `WsSecOutboundKeyInfoProfile` gains
+  `BinarySecurityTokenX509v3` (the new default).
+- Spool encryption keys are injected: `SpoolEncryptionKeyProvider` is public,
+  `StaticSpoolKey` is the one built-in, and the crate's environment-variable
+  surface went from 31 variables to 1. The bespoke KMS/HSM HTTP client
+  (~1.9 kLOC) is removed.
+- `InMemoryAuditSink::new()` returns `Result` instead of silently downgrading
+  to a derivable HMAC key.
+- Transport errors include the full cause chain (connection refused/reset/
+  timeout), not just reqwest's one-line summary.
+- Removed: `inject_xop_include`, the `strip_blank_text` C14N knob, the spool
+  KMS provider enum and its environment variables.
+
+### Interop verification
+
+- `tests/interop_holodeck_counterparty.rs` — live exchange with **Holodeck
+  B2B 6.1.1** (WSS4J) in Docker: asx's signed **two-payload** push is verified
+  and delivered by Holodeck; Holodeck's signed NRR receipt — echoing every
+  attachment digest — is verified by asx. Identities are generated fresh per
+  run.
+- `tests/interop_xmlsec_oracle.rs` — reference digests recomputed by
+  **xmlsec1**, the W3C XMLDSig reference implementation.
+- `tests/interop_openssl_smime_oracle.rs` — AS2 S/MIME in both directions
+  against the `openssl smime` CLI: openssl verifies/decrypts asx output, and
+  asx verifies/decrypts openssl-produced messages.
+- CI runs a `cargo hack` feature powerset in addition to the fixed matrix.
+
+## [0.13.0] — 2026-08-11
 
 Everything since 0.12.0. It is a **hard cut**: wire format, defaults and APIs
 changed without compatibility shims.

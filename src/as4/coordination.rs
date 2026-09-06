@@ -2,9 +2,14 @@
 
 use crate::core::{Result, SessionContext};
 
-/// Boxed future returned by [`ConversationOrderGate::acquire_ordered_turn`].
-type AcquireOrderedTurnFuture<'a> = std::pin::Pin<
+/// Boxed future yielding a held turn.
+type TurnFuture<'a> = std::pin::Pin<
     Box<dyn std::future::Future<Output = Result<Box<dyn ConversationGuardHandle>>> + Send + 'a>,
+>;
+
+/// Boxed future returned by [`ConversationOrderGate::reserve_ordered_turn`].
+type ReserveTurnFuture<'a> = std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<Box<dyn ConversationTurnHandle>>> + Send + 'a>,
 >;
 
 /// Capability surface for AS4 ordered-delivery and pull-queue coordination backends.
@@ -23,7 +28,7 @@ pub trait As4TopologyCoordination: Send + Sync {
 // ConversationOrderGate — distributed / pluggable gate abstraction
 // ---------------------------------------------------------------------------
 
-/// RAII guard returned by [`ConversationOrderGate::acquire_ordered_turn`].
+/// RAII guard for a conversation's active turn.
 ///
 /// The guard holds the ordered turn for a single AS4 conversation.  All
 /// subsequent waiters for the same conversation are suspended until this guard
@@ -38,6 +43,29 @@ pub trait ConversationGuardHandle: Send {
     /// Prefer explicit `release` so that the turn boundary is visible at the
     /// call site.
     fn release(self: Box<Self>);
+}
+
+/// A reserved place in a conversation's **arrival** order.
+///
+/// This is the half of the gate that makes ordering mean anything. The
+/// reservation is taken as soon as a message arrives — before it is parsed,
+/// verified or decrypted — so the queue reflects the order messages showed up
+/// in. [`wait_for_turn`](Self::wait_for_turn) is then awaited *after* that work,
+/// and yields only once every earlier arrival has finished.
+///
+/// Reserving after the work instead orders by processing time: a small message
+/// that arrived second overtakes a large one that arrived first (D54).
+///
+/// Dropping a reservation without waiting releases the place, so a failed
+/// receive does not block the conversation.
+pub trait ConversationTurnHandle: Send {
+    /// Wait until every earlier reservation for this conversation has been
+    /// released, then take the turn.
+    ///
+    /// # Errors
+    ///
+    /// Backend-specific; a distributed gate typically fails on lock timeout.
+    fn wait_for_turn(self: Box<Self>) -> TurnFuture<'static>;
 }
 
 /// Conversation-level ordering gate for AS4 ordered-delivery MEPs.
@@ -64,12 +92,13 @@ pub trait ConversationGuardHandle: Send {
 /// struct RedisOrderGate { client: redis::Client }
 ///
 /// impl ConversationOrderGate for RedisOrderGate {
-///     fn acquire_ordered_turn<'a>(
+///     fn reserve_ordered_turn<'a>(
 ///         &'a self, conversation_id: &'a str, _session: &'a SessionContext,
-///     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Box<dyn ConversationGuardHandle>>> + Send + 'a>> {
+///     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Box<dyn ConversationTurnHandle>>> + Send + 'a>> {
 ///         Box::pin(async move {
-///             let guard = self.acquire_redis_lock(conversation_id).await?;
-///             Ok(Box::new(guard) as Box<dyn ConversationGuardHandle>)
+///             // Take a sequence number now; wait for it in `wait_for_turn`.
+///             let ticket = self.next_ticket(conversation_id).await?;
+///             Ok(Box::new(ticket) as Box<dyn ConversationTurnHandle>)
 ///         })
 ///     }
 ///     fn record_message_ordering<'a>(
@@ -84,29 +113,46 @@ pub trait ConversationGuardHandle: Send {
 ///     fn topology_component(&self) -> &'static str { "redis-conversation-gate" }
 /// }
 /// ```
-pub trait ConversationOrderGate: As4TopologyCoordination {
-    /// Acquire and hold the ordered turn for `conversation_id`.
+pub trait ConversationOrderGate: As4TopologyCoordination + std::fmt::Debug {
+    /// Take this message's place in `conversation_id`'s arrival order.
     ///
-    /// Suspends until all previously-acquired turns for the same conversation
-    /// have been released.  Returns a [`ConversationGuardHandle`] that releases
-    /// the turn when dropped or when [`ConversationGuardHandle::release`] is
-    /// called.
+    /// Returns immediately with a [`ConversationTurnHandle`]; it does **not**
+    /// wait for the turn. Call this before parsing, verification or decryption,
+    /// so the queue records arrival order rather than completion order.
     ///
     /// # Errors
     ///
     /// Returns `ErrorCode::CapacityExhausted` if the gate cannot accept new
-    /// conversations (e.g., capacity limit reached, lock timeout, etc.).
+    /// conversations (capacity limit reached, lock timeout, and so on).
+    fn reserve_ordered_turn<'a>(
+        &'a self,
+        conversation_id: &'a str,
+        session: &'a SessionContext,
+    ) -> ReserveTurnFuture<'a>;
+
+    /// Reserve and immediately wait — the whole turn in one call.
+    ///
+    /// Only correct where there is no work to overlap with the wait. The
+    /// ordered receive path does not use it, because everything expensive
+    /// belongs *between* the two halves.
     fn acquire_ordered_turn<'a>(
         &'a self,
         conversation_id: &'a str,
         session: &'a SessionContext,
-    ) -> AcquireOrderedTurnFuture<'a>;
+    ) -> TurnFuture<'a> {
+        Box::pin(async move {
+            self.reserve_ordered_turn(conversation_id, session)
+                .await?
+                .wait_for_turn()
+                .await
+        })
+    }
 
     /// Validate and record the reply-predecessor relationship for ordered
     /// Two-Way MEPs.
     ///
-    /// Must be called **while holding** the guard from `acquire_ordered_turn`,
-    /// before releasing it.  Implementations that do not enforce predecessor
+    /// Must be called **while holding** the guard from
+    /// [`ConversationTurnHandle::wait_for_turn`], before releasing it.  Implementations that do not enforce predecessor
     /// semantics should return `Ok(())`.
     ///
     /// # Parameters

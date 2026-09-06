@@ -148,8 +148,25 @@ fn bench(mut f: impl FnMut(), name: &'static str, iterations: u64) -> BenchResul
 }
 
 #[cfg(all(feature = "as4", feature = "testing"))]
+/// Boundary shared by the payload builder and the `Content-Type` the bench
+/// hands the receive path. They have to agree: a `multipart/related` header
+/// without the boundary the body actually uses is rejected before any
+/// protocol work happens, so the bench measures a parse error instead of the
+/// verify/decrypt path it names.
+const AS4_BENCH_BOUNDARY: &str = "asx-perf-boundary";
+
+/// The `Content-Type` matching [`as4_multipart_payload_from_fixture`]'s output.
+#[cfg(all(feature = "as4", feature = "testing"))]
+fn as4_bench_content_type() -> String {
+    format!(
+        "multipart/related; boundary=\"{AS4_BENCH_BOUNDARY}\"; \
+         type=\"application/xop+xml\"; start=\"<soap-root@example.com>\""
+    )
+}
+
+#[cfg(all(feature = "as4", feature = "testing"))]
 fn as4_multipart_payload_from_fixture(soap_xml: &[u8]) -> Vec<u8> {
-    let boundary = "asx-perf-boundary";
+    let boundary = AS4_BENCH_BOUNDARY;
     let payload_cid = "perf-body@example.com";
     let mut soap = String::from_utf8_lossy(soap_xml).into_owned();
 
@@ -160,6 +177,23 @@ fn as4_multipart_payload_from_fixture(soap_xml: &[u8]) -> Vec<u8> {
             1,
         );
     }
+    // Strict interop requires the four-corner routing properties (ebMS3
+    // `originalSender` / `finalRecipient`), which the shared golden fixture
+    // does not carry. Injected here rather than added to the fixture, because
+    // the fixture is also the input to tests that assert on its exact shape.
+    if !soap.contains("eb:MessageProperties") {
+        soap = soap.replacen(
+            "</eb:CollaborationInfo>",
+            "</eb:CollaborationInfo>\
+             <eb:MessageProperties>\
+             <eb:Property name=\"originalSender\">urn:asx:perf:sender</eb:Property>\
+             <eb:Property name=\"finalRecipient\">urn:asx:perf:recipient</eb:Property>\
+             <eb:Property name=\"trackingIdentifier\">asx-perf-tracking-1</eb:Property>\
+             </eb:MessageProperties>",
+            1,
+        );
+    }
+
     if soap.contains("<S12:Body/>") {
         soap = soap.replacen(
             "<S12:Body/>",
@@ -253,17 +287,142 @@ fn print_results(results: &[BenchResult]) {
     }
 }
 
+/// Mint a real strict-runtime token and bind it, so the benchmarked path is the
+/// one production takes. The alternative — a `testing`-gated marker — is not
+/// available here: the perf gate deliberately builds without `testing`, because
+/// that feature disables the WS-Security enforcement being measured.
+/// A durable audit sink for the benchmarked paths.
+///
+/// Not decoration: the receive policies these benches use are fail-closed on
+/// audit events, so a bus without a production-durable sink makes every
+/// measured call return `ReliabilityFailure` instead of exercising the
+/// protocol. The gate must benchmark the path production takes.
+#[cfg(any(feature = "as2", feature = "as4"))]
+#[derive(Debug)]
+struct BenchSink;
+
+#[cfg(any(feature = "as2", feature = "as4"))]
+const _: () = {
+    use asx::core::Result as AsxResult;
+    use asx::observability::audit_sink::{
+        AuditEvent, AuditSinkDurability, DurableAuditSink, ReplayCursor,
+    };
+
+    impl DurableAuditSink for BenchSink {
+        fn durability(&self) -> AuditSinkDurability {
+            AuditSinkDurability::Durable
+        }
+        fn has_replay_cursor_integrity_protection(&self) -> bool {
+            true
+        }
+        fn store_event(&self, _event: &AuditEvent) -> AsxResult<()> {
+            Ok(())
+        }
+        fn retrieve_events_from(
+            &self,
+            _cursor: &ReplayCursor,
+            _limit: usize,
+        ) -> AsxResult<Vec<AuditEvent>> {
+            Ok(Vec::new())
+        }
+        fn current_cursor(&self) -> AsxResult<ReplayCursor> {
+            Ok(ReplayCursor {
+                last_event_id: "0".to_string(),
+                position: 0,
+                last_timestamp: 0,
+                integrity_tag_b64: String::new(),
+            })
+        }
+        fn acknowledge_cursor(&self, _cursor: &ReplayCursor) -> AsxResult<()> {
+            Ok(())
+        }
+        fn clear(&self) -> AsxResult<()> {
+            Ok(())
+        }
+    }
+};
+
+#[cfg(any(feature = "as2", feature = "as4"))]
+fn strict_bench_session(session_id: &str) -> SessionContext {
+    use asx::core::Result as AsxResult;
+    use asx::presets::StrictRuntimeBootstrap;
+    use asx::reliability::ReconciliationRequest;
+    use asx::storage::{BoxFuture, DedupStorage, ReconciliationStorage};
+    use std::sync::Arc;
+
+    #[derive(Debug)]
+    struct BenchDedup;
+    impl DedupStorage for BenchDedup {
+        fn is_durable(&self) -> bool {
+            true
+        }
+        fn cluster_safe(&self) -> bool {
+            true
+        }
+        fn first_seen<'a>(&'a self, _key: &'a str) -> BoxFuture<'a, AsxResult<bool>> {
+            Box::pin(async { Ok(true) })
+        }
+    }
+
+    #[derive(Debug)]
+    struct BenchReconciliation;
+    impl ReconciliationStorage for BenchReconciliation {
+        fn is_durable(&self) -> bool {
+            true
+        }
+        fn cluster_safe(&self) -> bool {
+            true
+        }
+        fn enqueue<'a>(&'a self, _r: ReconciliationRequest) -> BoxFuture<'a, AsxResult<bool>> {
+            Box::pin(async { Ok(true) })
+        }
+        fn queued_requests(&self) -> BoxFuture<'_, AsxResult<Vec<ReconciliationRequest>>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+        fn resolve<'a>(&'a self, _key: &'a str) -> BoxFuture<'a, AsxResult<bool>> {
+            Box::pin(async { Ok(true) })
+        }
+    }
+
+    let bus = EventBus::new_regulated(16, Arc::new(BenchSink)).expect("regulated bus");
+    let token = StrictRuntimeBootstrap::new("perf_gate")
+        .event_bus(&bus)
+        .dedup(&BenchDedup)
+        .reconciliation(&BenchReconciliation)
+        .validate()
+        .expect("startup validation");
+
+    token.bind(&SessionContext::new(session_id, "bench-p", "strict").expect("session"))
+}
+
+/// The bus the benchmarked paths run on.
+///
+/// Two properties are load-bearing. The receive policies here are fail-closed
+/// on audit events, so the bus needs a **production-durable** sink or every
+/// measured call returns `ReliabilityFailure` instead of exercising the
+/// protocol. And it must hold no subscription that nothing drains, because a
+/// full channel fails emission under a strict mode. `StrictWithAuditFallback`
+/// persists to the sink when no subscriber is live — the shape a regulated
+/// deployment runs (D37).
+#[cfg(any(feature = "as2", feature = "as4"))]
+fn bench_bus() -> EventBus {
+    use asx::observability::EventEmissionMode;
+    EventBus::builder()
+        .capacity(256)
+        .audit_sink(std::sync::Arc::new(BenchSink))
+        .emission_mode(EventEmissionMode::StrictWithAuditFallback)
+        .build()
+        .expect("bench bus")
+}
+
 fn run_results(#[allow(unused_variables)] iterations: u64) -> Vec<BenchResult> {
     #[allow(unused_mut)]
     let mut results = Vec::new();
 
     #[cfg(feature = "as2")]
     {
-        let session = SessionContext::new("bench-s-as2", "bench-p", "strict")
-            .expect("session")
-            .with_strict_runtime_bootstrap_validated(true);
-        let bus = EventBus::new(256).expect("bus");
-        let _events = bus.subscribe_scoped_events();
+        let session = strict_bench_session("bench-s-as2");
+        let bus = bench_bus();
         let payload = vec![b'A'; 2048];
         let credentials = bench_as2_credentials();
 
@@ -344,11 +503,9 @@ fn run_results(#[allow(unused_variables)] iterations: u64) -> Vec<BenchResult> {
 
     #[cfg(feature = "as4")]
     {
-        let session = SessionContext::new("bench-s-as4", "bench-p", "strict")
-            .expect("session")
-            .with_strict_runtime_bootstrap_validated(true);
-        let bus = EventBus::new(256).expect("bus");
-        let _events = bus.subscribe_scoped_events();
+        let session = strict_bench_session("bench-s-as4");
+        #[cfg(feature = "testing")]
+        let bus = bench_bus();
         let marker_payload =
             fs::read("tests/fixtures/as4_push_user_message.golden").expect("as4 fixture precheck");
 
@@ -373,7 +530,7 @@ fn run_results(#[allow(unused_variables)] iterations: u64) -> Vec<BenchResult> {
                         &bus,
                         As4ReceivePushSyncRequest {
                             request: As4ReceivePushRequest {
-                                http_content_type: "multipart/related".into(),
+                                http_content_type: as4_bench_content_type(),
                                 payload: std::sync::Arc::clone(&payload),
                                 receipt_payload: None,
                                 policy: bench_policy.clone(),
@@ -426,6 +583,14 @@ fn run_results(#[allow(unused_variables)] iterations: u64) -> Vec<BenchResult> {
     results
 }
 
+/// Compare measurements against the baseline.
+///
+/// A baseline entry with no matching measurement is a **failure**, not a
+/// skip. The alternative is what this gate used to do: the baseline named six
+/// benchmarks, the feature set the gate is invoked with compiles four, and the
+/// two most expensive ones — the AS2 and AS4 receive paths — were silently
+/// unchecked for as long as the entries sat there. A gate that quietly measures
+/// less than its baseline claims is the same shape as a test that cannot fail.
 fn check_regressions(
     baseline: &HashMap<String, f64>,
     results: &[BenchResult],
@@ -443,6 +608,21 @@ fn check_regressions(
                 ));
             }
         }
+    }
+
+    let measured: std::collections::HashSet<&str> = results.iter().map(|r| r.name).collect();
+    let mut unmeasured: Vec<&str> = baseline
+        .keys()
+        .map(String::as_str)
+        .filter(|name| !measured.contains(name))
+        .collect();
+    unmeasured.sort_unstable();
+    for name in unmeasured {
+        failures.push(format!(
+            "{name} is in the baseline but was not measured: this feature set does not \
+             compile it, so its baseline line checks nothing. Remove the line, or invoke \
+             the gate with the features that build the benchmark"
+        ));
     }
 
     if failures.is_empty() {

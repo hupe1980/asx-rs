@@ -100,18 +100,15 @@ For regulated deployments that require explicit startup proof, bind validated
 session context once and then use standard AS2 entry points:
 
 ```rust
-let strict_session = asx_rs::presets::session_with_strict_runtime_bootstrap_token(
-    "as2_receive_sync",
-    &bootstrap_token,
-    &session,
-)?;
+let strict_session = bootstrap_token.bind(&session);
 
 let received = asx_rs::as2::receive_sync(&strict_session, payload, verifier)?;
 ```
 
-In non-testing builds, strict interop AS2 entry points fail closed unless the
-session is startup-validated with
-`asx_rs::presets::session_with_strict_runtime_bootstrap_token(...)`.
+`bootstrap_token` comes from
+[`StrictRuntimeBootstrap::validate`](@/docs/getting-started.md#regulated-startup-gate-strict-production).
+In non-testing builds, strict-interop AS2 entry points refuse a session with no
+token binding, and there is no other way to set the marker.
 
 ### Receive (streaming ingress)
 
@@ -189,4 +186,4 @@ pub fn generate_mdn(
 
 AS2 flows emit protocol events through `EventBus` (for example: outbound prepared, MIC computed, message signed/encrypted, MDN received, duplicate detected).
 
-EventBus constructors are strict by default. Use fail-closed mode in regulated deployments and opt into best-effort explicitly via `EventBus::new_with_config_and_mode(..., EventEmissionMode::BestEffort)` only where transport progress must not depend on subscriber liveness.
+`EventBus` is strict by default. Use `EventBus::new_regulated(..)` in regulated deployments; opt into best-effort explicitly via `EventBus::builder().emission_mode(EventEmissionMode::BestEffort)` only where transport progress must not depend on subscriber liveness.

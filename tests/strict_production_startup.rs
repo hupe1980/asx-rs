@@ -10,10 +10,11 @@ use asx_rs::observability::audit_sink::{
 };
 use asx_rs::observability::{BackpressurePolicy, EventBus, EventEmissionMode};
 #[cfg(feature = "as4")]
-use asx_rs::presets::{DeploymentTopology, validate_strict_production_as4_topology_readiness};
-use asx_rs::presets::{strict_production_event_bus, validate_strict_production_startup_readiness};
+use asx_rs::presets::DeploymentTopology;
+use asx_rs::presets::StrictRuntimeBootstrap;
 use asx_rs::storage::{BoxFuture, DedupStorage, ReconciliationStorage};
 
+#[derive(Debug)]
 struct DurableTestAuditSink;
 
 impl DurableAuditSink for DurableTestAuditSink {
@@ -55,6 +56,7 @@ impl DurableAuditSink for DurableTestAuditSink {
     }
 }
 
+#[derive(Debug)]
 struct DurableClusterSafeReconciliation;
 
 impl ReconciliationStorage for DurableClusterSafeReconciliation {
@@ -84,6 +86,7 @@ impl ReconciliationStorage for DurableClusterSafeReconciliation {
     }
 }
 
+#[derive(Debug)]
 struct DurableClusterSafeDedup;
 
 impl DedupStorage for DurableClusterSafeDedup {
@@ -103,6 +106,7 @@ impl DedupStorage for DurableClusterSafeDedup {
     }
 }
 
+#[derive(Debug)]
 struct NonDurableReconciliation;
 
 impl ReconciliationStorage for NonDurableReconciliation {
@@ -128,6 +132,7 @@ impl ReconciliationStorage for NonDurableReconciliation {
     }
 }
 
+#[derive(Debug)]
 struct NonClusterSafeDedup;
 
 impl DedupStorage for NonClusterSafeDedup {
@@ -143,53 +148,73 @@ impl DedupStorage for NonClusterSafeDedup {
     }
 }
 
-#[test]
-fn strict_startup_validation_accepts_regulated_runtime_wiring() {
-    let bus = strict_production_event_bus(16, Arc::new(DurableTestAuditSink)).expect("bus");
-
-    let result = validate_strict_production_startup_readiness(
-        "strict_startup_integration",
-        &bus,
-        &DurableClusterSafeReconciliation,
-        &DurableClusterSafeDedup,
-    );
-
-    assert!(result.is_ok());
+fn regulated_bus() -> EventBus {
+    EventBus::new_regulated(16, Arc::new(DurableTestAuditSink)).expect("bus")
 }
 
 #[test]
-fn strict_startup_validation_rejects_non_transactional_event_bus() {
-    let bus = EventBus::new_with_config_and_mode(
-        16,
-        None,
-        BackpressurePolicy::default(),
-        EventEmissionMode::BestEffort,
-    )
-    .expect("bus");
+fn strict_startup_validation_accepts_regulated_runtime_wiring() {
+    let bus = regulated_bus();
 
-    let err = validate_strict_production_startup_readiness(
-        "strict_startup_integration",
-        &bus,
-        &DurableClusterSafeReconciliation,
-        &DurableClusterSafeDedup,
-    )
-    .expect_err("best-effort event bus must be rejected in strict startup validation");
+    StrictRuntimeBootstrap::new("strict_startup_integration")
+        .event_bus(&bus)
+        .reconciliation(&DurableClusterSafeReconciliation)
+        .dedup(&DurableClusterSafeDedup)
+        .validate()
+        .expect("regulated wiring must validate");
+}
+
+#[test]
+fn strict_startup_validation_rejects_best_effort_event_bus() {
+    let bus = EventBus::builder()
+        .capacity(16)
+        .backpressure(BackpressurePolicy::default())
+        .emission_mode(EventEmissionMode::BestEffort)
+        .build()
+        .expect("bus");
+
+    let err = StrictRuntimeBootstrap::new("strict_startup_integration")
+        .event_bus(&bus)
+        .reconciliation(&DurableClusterSafeReconciliation)
+        .dedup(&DurableClusterSafeDedup)
+        .validate()
+        .expect_err("best-effort event bus must be rejected in strict startup validation");
 
     assert_eq!(err.code, ErrorCode::ReliabilityFailure);
-    assert!(err.message.contains("StrictTransactional"));
+    assert!(err.message.contains("strict event emission mode"));
+}
+
+/// `StrictWithAuditFallback` requires a production-durable sink at construction
+/// and persists to it when no subscriber is live, so it *is* a strict mode.
+/// The gate used to demand `StrictTransactional` exactly, which made the mode
+/// its own documentation recommends unusable in a regulated deployment.
+#[test]
+fn strict_startup_validation_accepts_audit_fallback_mode() {
+    let bus = EventBus::builder()
+        .capacity(16)
+        .audit_sink(Arc::new(DurableTestAuditSink))
+        .emission_mode(EventEmissionMode::StrictWithAuditFallback)
+        .build()
+        .expect("bus");
+
+    StrictRuntimeBootstrap::new("strict_startup_integration")
+        .event_bus(&bus)
+        .reconciliation(&DurableClusterSafeReconciliation)
+        .dedup(&DurableClusterSafeDedup)
+        .validate()
+        .expect("audit-fallback strict mode must pass the startup gate");
 }
 
 #[test]
 fn strict_startup_validation_rejects_non_durable_reconciliation_backend() {
-    let bus = strict_production_event_bus(16, Arc::new(DurableTestAuditSink)).expect("bus");
+    let bus = regulated_bus();
 
-    let err = validate_strict_production_startup_readiness(
-        "strict_startup_integration",
-        &bus,
-        &NonDurableReconciliation,
-        &DurableClusterSafeDedup,
-    )
-    .expect_err("non-durable reconciliation backend must fail closed");
+    let err = StrictRuntimeBootstrap::new("strict_startup_integration")
+        .event_bus(&bus)
+        .reconciliation(&NonDurableReconciliation)
+        .dedup(&DurableClusterSafeDedup)
+        .validate()
+        .expect_err("non-durable reconciliation backend must fail closed");
 
     assert_eq!(err.code, ErrorCode::ReliabilityFailure);
     assert!(err.message.contains("durable reconciliation backend"));
@@ -197,55 +222,94 @@ fn strict_startup_validation_rejects_non_durable_reconciliation_backend() {
 
 #[test]
 fn strict_startup_validation_rejects_non_cluster_safe_dedup_backend() {
-    let bus = strict_production_event_bus(16, Arc::new(DurableTestAuditSink)).expect("bus");
+    let bus = regulated_bus();
 
-    let err = validate_strict_production_startup_readiness(
-        "strict_startup_integration",
-        &bus,
-        &DurableClusterSafeReconciliation,
-        &NonClusterSafeDedup,
-    )
-    .expect_err("non-cluster-safe dedup backend must fail closed");
+    let err = StrictRuntimeBootstrap::new("strict_startup_integration")
+        .event_bus(&bus)
+        .reconciliation(&DurableClusterSafeReconciliation)
+        .dedup(&NonClusterSafeDedup)
+        .validate()
+        .expect_err("non-cluster-safe dedup backend must fail closed");
 
     assert_eq!(err.code, ErrorCode::ReliabilityFailure);
     assert!(err.message.contains("cluster-safe dedup backend"));
 }
 
+/// Every component is mandatory: forgetting one must be an error, not a silently
+/// narrower check.
+#[test]
+fn strict_startup_validation_requires_every_component() {
+    let bus = regulated_bus();
+
+    let err = StrictRuntimeBootstrap::new("strict_startup_integration")
+        .event_bus(&bus)
+        .dedup(&DurableClusterSafeDedup)
+        .validate()
+        .expect_err("a missing reconciliation backend must be an error");
+
+    assert_eq!(err.code, ErrorCode::InvalidInput);
+    assert!(err.message.contains("reconciliation"));
+}
+
 #[cfg(feature = "as4")]
 #[test]
 fn strict_startup_validation_as4_topology_allows_single_node_process_local_components() {
+    let bus = regulated_bus();
     let store = As4PullStore::new();
     let gate = As4ConversationOrderGate::new(16);
 
-    let result = validate_strict_production_as4_topology_readiness(
-        "strict_startup_integration",
-        DeploymentTopology::SingleNode,
-        Some(&store),
-        Some(&gate),
-    );
+    let token = StrictRuntimeBootstrap::new("strict_startup_integration")
+        .event_bus(&bus)
+        .reconciliation(&DurableClusterSafeReconciliation)
+        .dedup(&DurableClusterSafeDedup)
+        .topology(DeploymentTopology::SingleNode)
+        .as4_pull_store(&store)
+        .as4_conversation_gate(&gate)
+        .validate()
+        .expect("single node may use process-local components");
 
-    assert!(result.is_ok());
+    assert_eq!(token.as4_topology(), Some(DeploymentTopology::SingleNode));
 }
 
 #[cfg(feature = "as4")]
 #[test]
 fn strict_startup_validation_as4_topology_rejects_clustered_process_local_components() {
+    let bus = regulated_bus();
     let store = As4PullStore::new();
     let gate = As4ConversationOrderGate::new(16);
 
-    let err = validate_strict_production_as4_topology_readiness(
-        "strict_startup_integration",
-        DeploymentTopology::Clustered,
-        Some(&store),
-        Some(&gate),
-    )
-    .expect_err("clustered startup must reject process-local AS4 pull/ordering components");
+    let err = StrictRuntimeBootstrap::new("strict_startup_integration")
+        .event_bus(&bus)
+        .reconciliation(&DurableClusterSafeReconciliation)
+        .dedup(&DurableClusterSafeDedup)
+        .topology(DeploymentTopology::Clustered)
+        .as4_pull_store(&store)
+        .as4_conversation_gate(&gate)
+        .validate()
+        .expect_err("clustered startup must reject process-local AS4 pull/ordering components");
 
     assert_eq!(err.code, ErrorCode::ReliabilityFailure);
     assert!(
-        err.message.contains("cluster-safe AS4 pull-store")
-            || err
-                .message
-                .contains("distributed AS4 conversation ordering coordination")
+        err.message.contains("pull-store") || err.message.contains("conversation-ordering"),
+        "message names the offending component: {}",
+        err.message
     );
+}
+
+/// A clustered deployment that supplies nothing at all must not slip through.
+#[cfg(feature = "as4")]
+#[test]
+fn strict_startup_validation_clustered_without_coordination_is_rejected() {
+    let bus = regulated_bus();
+
+    let err = StrictRuntimeBootstrap::new("strict_startup_integration")
+        .event_bus(&bus)
+        .reconciliation(&DurableClusterSafeReconciliation)
+        .dedup(&DurableClusterSafeDedup)
+        .topology(DeploymentTopology::Clustered)
+        .validate()
+        .expect_err("clustered startup with no coordination backends must fail closed");
+
+    assert_eq!(err.code, ErrorCode::ReliabilityFailure);
+    assert!(err.message.contains("pull-store"));
 }

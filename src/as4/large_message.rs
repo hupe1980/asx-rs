@@ -112,15 +112,12 @@ pub struct As4FragmentJoinerLimits {
     ///
     /// When `Some(duration)`, any group whose first fragment was ingested more
     /// than `duration` ago is evicted (and permanently rejected) the next time
-    /// `prune_stale_groups` is called.  When `None` (the default), time-based
-    /// eviction is disabled and incomplete groups are only removed when the
-    /// count or byte limits are hit.
+    /// `prune_stale_groups` is called. `None` disables time-based eviction, so
+    /// an abandoned group is only removed once the count or byte limit is hit —
+    /// which a sender that never completes a group can avoid indefinitely.
     ///
-    /// Recommended value for production BDEW MaKo deployments: `Some(Duration::from_secs(3600))`
-    /// (1 hour), which is sufficient for any reasonable large-message transfer
-    /// while protecting against memory exhaustion from abandoned groups.
-    ///
-    /// Default: `None` (disabled — preserves existing behaviour).
+    /// Default: `Some(1 hour)` — long enough for any reasonable large-message
+    /// transfer, and the value the BDEW MaKo profile is deployed with.
     pub max_group_age: Option<std::time::Duration>,
 }
 
@@ -620,6 +617,9 @@ fn build_fragment_envelope(
     )
     .with_roles(&policy.from_role, &policy.to_role)
     .with_action(&policy.action)
+    .with_message_timestamp(crate::time_utils::format_rfc3339_secs(
+        std::time::SystemTime::now(),
+    ))
     .with_service(&policy.service, &policy.service_type)
     .with_four_corner_properties(
         original_sender.as_str(),

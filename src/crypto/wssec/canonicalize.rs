@@ -243,6 +243,14 @@ pub struct SameDocumentReferenceIndex<'a> {
     entries: HashMap<&'a str, SameDocumentReferenceEntry<'a>>,
 }
 
+impl std::fmt::Debug for SameDocumentReferenceIndex<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SameDocumentReferenceIndex")
+            .field("ids", &self.entries.keys().collect::<Vec<_>>())
+            .finish()
+    }
+}
+
 impl<'a> SameDocumentReferenceIndex<'a> {
     pub(crate) fn build(doc: &'a Document<'a>) -> Self {
         Self::build_impl(doc, None)
@@ -627,12 +635,15 @@ fn serialize_root_node(
                     }
                     out.push_str("<?");
                     out.push_str(pi.target);
-                    if let Some(data) = pi.value {
-                        let data = data.trim_end();
-                        if !data.is_empty() {
-                            out.push(' ');
-                            out.push_str(data);
-                        }
+                    // C14N 1.0 §2.3 emits the PI data verbatim; only the
+                    // separating space is conditional on the data being
+                    // non-empty. Trimming it changes the octets a conformant
+                    // implementation digests.
+                    if let Some(data) = pi.value
+                        && !data.is_empty()
+                    {
+                        out.push(' ');
+                        out.push_str(data);
                     }
                     out.push_str("?>");
                     if is_before_doc_elem {
@@ -714,6 +725,32 @@ pub(crate) fn try_serialize_node_omitting(
     inclusive_ns_prefixes_override: Option<&[String]>,
     omit: Option<Node<'_, '_>>,
 ) -> std::fmt::Result {
+    serialize_subtree(
+        node,
+        out,
+        profile,
+        parent_ns,
+        inclusive_ns_prefixes_override,
+        omit,
+        true,
+    )
+}
+
+/// Serialize one node of the subset.
+///
+/// `apex` marks the node whose parent lies *outside* the node-set — the one
+/// element that Canonical XML 1.0 §2.3 gives the ancestors' in-scope `xml:*`
+/// attributes to. It is true only for the node the caller passed in, and false
+/// for everything reached by recursion.
+fn serialize_subtree(
+    node: Node<'_, '_>,
+    out: &mut impl std::fmt::Write,
+    profile: &WsSecCanonicalizationProfile,
+    parent_ns: &BTreeMap<String, String>,
+    inclusive_ns_prefixes_override: Option<&[String]>,
+    omit: Option<Node<'_, '_>>,
+    apex: bool,
+) -> std::fmt::Result {
     if let Some(omit) = omit
         && node == omit
     {
@@ -727,6 +764,7 @@ pub(crate) fn try_serialize_node_omitting(
             parent_ns,
             inclusive_ns_prefixes_override,
             omit,
+            apex,
         ),
         NodeType::Text => {
             // Every text node is emitted verbatim (modulo escaping), including
@@ -755,12 +793,12 @@ pub(crate) fn try_serialize_node_omitting(
             if let Some(pi) = node.pi() {
                 out.write_str("<?")?;
                 out.write_str(pi.target)?;
-                if let Some(data) = pi.value {
-                    let data = data.trim_end();
-                    if !data.is_empty() {
-                        out.write_char(' ')?;
-                        out.write_str(data)?;
-                    }
+                // Verbatim data, per C14N 1.0 §2.3 — see `serialize_root_node`.
+                if let Some(data) = pi.value
+                    && !data.is_empty()
+                {
+                    out.write_char(' ')?;
+                    out.write_str(data)?;
                 }
                 out.write_str("?>")?;
             }
@@ -768,13 +806,14 @@ pub(crate) fn try_serialize_node_omitting(
         }
         NodeType::Root => {
             for child in node.children() {
-                try_serialize_node_omitting(
+                serialize_subtree(
                     child,
                     out,
                     profile,
                     parent_ns,
                     inclusive_ns_prefixes_override,
                     omit,
+                    apex,
                 )?;
             }
             Ok(())
@@ -802,6 +841,45 @@ fn element_source_prefix<'a>(node: Node<'a, 'a>) -> &'a str {
     }
 }
 
+/// The `xml:*` attributes an apex element inherits from ancestors outside the
+/// node-set (Canonical XML 1.0 §2.3).
+///
+/// Nearest ancestor wins, and an attribute the element already carries is not
+/// inherited at all. The returned qualified name is read from the source
+/// document so the ancestor's own prefix for the XML namespace is preserved,
+/// exactly as for an attribute written on the element itself.
+fn inherited_xml_attributes<'a>(
+    node: Node<'a, 'a>,
+    doc_text: &'a str,
+) -> Vec<(&'a str, &'a str, String)> {
+    let mut inherited: Vec<(&str, &str, String)> = Vec::new();
+    for ancestor in node.ancestors().skip(1).filter(|n| n.is_element()) {
+        for attr in ancestor.attributes() {
+            if attr.namespace() != Some(XML_NS) {
+                continue;
+            }
+            let local = attr.name();
+            // Already carried by the element, or already taken from a nearer
+            // ancestor.
+            if node
+                .attributes()
+                .any(|own| own.namespace() == Some(XML_NS) && own.name() == local)
+                || inherited.iter().any(|(seen, _, _)| *seen == local)
+            {
+                continue;
+            }
+            let prefix = attribute_source_prefix(doc_text, &attr);
+            let qname = if prefix.is_empty() {
+                local.to_string()
+            } else {
+                format!("{prefix}:{local}")
+            };
+            inherited.push((local, attr.value(), qname));
+        }
+    }
+    inherited
+}
+
 /// Original prefix of an attribute's qualified name, from the source document.
 fn attribute_source_prefix<'input>(
     doc_text: &'input str,
@@ -821,6 +899,7 @@ fn serialize_element(
     parent_ns: &BTreeMap<String, String>,
     inclusive_ns_prefixes_override: Option<&[String]>,
     omit: Option<Node<'_, '_>>,
+    apex: bool,
 ) -> std::fmt::Result {
     let doc_text = node.document().input_text();
 
@@ -974,6 +1053,21 @@ fn serialize_element(
             (a.namespace(), a.name(), qname, a.value())
         })
         .collect();
+
+    // Canonical XML 1.0 §2.3, document subsets: an element whose parent is
+    // outside the node-set inherits every `xml:*` attribute in scope on its
+    // ancestors that it does not itself carry. Without this, the digest over a
+    // signed element nested under an `xml:lang` or `xml:space` is not the one a
+    // conformant implementation computes.
+    //
+    // Exclusive C14N §2 deliberately drops the rule — an element's canonical
+    // form must not depend on its enveloping context — so this applies only to
+    // the inclusive algorithm.
+    if apex && matches!(profile.kind, WsSecCanonicalizationKind::Inclusive) {
+        for (local, value, qname) in inherited_xml_attributes(node, doc_text) {
+            attrs.push((Some(XML_NS), local, qname, value));
+        }
+    }
     attrs.sort_unstable_by(|a, b| {
         let a_ns = a.0.unwrap_or("");
         let b_ns = b.0.unwrap_or("");
@@ -1003,13 +1097,14 @@ fn serialize_element(
     };
 
     for child in node.children() {
-        try_serialize_node_omitting(
+        serialize_subtree(
             child,
             out,
             profile,
             child_ns.as_ref(),
             inclusive_ns_prefixes_override,
             omit,
+            false,
         )?;
     }
 
@@ -1723,5 +1818,88 @@ mod w3c_c14n_vectors {
             !result.contains("S12"),
             "S12 namespace must not appear in SignedInfo: {result}"
         );
+    }
+
+    // ── C14N 1.0 §2.3 — document subsets ─────────────────────────────────
+
+    /// An element whose parent is outside the node-set inherits the `xml:*`
+    /// attributes in scope on its ancestors. Omitting them digests an octet
+    /// stream no conformant implementation produces, so a peer that signs a
+    /// nested element with inclusive C14N cannot be verified.
+    #[test]
+    fn inc_c14n_apex_inherits_ancestor_xml_attributes() {
+        let xml = r#"<outer xml:lang="fr" xml:space="preserve"><inner id="t">x</inner></outer>"#;
+        let result = canonicalize_element_by_id(xml, "t", &inc_profile());
+        assert_eq!(
+            result, r#"<inner id="t" xml:lang="fr" xml:space="preserve">x</inner>"#,
+            "C14N 1.0 §2.3: in-scope xml:* attributes join the apex element"
+        );
+    }
+
+    /// The nearest ancestor wins, and an attribute the element carries itself
+    /// is not overwritten by an ancestor's.
+    #[test]
+    fn inc_c14n_nearest_ancestor_wins_and_own_attributes_survive() {
+        let xml = r#"<a xml:lang="fr" xml:space="preserve"><b xml:lang="de"><c id="t" xml:space="default">x</c></b></a>"#;
+        let result = canonicalize_element_by_id(xml, "t", &inc_profile());
+        assert_eq!(
+            result,
+            r#"<c id="t" xml:lang="de" xml:space="default">x</c>"#
+        );
+    }
+
+    /// Exclusive C14N drops the rule on purpose: an element's canonical form
+    /// must not depend on what envelopes it (Exc-C14N §2).
+    #[test]
+    fn exc_c14n_apex_does_not_inherit_ancestor_xml_attributes() {
+        let xml = r#"<outer xml:lang="fr" xml:space="preserve"><inner id="t">x</inner></outer>"#;
+        let result = canonicalize_element_by_id(xml, "t", &exc_profile());
+        assert_eq!(result, r#"<inner id="t">x</inner>"#);
+    }
+
+    /// Only the apex inherits; a descendant already has the ancestor in the
+    /// node-set, so repeating the attribute would duplicate it.
+    #[test]
+    fn inc_c14n_descendants_do_not_repeat_inherited_xml_attributes() {
+        let xml = r#"<outer xml:lang="fr"><inner id="t"><deep/></inner></outer>"#;
+        let result = canonicalize_element_by_id(xml, "t", &inc_profile());
+        assert_eq!(
+            result,
+            r#"<inner id="t" xml:lang="fr"><deep></deep></inner>"#
+        );
+    }
+
+    // ── C14N 1.0 §2.3 — processing instructions ──────────────────────────
+
+    /// PI data is emitted verbatim; only the separating space is conditional.
+    /// Trimming the data changes the digest.
+    #[test]
+    fn pi_data_is_emitted_verbatim() {
+        let doc = roxmltree::Document::parse("<r><?target data  ?></r>").expect("parse");
+        let mut out = String::new();
+        try_serialize_node_with_inclusive_ns(
+            doc.root_element(),
+            &mut out,
+            &inc_profile(),
+            &EMPTY_NS_MAP,
+            None,
+        )
+        .expect("serialize");
+        assert_eq!(out, "<r><?target data  ?></r>");
+    }
+
+    #[test]
+    fn pi_without_data_omits_the_separating_space() {
+        let doc = roxmltree::Document::parse("<r><?target?></r>").expect("parse");
+        let mut out = String::new();
+        try_serialize_node_with_inclusive_ns(
+            doc.root_element(),
+            &mut out,
+            &inc_profile(),
+            &EMPTY_NS_MAP,
+            None,
+        )
+        .expect("serialize");
+        assert_eq!(out, "<r><?target?></r>");
     }
 }

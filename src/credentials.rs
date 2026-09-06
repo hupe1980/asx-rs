@@ -17,7 +17,7 @@ use crate::as4::{As4PreparedSendCredentials, As4SendCredentials, As4SendPolicy};
 ///
 /// This type centralizes signing and encryption PEM material so one caller
 /// object can drive either protocol's send path.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct PartnerCredentials {
     /// PEM-encoded signing certificate.
     pub signing_cert_pem: Option<Arc<[u8]>>,
@@ -25,6 +25,20 @@ pub struct PartnerCredentials {
     pub signing_key_pem: Option<Vec<u8>>,
     /// PEM-encoded recipient certificate used for encryption.
     pub recipient_cert_pem: Option<Arc<[u8]>>,
+}
+
+impl std::fmt::Debug for PartnerCredentials {
+    /// Never prints `signing_key_pem`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PartnerCredentials")
+            .field("signing_cert_pem", &self.signing_cert_pem)
+            .field(
+                "signing_key_pem",
+                &crate::core::redact_present(self.signing_key_pem.is_some()),
+            )
+            .field("recipient_cert_pem", &self.recipient_cert_pem)
+            .finish()
+    }
 }
 
 impl Drop for PartnerCredentials {

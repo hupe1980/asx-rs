@@ -115,7 +115,7 @@ impl ReplayCursor {
 /// Implementations must also avoid holding sink-internal locks while invoking
 /// user callbacks or bus-facing APIs. Violating this lock-ordering rule can
 /// create deadlocks under strict fail-closed audit emission.
-pub trait DurableAuditSink: Send + Sync {
+pub trait DurableAuditSink: Send + Sync + std::fmt::Debug {
     /// Return whether this sink provides production-grade durability semantics.
     ///
     /// Implementations should return [`AuditSinkDurability::Durable`] only when
@@ -162,6 +162,7 @@ pub enum AuditSinkDurability {
 }
 
 /// In-memory audit sink for testing
+#[derive(Debug)]
 pub struct InMemoryAuditSink {
     events: parking_lot::Mutex<Vec<AuditEvent>>,
     acknowledged_cursor: parking_lot::Mutex<ReplayCursor>,

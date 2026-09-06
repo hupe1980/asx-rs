@@ -54,46 +54,59 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 
 ## Regulated Startup Gate (Strict Production)
 
-In regulated deployments, validate runtime wiring before accepting traffic:
+In regulated deployments, validate the runtime wiring before accepting traffic.
+`StrictRuntimeBootstrap` checks every component in one place and hands back a
+token; the token is the only way to mark a session as startup-validated.
 
 ```rust
 use std::sync::Arc;
 
-use asx_rs::presets::{
-    DeploymentTopology,
-    StrictRuntimeBootstrapToken,
-    issue_strict_runtime_bootstrap_token_with_as4_topology,
-    strict_production_event_bus,
-};
-use asx_rs::storage::{DedupStorage, ReconciliationStorage};
 use asx_rs::as4::{As4ConversationOrderGate, As4PullStore};
+use asx_rs::observability::EventBus;
+use asx_rs::observability::audit_sink::DurableAuditSink;
+use asx_rs::presets::{DeploymentTopology, StrictRuntimeBootstrap, StrictRuntimeBootstrapToken};
+use asx_rs::storage::{DedupStorage, ReconciliationStorage};
 
 fn bootstrap_strict_runtime(
     reconciliation: Arc<dyn ReconciliationStorage>,
     dedup: Arc<dyn DedupStorage>,
-    audit_sink: Arc<dyn asx_rs::observability::audit_sink::DurableAuditSink>,
+    audit_sink: Arc<dyn DurableAuditSink>,
     pull_store: &As4PullStore,
     conversation_gate: &As4ConversationOrderGate,
-) -> asx_rs::Result<asx_rs::observability::EventBus> {
-    let bus = strict_production_event_bus(1024, audit_sink)?;
+) -> asx_rs::Result<(EventBus, StrictRuntimeBootstrapToken)> {
+    let bus = EventBus::new_regulated(1024, audit_sink)?;
 
-    let _token: StrictRuntimeBootstrapToken = issue_strict_runtime_bootstrap_token_with_as4_topology(
-        "startup",
-        &bus,
-        reconciliation.as_ref(),
-        dedup.as_ref(),
-        DeploymentTopology::Clustered,
-        Some(pull_store),
-        Some(conversation_gate),
-    )?;
+    let token = StrictRuntimeBootstrap::new("startup")
+        .event_bus(&bus)
+        .reconciliation(reconciliation.as_ref())
+        .dedup(dedup.as_ref())
+        .topology(DeploymentTopology::Clustered)
+        .as4_pull_store(pull_store)
+        .as4_conversation_gate(conversation_gate)
+        .validate()?;
 
-    Ok(bus)
+    Ok((bus, token))
 }
 ```
 
-This fails closed when any strict-production invariant is missing (non-transactional event mode, missing durable audit sink, non-durable or non-cluster-safe reliability backends, or clustered AS4 startup with process-local pull/order coordination). In non-testing builds, strict interop entry points also fail closed unless startup validation is bound to the session with `asx_rs::presets::session_with_strict_runtime_bootstrap_token`.
+It fails closed when any strict-production invariant is missing: a best-effort
+event bus, a missing durable audit sink, a dedup or reconciliation backend that
+does not declare itself durable **and** cluster-safe, or a clustered AS4
+deployment whose pull store or conversation gate is process-local.
 
-Migration note: bind strict-runtime once per session with `session_with_strict_runtime_bootstrap_token(...)`, then call standard AS2/AS4 ingress helper methods.
+Bind the token to each session once, then call the ordinary entry points:
+
+```rust
+# fn f(token: &asx_rs::presets::StrictRuntimeBootstrapToken, session: &asx_rs::core::SessionContext) {
+let session = token.bind(session);
+# let _ = session;
+# }
+```
+
+In non-testing builds, strict-interop entry points refuse a session that carries
+no token binding. The marker cannot be set any other way — there is no public
+setter for it, because a marker any caller could raise would assert that
+validation ran without it having run.
 
 ## Session Configuration (`SessionContextBuilder`)
 
@@ -290,12 +303,10 @@ use std::sync::Arc;
 fn end_to_end_as2() -> asx_rs::Result<()> {
     // 1. Build a reusable session (one per trading-partner relationship).
     let session = SessionContext::new("sess-acme-prod", "partner-acme", "strict")?;
-    let bus = EventBus::new_with_config_and_mode(
-        128,
-        None,
-        BackpressurePolicy::default(),
-        EventEmissionMode::BestEffort,
-    )?;
+    let bus = EventBus::builder()
+        .capacity(128)
+        .emission_mode(EventEmissionMode::BestEffort)
+        .build()?;
 
     // 2. Prepare credentials (load once; reuse across messages).
     let creds = As2SendCredentials {

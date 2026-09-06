@@ -110,6 +110,7 @@ pub struct MockReceivedMessage {
 // Internal — durable-flagged in-memory dedup for the mock
 // ---------------------------------------------------------------------------
 
+#[derive(Debug)]
 struct MockDedup(InMemoryDedupBackend);
 
 impl DedupStorage for MockDedup {
@@ -142,7 +143,7 @@ struct MockEndpointState {
 /// credentials before binding to a port.
 ///
 /// Obtain via [`MockAs4Endpoint::builder()`].
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct MockAs4EndpointBuilder {
     decryption_key_pem: Option<Vec<u8>>,
     receipt_signing: Option<(Vec<u8>, Vec<u8>)>,
@@ -224,6 +225,7 @@ impl MockAs4EndpointBuilder {
 /// channel, and replies with a synchronous AS4 receipt.
 ///
 /// Drop the `MockAs4Endpoint` to shut down the server.
+#[derive(Debug)]
 pub struct MockAs4Endpoint {
     local_addr: SocketAddr,
     rx: tokio::sync::Mutex<mpsc::UnboundedReceiver<MockReceivedMessage>>,
@@ -264,13 +266,11 @@ impl MockAs4Endpoint {
                 .expect("mock session must always construct"),
         );
         let event_bus = Arc::new(
-            EventBus::new_with_config_and_mode(
-                128,
-                None,
-                crate::observability::BackpressurePolicy::default(),
-                crate::observability::EventEmissionMode::BestEffort,
-            )
-            .expect("mock event bus must always construct"),
+            EventBus::builder()
+                .capacity(128)
+                .emission_mode(crate::observability::EventEmissionMode::BestEffort)
+                .build()
+                .expect("mock event bus must always construct"),
         );
 
         let mut policy_builder = As4PushPolicyBuilder::new()

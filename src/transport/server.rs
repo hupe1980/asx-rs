@@ -291,6 +291,10 @@ pub fn as4_router<H: As4AxumHandler>(handler: Arc<H>, path: &str, config: Router
 /// Reads the full body, bounded by `config.max_body_bytes`, within
 /// `config.body_read_timeout`.  Returns an appropriate 4xx/408 response on
 /// failure.
+// The error variant is `axum::Response`, a foreign type we hand straight back
+// to the framework. Boxing it would allocate on every rejected request to
+// satisfy a lint about a type we do not own.
+#[allow(clippy::result_large_err)]
 async fn read_http_request(req: Request, config: &RouterConfig) -> Result<HttpRequest, Response> {
     let (parts, body) = req.into_parts();
 
@@ -703,21 +707,24 @@ mod tests {
 
     #[test]
     fn handler_outcome_constructors_build_expected_variants() {
-        matches!(
+        // `matches!` returns a bool. Written as a bare statement — which is
+        // how this test read — it is discarded and the test passes whatever
+        // the constructors do.
+        assert!(matches!(
             HandlerOutcome::ok(),
             HandlerOutcome::Accepted { body: None, .. }
-        );
-        matches!(
+        ));
+        assert!(matches!(
             HandlerOutcome::ok_with_body(b"x".to_vec(), "text/plain"),
             HandlerOutcome::Accepted { body: Some(_), .. }
-        );
-        matches!(
+        ));
+        assert!(matches!(
             HandlerOutcome::bad_request("msg"),
             HandlerOutcome::Rejected { status: 400, .. }
-        );
-        matches!(
+        ));
+        assert!(matches!(
             HandlerOutcome::server_error("err"),
             HandlerOutcome::Rejected { status: 500, .. }
-        );
+        ));
     }
 }

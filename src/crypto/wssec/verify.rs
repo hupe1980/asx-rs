@@ -359,6 +359,26 @@ fn find_single_signature_node<'a>(
     }
 }
 
+/// The canonicalization a reference uses when it declares none.
+///
+/// XMLDSig §4.3.3.2: converting a node-set to the octet stream that gets
+/// digested uses **Canonical XML** — the inclusive algorithm — unless a
+/// transform says otherwise. Defaulting to exclusive instead computes a
+/// different digest from the signer's whenever an ancestor declares a
+/// namespace the subtree does not use, and reports a valid signature as a
+/// forgery. (This is the verify-side counterpart of D2, which is why the
+/// signing path *states* the exclusive algorithm rather than relying on a
+/// default.)
+///
+/// A `cid:` reference dereferences to an octet stream, not a node-set, so no
+/// canonicalization runs on it at all; the value returned for one is inert.
+fn default_c14n_kind(parsed_uri: &ParsedReferenceUri<'_>) -> WsSecCanonicalizationKind {
+    match parsed_uri {
+        ParsedReferenceUri::Cid { .. } => WsSecCanonicalizationKind::Exclusive,
+        _ => WsSecCanonicalizationKind::Inclusive,
+    }
+}
+
 /// SwA transform that additionally covers selected MIME part headers.
 /// Not supported — AS4 mandates the content-only transform.
 const SWA_ATTACHMENT_COMPLETE_TRANSFORM_URI: &str = "http://docs.oasis-open.org/wss/oasis-wss-SwAProfile-1.1#Attachment-Complete-Signature-Transform";
@@ -395,7 +415,9 @@ fn parse_reference_transform_profile(
         .find(|n| n.is_element() && is_ds_element(*n, "Transforms"));
 
     let Some(transforms) = transforms else {
-        return Ok((WsSecCanonicalizationKind::Exclusive, Vec::new()));
+        // No transforms at all. What that means depends on what the URI
+        // dereferences to.
+        return Ok((default_c14n_kind(parsed_uri), Vec::new()));
     };
 
     if matches!(parsed_uri, ParsedReferenceUri::Cid { .. }) {
@@ -428,7 +450,7 @@ fn parse_reference_transform_profile(
         return Ok((WsSecCanonicalizationKind::Exclusive, Vec::new()));
     }
 
-    let mut c14n_kind = WsSecCanonicalizationKind::Exclusive;
+    let mut c14n_kind = default_c14n_kind(parsed_uri);
     let mut inclusive_prefixes = Vec::new();
     for transform in transforms
         .children()
@@ -452,6 +474,10 @@ fn parse_reference_transform_profile(
                 ErrorContext::new("wssec_parse_references").with_message_id(uri.to_string()),
             ));
         }
+        // Stated explicitly rather than left to the initializer: the default
+        // for a reference that declares no transform is *inclusive*, so
+        // "exclusive" has to be an assignment, not the absence of one.
+        c14n_kind = WsSecCanonicalizationKind::Exclusive;
         for child in transform.children() {
             if !child.is_element() {
                 continue;
@@ -492,6 +518,7 @@ pub fn verify_signature_references_strict(
 ///
 /// Construct via `WsSecVerifyOptions::new()`, optionally chaining builder
 /// methods before passing to [`verify_enveloped_signature`].
+#[derive(Debug)]
 pub struct WsSecVerifyOptions<'a> {
     pub(crate) expected_cert_fingerprint_sha256: Option<&'a str>,
     pub(crate) revocation_policy: RevocationPolicy<'a>,
@@ -990,13 +1017,12 @@ fn decode_reference_digest_value(
     digest_method: WsSecDigestMethod,
     expected: &str,
 ) -> Result<Vec<u8>> {
-    let decoded = BASE64_STANDARD.decode(expected).map_err(|err| {
-        AsxError::new(
-            ErrorCode::ParseFailed,
-            format!("invalid base64 DigestValue for reference {uri}: {err}"),
-            ErrorContext::new("wssec_verify_references").with_message_id(uri.to_string()),
-        )
-    })?;
+    let decoded = crate::core::decode_xml_base64(
+        expected,
+        &format!("DigestValue for reference {uri}"),
+        "wssec_verify_references",
+    )
+    .map_err(|err| err.with_message_id(uri.to_string()))?;
     let expected_len = digest_method.output_len();
     if decoded.len() != expected_len {
         return Err(AsxError::new(
@@ -1105,18 +1131,6 @@ fn validate_cid_reference_uri(uri: &str) -> Result<&str> {
     }
 
     Ok(normalized)
-}
-
-#[cfg(test)]
-fn resolve_external_reference_bytes<'a>(
-    uri: &str,
-    external_references: &'a [(&str, &'a [u8])],
-) -> Option<&'a [u8]> {
-    let wanted_normalized_cid = normalize_cid_uri(uri);
-    external_references
-        .iter()
-        .find(|(candidate_uri, _)| normalize_cid_uri(candidate_uri) == wanted_normalized_cid)
-        .map(|(_, bytes)| *bytes)
 }
 
 fn verify_signature_value_with_components(
@@ -1551,13 +1565,8 @@ fn parse_signature_material_components_from_signature_with_signed_info<'a>(
                     ErrorContext::new("wssec_signature_material"),
                 )
             })?;
-        let der = BASE64_STANDARD.decode(b64).map_err(|err| {
-            AsxError::new(
-                ErrorCode::ParseFailed,
-                format!("invalid base64 X509Certificate: {err}"),
-                ErrorContext::new("wssec_signature_material"),
-            )
-        })?;
+        let der =
+            crate::core::decode_xml_base64(b64, "X509Certificate", "wssec_signature_material")?;
         x509_certificates_der.push(der);
     }
 
@@ -1568,21 +1577,17 @@ fn parse_signature_material_components_from_signature_with_signed_info<'a>(
         x509_certificates_der = token_certs_der;
     }
 
-    let signature_value = BASE64_STANDARD.decode(signature_value_b64).map_err(|err| {
-        AsxError::new(
-            ErrorCode::ParseFailed,
-            format!("invalid base64 SignatureValue: {err}"),
-            ErrorContext::new("wssec_signature_material"),
-        )
-    })?;
+    let signature_value = crate::core::decode_xml_base64(
+        signature_value_b64,
+        "SignatureValue",
+        "wssec_signature_material",
+    )?;
     let rsa_modulus = match (modulus_b64, key_value) {
-        (Some(v), _) => Some(BASE64_STANDARD.decode(v).map_err(|err| {
-            AsxError::new(
-                ErrorCode::ParseFailed,
-                format!("invalid base64 RSA modulus: {err}"),
-                ErrorContext::new("wssec_signature_material"),
-            )
-        })?),
+        (Some(v), _) => Some(crate::core::decode_xml_base64(
+            v,
+            "RSA modulus",
+            "wssec_signature_material",
+        )?),
         (None, Some(_)) => {
             return Err(AsxError::new(
                 ErrorCode::ParseFailed,
@@ -1594,13 +1599,11 @@ fn parse_signature_material_components_from_signature_with_signed_info<'a>(
     };
 
     let rsa_exponent = match (exponent_b64, key_value) {
-        (Some(v), _) => Some(BASE64_STANDARD.decode(v).map_err(|err| {
-            AsxError::new(
-                ErrorCode::ParseFailed,
-                format!("invalid base64 RSA exponent: {err}"),
-                ErrorContext::new("wssec_signature_material"),
-            )
-        })?),
+        (Some(v), _) => Some(crate::core::decode_xml_base64(
+            v,
+            "RSA exponent",
+            "wssec_signature_material",
+        )?),
         (None, Some(_)) => {
             return Err(AsxError::new(
                 ErrorCode::ParseFailed,
@@ -1747,13 +1750,11 @@ fn extract_x509_certificates_from_security_token_reference(
             )
         })?;
 
-    let token_der = BASE64_STANDARD.decode(token_b64).map_err(|err| {
-        AsxError::new(
-            ErrorCode::ParseFailed,
-            format!("invalid base64 wsse:BinarySecurityToken: {err}"),
-            ErrorContext::new("wssec_signature_material"),
-        )
-    })?;
+    let token_der = crate::core::decode_xml_base64(
+        token_b64,
+        "wsse:BinarySecurityToken",
+        "wssec_signature_material",
+    )?;
 
     if token_is_x509v3 {
         // Single DER certificate — the standard WSS4J/phase4/Domibus token
@@ -1881,16 +1882,7 @@ fn parse_der_header(input: &[u8], stage: &'static str) -> Result<(usize, usize)>
     Ok((header_len, value_len))
 }
 
-pub(crate) fn secure_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (lhs, rhs) in a.iter().zip(b.iter()) {
-        diff |= lhs ^ rhs;
-    }
-    diff == 0
-}
+pub(crate) use crate::core::constant_time_eq as secure_eq;
 
 #[cfg(test)]
 #[path = "verify_tests.rs"]
@@ -2040,7 +2032,10 @@ fn verify_enveloped_reference(
     }
 
     let mut saw_enveloped = false;
-    let mut c14n_kind = WsSecCanonicalizationKind::Exclusive;
+    // XMLDSig §4.3.3.2 again: the enveloped-signature transform yields a
+    // node-set, and turning that into octets uses inclusive Canonical XML
+    // unless a further transform names another algorithm.
+    let mut c14n_kind = WsSecCanonicalizationKind::Inclusive;
     if let Some(transforms) = reference
         .children()
         .find(|n| n.is_element() && is_ds_element(*n, "Transforms"))

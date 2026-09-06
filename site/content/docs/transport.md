@@ -32,6 +32,16 @@ let ingress: As2HttpIngress = as2_ingress_from_http(http_request)?;
 - Method is not `POST`
 - `Content-Type` is absent
 - `AS2-From` or `AS2-To` headers are absent
+- **any header it reads appears more than once** — `AS2-From`, `AS2-To`,
+  `Content-Type`, `Message-ID`, `AS2-Version`, `MIME-Version`,
+  `Disposition-Notification-To`, `Disposition-Notification-Options`,
+  `traceparent`
+- The body exceeds the size limit (`PayloadTooLarge` → HTTP 413)
+
+Each of those headers decides something — the partner the session binds to, the
+dedup key, where a receipt is sent, how the body is parsed. Taking the first of
+several while a proxy takes the last is a smuggling surface, so the ambiguity is
+refused rather than resolved.
 
 `As2HttpIngress` fields:
 
@@ -51,7 +61,7 @@ pub struct As2HttpIngress {
 In non-testing builds with strict interop sessions, bind strict runtime once
 and use the standard ingress helper APIs:
 
-1. `session_with_strict_runtime_bootstrap_token(...)`
+1. `bootstrap_token.bind(&session)` — see the [startup gate](@/docs/getting-started.md#regulated-startup-gate-strict-production)
 2. `receive_and_generate_mdn(...)` or `receive_and_generate_mdn_with_signing(...)`
 
 ### Breaking-Change Migration (Strict Runtime Default Enforcement)
@@ -70,11 +80,7 @@ After (default strict enforcement):
 
 ```rust
 let ingress = as2_ingress_from_http(req)?;
-let strict_session = asx_rs::presets::session_with_strict_runtime_bootstrap_token(
-    "transport_as2_ingress",
-    &bootstrap_token,
-    &session,
-)?;
+let strict_session = bootstrap_token.bind(&session);
 let out = ingress.receive_and_generate_mdn(&strict_session, verifier)?;
 ```
 
@@ -82,11 +88,7 @@ For AS4 push ingress helpers:
 
 ```rust
 let ingress = as4_ingress_from_http(req)?;
-let strict_session = asx_rs::presets::session_with_strict_runtime_bootstrap_token(
-    "transport_as4_ingress",
-    &bootstrap_token,
-    &session,
-)?;
+let strict_session = bootstrap_token.bind(&session);
 let out = ingress.receive_push_with_dedup_sync(
     asx_rs::transport::ingress::As4IngressReceivePushSyncRequest {
         session: &strict_session,
@@ -134,7 +136,7 @@ pub struct As4HttpIngress {
 ## Egress / HTTP Client (`client` feature)
 
 ```toml
-asx-rs = { version = "0.13", features = ["as2", "as4", "client"] }
+asx-rs = { version = "0.14", features = ["as2", "as4", "client"] }
 ```
 
 ### SSRF protection
@@ -280,10 +282,10 @@ impl HttpSendOutcome {
 ## Server / Axum Integration (`server` feature)
 
 ```toml
-asx-rs = { version = "0.13", features = ["as2", "as4", "server"] }
+asx-rs = { version = "0.14", features = ["as2", "as4", "server"] }
 ```
 
-The server layer provides axum 0.7 router builders with typed handler traits. It is built on top of the framework-agnostic ingress layer — the same validation logic runs regardless of how the request arrives.
+The server layer provides axum router builders with typed handler traits. It is built on top of the framework-agnostic ingress layer — the same validation logic runs regardless of how the request arrives.
 
 ### `HandlerOutcome`
 

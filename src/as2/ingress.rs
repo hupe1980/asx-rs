@@ -44,7 +44,7 @@ use super::{
 /// Silently ignoring async MDN requests violates RFC 4130 §7.3 and will cause
 /// partners that require async MDN confirmation to mark messages as
 /// unacknowledged.  Consider logging a warning when `mailto:` is detected.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub struct As2IngressReceiveRequest<'a> {
     pub session: &'a SessionContext,
     pub payload: &'a [u8],

@@ -23,6 +23,7 @@ use std::sync::Arc;
 const DEFAULT_MPC: &str =
     "http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/defaultMPC";
 
+#[derive(Debug)]
 pub struct As4EnqueuePullWithReliabilityRequest<'a> {
     pub store: &'a As4PullStore,
     pub mpc: String,
@@ -31,6 +32,7 @@ pub struct As4EnqueuePullWithReliabilityRequest<'a> {
     pub fail_closed_audit_events: bool,
 }
 
+#[derive(Debug)]
 pub struct As4ReceivePullWithReliabilityRequest<'a> {
     pub store: &'a As4PullStore,
     pub request: As4ReceivePullRequest,

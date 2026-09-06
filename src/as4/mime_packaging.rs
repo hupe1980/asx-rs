@@ -279,6 +279,7 @@ impl MimeAttachment {
 ///
 /// Handles serialization of SOAP envelope and attachments into properly-formatted
 /// multipart MIME structure with correct boundary markers and headers.
+#[derive(Debug)]
 pub struct MimePackageBuilder {
     boundary: String,
     root_soap_content_type: String,

@@ -20,7 +20,9 @@ pub use pull_store::{As4PullQueueSnapshot, As4PullStoreSnapshot, As4QueuedPullMe
 pub use pull_store::{As4PullStore, As4PullStoreLimits};
 
 pub use conversation_gate::{As4ConversationOrderGate, ConversationGuard};
-pub use coordination::{As4TopologyCoordination, ConversationGuardHandle, ConversationOrderGate};
+pub use coordination::{
+    As4TopologyCoordination, ConversationGuardHandle, ConversationOrderGate, ConversationTurnHandle,
+};
 
 // Free-function API — the former `*` associated functions are now
 // top-level functions in the `as4` module (the module itself is the namespace).
@@ -41,7 +43,7 @@ pub use receipt_verify::{
 ///
 /// ```toml
 /// # Enable in dev-dependencies only
-/// asx-rs = { version = "0.13", features = ["as4", "testing"] }
+/// asx-rs = { version = "0.14", features = ["as4", "testing"] }
 /// ```
 ///
 /// ```rust,ignore
@@ -54,7 +56,7 @@ pub use receipt_verify::{
 #[cfg(feature = "testing")]
 pub use receive::private as verifier_seal;
 pub use receive::{
-    As4ReceivePushAsyncFragmentAwareRequest, As4ReceivePushOrderedFragmentAwareRequest,
+    As4Ordered, As4ReceivePushAsyncFragmentAwareRequest, As4ReceivePushOrderedFragmentAwareRequest,
     As4ReceivePushOrderedRequest, As4ReceivePushSyncFragmentAwareRequest,
     As4ReceivePushSyncRequest, As4Verifier, As4WsSecVerifier, receive_push_ordered,
     receive_push_ordered_fragment_aware, receive_push_with_dedup_async,
@@ -85,7 +87,13 @@ pub use mime_packaging::{
 };
 
 pub mod pmode;
-#[cfg(feature = "testing")]
+/// The ebMS3 Test Service (Core §5.2.2).
+///
+/// **Not** test scaffolding: §5.2.2 makes the Test Service mandatory for a
+/// conformant MSH, and the eDelivery conformance suite exercises it as the
+/// `PING` profile. It was gated behind the `testing` feature — which raises a
+/// `compile_error!` in release builds — so no production deployment could
+/// implement a protocol feature the specification requires.
 pub mod test_service;
 
 /// In-process AS4 mock endpoint for integration testing.

@@ -43,6 +43,7 @@ pub use private::Sealed as TrustVerifierSeal;
 ///
 /// Returning the whole S/MIME envelope instead would hand the application an
 /// unparsed `multipart/signed` blob and produce a MIC no sender can reproduce.
+#[derive(Debug)]
 pub struct TrustResult {
     /// Whether S/MIME signature verification succeeded.
     pub signature: SignatureVerification,
@@ -99,7 +100,7 @@ impl TrustResult {
 /// implement [`As2TrustVerifier`] against a local fixture, which the `testing`
 /// feature permits via [`TrustVerifierSeal`](crate::as2::TrustVerifierSeal).
 /// Never enable the `testing` feature in production binaries.
-pub trait As2TrustVerifier: private::Sealed {
+pub trait As2TrustVerifier: private::Sealed + std::fmt::Debug {
     fn verify_and_decrypt(
         &self,
         session: &SessionContext,
@@ -149,6 +150,7 @@ pub trait AsyncAs2TrustVerifier: Send + Sync + private::Sealed {
 /// // or equivalently
 /// SyncToAsyncTrustVerifier(Arc::new(my_verifier))
 /// ```
+#[derive(Debug)]
 pub struct SyncToAsyncTrustVerifier<V: As2TrustVerifier + Send + Sync + 'static>(pub Arc<V>);
 
 impl<V: As2TrustVerifier + Send + Sync + 'static> SyncToAsyncTrustVerifier<V> {
@@ -241,15 +243,15 @@ impl As2TrustVerifier for InsecureBypassTrustVerifier {
 /// 2. **Encrypted-only** (`smime-type=enveloped-data`) — the `EnvelopedData`
 ///    layer is decrypted using [`Self::decryption_key_pem`] /
 ///    [`Self::decryption_cert_pem`].  No signature is required *unless*
-///    [`Self::require_signed`] is set, in which case unsigned messages are
-///    rejected.
+///    [`Self::signature_policy`] is [`As2SignaturePolicy::Required`], in which
+///    case unsigned messages are rejected.
 /// 3. **Signed-then-encrypted** (the AS2 interop recommendation per
 ///    RFC 4130 §7.5) — the outer `EnvelopedData` is decrypted first, then
 ///    the inner signed structure is verified.
 ///
 /// If `decryption_key_pem` is `None` and an encrypted payload arrives, the
 /// call returns [`crate::core::ErrorCode::DecryptionFailed`].
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct CmsSmimeTrustVerifier {
     /// PEM-encoded recipient private key for `EnvelopedData` decryption.
     /// Required when inbound AS2 messages are encrypted.
@@ -261,6 +263,20 @@ pub struct CmsSmimeTrustVerifier {
     ///
     /// Defaults to [`As2SignaturePolicy::Required`] — fail-closed.
     pub signature_policy: As2SignaturePolicy,
+}
+
+impl std::fmt::Debug for CmsSmimeTrustVerifier {
+    /// Never prints `decryption_key_pem`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CmsSmimeTrustVerifier")
+            .field(
+                "decryption_key_pem",
+                &crate::core::redact_present(self.decryption_key_pem.is_some()),
+            )
+            .field("decryption_cert_pem", &self.decryption_cert_pem)
+            .field("signature_policy", &self.signature_policy)
+            .finish()
+    }
 }
 
 /// Whether inbound AS2 messages must carry a verifiable signature.

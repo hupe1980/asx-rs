@@ -9,7 +9,7 @@ use sha2::{Digest, Sha256};
 
 #[inline]
 #[cfg(feature = "as4")]
-pub fn as4_strict_push_policy() -> asx_rs::as4::As4PushPolicy {
+pub(crate) fn as4_strict_push_policy() -> asx_rs::as4::As4PushPolicy {
     asx_rs::as4::As4PushPolicyBuilder::new()
         .fail_closed_audit_events(false)
         .build()
@@ -18,7 +18,7 @@ pub fn as4_strict_push_policy() -> asx_rs::as4::As4PushPolicy {
 
 #[inline]
 #[cfg(feature = "as4")]
-pub fn as4_unsigned_push_policy() -> asx_rs::as4::As4PushPolicy {
+pub(crate) fn as4_unsigned_push_policy() -> asx_rs::as4::As4PushPolicy {
     asx_rs::as4::As4PushPolicyBuilder::new()
         .allow_unsigned_push(true)
         .fail_closed_audit_events(false)
@@ -27,19 +27,19 @@ pub fn as4_unsigned_push_policy() -> asx_rs::as4::As4PushPolicy {
 }
 
 #[inline]
-pub fn fixture(name: &str) -> Vec<u8> {
+pub(crate) fn fixture(name: &str) -> Vec<u8> {
     let path = format!("tests/fixtures/{name}");
     std::fs::read(&path).unwrap_or_else(|_| panic!("failed to read fixture: {path}"))
 }
 
 #[inline]
-pub fn pki_fixture(name: &str) -> Vec<u8> {
+pub(crate) fn pki_fixture(name: &str) -> Vec<u8> {
     let path = format!("tests/fixtures/pki/{name}");
     std::fs::read(&path).unwrap_or_else(|_| panic!("failed to read pki fixture: {path}"))
 }
 
 #[cfg(feature = "as4")]
-pub fn signed_receipt_fixture(ref_to_message_id: &str) -> Vec<u8> {
+pub(crate) fn signed_receipt_fixture(ref_to_message_id: &str) -> Vec<u8> {
     const SIGNAL_WSU_ID: &str = "as4-receipt-signal";
 
     let unsigned = format!(
@@ -85,7 +85,7 @@ pub fn signed_receipt_fixture(ref_to_message_id: &str) -> Vec<u8> {
 }
 
 #[inline]
-pub fn session() -> SessionContext {
+pub(crate) fn session() -> SessionContext {
     SessionContext::new("as4-session-1", "partner-a", "strict").expect("session")
 }
 
@@ -104,7 +104,7 @@ fn cert_fingerprint_sha256_hex(cert_pem: &[u8]) -> String {
 }
 
 #[cfg(feature = "as4")]
-pub fn session_with_trust_anchor_and_fingerprint_pin(anchor_pem: &[u8]) -> SessionContext {
+pub(crate) fn session_with_trust_anchor_and_fingerprint_pin(anchor_pem: &[u8]) -> SessionContext {
     let mut cert_handle = CertHandle::new("as4-receipt-signing-anchor-with-pin");
     cert_handle.trust_anchor_pems =
         vec![String::from_utf8(anchor_pem.to_vec()).expect("trust-anchor PEM must be UTF-8")];
@@ -118,6 +118,6 @@ pub fn session_with_trust_anchor_and_fingerprint_pin(anchor_pem: &[u8]) -> Sessi
 }
 
 #[inline]
-pub fn dedup_backend() -> InMemoryDedupBackend {
+pub(crate) fn dedup_backend() -> InMemoryDedupBackend {
     InMemoryDedupBackend::default()
 }

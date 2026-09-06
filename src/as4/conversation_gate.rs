@@ -25,7 +25,9 @@ use std::sync::{Arc, Weak};
 use tokio::sync::{Mutex, Notify};
 
 use crate::as4::As4TopologyCoordination;
-use crate::as4::coordination::{ConversationGuardHandle, ConversationOrderGate};
+use crate::as4::coordination::{
+    ConversationGuardHandle, ConversationOrderGate, ConversationTurnHandle,
+};
 use crate::core::{AsxError, ErrorCode, ErrorContext, Result};
 
 // ── Public types ─────────────────────────────────────────────────────────────
@@ -379,6 +381,30 @@ impl ConversationGuardHandle for InProcessConversationGuardHandle {
     }
 }
 
+/// Trait-object wrapper over a [`ConversationTurnReservation`].
+///
+/// Owns its slot, so it stays valid across the parse/verify/decrypt work it is
+/// meant to span. Dropping it without waiting releases the place in the queue.
+#[derive(Debug)]
+struct InProcessTurnHandle(ConversationTurnReservation);
+
+impl ConversationTurnHandle for InProcessTurnHandle {
+    fn wait_for_turn(
+        self: Box<Self>,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = crate::core::Result<Box<dyn ConversationGuardHandle>>>
+                + Send,
+        >,
+    > {
+        Box::pin(async move {
+            let guard = self.0.wait_turn().await?;
+            Ok(Box::new(InProcessConversationGuardHandle(Some(guard)))
+                as Box<dyn ConversationGuardHandle>)
+        })
+    }
+}
+
 impl Drop for InProcessConversationGuardHandle {
     fn drop(&mut self) {
         // Guard releases on drop too — nothing to do here because dropping
@@ -389,29 +415,26 @@ impl Drop for InProcessConversationGuardHandle {
 
 #[allow(clippy::manual_async_fn)]
 impl ConversationOrderGate for As4ConversationOrderGate {
-    /// Acquire the ordered turn for `conversation_id`.
+    /// Take a ticket in this conversation's arrival order.
     ///
-    /// Combines the internal `reserve_turn` + `wait_turn` two-phase operation
-    /// into a single future.  For the in-process gate the optimization of early
-    /// reservation (before full parse) is available via the lower-level
-    /// `reserve_turn` / `wait_turn` methods; this combined path is provided for
-    /// trait-object callers that cannot use the concrete type.
-    fn acquire_ordered_turn<'a>(
+    /// Thin wrapper over the concrete `reserve_turn`; the wait happens in
+    /// [`ConversationTurnHandle::wait_for_turn`] so the caller can do the
+    /// expensive work in between. Early reservation is the correctness
+    /// property, not an optimization — see [`ConversationTurnHandle`].
+    fn reserve_ordered_turn<'a>(
         &'a self,
         conversation_id: &'a str,
         _session: &'a crate::core::SessionContext,
     ) -> std::pin::Pin<
         Box<
-            dyn std::future::Future<Output = crate::core::Result<Box<dyn ConversationGuardHandle>>>
+            dyn std::future::Future<Output = crate::core::Result<Box<dyn ConversationTurnHandle>>>
                 + Send
                 + 'a,
         >,
     > {
         Box::pin(async move {
-            let turn = self.reserve_turn(conversation_id).await?;
-            let guard = turn.wait_turn().await?;
-            Ok(Box::new(InProcessConversationGuardHandle(Some(guard)))
-                as Box<dyn ConversationGuardHandle>)
+            let reservation = self.reserve_turn(conversation_id).await?;
+            Ok(Box::new(InProcessTurnHandle(reservation)) as Box<dyn ConversationTurnHandle>)
         })
     }
 

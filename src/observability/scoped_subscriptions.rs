@@ -19,6 +19,7 @@ pub enum ScopedEventTryRecvError {
     Closed,
 }
 
+#[derive(Debug)]
 pub struct ScopedEventSubscription {
     receiver: mpsc::Receiver<ScopedAsxEvent>,
     senders: Arc<DashMap<u64, mpsc::Sender<ScopedAsxEvent>>>,

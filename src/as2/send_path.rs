@@ -11,7 +11,7 @@ use crate::http::HttpHeaders;
 use crate::reliability::{RetryConfig, RetryScheduler};
 use crate::transport::trace_context::generate_traceparent;
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct As2SendRequest {
     pub message_id: String,
     pub payload: Vec<u8>,
@@ -27,7 +27,7 @@ pub struct As2SendRequest {
     pub credentials: Option<As2SendCredentials>,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct As2SendPreparedRequest {
     pub message_id: String,
     pub payload: Vec<u8>,

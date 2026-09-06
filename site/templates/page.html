@@ -1,6 +1,29 @@
 {% extends "base.html" %}
 
 {% block content %}
+{#- Flatten `extra.nav` once so the page can find its own neighbours. Zola has
+    no ordering of its own here: the teaching order is editorial and lives in
+    config.toml, so prev/next has to come from the same list the sidebar uses,
+    or the two would disagree. -#}
+{%- set_global prev_item = false -%}
+{%- set_global next_item = false -%}
+{%- set_global seen_current = false -%}
+{%- set_global candidate_prev = false -%}
+{%- for group in config.extra.nav -%}
+  {%- for item in group.items -%}
+    {%- if next_item == false and seen_current -%}
+      {%- set_global next_item = item -%}
+    {%- endif -%}
+    {%- if item.path == current_path -%}
+      {%- set_global seen_current = true -%}
+      {%- set_global prev_item = candidate_prev -%}
+    {%- endif -%}
+    {%- if not seen_current -%}
+      {%- set_global candidate_prev = item -%}
+    {%- endif -%}
+  {%- endfor -%}
+{%- endfor -%}
+
 <div class="wrap docs-layout">
   {% include "_sidebar.html" %}
 
@@ -32,6 +55,23 @@
     <div class="doc-body">
       {{ page.content | safe }}
     </div>
+
+    {% if prev_item or next_item %}
+    <nav class="page-nav" aria-label="Documentation pages">
+      {% if prev_item %}
+      <a class="page-nav-link page-nav-prev" href="{{ get_url(path=prev_item.path) | safe }}">
+        <span class="page-nav-dir">← Previous</span>
+        <span class="page-nav-title">{{ prev_item.title }}</span>
+      </a>
+      {% else %}<span></span>{% endif %}
+      {% if next_item %}
+      <a class="page-nav-link page-nav-next" href="{{ get_url(path=next_item.path) | safe }}">
+        <span class="page-nav-dir">Next →</span>
+        <span class="page-nav-title">{{ next_item.title }}</span>
+      </a>
+      {% endif %}
+    </nav>
+    {% endif %}
 
     <footer class="doc-footer">
       <a href="{{ config.extra.repo }}/edit/main/site/content/{{ page.relative_path | replace(from='content/', to='') }}" rel="noopener">

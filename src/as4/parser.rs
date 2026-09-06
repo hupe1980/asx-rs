@@ -4,7 +4,6 @@ use crate::core::InteropMode;
 use crate::core::{AsxError, ErrorCode, ErrorContext, Result, SessionContext};
 use crate::observability::{AsxEvent, EventBus, emit_audit_event};
 use memchr::{memchr, memmem, memrchr};
-#[cfg(test)]
 use quick_xml::Reader;
 use quick_xml::events::Event as XmlEvent;
 use quick_xml::name::ResolveResult;
@@ -186,45 +185,6 @@ fn ensure_required_marker_present(
     }
 
     Ok(())
-}
-
-/// Match a small marker set in one linear pass across input bytes.
-///
-/// This avoids multiple full-buffer scans when validating required structural
-/// tokens in fail-fast prechecks.
-#[cfg(test)]
-fn has_all_markers_single_pass(raw: &[u8], markers: &[&[u8]]) -> bool {
-    if markers.iter().any(|marker| marker.is_empty()) {
-        return false;
-    }
-    if markers.is_empty() {
-        return true;
-    }
-
-    let mut seen = vec![false; markers.len()];
-    let mut remaining = markers.len();
-
-    let mut pos = 0;
-    while let Some((_, local_name, next_pos)) = next_opening_tag_local_name(raw, pos) {
-        if remaining == 0 {
-            break;
-        }
-
-        for (idx, marker) in markers.iter().enumerate() {
-            if seen[idx] {
-                continue;
-            }
-            if local_name == *marker {
-                seen[idx] = true;
-                remaining -= 1;
-                break;
-            }
-        }
-
-        pos = next_pos;
-    }
-
-    remaining == 0
 }
 
 fn next_opening_tag_local_name(raw: &[u8], mut pos: usize) -> Option<(usize, &[u8], usize)> {
@@ -801,7 +761,22 @@ fn parse_as4_user_message_summary_dom_from_doc(
         state.action = actions.into_iter().next();
 
         state.service = descendant_text(&user_message, EBMS3_CORE_NS, "Service");
-        state.conversation_id = descendant_text(&user_message, EBMS3_CORE_NS, "ConversationId");
+
+        // `eb:ConversationId` is `maxOccurs="1"` in ebMS3 Core, and it is the
+        // key the ordered-delivery gate queues on. Taking the first of several
+        // is document order deciding which conversation a message belongs to —
+        // and a bounded byte scanner, a schema validator and a downstream MSH
+        // need not agree on which one that is (D5).
+        let conversation_ids = descendant_texts(&user_message, EBMS3_CORE_NS, "ConversationId");
+        if strict_interop && conversation_ids.len() > 1 {
+            return Err(AsxError::new(
+                ErrorCode::InteropViolation,
+                "AS4 UserMessage contains duplicate ConversationId",
+                ErrorContext::for_session("as4_parse_user_message", session),
+            ));
+        }
+        state.conversation_id = conversation_ids.into_iter().next();
+
         state.timestamp = descendant_text(&user_message, EBMS3_CORE_NS, "Timestamp");
 
         let original_senders = message_property_values(&user_message, "originalSender");
@@ -1561,12 +1536,16 @@ fn is_valid_mpc_uri(value: &str) -> bool {
 /// no full-envelope allocation). Returns `None` on any parse/structural
 /// failure; ordered receive then rejects ingress without an explicit
 /// `ConversationId` gate key.
-#[cfg(test)]
+///
+/// The value is **unauthenticated** — it comes off the wire before any
+/// signature is checked. It is used only to reserve a place in the
+/// conversation's arrival queue; the ordered receive path compares it against
+/// the verified `eb:ConversationId` once parsing completes and rejects a
+/// mismatch, so a peer can only mis-order or reject its own messages.
 pub(super) fn extract_conversation_id_for_gate(payload: &[u8]) -> Option<String> {
     extract_conversation_id_for_gate_fast(payload)
 }
 
-#[cfg(test)]
 fn extract_conversation_id_for_gate_fast(payload: &[u8]) -> Option<String> {
     let bounded = &payload[..payload.len().min(MAX_AS4_PRECHECK_HEADER_SPAN_BYTES)];
     // Fail closed: ordered gate extraction must be bounded to the SOAP Header
@@ -1734,7 +1713,6 @@ fn first_opening_tag_pos_by_local_name(raw: &[u8], local_name: &[u8]) -> Option<
     None
 }
 
-#[cfg(test)]
 fn trim_ascii_whitespace_bytes(input: &[u8]) -> &[u8] {
     let start = input
         .iter()
@@ -1751,8 +1729,8 @@ fn trim_ascii_whitespace_bytes(input: &[u8]) -> &[u8] {
 #[cfg(test)]
 mod tests {
     use super::{
-        extract_conversation_id_for_gate, has_all_markers_single_pass, header_span_exceeds_limit,
-        parse_as4_receipt, parse_as4_user_message_document, parse_as4_user_message_from_doc,
+        extract_conversation_id_for_gate, header_span_exceeds_limit, parse_as4_receipt,
+        parse_as4_user_message_document, parse_as4_user_message_from_doc,
         precheck_as4_receipt_structure_bytes, precheck_as4_user_message_structure_bytes,
     };
     use crate::core::{AsxError, ErrorCode, InteropMode, SessionContext};
@@ -1779,79 +1757,6 @@ mod tests {
 
         parse_as4_receipt(&session, &event_bus, xml, interop, true)
             .expect_err("receipt parse must fail")
-    }
-
-    #[test]
-    fn marker_precheck_matches_all_required_tokens() {
-        let raw = br#"<S12:Envelope><S12:Header><eb:Messaging><eb:UserMessage/></eb:Messaging></S12:Header><S12:Body/></S12:Envelope>"#;
-        let markers: [&[u8]; 5] = [
-            b"Envelope",
-            b"Header",
-            b"Body",
-            b"Messaging",
-            b"UserMessage",
-        ];
-        assert!(has_all_markers_single_pass(raw, &markers));
-    }
-
-    #[test]
-    fn marker_precheck_rejects_missing_marker() {
-        let raw =
-            br#"<S12:Envelope><S12:Header><eb:Messaging/></S12:Header><S12:Body/></S12:Envelope>"#;
-        let markers: [&[u8]; 5] = [
-            b"Envelope",
-            b"Header",
-            b"Body",
-            b"Messaging",
-            b"UserMessage",
-        ];
-        assert!(!has_all_markers_single_pass(raw, &markers));
-    }
-
-    #[test]
-    fn marker_precheck_ignores_plain_text_mentions() {
-        let raw = b"Envelope Header Body Messaging UserMessage";
-        let markers: [&[u8]; 5] = [
-            b"Envelope",
-            b"Header",
-            b"Body",
-            b"Messaging",
-            b"UserMessage",
-        ];
-        assert!(!has_all_markers_single_pass(raw, &markers));
-    }
-
-    #[test]
-    fn marker_precheck_rejects_empty_marker() {
-        let raw = b"Envelope Header Body Messaging UserMessage";
-        let markers: [&[u8]; 2] = [b"Envelope", b""];
-        assert!(!has_all_markers_single_pass(raw, &markers));
-    }
-
-    #[test]
-    fn marker_precheck_ignores_comment_embedded_tag_mentions() {
-        let raw = br#"<S12:Envelope><S12:Header><!-- <S12:Body/><eb:Messaging/><eb:UserMessage/> --></S12:Header></S12:Envelope>"#;
-        let markers: [&[u8]; 5] = [
-            b"Envelope",
-            b"Header",
-            b"Body",
-            b"Messaging",
-            b"UserMessage",
-        ];
-        assert!(!has_all_markers_single_pass(raw, &markers));
-    }
-
-    #[test]
-    fn marker_precheck_ignores_cdata_embedded_tag_mentions() {
-        let raw = br#"<S12:Envelope><S12:Header><![CDATA[<S12:Body/><eb:Messaging/><eb:UserMessage/>]]></S12:Header></S12:Envelope>"#;
-        let markers: [&[u8]; 5] = [
-            b"Envelope",
-            b"Header",
-            b"Body",
-            b"Messaging",
-            b"UserMessage",
-        ];
-        assert!(!has_all_markers_single_pass(raw, &markers));
     }
 
     #[test]
@@ -2187,6 +2092,27 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("AS4 eb:SignalMessage missing eb:Receipt")
+        );
+    }
+}
+
+#[cfg(test)]
+mod gate_key_multipart_probe {
+    #[test]
+    fn probe_extracts_from_a_multipart_body() {
+        let soap = "<S12:Envelope xmlns:S12='http://www.w3.org/2003/05/soap-envelope' \
+             xmlns:eb='http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/'>\
+             <S12:Header><eb:Messaging><eb:UserMessage><eb:CollaborationInfo>\
+             <eb:ConversationId>conv-multipart</eb:ConversationId>\
+             </eb:CollaborationInfo></eb:UserMessage></eb:Messaging></S12:Header>\
+             <S12:Body/></S12:Envelope>";
+        let body = format!(
+            "--b\r\nContent-Type: application/soap+xml\r\nContent-ID: <r@e>\r\n\r\n{soap}\r\n--b--\r\n"
+        );
+        assert_eq!(
+            super::extract_conversation_id_for_gate(body.as_bytes()).as_deref(),
+            Some("conv-multipart"),
+            "the gate key must be recoverable from the multipart shape AS4 receive requires"
         );
     }
 }

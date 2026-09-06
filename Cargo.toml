@@ -1,15 +1,37 @@
 [package]
 name = "asx-rs"
-version = "0.13.0"
+version = "0.14.0"
 edition = "2024"
 authors = ["hupe1980"]
 description = "AS2 and AS4 B2B messaging library for Rust — signing, encryption, MDN, and ebMS3/AS4 profile support"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/hupe1980/asx-rs"
 readme = "README.md"
+# Edition 2024 needs 1.85; the `dns` feature's DNS client needs 1.88, and a
+# split MSRV per feature is a worse promise than one honest number. Raise
+# deliberately: a bump is a breaking change for embedders pinned to an older
+# toolchain, and CI builds this exact version.
+rust-version = "1.88"
+keywords = ["as2", "as4", "ebms3", "edi", "peppol"]
+categories = ["network-programming", "cryptography", "encoding"]
 # Not part of the published crate: internal review notes, the documentation
-# website, CI scaffolding and benchmark data.
-exclude = ["FINDINGS.md", "REVIEW.md", "artifacts/", "scripts/", "benches/", "site/"]
+# website, CI scaffolding, benchmark data, and the gitignored working folders.
+exclude = [
+    "FINDINGS.md",
+    "REVIEW.md",
+    "artifacts/",
+    "scripts/",
+    "benches/",
+    "site/",
+    "concepts/",
+    "specs/",
+]
+
+# `as2` and `as4` are not default features, so a docs.rs build with default
+# features would publish an almost empty crate. Build everything.
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
 
 [workspace]
 members = ["xtask"]
@@ -31,7 +53,28 @@ trace = []
 prometheus = []
 opentelemetry = ["dep:opentelemetry-api"]
 async-ocsp = ["dep:reqwest", "crypto"]
+dns = ["dep:hickory-resolver"]
 testing = []
+
+[lints.rust]
+# `unsafe_code` is forbidden on the library itself via `#![forbid(unsafe_code)]`
+# in `src/lib.rs`, not here: a workspace lint would also cover test targets, and
+# `tests/xmlenc_streaming_metrics.rs` installs a counting `GlobalAlloc` to prove
+# the streaming decrypt path does not buffer the whole payload.
+missing_debug_implementations = "warn"
+unreachable_pub = "warn"
+
+[lints.clippy]
+todo = "deny"
+unimplemented = "deny"
+dbg_macro = "deny"
+# NOT enabled: `indexing_slicing`, `unwrap_used`, `expect_used`. They fire on
+# ~200 sites that are provably in range or assert an invariant established on
+# the line above (`HEX[(b >> 4) as usize]` over a 16-byte table, `digest[..16]`
+# over a SHA-256 output). Silencing each with an `#[allow]` would add no safety
+# and would hide the next real one. Panic-freedom on untrusted input is enforced
+# where it can actually be observed instead: `just fuzz-gate` fails on any panic
+# across the profile loader, the policy resolver and wire parsing.
 
 [dependencies]
 tracing = "0.1"
@@ -68,6 +111,7 @@ roxmltree = { version = "0.21", optional = true }
 opentelemetry-api = { package = "opentelemetry", version = "0.32", default-features = false, features = ["metrics"], optional = true }
 smallvec = "1"
 rustix = { version = "1", features = ["fs"] }
+hickory-resolver = { version = "0.26", default-features = false, features = ["system-config", "tokio"], optional = true }
 
 [dev-dependencies]
 proptest = "1"
@@ -86,11 +130,6 @@ required-features = ["as4"]
 [[bench]]
 name = "event_bus_emission_modes"
 harness = false
-
-[[bench]]
-name = "incident_runtime_burst"
-harness = false
-required-features = ["client"]
 
 [[bench]]
 name = "spool_headroom_hygiene"

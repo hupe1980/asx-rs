@@ -860,7 +860,22 @@ fn verify_non_repudiation(
             ));
         }
 
-        if echoed.digest_value_b64 != sent_ref.digest_value_b64 {
+        // Compare the *decoded* digests, in constant time. Comparing the base64
+        // text instead would reject a conformant counterparty whose XML wraps
+        // `ds:DigestValue` across lines — and would report that as "the
+        // acknowledgement refers to different bytes than were sent", i.e. a
+        // security incident, for a receipt that is in fact correct.
+        let echoed_digest = crate::core::decode_xml_base64(
+            &echoed.digest_value_b64,
+            "receipt MessagePartNRInformation DigestValue",
+            "as4_receipt_non_repudiation",
+        )?;
+        let sent_digest = crate::core::decode_xml_base64(
+            &sent_ref.digest_value_b64,
+            "sent message DigestValue",
+            "as4_receipt_non_repudiation",
+        )?;
+        if !crate::core::constant_time_eq(&echoed_digest, &sent_digest) {
             return Err(reject(
                 session,
                 event_bus,
@@ -1298,6 +1313,57 @@ mod tests {
 
         let verified = verify(&session, &sent, rewritten.as_bytes(), &policy)
             .expect("prefix-agnostic parse")
+            .into_receipt()
+            .expect("receipt");
+        assert!(verified.non_repudiation.is_verified());
+    }
+
+    /// XML Signature §6.1 defines its base64 content by reference to RFC 2045,
+    /// which line-wraps, and any XML pretty-printer will fold a long
+    /// `ds:DigestValue` anyway. Comparing the base64 *text* rejected such a
+    /// receipt and reported it as "the acknowledgement refers to different
+    /// bytes than were sent" — a security incident raised against a conformant
+    /// counterparty. The digests are decoded and compared as bytes.
+    #[test]
+    fn receipt_with_line_wrapped_digest_values_is_accepted() {
+        let (cert_pem, key_pem) = keypair();
+        let session = session_trusting(&cert_pem);
+        let sent = sent_output("msg-wrapped-b64@example", &cert_pem, &key_pem);
+
+        let receipt = generate_receipt_with_nri(
+            &session,
+            "receipt-wrapped@partner",
+            &sent.message_id,
+            &sent_nri(&sent),
+        )
+        .expect("receipt");
+
+        // Fold every DigestValue at 20 characters, the way an XML pretty-printer
+        // or an RFC 2045 encoder would.
+        let mut wrapped = String::from_utf8(receipt).expect("utf8");
+        for reference in sent_nri(&sent) {
+            let folded: String = reference
+                .digest_value_b64
+                .as_bytes()
+                .chunks(20)
+                .map(|c| String::from_utf8_lossy(c).into_owned())
+                .collect::<Vec<_>>()
+                .join("\n          ");
+            wrapped = wrapped.replace(
+                &format!(
+                    "<ds:DigestValue>{}</ds:DigestValue>",
+                    reference.digest_value_b64
+                ),
+                &format!("<ds:DigestValue>\n          {folded}\n        </ds:DigestValue>"),
+            );
+        }
+        assert!(wrapped.contains("\n          "), "test must actually wrap");
+
+        let mut policy = As4ReceiptPolicy::regulated();
+        policy.require_signed_receipt = false;
+
+        let verified = verify(&session, &sent, wrapped.as_bytes(), &policy)
+            .expect("line-wrapped base64 is legal XMLDSig")
             .into_receipt()
             .expect("receipt");
         assert!(verified.non_repudiation.is_verified());

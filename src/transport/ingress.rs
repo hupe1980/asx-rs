@@ -15,16 +15,46 @@ use std::sync::Arc;
 // ── Helpers ────────────────────────────────────────────────────────────────
 
 /// Find the first header value for `name` (case-insensitive).
-fn find_header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
-    headers
+/// Look up a header that may appear **at most once**.
+///
+/// A repeated header is an error, not a first-wins choice. Every header this
+/// module reads decides something: `AS2-From` names the partner the session is
+/// bound to, `Message-ID` is the dedup key, `Disposition-Notification-To` is
+/// where a receipt gets sent, and `Content-Type` decides how the body is
+/// parsed. If this crate reads the first occurrence while a reverse proxy, a
+/// log pipeline or the partner's own gateway reads the last, they disagree
+/// about who sent what — which is request smuggling with extra steps.
+///
+/// The D5 rule — ambiguity is rejected, never resolved by document order —
+/// applied to HTTP rather than only to repeated XML elements.
+fn find_header<'a>(
+    headers: &'a [(String, String)],
+    name: &str,
+    ctx: &'static str,
+) -> Result<Option<&'a str>> {
+    let mut matches = headers
         .iter()
-        .find(|(k, _)| k.eq_ignore_ascii_case(name))
-        .map(|(_, v)| v.as_str())
+        .filter(|(k, _)| k.eq_ignore_ascii_case(name))
+        .map(|(_, v)| v.as_str());
+
+    let Some(first) = matches.next() else {
+        return Ok(None);
+    };
+    if matches.next().is_some() {
+        return Err(AsxError::new(
+            ErrorCode::InvalidInput,
+            format!(
+                "HTTP header '{name}' appears more than once; refusing to choose one — a                  repeated header lets this endpoint and anything else in the request path                  disagree about the message's identity"
+            ),
+            ErrorContext::new(ctx),
+        ));
+    }
+    Ok(Some(first))
 }
 
-/// Require header `name`, returning a trimmed owned copy or an `InvalidInput` error.
+/// [`find_header`], then trim and reject an empty or absent value.
 fn require_header(headers: &[(String, String)], name: &str, ctx: &'static str) -> Result<String> {
-    match find_header(headers, name) {
+    match find_header(headers, name, ctx)? {
         Some(v) if !v.trim().is_empty() => Ok(v.trim().to_string()),
         _ => Err(AsxError::new(
             ErrorCode::InvalidInput,
@@ -119,27 +149,35 @@ pub fn as2_ingress_from_http(request: HttpRequest) -> Result<As2HttpIngress> {
         ));
     }
 
-    let message_id = find_header(&request.headers, "Message-ID")
+    let message_id = find_header(&request.headers, "Message-ID", "as2_ingress")?
         .filter(|v| !v.trim().is_empty())
         .map(|v| v.trim().to_string());
 
-    let as2_version = find_header(&request.headers, "AS2-Version")
+    let as2_version = find_header(&request.headers, "AS2-Version", "as2_ingress")?
         .filter(|v| !v.trim().is_empty())
         .map(|v| v.trim().to_string());
 
-    let mime_version = find_header(&request.headers, "MIME-Version")
+    let mime_version = find_header(&request.headers, "MIME-Version", "as2_ingress")?
         .filter(|v| !v.trim().is_empty())
         .map(|v| v.trim().to_string());
 
-    let disposition_notification_to = find_header(&request.headers, "Disposition-Notification-To")
-        .filter(|v| !v.trim().is_empty())
-        .map(|v| v.trim().to_string());
+    let disposition_notification_to = find_header(
+        &request.headers,
+        "Disposition-Notification-To",
+        "as2_ingress",
+    )?
+    .filter(|v| !v.trim().is_empty())
+    .map(|v| v.trim().to_string());
 
-    let disposition_notification_options =
-        find_header(&request.headers, "Disposition-Notification-Options")
-            .filter(|v| !v.trim().is_empty())
-            .map(|v| v.trim().to_string());
-    let traceparent = find_header(&request.headers, "traceparent").and_then(normalize_traceparent);
+    let disposition_notification_options = find_header(
+        &request.headers,
+        "Disposition-Notification-Options",
+        "as2_ingress",
+    )?
+    .filter(|v| !v.trim().is_empty())
+    .map(|v| v.trim().to_string());
+    let traceparent = find_header(&request.headers, "traceparent", "as2_ingress")?
+        .and_then(normalize_traceparent);
 
     Ok(As2HttpIngress {
         body: request.body,
@@ -229,6 +267,7 @@ pub struct As4HttpIngress {
     pub raw_headers: HttpHeaders,
 }
 
+#[derive(Debug)]
 #[cfg(feature = "as4")]
 pub struct As4IngressReceivePushSyncRequest<'a> {
     pub session: &'a crate::core::SessionContext,
@@ -286,7 +325,8 @@ pub fn as4_ingress_from_http(request: HttpRequest) -> Result<As4HttpIngress> {
     }
 
     let action = extract_action_param(&content_type);
-    let traceparent = find_header(&request.headers, "traceparent").and_then(normalize_traceparent);
+    let traceparent = find_header(&request.headers, "traceparent", "as4_ingress")?
+        .and_then(normalize_traceparent);
 
     // Enforce body size limit before processing the SOAP payload.
     let body_len = request.body.len();
@@ -440,8 +480,102 @@ fn extract_action_param(content_type: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+
     #![cfg_attr(not(feature = "interop-relaxed"), allow(unused_imports, dead_code))]
     use super::*;
+
+    /// A repeated identity header is refused rather than resolved first-wins.
+    ///
+    /// Two `AS2-From` headers let this endpoint bind the session to one partner
+    /// while a proxy or the partner's own gateway reads the other. axum yields
+    /// one entry per duplicate value, so this reaches the ingress layer exactly
+    /// as written here.
+    #[test]
+    fn duplicate_as2_identity_headers_are_refused() {
+        for header in [
+            "AS2-From",
+            "AS2-To",
+            "Content-Type",
+            "Message-ID",
+            "Disposition-Notification-To",
+        ] {
+            let mut headers: HttpHeaders = smallvec::smallvec![
+                ("AS2-From".to_string(), "sender".to_string()),
+                ("AS2-To".to_string(), "receiver".to_string()),
+                (
+                    "Content-Type".to_string(),
+                    "application/pkcs7-mime".to_string()
+                ),
+            ];
+            // Ensure the header under test appears twice, whether or not the
+            // baseline already carries one.
+            while headers
+                .iter()
+                .filter(|(k, _)| k.eq_ignore_ascii_case(header))
+                .count()
+                < 2
+            {
+                headers.push((header.to_string(), "smuggled-value".to_string()));
+            }
+
+            let err = as2_ingress_from_http(HttpRequest {
+                method: "POST".to_string(),
+                uri: "/as2".to_string(),
+                headers,
+                body: vec![1u8].into(),
+            })
+            .unwrap_err();
+            assert_eq!(err.code, ErrorCode::InvalidInput, "{header}: {err:?}");
+            assert!(
+                err.message.contains("more than once"),
+                "{header}: {}",
+                err.message
+            );
+        }
+    }
+
+    #[test]
+    fn duplicate_as4_content_type_is_refused() {
+        let err = as4_ingress_from_http(HttpRequest {
+            method: "POST".to_string(),
+            uri: "/as4".to_string(),
+            headers: smallvec::smallvec![
+                (
+                    "Content-Type".to_string(),
+                    "application/soap+xml".to_string(),
+                ),
+                (
+                    "Content-Type".to_string(),
+                    "multipart/related; boundary=b".to_string(),
+                ),
+            ],
+            body: vec![1u8].into(),
+        })
+        .expect_err("a repeated Content-Type must be refused");
+        assert_eq!(err.code, ErrorCode::InvalidInput);
+    }
+
+    /// The common case still works: one of each.
+    #[test]
+    fn single_headers_are_accepted() {
+        let ingress = as2_ingress_from_http(HttpRequest {
+            method: "POST".to_string(),
+            uri: "/as2".to_string(),
+            headers: smallvec::smallvec![
+                ("AS2-From".to_string(), "sender".to_string()),
+                ("AS2-To".to_string(), "receiver".to_string()),
+                (
+                    "Content-Type".to_string(),
+                    "application/pkcs7-mime".to_string(),
+                ),
+                ("Message-ID".to_string(), "<m@example.com>".to_string()),
+            ],
+            body: vec![1u8].into(),
+        })
+        .expect("a well-formed request must still pass");
+        assert_eq!(ingress.as2_from, "sender");
+        assert_eq!(ingress.message_id.as_deref(), Some("<m@example.com>"));
+    }
     #[cfg(feature = "as4")]
     use crate::as4::As4TopologyCoordination;
     #[cfg(feature = "as4")]
@@ -453,9 +587,7 @@ mod tests {
         AuditEvent, AuditSinkDurability, DurableAuditSink, InMemoryAuditSink, ReplayCursor,
     };
     #[cfg(feature = "as4")]
-    use crate::presets::{
-        DeploymentTopology, issue_strict_runtime_bootstrap_token_with_as4_topology,
-    };
+    use crate::presets::{DeploymentTopology, StrictRuntimeBootstrap};
     #[cfg(feature = "as4")]
     use crate::reliability::ReconciliationRequest;
     #[cfg(feature = "as4")]
@@ -1032,6 +1164,7 @@ mod tests {
     }
 
     #[cfg(feature = "as4")]
+    #[derive(Debug)]
     struct DurableTestAuditSink {
         inner: InMemoryAuditSink,
     }
@@ -1085,6 +1218,7 @@ mod tests {
     }
 
     #[cfg(feature = "as4")]
+    #[derive(Debug)]
     struct DurableClusterSafeDedup;
 
     #[cfg(feature = "as4")]
@@ -1106,6 +1240,7 @@ mod tests {
     }
 
     #[cfg(feature = "as4")]
+    #[derive(Debug)]
     struct DurableClusterSafeReconciliation;
 
     #[cfg(feature = "as4")]
@@ -1133,7 +1268,7 @@ mod tests {
 
     #[cfg(feature = "as4")]
     fn strict_event_bus() -> crate::observability::EventBus {
-        crate::presets::strict_production_event_bus(16, Arc::new(DurableTestAuditSink::new()))
+        crate::observability::EventBus::new_regulated(16, Arc::new(DurableTestAuditSink::new()))
             .expect("strict production event bus")
     }
 
@@ -1153,16 +1288,15 @@ mod tests {
 
         let pull_store = StrictTestCoordination("pull-store");
         let conversation_gate = StrictTestCoordination("conversation-order-gate");
-        issue_strict_runtime_bootstrap_token_with_as4_topology(
-            "transport_as4_ingress_helper",
-            &strict_event_bus(),
-            &DurableClusterSafeReconciliation,
-            &DurableClusterSafeDedup,
-            DeploymentTopology::Clustered,
-            Some(&pull_store),
-            Some(&conversation_gate),
-        )
-        .expect("strict runtime token")
+        StrictRuntimeBootstrap::new("transport_as4_ingress_helper")
+            .event_bus(&strict_event_bus())
+            .reconciliation(&DurableClusterSafeReconciliation)
+            .dedup(&DurableClusterSafeDedup)
+            .topology(DeploymentTopology::Clustered)
+            .as4_pull_store(&pull_store)
+            .as4_conversation_gate(&conversation_gate)
+            .validate()
+            .expect("strict runtime token")
     }
 
     #[cfg(feature = "as4")]
@@ -1195,8 +1329,9 @@ mod tests {
 
         assert_eq!(err.code, ErrorCode::PolicyViolation);
         assert!(
+            err.message.contains("strict-runtime bootstrap token"),
+            "message must point at the startup gate: {}",
             err.message
-                .contains("strict-runtime bootstrap token binding")
         );
     }
 
@@ -1209,12 +1344,7 @@ mod tests {
         );
         let ingress = as4_ingress_from_http(req).expect("as4 ingress");
         let token = strict_runtime_token();
-        let strict_session = crate::presets::session_with_strict_runtime_bootstrap_token(
-            "transport_as4_ingress_helper",
-            &token,
-            &strict_session(),
-        )
-        .expect("strict session");
+        let strict_session = token.bind(&strict_session());
 
         let err = ingress
             .receive_push_with_dedup_sync(As4IngressReceivePushSyncRequest {
@@ -1275,12 +1405,9 @@ mod tests {
         let ingress = as4_ingress_from_http(req).expect("as4 ingress");
         let signing_cert_pem = pki_fixture("receipt_signing.cert.pem");
         let token = strict_runtime_token();
-        let strict_session = crate::presets::session_with_strict_runtime_bootstrap_token(
-            "transport_as4_ingress_helper",
-            &token,
-            &session_with_trust_anchor_and_fingerprint_pin(&signing_cert_pem),
-        )
-        .expect("strict session");
+        let strict_session = token.bind(&session_with_trust_anchor_and_fingerprint_pin(
+            &signing_cert_pem,
+        ));
         let bus = crate::observability::EventBus::new(16).expect("bus");
         let _events = bus.subscribe_scoped_events();
 

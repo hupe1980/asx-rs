@@ -405,7 +405,8 @@ fn encrypt_xmlenc_preparsed(
             // choice of AES-256-GCM — the wrap is as much a part of the
             // construction as the bulk cipher.
             let kek_len = aes_key.len();
-            let kdf_output = concat_kdf_sha256(&z, (kek_len * 8) as u32, &[], &[], &[]);
+            let kdf_output =
+                concat_kdf_sha256(&z, (kek_len * 8) as u32, &ConcatKdfParams::default());
             let kek = kdf_output[..kek_len].to_vec();
             let key_wrap_uri = key_wrap_uri_for_kek_len(kek_len)?;
             // Zeroize the shared secret immediately after use.
@@ -842,6 +843,51 @@ fn aes_key_unwrap(kek: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>> {
     Ok(result)
 }
 
+/// The `xenc11:ConcatKDFParams` attributes that feed the KDF's `OtherInfo`.
+///
+/// All five are hexBinary **bit strings**, not base64 (XML Encryption 1.1
+/// §5.4.1) — reading them as base64 derives a key-encryption key no conformant
+/// peer computes (D6).
+///
+/// All five reach the derivation. Dropping one silently yields a different KEK
+/// from the peer's, which surfaces as "AES Key Unwrap integrity check failed"
+/// and names the KEK rather than the missing parameter.
+#[derive(Debug, Default, Clone)]
+struct ConcatKdfParams {
+    algorithm_id: Vec<u8>,
+    party_u_info: Vec<u8>,
+    party_v_info: Vec<u8>,
+    supp_pub_info: Vec<u8>,
+    supp_priv_info: Vec<u8>,
+}
+
+impl ConcatKdfParams {
+    /// Read all five attributes off a `ConcatKDFParams` element.
+    fn parse(element: &BytesStart<'_>) -> Result<Self> {
+        let read = |name: &[u8]| -> Result<Vec<u8>> {
+            match element_attribute_value(element, name)? {
+                Some(raw) => decode_concat_kdf_param_bits(&raw),
+                None => Ok(Vec::new()),
+            }
+        };
+        Ok(Self {
+            algorithm_id: read(b"AlgorithmID")?,
+            party_u_info: read(b"PartyUInfo")?,
+            party_v_info: read(b"PartyVInfo")?,
+            supp_pub_info: read(b"SuppPubInfo")?,
+            supp_priv_info: read(b"SuppPrivInfo")?,
+        })
+    }
+
+    fn other_info_len(&self) -> usize {
+        self.algorithm_id.len()
+            + self.party_u_info.len()
+            + self.party_v_info.len()
+            + self.supp_pub_info.len()
+            + self.supp_priv_info.len()
+    }
+}
+
 /// ConcatKDF \u2014 the single-step Concatenation Key Derivation Function of
 /// NIST SP 800-56A \u00a75.8.1, as referenced by W3C XML Encryption 1.1 \u00a75.4.1.
 ///
@@ -849,7 +895,8 @@ fn aes_key_unwrap(kek: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>> {
 ///
 /// ```text
 /// H( counter(4B BE = 1) || Z || OtherInfo )
-/// OtherInfo = AlgorithmID || PartyUInfo || PartyVInfo   (raw concatenation)
+/// OtherInfo = AlgorithmID || PartyUInfo || PartyVInfo
+///             || SuppPubInfo || SuppPrivInfo             (raw concatenation)
 /// ```
 ///
 /// `OtherInfo` is the **raw concatenation** of the fixed-info bit strings, per
@@ -863,26 +910,20 @@ fn aes_key_unwrap(kek: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>> {
 /// `[..keydatalen_bits / 8]` of the returned 32-byte digest. SHA-256 yields 256
 /// bits, so a single iteration covers every KEK size AES-KW accepts
 /// (128/192/256).
-fn concat_kdf_sha256(
-    z: &[u8],
-    keydatalen_bits: u32,
-    algorithm_id: &[u8],
-    party_u_info: &[u8],
-    party_v_info: &[u8],
-) -> [u8; 32] {
+fn concat_kdf_sha256(z: &[u8], keydatalen_bits: u32, params: &ConcatKdfParams) -> [u8; 32] {
     debug_assert!(
         keydatalen_bits as usize <= 256,
         "single-iteration ConcatKDF only yields up to 256 bits of key material"
     );
-    let mut input: Vec<u8> = Vec::with_capacity(
-        4 + z.len() + algorithm_id.len() + party_u_info.len() + party_v_info.len(),
-    );
+    let mut input: Vec<u8> = Vec::with_capacity(4 + z.len() + params.other_info_len());
     input.extend_from_slice(&1u32.to_be_bytes()); // counter = 1
     input.extend_from_slice(z);
     // OtherInfo: raw concatenation, no length prefixes, no keydatalen.
-    input.extend_from_slice(algorithm_id);
-    input.extend_from_slice(party_u_info);
-    input.extend_from_slice(party_v_info);
+    input.extend_from_slice(&params.algorithm_id);
+    input.extend_from_slice(&params.party_u_info);
+    input.extend_from_slice(&params.party_v_info);
+    input.extend_from_slice(&params.supp_pub_info);
+    input.extend_from_slice(&params.supp_priv_info);
 
     let digest =
         openssl::hash::hash(MessageDigest::sha256(), &input).expect("SHA-256 is always available");
@@ -1023,7 +1064,7 @@ fn decode_concat_kdf_param_bits(raw: &[u8]) -> Result<Vec<u8>> {
     };
 
     let mut octets = Vec::with_capacity(trimmed.len() / 2);
-    for pair in trimmed.chunks_exact(2) {
+    for pair in trimmed.as_chunks::<2>().0 {
         octets.push((hex_nibble(pair[0])? << 4) | hex_nibble(pair[1])?);
     }
 
@@ -1059,9 +1100,7 @@ pub fn decrypt_payload_xmlenc(
     let mut originator_pubkey_text = String::new();
     let mut active_reading_originator_pubkey = false;
     let mut originator_curve_oid_urn: Option<String> = None;
-    let mut concat_kdf_algid: Vec<u8> = Vec::new();
-    let mut concat_kdf_party_u: Vec<u8> = Vec::new();
-    let mut concat_kdf_party_v: Vec<u8> = Vec::new();
+    let mut concat_kdf = ConcatKdfParams::default();
 
     loop {
         let (ns, event) = reader.read_resolved_event().map_err(|err| {
@@ -1108,15 +1147,7 @@ pub fn decrypt_payload_xmlenc(
                 if namespace_is_xenc_or_xenc11(&ns)
                     && element.local_name().as_ref() == b"ConcatKDFParams"
                 {
-                    if let Some(v) = element_attribute_value(&element, b"AlgorithmID")? {
-                        concat_kdf_algid = decode_concat_kdf_param_bits(&v)?;
-                    }
-                    if let Some(v) = element_attribute_value(&element, b"PartyUInfo")? {
-                        concat_kdf_party_u = decode_concat_kdf_param_bits(&v)?;
-                    }
-                    if let Some(v) = element_attribute_value(&element, b"PartyVInfo")? {
-                        concat_kdf_party_v = decode_concat_kdf_param_bits(&v)?;
-                    }
+                    concat_kdf = ConcatKdfParams::parse(&element)?;
                 }
 
                 if kind == XmlEncTag::CipherValue {
@@ -1179,15 +1210,7 @@ pub fn decrypt_payload_xmlenc(
                 if namespace_is_xenc_or_xenc11(&ns)
                     && element.local_name().as_ref() == b"ConcatKDFParams"
                 {
-                    if let Some(v) = element_attribute_value(&element, b"AlgorithmID")? {
-                        concat_kdf_algid = decode_concat_kdf_param_bits(&v)?;
-                    }
-                    if let Some(v) = element_attribute_value(&element, b"PartyUInfo")? {
-                        concat_kdf_party_u = decode_concat_kdf_param_bits(&v)?;
-                    }
-                    if let Some(v) = element_attribute_value(&element, b"PartyVInfo")? {
-                        concat_kdf_party_v = decode_concat_kdf_param_bits(&v)?;
-                    }
+                    concat_kdf = ConcatKdfParams::parse(&element)?;
                 }
 
                 stack.push(kind);
@@ -1463,13 +1486,7 @@ pub fn decrypt_payload_xmlenc(
 
             // ConcatKDF (NIST SP 800-56A) → key-encryption key sized to the
             // declared kw-aes128/192/256 algorithm.
-            let kdf_output = concat_kdf_sha256(
-                &z,
-                (kek_len * 8) as u32,
-                &concat_kdf_algid,
-                &concat_kdf_party_u,
-                &concat_kdf_party_v,
-            );
+            let kdf_output = concat_kdf_sha256(&z, (kek_len * 8) as u32, &concat_kdf);
             let kek = kdf_output[..kek_len].to_vec();
             // Zeroize shared secret immediately after KDF.
             use zeroize::Zeroize as _;
@@ -1541,7 +1558,7 @@ mod tests {
     #[test]
     fn concat_kdf_empty_otherinfo_matches_sp800_56a_single_step() {
         let z = b"\x01\x02\x03\x04\x05\x06\x07\x08 shared-secret bytes";
-        let got = concat_kdf_sha256(z, 128, &[], &[], &[]);
+        let got = concat_kdf_sha256(z, 128, &ConcatKdfParams::default());
 
         let mut expected_input = Vec::new();
         expected_input.extend_from_slice(&1u32.to_be_bytes());
@@ -1560,11 +1577,80 @@ mod tests {
 
     /// `OtherInfo` is a raw concatenation: no length prefixes are inserted
     /// between AlgorithmID / PartyUInfo / PartyVInfo.
+    /// SP 800-56A §5.8.1.2 concatenates all five fixed-info fields. Ignoring
+    /// the two supplementary ones derives a different KEK from a peer that
+    /// supplies either, surfacing as an unexplained "AES Key Unwrap integrity
+    /// check failed".
+    #[test]
+    fn concat_kdf_includes_the_supplementary_info_fields() {
+        let z = b"shared-secret";
+        let without = concat_kdf_sha256(z, 128, &ConcatKdfParams::default());
+        let with_pub = concat_kdf_sha256(
+            z,
+            128,
+            &ConcatKdfParams {
+                supp_pub_info: b"\x00\x00\x00\x80".to_vec(),
+                ..ConcatKdfParams::default()
+            },
+        );
+        let with_priv = concat_kdf_sha256(
+            z,
+            128,
+            &ConcatKdfParams {
+                supp_priv_info: b"\x00\x00\x00\x80".to_vec(),
+                ..ConcatKdfParams::default()
+            },
+        );
+        assert_ne!(without, with_pub, "SuppPubInfo must reach the hash input");
+        assert_ne!(without, with_priv, "SuppPrivInfo must reach the hash input");
+
+        // The fields concatenate in a fixed order. Two *different* values swap
+        // to a different octet string; the same value in either slot does not,
+        // because OtherInfo carries no field boundaries at all.
+        let pub_then_priv = concat_kdf_sha256(
+            z,
+            128,
+            &ConcatKdfParams {
+                supp_pub_info: b"AAA".to_vec(),
+                supp_priv_info: b"BB".to_vec(),
+                ..ConcatKdfParams::default()
+            },
+        );
+        let priv_then_pub = concat_kdf_sha256(
+            z,
+            128,
+            &ConcatKdfParams {
+                supp_pub_info: b"BB".to_vec(),
+                supp_priv_info: b"AAA".to_vec(),
+                ..ConcatKdfParams::default()
+            },
+        );
+        assert_ne!(
+            pub_then_priv, priv_then_pub,
+            "SuppPubInfo precedes SuppPrivInfo in OtherInfo"
+        );
+    }
+
     #[test]
     fn concat_kdf_otherinfo_is_raw_concatenation() {
         let z = b"Z-secret";
-        let combined = concat_kdf_sha256(z, 128, b"ABCDEF", &[], &[]);
-        let split = concat_kdf_sha256(z, 128, b"ABC", b"DEF", &[]);
+        let combined = concat_kdf_sha256(
+            z,
+            128,
+            &ConcatKdfParams {
+                algorithm_id: b"ABCDEF".to_vec(),
+                ..ConcatKdfParams::default()
+            },
+        );
+        let split = concat_kdf_sha256(
+            z,
+            128,
+            &ConcatKdfParams {
+                algorithm_id: b"ABC".to_vec(),
+                party_u_info: b"DEF".to_vec(),
+                ..ConcatKdfParams::default()
+            },
+        );
         assert_eq!(
             combined, split,
             "raw concatenation: AlgorithmID||PartyUInfo boundaries must not affect the hash"

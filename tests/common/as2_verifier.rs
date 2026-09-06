@@ -8,13 +8,13 @@ use asx_rs::lifecycle::TrustEvidence;
 
 #[cfg(all(feature = "as2", feature = "testing"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct DeterministicTrustVerifier {
+pub(crate) struct DeterministicTrustVerifier {
     trust: TrustEvidence,
 }
 
 #[cfg(all(feature = "as2", feature = "testing"))]
 impl DeterministicTrustVerifier {
-    pub fn new(trust: TrustEvidence) -> Self {
+    pub(crate) fn new(trust: TrustEvidence) -> Self {
         Self { trust }
     }
 }

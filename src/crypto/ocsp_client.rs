@@ -37,7 +37,7 @@ struct CachedResponses {
 // OcspResponseCache trait
 // ---------------------------------------------------------------------------
 
-pub trait OcspResponseCache: Send + Sync {
+pub trait OcspResponseCache: Send + Sync + std::fmt::Debug {
     fn get(&self, cache_key: &str, now_secs: u64) -> Result<Option<Vec<Vec<u8>>>>;
     fn put(
         &self,
@@ -486,25 +486,48 @@ pub mod async_transport {
             Self { client: None }
         }
 
-        /// Create with a pre-configured reqwest client (for custom settings)
+        /// Create with a pre-configured reqwest client.
+        ///
+        /// # ⚠ This opts out of responder-URL validation
+        ///
+        /// The default transport validates each responder URL against the
+        /// private/loopback/link-local ranges and pins the connection to the
+        /// addresses it checked, because the URL comes from an inbound
+        /// certificate's AIA extension. Supplying a client asserts that **you**
+        /// own that policy — the URL is used as given.
+        ///
+        /// The legitimate reason to do this is an internal PKI whose responder
+        /// really is on a private address, or an egress proxy. If that is not
+        /// your situation, use [`new`](Self::new).
         pub fn with_client(client: reqwest::Client) -> Self {
             Self {
                 client: Some(client),
             }
         }
 
-        fn get_client(&self) -> reqwest::Client {
-            self.client.clone().unwrap_or_else(|| {
-                // The OCSP responder URL is taken from the certificate's AIA
-                // extension and is therefore attacker-influenced for an
-                // attacker-supplied cert. Never follow redirects: a `3xx` could
-                // steer the request to an internal host (SSRF). A responder URL
-                // is a fixed endpoint that has no legitimate reason to redirect.
-                reqwest::Client::builder()
-                    .redirect(reqwest::redirect::Policy::none())
-                    .build()
-                    .unwrap_or_default()
-            })
+        /// Build the client for one responder URL.
+        ///
+        /// The URL comes from the certificate's AIA extension, so on an inbound
+        /// message it is chosen by whoever presented the certificate — and
+        /// revocation checking runs *while* trust is being established, i.e.
+        /// before that party is trusted at all. It is therefore validated
+        /// against the private/loopback/link-local ranges and pinned to the
+        /// addresses that were checked, exactly like any other egress. Without
+        /// that, a peer could point the responder at `169.254.169.254` or an
+        /// internal admin endpoint and have this process POST to it.
+        ///
+        /// A caller-supplied client (`with_client`) is used as given: that
+        /// caller has taken responsibility for its own egress policy.
+        async fn client_for(&self, url: &str) -> Result<reqwest::Client> {
+            if let Some(client) = self.client.clone() {
+                return Ok(client);
+            }
+            crate::transport::egress::validated_pinned_ocsp_client(
+                url,
+                &crate::transport::egress::TransportConfig::default(),
+                "ocsp_client_fetch_async",
+            )
+            .await
         }
     }
 
@@ -517,7 +540,7 @@ pub mod async_transport {
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<u8>>> + Send + 'a>>
         {
             Box::pin(async move {
-                let client = self.get_client();
+                let client = self.client_for(url).await?;
 
                 let response = client
                     .post(url)
@@ -623,6 +646,15 @@ pub mod async_transport {
         pub cache_namespace: &'a str,
     }
 
+    impl std::fmt::Debug for AsyncOcspFetchWithTransportRequest<'_> {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("AsyncOcspFetchWithTransportRequest")
+                .field("ttl_secs", &self.ttl_secs)
+                .field("cache_namespace", &self.cache_namespace)
+                .finish_non_exhaustive()
+        }
+    }
+
     /// Async fetch with configurable transport and explicit cache namespace.
     pub async fn fetch_ocsp_responses_with_cache_and_transport_async_scoped(
         request: AsyncOcspFetchWithTransportRequest<'_>,
@@ -716,6 +748,8 @@ static CACHE_TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Debug)]
 
     struct InMemoryTestCache {
         store: parking_lot::Mutex<std::collections::HashMap<String, CachedResponses>>,
@@ -1194,4 +1228,72 @@ mod tests {
     }
 
     // The previous shared-runtime worker path and its metrics tests were removed.
+}
+
+#[cfg(all(test, feature = "async-ocsp"))]
+mod ocsp_ssrf_tests {
+    use super::async_transport::{AsyncOcspHttpTransport, ReqwestOcspTransport};
+    use std::time::Duration;
+
+    /// The responder URL comes from an inbound certificate's AIA extension, and
+    /// revocation checking runs *before* that certificate is trusted. Without a
+    /// private-range check a peer could point it at cloud instance metadata or
+    /// an internal admin endpoint and have this process POST to it.
+    #[tokio::test]
+    async fn a_responder_on_a_private_or_link_local_address_is_refused() {
+        let transport = ReqwestOcspTransport::new();
+        for url in [
+            "http://169.254.169.254/latest/meta-data/", // cloud metadata
+            "http://127.0.0.1:8080/ocsp",
+            "http://localhost/ocsp",
+            "http://10.0.0.5/ocsp",
+            "http://192.168.1.1/ocsp",
+            "https://[::1]/ocsp",
+        ] {
+            let err = transport
+                .post_ocsp_request_async(url, b"req", Duration::from_secs(1))
+                .await
+                .expect_err("must refuse a private-range OCSP responder");
+            assert_eq!(
+                err.code,
+                crate::core::ErrorCode::InvalidInput,
+                "url {url} produced {err:?}"
+            );
+        }
+    }
+
+    /// A non-HTTP scheme must not reach the transport either.
+    #[tokio::test]
+    async fn a_non_http_responder_scheme_is_refused() {
+        let transport = ReqwestOcspTransport::new();
+        for url in ["file:///etc/passwd", "gopher://example.org/", "ftp://x/"] {
+            let err = transport
+                .post_ocsp_request_async(url, b"req", Duration::from_secs(1))
+                .await
+                .expect_err("must refuse a non-HTTP scheme");
+            assert_eq!(err.code, crate::core::ErrorCode::InvalidInput);
+        }
+    }
+
+    /// RFC 6960 responders are routinely plain HTTP and their responses are
+    /// signed, so requiring HTTPS here would break revocation against most
+    /// public PKIs. Plain HTTP must therefore pass *validation* — it fails
+    /// later, at connect time, which is a different error.
+    #[tokio::test]
+    async fn plain_http_to_a_public_host_passes_validation() {
+        let transport = ReqwestOcspTransport::new();
+        let err = transport
+            .post_ocsp_request_async(
+                "http://ocsp.invalid-tld-for-tests./x",
+                b"req",
+                Duration::from_millis(200),
+            )
+            .await
+            .expect_err("the host does not resolve");
+        // Whatever it is, it must not be the scheme rejection.
+        assert!(
+            !err.message.contains("plain HTTP egress is not permitted"),
+            "plain HTTP must be allowed for OCSP: {err:?}"
+        );
+    }
 }

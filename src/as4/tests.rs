@@ -255,6 +255,8 @@ fn multipart_rejects_a_reference_with_no_matching_part() {
     assert!(err.message.contains("absent@gitb"), "{}", err.message);
 }
 
+#[derive(Debug)]
+
 struct DurableTestDedup(InMemoryDedupBackend);
 
 impl DedupStorage for DurableTestDedup {
@@ -280,6 +282,8 @@ fn reliability() -> (DurableTestReconciliation, DurableTestDedup) {
         DurableTestDedup(InMemoryDedupBackend::default()),
     )
 }
+
+#[derive(Debug)]
 
 struct DurableTestReconciliation(InMemoryReconciliationHook);
 

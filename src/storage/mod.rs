@@ -12,6 +12,15 @@ use std::future::Future;
 use std::pin::Pin;
 use std::task::Poll;
 
+/// A conformance suite an embedder runs against its own backend, to establish
+/// the durability and atomicity that `is_durable()`, `cluster_safe()` and
+/// `DurableAuditSink::durability()` only *declare*.
+///
+/// Covers all three storage traits: [`DedupStorage`], [`ReconciliationStorage`]
+/// and [`crate::observability::audit_sink::DurableAuditSink`].
+#[cfg(feature = "testing")]
+pub mod conformance;
+
 /// `dyn`-safe boxed async future for storage trait methods.
 ///
 /// This is the return type of [`DedupStorage::first_seen`].  Implementations
@@ -88,28 +97,67 @@ pub(crate) fn drive_reconciliation_future<T>(future: impl Future<Output = T>) ->
 /// Implementations must provide strict idempotency guarantees: each idempotency key
 /// is seen exactly once, and lock poison/infrastructure failures must fail-closed.
 ///
-/// # Example implementation (in-memory, sync-wrapped)
-/// ```rust,ignore
+/// # Implementing it
+///
+/// A process-local backend wraps synchronous logic; the future resolves on the
+/// first `.await`.
+///
+/// ```
+/// use asx_rs::storage::{BoxFuture, DedupStorage};
+/// use std::collections::HashSet;
+/// use std::sync::Mutex;
+///
+/// #[derive(Debug, Default)]
+/// struct MyMemoryStore {
+///     seen: Mutex<HashSet<String>>,
+/// }
+///
 /// impl DedupStorage for MyMemoryStore {
-///     fn is_durable(&self) -> bool { false }
-///     fn first_seen<'a>(&'a self, key: &'a str) -> BoxFuture<'a, asx_rs::core::Result<bool>> {
-///         Box::pin(async move { self.inner_first_seen_sync(key) })
+///     fn is_durable(&self) -> bool {
+///         false // forgets everything on restart
+///     }
+///
+///     fn first_seen<'a>(&'a self, key: &'a str) -> BoxFuture<'a, asx_rs::Result<bool>> {
+///         Box::pin(async move {
+///             // A poisoned lock must fail closed, never report "not seen".
+///             let mut seen = self.seen.lock().map_err(|_| {
+///                 asx_rs::AsxError::new(
+///                     asx_rs::ErrorCode::ReliabilityFailure,
+///                     "dedup mutex poisoned",
+///                     asx_rs::ErrorContext::new("my_memory_store"),
+///                 )
+///             })?;
+///             Ok(seen.insert(key.to_string()))
+///         })
 ///     }
 /// }
+///
+/// # tokio_test_helper();
+/// # fn tokio_test_helper() {
+/// let store = MyMemoryStore::default();
+/// let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+/// assert!(rt.block_on(store.first_seen("msg-1")).unwrap());   // first time
+/// assert!(!rt.block_on(store.first_seen("msg-1")).unwrap());  // duplicate
+/// # }
 /// ```
 ///
-/// # Example implementation (async backend)
-/// ```rust,ignore
+/// A durable, cluster-safe backend declares both properties and does the work in
+/// the returned future — one round trip, no `block_on`:
+///
+/// ```text
 /// impl DedupStorage for RedisDedup {
 ///     fn is_durable(&self) -> bool { true }
-///     fn first_seen<'a>(&'a self, key: &'a str) -> BoxFuture<'a, asx_rs::core::Result<bool>> {
+///     fn cluster_safe(&self) -> bool { true }
+///
+///     fn first_seen<'a>(&'a self, key: &'a str) -> BoxFuture<'a, asx_rs::Result<bool>> {
 ///         Box::pin(async move {
-///             self.redis.set_nx(key).await.map_err(|e| storage_err(e))
+///             // SET key 1 NX EX <window>  ->  Ok(true) when the key was created.
+///             self.redis.set_nx(key, self.window).await.map_err(storage_err)
 ///         })
 ///     }
 /// }
 /// ```
-pub trait DedupStorage: Send + Sync {
+pub trait DedupStorage: Send + Sync + std::fmt::Debug {
     /// Return whether this backend persists dedup state durably.
     ///
     /// Implementations that keep replay-protection keys only in process memory
@@ -157,7 +205,7 @@ pub trait DedupStorage: Send + Sync {
 ///
 /// ```toml
 /// [dependencies]
-/// asx-rs = "=0.5.0"  # exact-version pin — ReconciliationStorage is not yet stable
+/// asx-rs = "=0.13.0"  # exact-version pin — ReconciliationStorage is not yet stable
 /// ```
 ///
 /// The sealed-trait pattern is intentionally not used here so that downstream
@@ -165,7 +213,7 @@ pub trait DedupStorage: Send + Sync {
 /// this crate reaches `1.0`.  Once the trait stabilises the exact-pin
 /// requirement will be lifted and a crate-level migration notice will be
 /// published.
-pub trait ReconciliationStorage: Send + Sync {
+pub trait ReconciliationStorage: Send + Sync + std::fmt::Debug {
     /// Return whether this backend persists reconciliation state durably.
     ///
     /// Implementations that keep state only in process memory must return `false`.

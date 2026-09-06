@@ -4,20 +4,22 @@
 //! AS4 endpoint URL and signing certificate for a participant from the PEPPOL
 //! Participant Identifier + Document Type Identifier + Process Identifier triple.
 //!
-//! # DNS Discovery (BDXL / SML)
+//! # Finding the SMP (BDXL)
 //!
-//! The SMP hostname is computed by hashing the canonical participant identifier:
+//! Before any metadata can be fetched, the SMP that holds it has to be found.
+//! Peppol and CEF eDelivery publish that in DNS as a U-NAPTR record keyed by a
+//! hash of the participant identifier — see [`bdxl`] for the construction, the
+//! record format, and the [`BdxlResolver`] seam that performs the query.
 //!
 //! ```text
-//! canonical  = "{scheme}::{participant_id}"            (e.g. "iso6523-actorid-upis::0088:1234567890123")
-//! dns_label  = "B-" + lowercase_hex(md5(lowercase(canonical)))
-//! smp_host   = "{dns_label}.{sml_zone}"                (e.g. "B-abc123….acc.edelivery.tech.ec.europa.eu")
-//! smp_base   = "https://{smp_host}/"
+//! name = strip-trailing(base32(sha256(lowercase(ID-VALUE))), "=") + "." + ID-SCHEME + "." + ZONE
+//! name. IN NAPTR 100 10 "U" "Meta:SMP" "!.*!https://smp.example.org!" .
 //! ```
 //!
-//! The ServiceMetadata is retrieved with:
+//! The ServiceMetadata is then retrieved from the SMP the record named:
+//!
 //! ```text
-//! GET {smp_base}{url_encoded_canonical}/services/{url_encoded_document_type_id}
+//! GET {smp_base}/{url_encoded_canonical_id}/services/{url_encoded_document_type_id}
 //! ```
 //!
 //! # Verify the SMP signature
@@ -45,36 +47,61 @@
 //!
 //! # SSRF protection
 //!
-//! The constructed SMP URL is validated before the HTTP request is issued.
-//! The `sml_zone` value in [`SmpConfig`] **must** be a trusted PEPPOL SML
-//! hostname supplied by the operator — treat it like a service URL, not user
-//! data.
+//! The SMP URL is validated **and pinned** before the HTTP request is issued,
+//! so a host that passed the check cannot be swapped for a private address on
+//! the connection. The `sml_zone` in [`SmpConfig`] names the DNS zone that is
+//! allowed to answer for participants — treat it as configuration, not user
+//! data — and a NAPTR record may only name an `https` SMP.
 //!
 //! # Example
 //!
 //! ```rust,no_run
-//! use asx_rs::smp::{SmpClient, SmpLookupRequest};
+//! # #[cfg(feature = "dns")]
+//! # mod example {
+//! use asx_rs::smp::{HickoryBdxlResolver, SmpClient, SmpConfig, SmpLookupRequest, SmpSignaturePolicy};
+//! use std::sync::Arc;
 //!
-//! async fn example() -> asx_rs::core::Result<()> {
-//!     let client = SmpClient::new("acc.edelivery.tech.ec.europa.eu");
-//!     let endpoint = client.lookup_endpoint(SmpLookupRequest {
-//!         participant_id:   "0088:1234567890123".to_string(),
-//!         document_type_id: "urn:oasis:names:specification:ubl:schema:xsd:Invoice-2::Invoice##\
-//!                            urn:cen.eu:en16931:2017#compliant#\
-//!                            urn:fdc:peppol.eu:2017:poacc:billing:3.0::2.1".to_string(),
-//!         process_id:       "urn:fdc:peppol.eu:2017:poacc:billing:01:1.0".to_string(),
-//!         transport_profile: None,
-//!     }).await?;
+//! async fn example(smp_ca_pem: String) -> asx_rs::core::Result<()> {
+//!     let client = SmpClient::with_config(SmpConfig {
+//!         signature_policy: SmpSignaturePolicy::verify_with_trust_anchors(vec![smp_ca_pem]),
+//!         ..SmpConfig::peppol_production()
+//!     })
+//!     .with_resolver(Arc::new(HickoryBdxlResolver::from_system_config()?));
+//!
+//!     let endpoint = client
+//!         .lookup_endpoint(SmpLookupRequest {
+//!             participant_id: "0088:1234567890123".to_string(),
+//!             document_type_id: "urn:oasis:names:specification:ubl:schema:xsd:Invoice-2::Invoice##\
+//!                                urn:cen.eu:en16931:2017#compliant#\
+//!                                urn:fdc:peppol.eu:2017:poacc:billing:3.0::2.1"
+//!                 .to_string(),
+//!             process_id: "urn:fdc:peppol.eu:2017:poacc:billing:01:1.0".to_string(),
+//!             transport_profile: None,
+//!         })
+//!         .await?;
+//!
 //!     println!("AS4 endpoint: {}", endpoint.url);
 //!     Ok(())
 //! }
+//! # }
 //! ```
 //!
 //! [OASIS BDX SMP 1.0 / PEPPOL BIS]: https://docs.peppol.eu/edelivery/smp/
 
+use std::sync::Arc;
+
 use crate::core::{AsxError, ErrorCode, ErrorContext, Result};
-use crate::transport::egress::validate_egress_url;
+use crate::transport::egress::{TransportConfig, validated_pinned_client};
 use roxmltree::Document;
+
+pub mod bdxl;
+
+#[cfg(feature = "dns")]
+pub use bdxl::HickoryBdxlResolver;
+pub use bdxl::{
+    BdxlResolver, NaptrRecord, SmlDiscovery, StaticBdxlResolver, bdxl_dns_name, legacy_cname_host,
+    select_smp_base_url,
+};
 
 // ── Well-known constants ──────────────────────────────────────────────────
 
@@ -84,18 +111,36 @@ pub const PEPPOL_AS4_TRANSPORT_PROFILE: &str = "peppol-transport-as4-v2_0";
 /// Default PEPPOL participant identifier scheme.
 pub const PEPPOL_PARTICIPANT_SCHEME: &str = "iso6523-actorid-upis";
 
+/// SML zone answering for the **Peppol production** network.
+///
+/// OpenPeppol took the SML in-house during 2026; the European Commission zone
+/// this replaced (`edelivery.tech.ec.europa.eu`) stopped answering participant
+/// lookups on 31 August 2026.
+pub const PEPPOL_PRODUCTION_SML_ZONE: &str = "participant.sml.prod.tech.peppol.org";
+
+/// SML zone answering for the **Peppol test** network (SMK).
+pub const PEPPOL_TEST_SML_ZONE: &str = "participant.sml.test.tech.peppol.org";
+
 // ── Types ─────────────────────────────────────────────────────────────────
 
 /// Configuration for an [`SmpClient`].
 #[derive(Debug, Clone)]
 pub struct SmpConfig {
-    /// SML DNS zone used to construct SMP hostnames.
+    /// SML DNS zone that answers participant lookups.
     ///
     /// | Network | Value |
     /// |---------|-------|
-    /// | PEPPOL test | `acc.edelivery.tech.ec.europa.eu` |
-    /// | PEPPOL production | `edelivery.tech.ec.europa.eu` |
+    /// | Peppol production | [`PEPPOL_PRODUCTION_SML_ZONE`] |
+    /// | Peppol test (SMK) | [`PEPPOL_TEST_SML_ZONE`] |
+    ///
+    /// Unused when [`discovery`](Self::discovery) is [`SmlDiscovery::Static`].
     pub sml_zone: String,
+
+    /// How the SMP holding a participant's metadata is located.
+    ///
+    /// Defaults to [`SmlDiscovery::Naptr`] — what Peppol and CEF eDelivery
+    /// publish. Requires a resolver; see [`SmpClient::with_resolver`].
+    pub discovery: SmlDiscovery,
 
     /// Participant identifier scheme prepended to the participant ID before
     /// hashing.  Default: [`PEPPOL_PARTICIPANT_SCHEME`].
@@ -124,7 +169,8 @@ impl SmpConfig {
     /// routing.
     pub fn peppol_test() -> Self {
         Self {
-            sml_zone: "acc.edelivery.tech.ec.europa.eu".to_string(),
+            sml_zone: PEPPOL_TEST_SML_ZONE.to_string(),
+            discovery: SmlDiscovery::Naptr,
             participant_scheme: PEPPOL_PARTICIPANT_SCHEME.to_string(),
             transport_profile: PEPPOL_AS4_TRANSPORT_PROFILE.to_string(),
             signature_policy: SmpSignaturePolicy::Deny,
@@ -139,7 +185,24 @@ impl SmpConfig {
     /// for routing.
     pub fn peppol_production() -> Self {
         Self {
-            sml_zone: "edelivery.tech.ec.europa.eu".to_string(),
+            sml_zone: PEPPOL_PRODUCTION_SML_ZONE.to_string(),
+            discovery: SmlDiscovery::Naptr,
+            participant_scheme: PEPPOL_PARTICIPANT_SCHEME.to_string(),
+            transport_profile: PEPPOL_AS4_TRANSPORT_PROFILE.to_string(),
+            signature_policy: SmpSignaturePolicy::Deny,
+        }
+    }
+
+    /// Config for a known SMP, skipping DNS discovery.
+    ///
+    /// For a bilateral agreement or a test SMP whose URL is configuration
+    /// rather than something to be looked up. No resolver is needed.
+    pub fn with_static_smp(smp_base_url: impl Into<String>) -> Self {
+        Self {
+            sml_zone: String::new(),
+            discovery: SmlDiscovery::Static {
+                smp_base_url: smp_base_url.into(),
+            },
             participant_scheme: PEPPOL_PARTICIPANT_SCHEME.to_string(),
             transport_profile: PEPPOL_AS4_TRANSPORT_PROFILE.to_string(),
             signature_policy: SmpSignaturePolicy::Deny,
@@ -263,27 +326,74 @@ pub struct SmpLookupRequest {
     pub transport_profile: Option<String>,
 }
 
+impl SmpLookupRequest {
+    /// A lookup using the config's default transport profile.
+    ///
+    /// The three identifiers are the ones a Peppol AP already has to hand: the
+    /// recipient participant, the document type it is sending, and the process
+    /// that document belongs to.
+    ///
+    /// ```
+    /// # use asx_rs::smp::SmpLookupRequest;
+    /// let request = SmpLookupRequest::new(
+    ///     "0088:1234567890123",
+    ///     "urn:cen.eu:en16931:2017#compliant#urn:fdc:peppol.eu:2017:poacc:billing:3.0::2.1",
+    ///     "urn:fdc:peppol.eu:2017:poacc:billing:01:1.0",
+    /// );
+    /// assert!(request.transport_profile.is_none());
+    /// ```
+    pub fn new(
+        participant_id: impl Into<String>,
+        document_type_id: impl Into<String>,
+        process_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            participant_id: participant_id.into(),
+            document_type_id: document_type_id.into(),
+            process_id: process_id.into(),
+            transport_profile: None,
+        }
+    }
+
+    /// Request a specific transport profile instead of the config's default.
+    #[must_use]
+    pub fn with_transport_profile(mut self, transport_profile: impl Into<String>) -> Self {
+        self.transport_profile = Some(transport_profile.into());
+        self
+    }
+}
+
 // ── Client ────────────────────────────────────────────────────────────────
 
 /// Async PEPPOL SMP client for dynamic AS4 endpoint discovery.
 ///
 /// Construct with [`SmpClient::new`] (convenience) or
 /// [`SmpClient::with_config`] (full control).
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct SmpClient {
     config: SmpConfig,
-    http: reqwest::Client,
+    /// Timeouts and pool settings for the per-lookup pinned client.
+    ///
+    /// The client itself is built **per request** so it can be pinned to the
+    /// addresses that URL validation actually checked; a long-lived client
+    /// would re-resolve DNS and reopen the rebinding hole.
+    transport: TransportConfig,
+    /// Performs the BDXL NAPTR query. `None` until one is supplied, which is
+    /// why [`SmlDiscovery::Naptr`] reports a configuration error rather than
+    /// silently falling back to a scheme the network no longer publishes.
+    resolver: Option<Arc<dyn BdxlResolver>>,
 }
 
 impl SmpClient {
-    /// Create a client that targets the given SML zone with PEPPOL defaults.
+    /// Create a client that targets the given SML zone with Peppol defaults
+    /// and BDXL NAPTR discovery.
     ///
-    /// # Panics
-    /// Panics if the HTTP client cannot be built (system TLS configuration
-    /// error).
+    /// Supply a resolver with [`with_resolver`](Self::with_resolver) before
+    /// looking anything up.
     pub fn new(sml_zone: impl Into<String>) -> Self {
         Self::with_config(SmpConfig {
             sml_zone: sml_zone.into(),
+            discovery: SmlDiscovery::Naptr,
             participant_scheme: PEPPOL_PARTICIPANT_SCHEME.to_string(),
             transport_profile: PEPPOL_AS4_TRANSPORT_PROFILE.to_string(),
             signature_policy: SmpSignaturePolicy::Deny,
@@ -291,20 +401,24 @@ impl SmpClient {
     }
 
     /// Create a client with explicit [`SmpConfig`].
-    ///
-    /// # Panics
-    /// Panics if the HTTP client cannot be built.
     pub fn with_config(config: SmpConfig) -> Self {
-        let http = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(10))
-            // Do not follow redirects: the SMP lookup URL is SSRF-validated
-            // before the request, but a `3xx Location` from a compromised or
-            // spoofed SMP would be followed to an unchecked (possibly internal)
-            // host. SMP endpoints are fixed and never legitimately redirect.
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .expect("failed to build SMP reqwest client");
-        Self { config, http }
+        Self {
+            config,
+            transport: TransportConfig {
+                request_timeout: std::time::Duration::from_secs(10),
+                ..TransportConfig::default()
+            },
+            resolver: None,
+        }
+    }
+
+    /// Attach the resolver that performs BDXL NAPTR queries.
+    ///
+    /// Required for [`SmlDiscovery::Naptr`]; ignored by the other modes.
+    #[must_use]
+    pub fn with_resolver(mut self, resolver: Arc<dyn BdxlResolver>) -> Self {
+        self.resolver = Some(resolver);
+        self
     }
 
     /// Return the `SmpConfig` this client was created with.
@@ -326,10 +440,18 @@ impl SmpClient {
     /// - [`ErrorCode::NotFound`] — SMP returned a non-2xx status.
     /// - [`ErrorCode::ParseFailed`] — XML parsing or endpoint extraction failed.
     pub async fn lookup_endpoint(&self, req: SmpLookupRequest) -> Result<SmpEndpoint> {
-        let url = self.build_lookup_url(&req);
-        validate_egress_url(&url, "smp_lookup").await?;
+        let smp_base = self.resolve_smp_base_url(&req.participant_id).await?;
+        let url = self.build_lookup_url_at(&smp_base, &req);
 
-        let response = self.http.get(&url).send().await.map_err(|e| {
+        // Validate **and pin** in one step. Validating the URL and then letting
+        // a separately-built client resolve DNS again is a
+        // time-of-check/time-of-use hole: the attacker answers the check with a
+        // public address and the connection with a private one. An SMP lookup
+        // decides where a message goes and which key it is encrypted to, so it
+        // is the last place to leave that open.
+        let http = validated_pinned_client(&url, &self.transport, "smp_lookup").await?;
+
+        let response = http.get(&url).send().await.map_err(|e| {
             AsxError::new(
                 ErrorCode::TransportFailure,
                 format!("SMP HTTP request failed for '{url}': {e}"),
@@ -370,39 +492,104 @@ impl SmpClient {
         )
     }
 
-    /// Compute the full SMP ServiceMetadata lookup URL for a request.
+    /// The DNS name a [`SmlDiscovery::Naptr`] or [`SmlDiscovery::LegacyCname`]
+    /// lookup queries for `participant_id`.
     ///
-    /// Exposed primarily for testing and logging purposes.
-    pub fn build_lookup_url(&self, req: &SmpLookupRequest) -> String {
-        let smp_base = self.build_smp_base_url(&req.participant_id);
+    /// Exposed so a deployment can check what a lookup will ask for — a name
+    /// that resolves to nothing and an unregistered participant are otherwise
+    /// the same observation.
+    pub fn discovery_dns_name(&self, participant_id: &str) -> Option<String> {
+        match &self.config.discovery {
+            SmlDiscovery::Naptr => Some(bdxl_dns_name(
+                &self.config.participant_scheme,
+                participant_id,
+                &self.config.sml_zone,
+            )),
+            SmlDiscovery::LegacyCname => Some(legacy_cname_host(
+                &self.config.participant_scheme,
+                participant_id,
+                &self.config.sml_zone,
+            )),
+            SmlDiscovery::Static { .. } => None,
+        }
+    }
+
+    /// Locate the SMP that holds `participant_id`'s metadata.
+    async fn resolve_smp_base_url(&self, participant_id: &str) -> Result<String> {
+        match &self.config.discovery {
+            SmlDiscovery::Static { smp_base_url } => {
+                Ok(smp_base_url.trim_end_matches('/').to_string())
+            }
+            SmlDiscovery::LegacyCname => Ok(format!(
+                "https://{}",
+                legacy_cname_host(
+                    &self.config.participant_scheme,
+                    participant_id,
+                    &self.config.sml_zone,
+                )
+            )),
+            SmlDiscovery::Naptr => {
+                let Some(resolver) = self.resolver.as_ref() else {
+                    return Err(AsxError::new(
+                        ErrorCode::InvalidInput,
+                        "SmlDiscovery::Naptr needs a DNS resolver: call \
+                         SmpClient::with_resolver(..) — with HickoryBdxlResolver under the \
+                         `dns` feature, or your own BdxlResolver. Use \
+                         SmpConfig::with_static_smp(..) if the SMP URL is known in advance",
+                        ErrorContext::new("smp_discovery"),
+                    ));
+                };
+                let name = bdxl_dns_name(
+                    &self.config.participant_scheme,
+                    participant_id,
+                    &self.config.sml_zone,
+                );
+                let records = resolver.lookup_naptr(&name).await?;
+                if records.is_empty() {
+                    return Err(AsxError::new(
+                        ErrorCode::NotFound,
+                        format!(
+                            "participant '{participant_id}' is not registered in SML zone \
+                             '{}': no NAPTR records at '{name}'",
+                            self.config.sml_zone
+                        ),
+                        ErrorContext::new("smp_discovery"),
+                    ));
+                }
+                select_smp_base_url(&records)
+            }
+        }
+    }
+
+    /// Compute the full SMP ServiceMetadata lookup URL against a known SMP base.
+    ///
+    /// Exposed primarily for testing and logging purposes; [`lookup_endpoint`]
+    /// finds the base itself.
+    ///
+    /// [`lookup_endpoint`]: Self::lookup_endpoint
+    pub fn build_lookup_url_at(&self, smp_base_url: &str, req: &SmpLookupRequest) -> String {
         let canonical = format!("{}::{}", self.config.participant_scheme, req.participant_id);
         format!(
-            "{}{}/services/{}",
-            smp_base,
+            "{}/{}/services/{}",
+            smp_base_url.trim_end_matches('/'),
             percent_encode(&canonical),
             percent_encode(&req.document_type_id),
         )
-    }
-
-    /// Construct the SMP base URL for a participant using the PEPPOL BDXL
-    /// MD5-based DNS formula.
-    fn build_smp_base_url(&self, participant_id: &str) -> String {
-        let canonical = format!(
-            "{}::{}",
-            self.config.participant_scheme,
-            participant_id.to_lowercase()
-        );
-        let hash = md5_hex(canonical.as_bytes());
-        format!("https://B-{}.{}/", hash, self.config.sml_zone)
     }
 }
 
 // ── XML parsing ───────────────────────────────────────────────────────────
 
-/// OASIS BDX SMP / PEPPOL SMP 1.0 namespace.
+/// OASIS BDX SMP 1.0 (`busdox`) — the shape Peppol and CEF eDelivery publish.
 const SMP_NS: &str = "http://busdox.org/serviceMetadata/publishing/1.0/";
-/// OASIS BDX SMP 2.0 namespace (used by some CEF deployments).
-const SMP_NS_V2: &str = "http://docs.oasis-open.org/bdxr/ns/SMP/2/ServiceMetadata";
+/// OASIS SMP 2.0 document namespace.
+const SMP2_NS_SERVICE_METADATA: &str = "http://docs.oasis-open.org/bdxr/ns/SMP/2/ServiceMetadata";
+/// OASIS SMP 2.0 basic components — where every leaf element in a 2.0
+/// `ServiceMetadata` actually lives.
+const SMP2_NS_BASIC: &str = "http://docs.oasis-open.org/bdxr/ns/SMP/2/BasicComponents";
+/// OASIS SMP 2.0 aggregate components — `ProcessMetadata`, `Process`,
+/// `Endpoint`, `Certificate`.
+const SMP2_NS_AGGREGATE: &str = "http://docs.oasis-open.org/bdxr/ns/SMP/2/AggregateComponents";
 
 /// Parse `ServiceMetadata` XML bytes and extract the first matching endpoint.
 ///
@@ -430,17 +617,19 @@ fn parse_service_metadata(
     })?;
 
     let signer = enforce_smp_signature_policy(text, &doc, signature_policy)?;
+    let version = SmpVersion::detect(&doc)?;
 
-    let mut endpoint = extract_endpoint(&doc, process_id, transport_profile).ok_or_else(|| {
-        AsxError::new(
-            ErrorCode::NotFound,
-            format!(
-                "no matching AS4 endpoint found in SMP for process '{process_id}' \
-                 with transport profile '{transport_profile}'"
-            ),
-            ErrorContext::new("smp_parse"),
-        )
-    })?;
+    let mut endpoint =
+        extract_endpoint(&doc, version, process_id, transport_profile)?.ok_or_else(|| {
+            AsxError::new(
+                ErrorCode::NotFound,
+                format!(
+                    "no matching AS4 endpoint found in SMP for process '{process_id}' \
+                     with transport profile '{transport_profile}'"
+                ),
+                ErrorContext::new("smp_parse"),
+            )
+        })?;
 
     endpoint.signed_document = std::sync::Arc::from(xml);
     endpoint.verified_signer_fingerprint_sha256 = signer;
@@ -505,9 +694,10 @@ const XMLDSIG_NS: &str = "http://www.w3.org/2000/09/xmldsig#";
 
 /// Whether the document contains a `ds:Signature` element.
 ///
-/// Presence only — verifying it requires whole-document (`URI=""`) reference
-/// support that the WS-Security verifier does not implement. See
-/// [`SmpEndpoint::signed_document`].
+/// Presence only. [`SmpSignaturePolicy::Verify`] is what actually checks the
+/// enveloped signature; this backs the weaker
+/// [`SmpSignaturePolicy::RequireSignaturePresent`], which catches an outright
+/// unsigned SMP and nothing more.
 fn has_enveloped_signature(doc: &Document<'_>) -> bool {
     doc.descendants().any(|n| {
         n.is_element()
@@ -516,114 +706,215 @@ fn has_enveloped_signature(doc: &Document<'_>) -> bool {
     })
 }
 
-/// Walk the roxmltree document and find the first `<Endpoint>` whose
-/// `<ProcessIdentifier>` matches `process_id` and whose `transportProfile`
-/// attribute matches `transport_profile`.
+/// Which OASIS SMP generation a `ServiceMetadata` document is written in.
+///
+/// The two are not dialects of one grammar: 2.0 moved the transport profile
+/// from an attribute to an element, renamed the address and the process
+/// identifier, and nested the certificate. Detecting the version and then
+/// parsing with that version's rules is the alternative to a name-matching
+/// walk that accepts a mixture neither specification defines (D5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SmpVersion {
+    /// OASIS BDX SMP 1.0 (`busdox`).
+    V1,
+    /// OASIS SMP 2.0.
+    V2,
+}
+
+impl SmpVersion {
+    /// Determine the version from the document element's namespace.
+    fn detect(doc: &Document<'_>) -> Result<Self> {
+        let root = doc.root_element();
+        match root.tag_name().namespace() {
+            Some(SMP_NS) => Ok(Self::V1),
+            Some(SMP2_NS_SERVICE_METADATA) => Ok(Self::V2),
+            other => Err(AsxError::new(
+                ErrorCode::ParseFailed,
+                format!(
+                    "SMP response document element is {{{}}}{}; expected an OASIS SMP 1.0 \
+                     ({SMP_NS}) or SMP 2.0 ({SMP2_NS_SERVICE_METADATA}) ServiceMetadata",
+                    other.unwrap_or("no namespace"),
+                    root.tag_name().name(),
+                ),
+                ErrorContext::new("smp_parse"),
+            )),
+        }
+    }
+}
+
+/// Find the endpoint for `process_id` + `transport_profile`.
+///
+/// Ambiguity is refused rather than resolved by document order: a response
+/// offering the same process and transport profile twice would otherwise let
+/// whichever entry came first decide where a message goes.
 fn extract_endpoint(
     doc: &Document<'_>,
+    version: SmpVersion,
     process_id: &str,
     transport_profile: &str,
-) -> Option<SmpEndpoint> {
-    // Both SMP 1.0 (busdox) and SMP 2.0 (OASIS) share the same element
-    // structure; we match on local name and accept either namespace.
-    for node in doc.descendants() {
-        if !matches_smp_element(&node, "Endpoint") {
+) -> Result<Option<SmpEndpoint>> {
+    let mut found: Option<SmpEndpoint> = None;
+
+    for endpoint in doc.descendants().filter(|n| is_endpoint(*n, version)) {
+        let Some(profile) = endpoint_transport_profile(endpoint, version) else {
+            continue;
+        };
+        if !profile.trim().eq_ignore_ascii_case(transport_profile) {
             continue;
         }
-
-        // Check transportProfile attribute.
-        let profile = node.attribute("transportProfile")?;
-        if !profile.eq_ignore_ascii_case(transport_profile) {
+        let Some(declared_process) = ancestor_process_id(endpoint, version) else {
+            continue;
+        };
+        if !declared_process.trim().eq_ignore_ascii_case(process_id) {
             continue;
         }
-
-        // Walk up to find <Process> → <ProcessIdentifier>.
-        let process_node = find_ancestor_process_id(doc, &node)?;
-        if !process_node.eq_ignore_ascii_case(process_id) {
+        let Some(url) = endpoint_address(endpoint, version) else {
             continue;
+        };
+
+        if found.is_some() {
+            return Err(AsxError::new(
+                ErrorCode::ParseFailed,
+                format!(
+                    "SMP response offers more than one endpoint for process '{process_id}' \
+                     with transport profile '{transport_profile}'; refusing to resolve the \
+                     ambiguity by document order"
+                ),
+                ErrorContext::new("smp_parse"),
+            ));
         }
 
-        // Extract child elements.
-        let url =
-            find_child_text(&node, "EndpointURI").or_else(|| find_child_text(&node, "Address"))?; // SMP 2.0 uses <Address>
-
-        let certificate_der_b64 = find_child_text(&node, "Certificate");
-        let service_description = find_child_text(&node, "ServiceDescription");
-        let service_activation_date = find_child_text(&node, "ServiceActivationDate");
-        let service_expiration_date = find_child_text(&node, "ServiceExpirationDate");
-
-        return Some(SmpEndpoint {
+        found = Some(SmpEndpoint {
             // Both replaced by `parse_service_metadata` once the policy has run.
             signed_document: std::sync::Arc::from(&[][..]),
             verified_signer_fingerprint_sha256: None,
             url: url.trim().to_string(),
-            certificate_der_b64: certificate_der_b64.map(|s| s.trim().to_string()),
-            transport_profile: profile.to_string(),
-            service_description: service_description.map(|s| s.trim().to_string()),
-            service_activation_date: service_activation_date.map(|s| s.trim().to_string()),
-            service_expiration_date: service_expiration_date.map(|s| s.trim().to_string()),
+            certificate_der_b64: endpoint_certificate(endpoint, version)
+                .map(|s| s.split_whitespace().collect()),
+            transport_profile: profile.trim().to_string(),
+            service_description: child_text(endpoint, version, "ServiceDescription", "Description")
+                .map(|s| s.trim().to_string()),
+            service_activation_date: child_text(
+                endpoint,
+                version,
+                "ServiceActivationDate",
+                "ActivationDate",
+            )
+            .map(|s| s.trim().to_string()),
+            service_expiration_date: child_text(
+                endpoint,
+                version,
+                "ServiceExpirationDate",
+                "ExpirationDate",
+            )
+            .map(|s| s.trim().to_string()),
         });
     }
-    None
+
+    Ok(found)
 }
 
-/// Returns `true` when `node` is an element with local name `local` in either
-/// the SMP 1.0 or SMP 2.0 namespace (or no namespace at all, for lenient parsing).
-fn matches_smp_element(node: &roxmltree::Node<'_, '_>, local: &str) -> bool {
-    if !node.is_element() {
-        return false;
+/// Whether `node` is an `Endpoint` element of the given SMP generation.
+fn is_endpoint(node: roxmltree::Node<'_, '_>, version: SmpVersion) -> bool {
+    match version {
+        SmpVersion::V1 => is_named(node, SMP_NS, "Endpoint"),
+        SmpVersion::V2 => is_named(node, SMP2_NS_AGGREGATE, "Endpoint"),
     }
-    if node.tag_name().name() != local {
-        return false;
-    }
-    let ns = node.tag_name().namespace().unwrap_or("");
-    ns.is_empty() || ns == SMP_NS || ns == SMP_NS_V2
 }
 
-/// Find the `<ProcessIdentifier>` text value in the ancestor `<Process>` node.
-fn find_ancestor_process_id<'a>(
-    _doc: &'a Document<'a>,
-    endpoint: &roxmltree::Node<'a, '_>,
-) -> Option<&'a str> {
-    // Walk up: Endpoint → ServiceEndpointList → Process → ProcessIdentifier
-    let service_endpoint_list = endpoint.parent()?;
-    let process = service_endpoint_list.parent()?;
-    for child in process.children() {
-        if matches_smp_element(&child, "ProcessIdentifier") {
-            return child.text();
-        }
-    }
-    None
-}
-
-/// Return the trimmed text of the first child element with local name `name`.
-fn find_child_text<'a>(node: &roxmltree::Node<'a, '_>, name: &str) -> Option<&'a str> {
-    for child in node.children() {
-        if matches_smp_element(&child, name) {
-            return child.text();
-        }
-    }
-    None
-}
-
-// ── Crypto helpers ────────────────────────────────────────────────────────
-
-/// Compute the lowercase hex-encoded MD5 of `input`.
+/// The endpoint's transport profile.
 ///
-/// MD5 is used here **solely** for PEPPOL DNS name construction per the BDXL
-/// specification — it provides no security property and is not used for
-/// content integrity.
-fn md5_hex(input: &[u8]) -> String {
-    use openssl::hash::{MessageDigest, hash};
-    // MD5 failure would require an OpenSSL build without MD5 support, which
-    // PEPPOL deployments will never encounter.
-    let digest = hash(MessageDigest::md5(), input).expect("MD5 unavailable");
-    let mut hex = String::with_capacity(32);
-    for b in &*digest {
-        use std::fmt::Write;
-        let _ = write!(hex, "{b:02x}");
+/// SMP 1.0 carries it as the `transportProfile` attribute; SMP 2.0 moved it
+/// into a `TransportProfileID` child element. Reading only the attribute — as
+/// this crate did — matches no SMP 2.0 endpoint at all.
+fn endpoint_transport_profile<'a>(
+    endpoint: roxmltree::Node<'a, '_>,
+    version: SmpVersion,
+) -> Option<&'a str> {
+    match version {
+        SmpVersion::V1 => endpoint.attribute("transportProfile"),
+        SmpVersion::V2 => child_in(endpoint, SMP2_NS_BASIC, "TransportProfileID")?.text(),
     }
-    hex
+}
+
+/// The URL an AS4 message is POSTed to.
+fn endpoint_address<'a>(endpoint: roxmltree::Node<'a, '_>, version: SmpVersion) -> Option<&'a str> {
+    match version {
+        SmpVersion::V1 => child_in(endpoint, SMP_NS, "EndpointReference")
+            .and_then(|reference| child_in(reference, WSA_NS, "Address"))
+            .or_else(|| child_in(endpoint, SMP_NS, "EndpointURI"))?
+            .text(),
+        SmpVersion::V2 => child_in(endpoint, SMP2_NS_BASIC, "AddressURI")?.text(),
+    }
+}
+
+/// The receiving party's base64 DER certificate.
+fn endpoint_certificate<'a>(
+    endpoint: roxmltree::Node<'a, '_>,
+    version: SmpVersion,
+) -> Option<&'a str> {
+    match version {
+        SmpVersion::V1 => child_in(endpoint, SMP_NS, "Certificate")?.text(),
+        // SMP 2.0 nests the bytes one level deeper, in a typed wrapper.
+        SmpVersion::V2 => child_in(endpoint, SMP2_NS_AGGREGATE, "Certificate")
+            .and_then(|cert| child_in(cert, SMP2_NS_BASIC, "ContentBinaryObject"))?
+            .text(),
+    }
+}
+
+/// Text of the first matching child, named per generation.
+fn child_text<'a>(
+    endpoint: roxmltree::Node<'a, '_>,
+    version: SmpVersion,
+    v1_name: &str,
+    v2_name: &str,
+) -> Option<&'a str> {
+    match version {
+        SmpVersion::V1 => child_in(endpoint, SMP_NS, v1_name)?.text(),
+        SmpVersion::V2 => child_in(endpoint, SMP2_NS_BASIC, v2_name)?.text(),
+    }
+}
+
+/// The process identifier governing this endpoint.
+///
+/// SMP 1.0 nests `Endpoint` under `ServiceEndpointList` under `Process`, whose
+/// `ProcessIdentifier` names it. SMP 2.0 places `Endpoint` and `Process`
+/// side by side inside `ProcessMetadata`, and the identifier is `Process/ID`.
+fn ancestor_process_id<'a>(
+    endpoint: roxmltree::Node<'a, '_>,
+    version: SmpVersion,
+) -> Option<&'a str> {
+    match version {
+        SmpVersion::V1 => {
+            let process = endpoint.parent()?.parent()?;
+            child_in(process, SMP_NS, "ProcessIdentifier")?.text()
+        }
+        SmpVersion::V2 => {
+            let process_metadata = endpoint.parent()?;
+            let process = child_in(process_metadata, SMP2_NS_AGGREGATE, "Process")?;
+            child_in(process, SMP2_NS_BASIC, "ID")?.text()
+        }
+    }
+}
+
+/// WS-Addressing namespace — SMP 1.0 wraps the endpoint URL in an
+/// `EndpointReference/Address`.
+const WSA_NS: &str = "http://www.w3.org/2005/08/addressing";
+
+/// Whether `node` is an element `{namespace}local`.
+fn is_named(node: roxmltree::Node<'_, '_>, namespace: &str, local: &str) -> bool {
+    node.is_element()
+        && node.tag_name().name() == local
+        && node.tag_name().namespace() == Some(namespace)
+}
+
+/// The first child element `{namespace}local` of `node`.
+fn child_in<'a, 'i>(
+    node: roxmltree::Node<'a, 'i>,
+    namespace: &str,
+    local: &str,
+) -> Option<roxmltree::Node<'a, 'i>> {
+    node.children().find(|c| is_named(*c, namespace, local))
 }
 
 // ── URL helpers ───────────────────────────────────────────────────────────
@@ -653,14 +944,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn md5_hex_known_value() {
-        // Pre-computed: echo -n "iso6523-actorid-upis::0088:5798009883995" | md5sum
-        let result = md5_hex("iso6523-actorid-upis::0088:5798009883995".as_bytes());
-        assert_eq!(result.len(), 32, "MD5 hex should be 32 chars");
-        assert!(result.chars().all(|c| c.is_ascii_hexdigit()));
-    }
-
-    #[test]
     fn percent_encode_peppol_doc_type() {
         let raw = "urn:oasis:names:specification:ubl:schema:xsd:Invoice-2::Invoice##test";
         let encoded = percent_encode(raw);
@@ -670,24 +953,125 @@ mod tests {
     }
 
     #[test]
-    fn build_lookup_url_structure() {
-        let client = SmpClient::new("acc.edelivery.tech.ec.europa.eu");
+    fn lookup_url_appends_the_smp_rest_binding_to_the_discovered_base() {
+        let client = SmpClient::with_config(SmpConfig::with_static_smp("https://smp.example.org/"));
         let req = SmpLookupRequest {
             participant_id: "0088:5798009883995".to_string(),
             document_type_id: "urn:test:doc".to_string(),
             process_id: "urn:test:process".to_string(),
             transport_profile: None,
         };
-        let url = client.build_lookup_url(&req);
-        assert!(
-            url.starts_with("https://B-"),
-            "must start with SMP DNS scheme"
+        assert_eq!(
+            client.build_lookup_url_at("https://smp.example.org/", &req),
+            "https://smp.example.org\
+             /iso6523-actorid-upis%3A%3A0088%3A5798009883995\
+             /services/urn%3Atest%3Adoc"
         );
-        assert!(
-            url.contains(".acc.edelivery.tech.ec.europa.eu/"),
-            "must embed SML zone"
+    }
+
+    /// The Peppol presets must name the OpenPeppol zones. The European
+    /// Commission zones they replaced stopped answering on 31 August 2026, so a
+    /// stale constant here is a lookup that silently finds nothing.
+    #[test]
+    fn peppol_presets_name_the_openpeppol_sml_zones() {
+        assert_eq!(
+            SmpConfig::peppol_production().sml_zone,
+            "participant.sml.prod.tech.peppol.org"
         );
-        assert!(url.contains("/services/"), "must have /services/ path");
+        assert_eq!(
+            SmpConfig::peppol_test().sml_zone,
+            "participant.sml.test.tech.peppol.org"
+        );
+        assert!(matches!(
+            SmpConfig::peppol_production().discovery,
+            SmlDiscovery::Naptr
+        ));
+    }
+
+    #[test]
+    fn discovery_dns_name_matches_the_bdxl_construction() {
+        let client = SmpClient::with_config(SmpConfig::peppol_production());
+        assert_eq!(
+            client
+                .discovery_dns_name("0088:5790002590993")
+                .expect("NAPTR discovery names a host"),
+            "2M2UFGZNGSS25JOOMOV2S4VGG7PW64KIVYNONDSVZSRT4EAZVCLQ\
+             .iso6523-actorid-upis.participant.sml.prod.tech.peppol.org"
+        );
+        assert_eq!(
+            SmpClient::with_config(SmpConfig::with_static_smp("https://smp.example.org"))
+                .discovery_dns_name("0088:5790002590993"),
+            None,
+            "a statically configured SMP is not looked up"
+        );
+    }
+
+    /// NAPTR discovery without a resolver is a configuration error that names
+    /// the fix, not a silent fall-back to a scheme the network withdrew.
+    #[tokio::test]
+    async fn naptr_discovery_without_a_resolver_reports_the_missing_seam() {
+        let client = SmpClient::with_config(SmpConfig::peppol_production());
+        let err = client
+            .resolve_smp_base_url("0088:5790002590993")
+            .await
+            .expect_err("NAPTR discovery needs a resolver");
+        assert_eq!(err.code, crate::core::ErrorCode::InvalidInput);
+        assert!(err.message.contains("with_resolver"), "{}", err.message);
+    }
+
+    #[tokio::test]
+    async fn naptr_discovery_resolves_the_smp_base_url() {
+        let name = bdxl_dns_name(
+            "iso6523-actorid-upis",
+            "0088:5790002590993",
+            "participant.sml.prod.tech.peppol.org",
+        );
+        let client = SmpClient::with_config(SmpConfig::peppol_production()).with_resolver(
+            Arc::new(StaticBdxlResolver::new().with_smp(name, "https://smp.example.org")),
+        );
+        assert_eq!(
+            client
+                .resolve_smp_base_url("0088:5790002590993")
+                .await
+                .expect("the participant is registered"),
+            "https://smp.example.org"
+        );
+    }
+
+    /// An unregistered participant is `NotFound`, and the message names the
+    /// zone and the name that was queried — otherwise a wrong zone and a
+    /// genuinely absent participant are the same observation.
+    #[tokio::test]
+    async fn unregistered_participant_reports_not_found_with_the_queried_name() {
+        let client = SmpClient::with_config(SmpConfig::peppol_production())
+            .with_resolver(Arc::new(StaticBdxlResolver::new()));
+        let err = client
+            .resolve_smp_base_url("0088:0000000000000")
+            .await
+            .expect_err("nothing is registered");
+        assert_eq!(err.code, crate::core::ErrorCode::NotFound);
+        assert!(
+            err.message.contains("participant.sml.prod.tech.peppol.org"),
+            "{}",
+            err.message
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_cname_discovery_builds_the_historical_host() {
+        let client = SmpClient::with_config(SmpConfig {
+            discovery: SmlDiscovery::LegacyCname,
+            sml_zone: "edelivery.tech.ec.europa.eu".to_string(),
+            ..SmpConfig::peppol_production()
+        });
+        assert_eq!(
+            client
+                .resolve_smp_base_url("0088:123abc")
+                .await
+                .expect("the construction is pure"),
+            "https://B-f5e78500450d37de5aabe6648ac3bb70\
+             .iso6523-actorid-upis.edelivery.tech.ec.europa.eu"
+        );
     }
 
     #[test]
@@ -724,6 +1108,127 @@ mod tests {
         assert_eq!(ep.transport_profile, "peppol-transport-as4-v2_0");
         assert_eq!(ep.service_description.as_deref(), Some("Test AP"));
         assert_eq!(ep.service_activation_date.as_deref(), Some("2024-01-01"));
+    }
+
+    /// OASIS SMP 2.0 moved the transport profile from an attribute to an
+    /// element, renamed the address and the process identifier, and nested the
+    /// certificate. The crate advertised 2.0 support while reading only the 1.0
+    /// attribute, so no 2.0 endpoint could ever match.
+    #[test]
+    fn parse_service_metadata_smp2_roundtrip() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<smp:ServiceMetadata
+    xmlns:smp="http://docs.oasis-open.org/bdxr/ns/SMP/2/ServiceMetadata"
+    xmlns:sma="http://docs.oasis-open.org/bdxr/ns/SMP/2/AggregateComponents"
+    xmlns:smb="http://docs.oasis-open.org/bdxr/ns/SMP/2/BasicComponents">
+  <smb:ID>urn:test:doc</smb:ID>
+  <smb:ParticipantID>0088:1234567890123</smb:ParticipantID>
+  <sma:ProcessMetadata>
+    <sma:Process>
+      <smb:ID>urn:test:process</smb:ID>
+    </sma:Process>
+    <sma:Endpoint>
+      <smb:TransportProfileID>peppol-transport-as4-v2_0</smb:TransportProfileID>
+      <smb:Description>Test AP</smb:Description>
+      <smb:AddressURI>https://ap.example.com/as4/receive</smb:AddressURI>
+      <smb:ActivationDate>2024-01-01</smb:ActivationDate>
+      <smb:ExpirationDate>2025-12-31</smb:ExpirationDate>
+      <sma:Certificate>
+        <smb:ContentBinaryObject>MIIB</smb:ContentBinaryObject>
+      </sma:Certificate>
+    </sma:Endpoint>
+  </sma:ProcessMetadata>
+</smp:ServiceMetadata>"#;
+        let ep = parse_service_metadata(
+            xml.as_bytes(),
+            "urn:test:process",
+            "peppol-transport-as4-v2_0",
+            &SmpSignaturePolicy::AllowUnsigned,
+        )
+        .expect("an SMP 2.0 response must parse");
+        assert_eq!(ep.url, "https://ap.example.com/as4/receive");
+        assert_eq!(ep.certificate_der_b64.as_deref(), Some("MIIB"));
+        assert_eq!(ep.service_description.as_deref(), Some("Test AP"));
+        assert_eq!(ep.service_activation_date.as_deref(), Some("2024-01-01"));
+        assert_eq!(ep.service_expiration_date.as_deref(), Some("2025-12-31"));
+    }
+
+    /// SMP 1.0 may wrap the address in a WS-Addressing `EndpointReference`.
+    #[test]
+    fn parse_service_metadata_smp1_endpoint_reference_address() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<ServiceMetadata xmlns="http://busdox.org/serviceMetadata/publishing/1.0/"
+                 xmlns:wsa="http://www.w3.org/2005/08/addressing">
+  <ServiceInformation>
+    <ProcessList>
+      <Process>
+        <ProcessIdentifier>urn:test:process</ProcessIdentifier>
+        <ServiceEndpointList>
+          <Endpoint transportProfile="peppol-transport-as4-v2_0">
+            <EndpointReference><wsa:Address>https://ap.example.com/as4</wsa:Address></EndpointReference>
+          </Endpoint>
+        </ServiceEndpointList>
+      </Process>
+    </ProcessList>
+  </ServiceInformation>
+</ServiceMetadata>"#;
+        let ep = parse_service_metadata(
+            xml.as_bytes(),
+            "urn:test:process",
+            "peppol-transport-as4-v2_0",
+            &SmpSignaturePolicy::AllowUnsigned,
+        )
+        .expect("the WS-Addressing shape must parse");
+        assert_eq!(ep.url, "https://ap.example.com/as4");
+    }
+
+    /// Two endpoints for one process and transport profile are ambiguous. The
+    /// answer decides where a message goes, so document order must not settle
+    /// it (D5).
+    #[test]
+    fn duplicate_endpoints_for_one_process_are_rejected() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<ServiceMetadata xmlns="http://busdox.org/serviceMetadata/publishing/1.0/">
+  <ServiceInformation>
+    <ProcessList>
+      <Process>
+        <ProcessIdentifier>urn:test:process</ProcessIdentifier>
+        <ServiceEndpointList>
+          <Endpoint transportProfile="peppol-transport-as4-v2_0">
+            <EndpointURI>https://first.example/as4</EndpointURI>
+          </Endpoint>
+          <Endpoint transportProfile="peppol-transport-as4-v2_0">
+            <EndpointURI>https://second.example/as4</EndpointURI>
+          </Endpoint>
+        </ServiceEndpointList>
+      </Process>
+    </ProcessList>
+  </ServiceInformation>
+</ServiceMetadata>"#;
+        let err = parse_service_metadata(
+            xml.as_bytes(),
+            "urn:test:process",
+            "peppol-transport-as4-v2_0",
+            &SmpSignaturePolicy::AllowUnsigned,
+        )
+        .expect_err("an ambiguous response must be refused");
+        assert_eq!(err.code, crate::core::ErrorCode::ParseFailed);
+        assert!(err.message.contains("more than one"), "{}", err.message);
+    }
+
+    /// A document in neither SMP namespace is refused by name rather than
+    /// walked with lenient element matching.
+    #[test]
+    fn unknown_document_namespace_is_refused() {
+        let xml = r#"<ServiceMetadata xmlns="urn:not-an-smp"><Endpoint/></ServiceMetadata>"#;
+        let err = parse_service_metadata(
+            xml.as_bytes(),
+            "urn:test:process",
+            "peppol-transport-as4-v2_0",
+            &SmpSignaturePolicy::AllowUnsigned,
+        )
+        .expect_err("an unknown namespace must be refused");
+        assert_eq!(err.code, crate::core::ErrorCode::ParseFailed);
     }
 
     #[test]

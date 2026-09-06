@@ -61,6 +61,7 @@ mod async_completion;
 mod entrypoints;
 mod metadata;
 mod ordered;
+pub use ordered::As4Ordered;
 mod ordered_async;
 mod payload;
 mod processing;

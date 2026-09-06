@@ -777,7 +777,7 @@ fn normalize_fingerprint(value: Option<&str>) -> Option<String> {
 ///
 /// `entity` must be the complete MIME entity to sign — headers, a blank line,
 /// then content — because that is exactly what RFC 4130 §7.3.1 makes the MIC
-/// input. Build it with [`crate::as2::build_mime_entity`] so the payload's real
+/// input. Build it with the AS2 send path's MIME entity builder so the payload's real
 /// `Content-Type` travels on the wire.
 pub fn sign_smime_message(
     payload: &[u8],

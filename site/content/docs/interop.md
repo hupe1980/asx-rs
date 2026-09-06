@@ -29,7 +29,7 @@ let session = SessionContext::new("sess-1", "partner-a", "profile-a")?;
 
 `interop-strict` is in the default Cargo feature set. `interop-relaxed` is optional and must be explicitly enabled:
 ```toml
-asx-rs = { version = "0.13", features = ["as2", "interop-relaxed"] }
+asx-rs = { version = "0.14", features = ["as2", "interop-relaxed"] }
 ```
 
 ### Interop mode does not govern message security

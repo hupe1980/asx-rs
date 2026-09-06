@@ -3,6 +3,44 @@
 /// Implements RFC 5751 (S/MIME) with OASIS ebMS 3.0 messaging format and WS-Security
 /// for AS4 push/pull message construction.
 use crate::core::Result;
+
+/// Splice a finished `wsse:Security` header into the slot
+/// [`WSSE_HEADER_PLACEHOLDER`] reserved, replacing it exactly once.
+///
+/// Fails if the placeholder is absent or appears more than once, so the
+/// "brittle string-marker insertion" this replaces cannot fail silently — which
+/// is the property the rebuild it replaces was chosen for, without the race the
+/// rebuild introduced (D42).
+///
+/// # Errors
+///
+/// [`ErrorCode::InvalidInput`](crate::ErrorCode::InvalidInput) when the
+/// envelope does not contain exactly one placeholder.
+pub fn splice_ws_security_header(envelope: &str, header_xml: &str) -> Result<String> {
+    let occurrences = envelope.matches(WSSE_HEADER_PLACEHOLDER).count();
+    if occurrences != 1 {
+        return Err(crate::core::AsxError::new(
+            crate::core::ErrorCode::InvalidInput,
+            format!(
+                "SOAP envelope must contain exactly one wsse:Security placeholder to splice \
+                 into, found {occurrences}; build it with \
+                 SoapEnvelopeBuilder::with_ws_security_placeholder()"
+            ),
+            crate::core::ErrorContext::new("as4_soap_builder"),
+        ));
+    }
+    Ok(envelope.replacen(WSSE_HEADER_PLACEHOLDER, header_xml, 1))
+}
+
+/// Marker reserving the position of the `wsse:Security` header inside
+/// `soap:Header`, emitted by
+/// [`SoapEnvelopeBuilder::with_ws_security_placeholder`].
+///
+/// It exists so the envelope is built **once**. Building it a second time to
+/// add the security header is what let `eb:Timestamp` change between the bytes
+/// that were digested and the bytes that shipped (D42) — a defect that only
+/// appeared when the two builds straddled a whole second.
+pub const WSSE_HEADER_PLACEHOLDER: &str = "<!--asx:wsse-security-header-->";
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 
 const SOAP12_NAMESPACE: &str = "http://www.w3.org/2003/05/soap-envelope";
@@ -66,6 +104,9 @@ impl WsAddressingHeaders {
 #[derive(Debug, Clone)]
 pub struct SoapEnvelopeBuilder {
     message_id: String,
+    /// `eb:Timestamp` for `eb:MessageInfo`. **Required** — see
+    /// [`with_message_timestamp`](SoapEnvelopeBuilder::with_message_timestamp).
+    message_timestamp: Option<String>,
     from_party_id: String,
     to_party_id: String,
     /// `type` attribute on the From `<eb:PartyId>`; `None` omits the attribute.
@@ -105,6 +146,8 @@ pub struct SoapEnvelopeBuilder {
     /// `(content_id, mime_type, compression_type)`.
     extra_part_infos: Vec<(String, String, Option<String>)>,
     ws_security_header: Option<String>,
+    /// Emit [`WSSE_HEADER_PLACEHOLDER`] where the security header will go.
+    ws_security_placeholder: bool,
     /// Optional WS-Addressing headers to include in the SOAP Header.
     ws_addressing: Option<WsAddressingHeaders>,
 }
@@ -140,6 +183,7 @@ impl SoapEnvelopeBuilder {
     ) -> Self {
         Self {
             message_id: message_id.into(),
+            message_timestamp: None,
             from_party_id: from_party_id.into(),
             to_party_id: to_party_id.into(),
             from_party_id_type: Some(EBCORE_PARTY_ID_TYPE_UNREGISTERED.into()),
@@ -164,6 +208,7 @@ impl SoapEnvelopeBuilder {
             payload_content_id: "payload@example.org".into(),
             extra_part_infos: Vec::new(),
             ws_security_header: None,
+            ws_security_placeholder: false,
             ws_addressing: None,
         }
         .with_default_four_corner_properties()
@@ -282,6 +327,25 @@ impl SoapEnvelopeBuilder {
         self
     }
 
+    /// Pin `eb:MessageInfo/eb:Timestamp`. **Required** — [`build`](Self::build)
+    /// fails without it.
+    ///
+    /// `eb:Timestamp` is inside the signed `eb:Messaging` block, and the AS4
+    /// send path builds the envelope twice for one message: once unsigned, to
+    /// digest that block, and once with the `wsse:Security` header. If each
+    /// build read the clock, the two would disagree whenever they straddled a
+    /// second — roughly one send in a thousand — and the envelope that shipped
+    /// would not be the one that was signed. Nobody could verify it, and it
+    /// would look like a flaky partner.
+    ///
+    /// Making this an input rather than an ambient read is what turns that from
+    /// unlikely into impossible.
+    #[must_use]
+    pub fn with_message_timestamp(mut self, timestamp: impl Into<String>) -> Self {
+        self.message_timestamp = Some(timestamp.into());
+        self
+    }
+
     pub fn with_conversation_id(mut self, conversation_id: impl Into<String>) -> Self {
         self.conversation_id = Some(conversation_id.into());
         self
@@ -312,6 +376,20 @@ impl SoapEnvelopeBuilder {
     /// Set MIME Content-ID used by `<ebms:PartInfo href="cid:...">`.
     pub fn with_payload_content_id(mut self, payload_content_id: impl Into<String>) -> Self {
         self.payload_content_id = payload_content_id.into();
+        self
+    }
+
+    /// Reserve the `wsse:Security` slot with [`WSSE_HEADER_PLACEHOLDER`] instead
+    /// of supplying the header now.
+    ///
+    /// Sign the resulting envelope, then splice the finished header in with
+    /// [`splice_ws_security_header`]. The signature covers the `eb:Messaging`
+    /// and `soap:Body` subtrees, and the placeholder sits in neither, so the
+    /// splice cannot change a digest — whereas rebuilding the envelope can, and
+    /// did.
+    #[must_use]
+    pub fn with_ws_security_placeholder(mut self) -> Self {
+        self.ws_security_placeholder = true;
         self
     }
 
@@ -394,9 +472,24 @@ impl SoapEnvelopeBuilder {
 
         // MessageInfo
         xml.push_str("        <ebms:MessageInfo>\n");
+        // Required, not defaulted. `eb:Timestamp` sits inside the signed
+        // `eb:Messaging` block and the AS4 send path builds the envelope twice
+        // — reading the clock here made the two builds disagree whenever they
+        // straddled a second, shipping an envelope its own signature did not
+        // cover. Refusing is the only way to keep that unrepresentable rather
+        // than merely unlikely.
+        let Some(message_timestamp) = self.message_timestamp.as_deref() else {
+            return Err(crate::core::AsxError::new(
+                crate::core::ErrorCode::InvalidInput,
+                "SoapEnvelopeBuilder requires an eb:Timestamp pinned with \
+                 with_message_timestamp(..); reading the clock inside build() lets two \
+                 builds of the same message disagree and ship an envelope its own \
+                 signature does not cover",
+                crate::core::ErrorContext::new("as4_soap_builder"),
+            ));
+        };
         xml.push_str(&format!(
-            "          <ebms:Timestamp>{}</ebms:Timestamp>\n",
-            crate::time_utils::format_rfc3339_secs(std::time::SystemTime::now())
+            "          <ebms:Timestamp>{message_timestamp}</ebms:Timestamp>\n"
         ));
         xml.push_str(&format!(
             "          <ebms:MessageId wsu:Id=\"{}\">{}</ebms:MessageId>\n",
@@ -555,6 +648,9 @@ impl SoapEnvelopeBuilder {
 
         if let Some(wsse) = &self.ws_security_header {
             xml.push_str(wsse);
+        } else if self.ws_security_placeholder {
+            xml.push_str(WSSE_HEADER_PLACEHOLDER);
+            xml.push('\n');
         }
 
         xml.push_str("  </soap:Header>\n");
@@ -758,6 +854,7 @@ mod tests {
     fn soap_envelope_builder_generates_valid_xml() {
         let builder =
             SoapEnvelopeBuilder::new("msg-123", "sender@example.org", "receiver@example.com")
+                .with_message_timestamp("2026-09-06T12:00:00Z")
                 .with_action("urn:example:action")
                 .with_conversation_id("conv-456");
 
@@ -791,6 +888,7 @@ mod tests {
         // Defaults: unregistered party-id type, ebMS3 default role, conv "1".
         let default_envelope = String::from_utf8(
             SoapEnvelopeBuilder::new("m-1", "pa", "pb")
+                .with_message_timestamp("2026-09-06T12:00:00Z")
                 .build()
                 .expect("build"),
         )
@@ -813,6 +911,7 @@ mod tests {
         // Explicit overrides: untyped party ids, named roles, agreement ref.
         let envelope = String::from_utf8(
             SoapEnvelopeBuilder::new("m-2", "org:example:company:A", "org:example:company:B")
+                .with_message_timestamp("2026-09-06T12:00:00Z")
                 .with_party_id_types(None, None)
                 .with_roles("Sender", "Receiver")
                 .with_agreement_ref("http://agreements.example.org/a0", None)
@@ -836,6 +935,7 @@ mod tests {
     #[test]
     fn soap_envelope_builder_allows_overriding_four_corner_properties() {
         let builder = SoapEnvelopeBuilder::new("msg-abc", "ap-sender", "ap-receiver")
+            .with_message_timestamp("2026-09-06T12:00:00Z")
             .with_four_corner_properties("participant-a", "participant-b", "track-789");
 
         let envelope = builder.build().expect("build");
@@ -849,7 +949,8 @@ mod tests {
     #[test]
     fn soap_envelope_escapes_xml_characters() {
         let builder =
-            SoapEnvelopeBuilder::new("msg-<test>", "sender@example.org", "receiver@example.com");
+            SoapEnvelopeBuilder::new("msg-<test>", "sender@example.org", "receiver@example.com")
+                .with_message_timestamp("2026-09-06T12:00:00Z");
         let envelope = builder.build().expect("build");
         let envelope_str = String::from_utf8(envelope).expect("utf8");
 
@@ -911,6 +1012,123 @@ mod tests {
         assert!(
             header_str.contains(&der_b64),
             "BinarySecurityToken must carry base64(DER)"
+        );
+    }
+}
+
+#[cfg(test)]
+mod timestamp_pinning_tests {
+    use super::*;
+
+    /// `eb:Timestamp` sits inside the signed `eb:Messaging` block, and the AS4
+    /// A `build()` that read the clock itself would disagree with an earlier
+    /// build of the same message whenever the two straddled a second, shipping
+    /// an envelope that is not the one that was signed. Making the timestamp a
+    /// *required input* turns that race into an error at the first build.
+    #[test]
+    fn build_refuses_without_a_pinned_timestamp() {
+        let err = SoapEnvelopeBuilder::new("msg-1", "from", "to")
+            .with_action("urn:example:action")
+            .build()
+            .expect_err("an unpinned timestamp must be an error, not a clock read");
+
+        assert_eq!(err.code, crate::core::ErrorCode::InvalidInput);
+        assert!(
+            err.message.contains("with_message_timestamp"),
+            "the error names the fix: {}",
+            err.message
+        );
+    }
+
+    /// Two builds of the same message must be byte-identical, because the
+    /// second is what ships and the first is what was digested.
+    #[test]
+    fn two_builds_with_a_pinned_timestamp_agree() {
+        let make = || {
+            SoapEnvelopeBuilder::new("msg-1", "from", "to")
+                .with_action("urn:example:action")
+                .with_message_timestamp("2026-09-06T12:00:00Z")
+                .build()
+                .expect("build")
+        };
+
+        assert_eq!(
+            make(),
+            make(),
+            "a pinned timestamp must make the build deterministic"
+        );
+    }
+
+    /// The placeholder must sit outside both signed subtrees, so splicing the
+    /// security header into it cannot change `eb:Messaging` or `soap:Body` —
+    /// which is what makes one build plus a splice safe where two builds were
+    /// not.
+    #[test]
+    fn splicing_the_security_header_leaves_the_signed_subtrees_untouched() {
+        let envelope = SoapEnvelopeBuilder::new("msg-1", "from", "to")
+            .with_action("urn:example:action")
+            .with_message_timestamp("2026-09-06T12:00:00Z")
+            .with_ws_security_placeholder()
+            .build()
+            .expect("build");
+        let envelope = String::from_utf8(envelope).expect("utf8");
+
+        let spliced = splice_ws_security_header(&envelope, "<wsse:Security/>").expect("splice");
+
+        let messaging = |xml: &str| {
+            let start = xml.find("<ebms:Messaging").expect("messaging");
+            let end = xml.find("</ebms:Messaging>").expect("messaging end");
+            xml[start..end].to_string()
+        };
+        let body = |xml: &str| {
+            let start = xml.find("<soap:Body").expect("body");
+            let end = xml.find("</soap:Body>").expect("body end");
+            xml[start..end].to_string()
+        };
+
+        assert_eq!(messaging(&envelope), messaging(&spliced));
+        assert_eq!(body(&envelope), body(&spliced));
+        assert!(spliced.contains("<wsse:Security/>"));
+        assert!(!spliced.contains(WSSE_HEADER_PLACEHOLDER));
+    }
+
+    /// The splice replaces a marker in generated XML, which is only safe if a
+    /// miss is loud. Zero placeholders and two placeholders are both errors.
+    #[test]
+    fn splicing_requires_exactly_one_placeholder() {
+        let without = SoapEnvelopeBuilder::new("msg-1", "from", "to")
+            .with_action("urn:example:action")
+            .with_message_timestamp("2026-09-06T12:00:00Z")
+            .build()
+            .expect("build");
+        let without = String::from_utf8(without).expect("utf8");
+
+        let err = splice_ws_security_header(&without, "<wsse:Security/>")
+            .expect_err("no placeholder must be an error, not a no-op");
+        assert_eq!(err.code, crate::core::ErrorCode::InvalidInput);
+
+        let doubled = format!("{WSSE_HEADER_PLACEHOLDER}{WSSE_HEADER_PLACEHOLDER}");
+        splice_ws_security_header(&doubled, "<wsse:Security/>")
+            .expect_err("two placeholders are ambiguous");
+    }
+
+    /// The negative half: one second's difference changes the signed bytes,
+    /// which is precisely why the pin has to exist — and proves the test above
+    /// is testing something.
+    #[test]
+    fn a_timestamp_one_second_apart_changes_the_signed_bytes() {
+        let make = |ts: &str| {
+            SoapEnvelopeBuilder::new("msg-1", "from", "to")
+                .with_action("urn:example:action")
+                .with_message_timestamp(ts)
+                .build()
+                .expect("build")
+        };
+
+        assert_ne!(
+            make("2026-09-06T12:00:00Z"),
+            make("2026-09-06T12:00:01Z"),
+            "eb:Timestamp is inside the signed eb:Messaging block"
         );
     }
 }

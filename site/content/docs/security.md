@@ -142,6 +142,32 @@ Stale or expired OCSP responses are rejected.
 
 ---
 
+## Outbound requests are validated *and pinned*
+
+Three paths make an outbound HTTP request, and two take their target from
+something the counterparty influences:
+
+| Path | Target chosen by |
+|---|---|
+| AS2/AS4 egress | The deployment's own P-Mode or partner configuration |
+| **SMP lookup** | The SML zone (operator) plus a participant identifier (not) |
+| **OCSP** | The **certificate's AIA extension** — by whoever presented the certificate, *before* it is trusted |
+
+All three refuse private, loopback and link-local targets, refuse non-HTTP
+schemes, and never follow redirects: a `3xx` would reach a host nothing checked.
+
+Validating is not enough on its own. Resolving DNS to check the address and then
+letting the HTTP client resolve again is a time-of-check/time-of-use hole — the
+attacker answers the check with a public address and the connection with a
+private one. Every path therefore pins the connection to the addresses that were
+validated.
+
+Plain HTTP is refused everywhere **except** OCSP: RFC 6960 responses are signed
+by the responder, and public PKIs publish `http://` responder URLs, so requiring
+TLS there would break revocation checking rather than improve it.
+
+---
+
 ## Cryptographic Algorithms
 
 ### AS2 (S/MIME)
@@ -376,8 +402,10 @@ recipient certificate. Verify the response signature with
 
 | Control | Status |
 |---|---|
-| SMP URL SSRF validation + DNS pinning + no redirects | ✅ enforced |
-| `ds:Signature` **present** on the response | ✅ enforced by default (`SmpSignaturePolicy::RequireSignaturePresent`) |
+| SMP URL SSRF validation + DNS pinning + no redirects | ✅ enforced — the lookup validates and pins in one step, so the addresses that were checked are the ones connected to |
+| The NAPTR record naming the SMP may only yield an `https` URI, and may not use a backreference | ✅ enforced — the SMP URL is read out of DNS, so the record's contents are an input to where a message goes |
+| The result is usable at all | ⛔ **refused** by default (`SmpSignaturePolicy::Deny`) — a lookup whose authenticity was never established does not silently become a routing decision |
+| `ds:Signature` **present** on the response | ✅ with `SmpSignaturePolicy::RequireSignaturePresent` — catches an unsigned SMP and nothing else |
 | `ds:Signature` **verifies** | ✅ with `SmpSignaturePolicy::Verify` |
 | SMP certificate chains to the network SMP CA | ✅ with `SmpSignaturePolicy::Verify` |
 
@@ -395,7 +423,9 @@ returns the exact response bytes for callers that want to verify independently.
 
 **Assurance note.** The enveloped whole-document path is newer than the AS4
 signing path and is not yet cross-validated against an independent
-implementation, so treat it accordingly.
+implementation, so treat it accordingly. DNSSEC validation of the SML zone is
+the resolver's job — the Peppol zones are signed, and `BdxlResolver` is where a
+deployment supplies a validating client.
 
 ---
 

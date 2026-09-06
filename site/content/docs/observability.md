@@ -18,12 +18,10 @@ use asx_rs::observability::{BackpressurePolicy, EventBus, EventEmissionMode};
 let bus = EventBus::new(64)?;
 
 // Optional explicit best-effort mode for loss-tolerant flows:
-let best_effort_bus = EventBus::new_with_config_and_mode(
-    64,
-    None,
-    BackpressurePolicy::default(),
-    EventEmissionMode::BestEffort,
-)?;
+let best_effort_bus = EventBus::builder()
+    .capacity(64)
+    .emission_mode(EventEmissionMode::BestEffort)
+    .build()?;
 ```
 
 Pass the same `EventBus` instance across concurrent sessions so all events flow through a single fan-out point. The bus is clone-safe (`Arc`-backed internally).
@@ -34,25 +32,21 @@ In strict default mode, emits are transactional with respect to strict precondit
 
 ## Backpressure
 
-Configure backpressure limits with `EventBus::new_with_config_and_mode`:
+Configure backpressure limits on the builder:
 
 ```rust
-use asx_rs::observability::{
-    BackpressureAction, BackpressurePolicy, EventBus, EventEmissionMode,
-};
+use asx_rs::observability::{BackpressureAction, BackpressurePolicy, EventBus};
 
-let bus = EventBus::new_with_config_and_mode(
-    64,
-    None,
-    BackpressurePolicy {
+let bus = EventBus::builder()
+    .capacity(64)
+    .backpressure(BackpressurePolicy {
         max_dropped: Some(100),
         max_lagged: Some(50),
         action: BackpressureAction::FailClosed,
         window_secs: 60,  // sliding window (must be > 0)
         session_channel_capacity: 64,
-    },
-    EventEmissionMode::StrictTransactional,
-)?;
+    })
+    .build()?;
 ```
 
 | `BackpressureAction` | Behaviour |
@@ -64,36 +58,11 @@ let bus = EventBus::new_with_config_and_mode(
 
 Dropped and lagged counters reset automatically after `window_secs` seconds. This prevents an early burst from permanently latching `FailClosed` in a long-running process.
 
-### High-cardinality incident sizing advisor
-
-For incident webhook/paging channels, use the built-in sizing advisor to derive deterministic queue/timeout/backpressure settings from measured workload signals:
-
-```rust
-use asx_rs::{
-    IncidentDeliverySizingInput, recommend_incident_delivery_config,
-};
-
-let config = recommend_incident_delivery_config(IncidentDeliverySizingInput {
-    peak_incidents_per_sec: 300,
-    sustained_burst_secs: 4,
-    delivery_p99_millis: 180,
-    regulated: true,
-})?;
-
-assert_eq!(config.queue_capacity, 2048);
-assert_eq!(config.request_timeout_secs, 2);
-```
-
-Sizing semantics:
-1. Queue capacity is projected backlog (`peak_incidents_per_sec * sustained_burst_secs`) rounded up to next power-of-two, with profile bounds.
-2. `request_timeout_secs` is derived from `4 * delivery_p99_millis` and clamped to operational limits.
-3. Regulated mode uses fail-closed overflow and non-zero wait budget; non-regulated mode uses best-effort drop with zero wait.
-
 ---
 
 ## Audit Sink Integration
 
-`EventBus::new_with_config_and_mode` can attach a durable sink that persists every event before fan-out:
+`EventBusBuilder::audit_sink` attaches a durable sink that persists every event before fan-out:
 
 ```rust
 use asx_rs::observability::{
@@ -134,12 +103,14 @@ impl DurableAuditSink for PostgresAuditSink {
     }
 }
 
-let bus = EventBus::new_with_config_and_mode(
-    64,
-    Some(Arc::new(PostgresAuditSink { /* ... */ })),
-    BackpressurePolicy::default(),
-    EventEmissionMode::StrictTransactional,
-)?;
+let bus = EventBus::builder()
+    .capacity(64)
+    .audit_sink(Arc::new(PostgresAuditSink { /* ... */ }))
+    .build()?;
+
+// Or, for a regulated deployment — this additionally rejects a sink that is not
+// production-durable or does not integrity-protect its replay cursor:
+let bus = EventBus::new_regulated(64, Arc::new(PostgresAuditSink { /* ... */ }))?;
 ```
 
 The sink's `store_event` is called synchronously in the emit hot-path. Keep it fast; delegate to a background writer via an internal channel if latency matters.
@@ -188,7 +159,11 @@ tokio::spawn(async move {
 
 Protocol operations use `emit_audit_event` for security-critical events (signature verification, deduplication). Best-effort behavior is available by configuring `EventBus` with `EventEmissionMode::BestEffort` and `BackpressureAction::Track`.
 
-High-level APIs now default to strict subscriber requirements. Use explicit mode constructors (`new_with_config_and_mode`, `new_with_config_and_mode_and_metrics`) with `EventEmissionMode::BestEffort` when subscriber liveness must not gate protocol progress.
+Emission is strict by default. Select `EventEmissionMode::BestEffort` on the
+builder when subscriber liveness must not gate protocol progress, or
+`StrictWithAuditFallback` — which keeps strictness but persists to the durable
+sink instead of failing when no subscriber is live, and is accepted by the
+[regulated startup gate](@/docs/getting-started.md#regulated-startup-gate-strict-production).
 
 ---
 
@@ -239,120 +214,52 @@ println!("lagged:  {}", metrics.lagged());
 
 These are `AtomicU64` values — safe to read from any thread without acquiring a lock. Expose them to Prometheus or your metrics sink by polling on a background task.
 
-### AS4 receipt taxonomy alert thresholds
+### Receipt-taxonomy and provider-health counters
 
-Use the built-in evaluator to convert receipt taxonomy counters into SLO-friendly alerts:
+Two counter readouts summarise what the protocol paths classified:
 
 ```rust
-use asx_rs::observability::As4ReceiptTaxonomyAlertPolicy;
-
 let metrics = bus.metrics();
-let alerts = metrics.evaluate_as4_receipt_taxonomy_alerts(
-    &As4ReceiptTaxonomyAlertPolicy::default(),
+
+let receipts = metrics.as4_receipt_taxonomy_snapshot();
+println!(
+    "receipts: {} classified, {} security failures, {} interop failures",
+    receipts.total,
+    receipts.security_verification_failed,
+    receipts.semantic_interop_failure,
 );
 
-for alert in alerts {
-    println!(
-        "{:?} {:?}: {} ppm over {} samples; runbook={} ",
-        alert.severity,
-        alert.category,
-        alert.observed_rate_ppm,
-        alert.sample_size,
-        alert.runbook_hint,
-    );
-}
+let providers = metrics.as2_provider_health_snapshot();
+println!(
+    "spool key provider: {} of {} transitions were into `failing`",
+    providers.transition_to_failing,
+    providers.total_transitions,
+);
 ```
 
-Default thresholds:
-1. Minimum sample size: 100 receipt taxonomy outcomes.
-2. security_verification_failed: warning at 1 percent (10,000 ppm), critical at 5 percent (50,000 ppm).
-3. semantic_interop_failure: warning at 0.5 percent (5,000 ppm), critical at 2 percent (20,000 ppm).
+Numbers, not verdicts.
 
-Operational runbook mapping:
-1. Security verification failures: verify signer trust chain, signature transform parity, and certificate rotation state.
-2. Semantic interop failures: verify RefToMessageId correlation rules, parser namespace handling, and partner profile drift.
+### Where the thresholds live
 
-### Periodic alert export
+`asx-rs` ships no alerting engine: no thresholds, no severity grading, no
+incident types, no scheduler. Whether a 1 % receipt-verification failure rate is
+normal or an incident is a partner-SLA and topology question, and the monitoring
+stack you already run answers it better than a library can.
 
-Convert threshold breaches into exported events and metrics on a periodic loop:
+Scrape the counters, or consume `AsxEvent::ReceiptTaxonomyOutcome`, and write
+the rule where your other rules live:
 
-```rust
-use asx_rs::core::SessionContext;
-use asx_rs::observability::As4ReceiptTaxonomyAlertPolicy;
-
-let sess = SessionContext::new("ops-taxonomy", "ops", "strict")?;
-let policy = As4ReceiptTaxonomyAlertPolicy::default();
-
-let alerts = bus.export_as4_receipt_taxonomy_alerts(&sess, &policy, false)?;
-for alert in alerts {
-    println!(
-        "raised {:?} {:?} at {} ppm (n={})",
-        alert.severity,
-        alert.category,
-        alert.observed_rate_ppm,
-        alert.sample_size,
-    );
-}
+```promql
+# Page when more than 1% of classified receipts fail verification over 15
+# minutes, with a meaningful sample.
+(
+  sum(rate(asx_as4_receipt_taxonomy_outcome_total{outcome="security_verification_failed"}[15m]))
+  /
+  sum(rate(asx_as4_receipt_taxonomy_outcome_total[15m]))
+) > 0.01
+and
+sum(increase(asx_as4_receipt_taxonomy_outcome_total[15m])) > 100
 ```
 
-Export side effects:
-1. Emits `AsxEvent::ReceiptTaxonomyAlertRaised` for each threshold breach.
-2. Increments `asx_as4_receipt_taxonomy_alert_total` with labels `protocol`, `signal`, `severity`, `category`.
-
-### Incident forwarding with dedup keys
-
-Use the forwarding API to send threshold breaches to incident channels with stable dedup keys:
-
-```rust
-use asx_rs::observability::{
-    As4ReceiptTaxonomyAlertDispatchPolicy, As4ReceiptTaxonomyAlertIncident,
-    As4ReceiptTaxonomyAlertPolicy, As4ReceiptTaxonomyIncidentChannel,
-};
-use asx_rs::core::Result;
-
-#[derive(Debug)]
-struct IncidentBackendChannel;
-
-impl As4ReceiptTaxonomyIncidentChannel for IncidentBackendChannel {
-    fn send_incident(&self, incident: &As4ReceiptTaxonomyAlertIncident) -> Result<()> {
-        // Forward to your incident backend with incident.dedup_key
-        let _ = incident;
-        Ok(())
-    }
-}
-
-let incidents = bus.forward_as4_receipt_taxonomy_alerts(
-    &sess,
-    &As4ReceiptTaxonomyAlertPolicy::default(),
-    &As4ReceiptTaxonomyAlertDispatchPolicy {
-        interval_secs: 60,
-        dedup_cooldown_secs: 300,
-    },
-    "incident-backend",
-    &IncidentBackendChannel,
-    true,
-)?;
-
-for incident in incidents {
-    println!("dedup={} severity={:?}", incident.dedup_key, incident.severity);
-}
-```
-
-Forwarding side effects:
-1. Increments `asx_as4_receipt_taxonomy_incident_forward_total` with labels `protocol`, `channel`, `severity`, `category`, `result`.
-2. Uses stable dedup keys such as `as4:receipt-taxonomy:critical:security_verification_failed`.
-
-For fixed cadence operation, run `run_as4_receipt_taxonomy_alert_scheduler(...)` with a shutdown watch channel.
-
-Library scope note:
-1. Keep provider-specific adapters in downstream crates or service code.
-2. Keep this crate focused on trait contracts, dedup policy, and scheduler orchestration.
-
-### Companion adapter guidance
-
-Use [incident-channel-companion-guidance.md](@/docs/incident-channels.md) when building vendor-specific paging/webhook adapters in a companion crate.
-
-It includes:
-1. Trait-first adapter patterns for `As4ReceiptTaxonomyIncidentChannel` and `As2ProviderHealthIncidentChannel`.
-2. Stable dedup-key templates for AS4 receipt taxonomy and AS2 provider health incidents.
-3. Operational guardrails (bounded queueing, best-effort transport, and secret-safe payload mapping).
+Metric names are API: renaming one breaks dashboards and alert rules this
+repository cannot see.

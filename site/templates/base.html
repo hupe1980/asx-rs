@@ -23,23 +23,42 @@
 {%- else -%}
   {%- set full_title = page_title ~ " · " ~ config.title -%}
 {%- endif -%}
+{%- set page_url = current_url | default(value=config.base_url) -%}
+{%- set social_image = get_url(path='social-card.png') -%}
 
 <title>{{ full_title }}</title>
 <meta name="description" content="{{ meta_description }}">
-<link rel="canonical" href="{{ current_url | default(value=config.base_url) | safe }}">
+<link rel="canonical" href="{{ page_url | safe }}">
+
+{#- Both are declared so the browser chrome matches the palette the stylesheet
+    picks, instead of flashing the default light bar over a dark page. -#}
+<meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#0e1116" media="(prefers-color-scheme: dark)">
+<meta name="color-scheme" content="light dark">
 
 <meta property="og:type" content="{% if is_home %}website{% else %}article{% endif %}">
 <meta property="og:site_name" content="{{ config.title }}">
+<meta property="og:locale" content="en_US">
 <meta property="og:title" content="{{ full_title }}">
 <meta property="og:description" content="{{ meta_description }}">
-<meta property="og:url" content="{{ current_url | default(value=config.base_url) | safe }}">
-<meta property="og:image" content="{{ get_url(path='social-card.svg') | safe }}">
+<meta property="og:url" content="{{ page_url | safe }}">
+{#- PNG, not the SVG this used to point at: X, LinkedIn, Facebook and Slack all
+    refuse SVG previews, so the card silently never rendered anywhere. -#}
+<meta property="og:image" content="{{ social_image | safe }}">
+<meta property="og:image:type" content="image/png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="asx-rs — AS2 and AS4 B2B messaging for Rust">
 <meta name="twitter:card" content="summary_large_image">
 <meta name="twitter:title" content="{{ full_title }}">
 <meta name="twitter:description" content="{{ meta_description }}">
+<meta name="twitter:image" content="{{ social_image | safe }}">
 
 <link rel="icon" href="{{ get_url(path='favicon.svg') | safe }}" type="image/svg+xml">
 <link rel="stylesheet" href="{{ get_url(path='style.css') | safe }}">
+{%- if config.build_search_index %}
+<link rel="preconnect" href="{{ config.base_url | safe }}">
+{%- endif %}
 
 <script type="application/ld+json">
 {%- if is_home -%}
@@ -51,23 +70,61 @@
   "url": "{{ config.base_url | safe }}",
   "codeRepository": "{{ config.extra.repo }}",
   "programmingLanguage": "Rust",
+  "runtimePlatform": "Rust",
   "softwareVersion": "{{ config.extra.version }}",
   "license": "https://spdx.org/licenses/MIT.html",
+  "image": "{{ social_image | safe }}",
   "keywords": "AS2, AS4, ebMS3, EDI, S/MIME, WS-Security, PEPPOL, eDelivery, Rust"
 }
 {%- else -%}
 {
   "@context": "https://schema.org",
-  "@type": "TechArticle",
-  "headline": {{ page_title | json_encode | safe }},
-  "description": {{ meta_description | json_encode | safe }},
-  "url": "{{ current_url | default(value=config.base_url) | safe }}",
-  "isPartOf": {
-    "@type": "WebSite",
-    "name": "{{ config.title }}",
-    "url": "{{ config.base_url | safe }}"
-  },
-  "inLanguage": "en"
+  "@graph": [
+    {
+      "@type": "TechArticle",
+      "headline": {{ page_title | json_encode | safe }},
+      "description": {{ meta_description | json_encode | safe }},
+      "url": "{{ page_url | safe }}",
+      "image": "{{ social_image | safe }}",
+      "inLanguage": "en",
+      "isPartOf": {
+        "@type": "WebSite",
+        "name": "{{ config.title }}",
+        "url": "{{ config.base_url | safe }}"
+      },
+      "about": {
+        "@type": "SoftwareSourceCode",
+        "name": "asx-rs",
+        "programmingLanguage": "Rust",
+        "codeRepository": "{{ config.extra.repo }}"
+      }
+    },
+    {
+      "@type": "BreadcrumbList",
+      "itemListElement": [
+        {
+          "@type": "ListItem",
+          "position": 1,
+          "name": "asx-rs",
+          "item": "{{ config.base_url | safe }}"
+        },
+        {
+          "@type": "ListItem",
+          "position": 2,
+          "name": "Documentation",
+          "item": "{{ get_url(path='@/docs/_index.md') | safe }}"
+        }
+        {%- if page is defined %},
+        {
+          "@type": "ListItem",
+          "position": 3,
+          "name": {{ page_title | json_encode | safe }},
+          "item": "{{ page_url | safe }}"
+        }
+        {%- endif %}
+      ]
+    }
+  ]
 }
 {%- endif -%}
 </script>
@@ -85,6 +142,11 @@
       <a href="{{ get_url(path='@/docs/_index.md') | safe }}">Docs</a>
       <a href="{{ config.extra.api_docs }}" rel="noopener">API</a>
       <a href="{{ config.extra.repo }}" rel="noopener">GitHub</a>
+      <button type="button" class="search-open" data-search-open aria-haspopup="dialog">
+        <span aria-hidden="true">⌕</span>
+        <span class="search-open-label">Search</span>
+        <kbd>/</kbd>
+      </button>
     </nav>
   </div>
 </header>
@@ -108,5 +170,17 @@
     </p>
   </div>
 </footer>
+
+<dialog class="search-dialog" data-search-dialog aria-label="Search the documentation">
+  <form method="dialog" class="search-form">
+    <input type="search" data-search-input placeholder="Search the documentation…"
+           aria-label="Search query" autocomplete="off" spellcheck="false">
+    <button type="submit" class="search-close" aria-label="Close search">Esc</button>
+  </form>
+  <div class="search-results" data-search-results role="listbox" aria-label="Search results"></div>
+</dialog>
+
+<script src="{{ get_url(path='search.js') | safe }}"
+        data-index="{{ get_url(path='search_index.en.json') | safe }}" defer></script>
 </body>
 </html>

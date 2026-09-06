@@ -6,15 +6,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use dashmap::DashMap;
 use tokio::sync::mpsc;
-#[cfg(test)]
-use tokio::sync::watch;
 
 use crate::core::{AsxError, ErrorCode, ErrorContext, Result, SessionContext};
 use crate::observability::audit_sink::{
     AuditEvent, AuditMetadata, AuditSeverity, AuditSinkDurability, DurableAuditSink, ReplayCursor,
 };
 
-mod alerts;
 mod audit_persistence;
 mod audit_runtime;
 pub mod audit_sink;
@@ -33,17 +30,33 @@ pub mod prometheus;
 mod scoped_subscriptions;
 mod session_subscriptions;
 mod sink_forwarding;
-pub use crate::alerting::{
-    As2ProviderHealthAlert, As2ProviderHealthAlertCategory, As2ProviderHealthAlertDispatchPolicy,
-    As2ProviderHealthAlertIncident, As2ProviderHealthAlertPolicy, As2ProviderHealthAlertSeverity,
-    As2ProviderHealthIncidentChannel, As2ProviderHealthSnapshot, As4ReceiptTaxonomyAlert,
-    As4ReceiptTaxonomyAlertCategory, As4ReceiptTaxonomyAlertDispatchPolicy,
-    As4ReceiptTaxonomyAlertIncident, As4ReceiptTaxonomyAlertPolicy,
-    As4ReceiptTaxonomyAlertSeverity, As4ReceiptTaxonomyIncidentChannel, As4ReceiptTaxonomySnapshot,
-};
-pub use crate::alerting::{
-    As2ProviderHealthAlertSchedulerRequest, As4ReceiptTaxonomyAlertSchedulerRequest,
-};
+/// Counter readout for the AS4 receipt-signal taxonomy.
+///
+/// A snapshot of what the event bus has counted, not a judgement about it:
+/// thresholds, rates and paging belong to the monitoring stack that already
+/// owns them for every other service in the deployment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct As4ReceiptTaxonomySnapshot {
+    /// Receipts rejected because a cryptographic check failed.
+    pub security_verification_failed: u64,
+    /// Receipts rejected because the counterparty's shape or correlation was wrong.
+    pub semantic_interop_failure: u64,
+    /// Receipt signals classified in total.
+    pub total: u64,
+}
+
+/// Counter readout for spool-key-provider health transitions.
+///
+/// As with [`As4ReceiptTaxonomySnapshot`], the numbers are exported and the
+/// interpretation is the operator's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct As2ProviderHealthSnapshot {
+    /// Transitions into the `failing` state.
+    pub transition_to_failing: u64,
+    /// Health-state transitions observed in total.
+    pub total_transitions: u64,
+}
+
 #[cfg(test)]
 use audit_persistence::{event_code, event_message};
 use construction::{
@@ -51,6 +64,7 @@ use construction::{
     new_with_config_and_mode_and_metrics as new_with_config_and_mode_and_metrics_impl,
     validate_regulated_audit_sink,
 };
+pub use construction_api::EventBusBuilder;
 pub use emission_runtime::emit_audit_event;
 #[cfg(any(feature = "as2", feature = "as4"))]
 pub(crate) use emission_runtime::{emit_protocol_event, require_durable_audit_sink};
@@ -90,12 +104,6 @@ pub trait MetricsSink: Send + Sync + std::fmt::Debug {
 }
 
 const AS4_RECEIPT_TAXONOMY_OUTCOME_TOTAL: &str = "asx_as4_receipt_taxonomy_outcome_total";
-const AS4_RECEIPT_TAXONOMY_ALERT_TOTAL: &str = "asx_as4_receipt_taxonomy_alert_total";
-const AS4_RECEIPT_TAXONOMY_INCIDENT_FORWARD_TOTAL: &str =
-    "asx_as4_receipt_taxonomy_incident_forward_total";
-const AS2_PROVIDER_HEALTH_ALERT_TOTAL: &str = "asx_as2_provider_health_alert_total";
-const AS2_PROVIDER_HEALTH_INCIDENT_FORWARD_TOTAL: &str =
-    "asx_as2_provider_health_incident_forward_total";
 
 /// No-op [`MetricsSink`] that discards all observations.
 ///
@@ -354,83 +362,6 @@ impl BackpressurePolicy {
     }
 }
 
-/// Input parameters for sizing `EventBus` channel capacities.
-///
-/// The recommendation models a bounded burst backlog during subscriber pauses:
-///
-/// `required_backlog = ceil(peak_events_per_sec * max_subscriber_pause_ms / 1000)`
-///
-/// A caller-controlled burst multiplier and fixed headroom are then applied to
-/// reduce the risk of transient lag in real deployments.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct EventBusCapacitySizingInput {
-    /// Peak sustained events emitted per second.
-    pub peak_events_per_sec: u64,
-    /// Longest tolerated subscriber pause (GC, scheduler stall, I/O blip), in milliseconds.
-    pub max_subscriber_pause_ms: u64,
-    /// Extra burst multiplier applied after pause-derived backlog (minimum effective value is 1).
-    pub burst_multiplier: u64,
-}
-
-/// Recommended capacities for constructing `EventBus` and `BackpressurePolicy`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct EventBusCapacityRecommendation {
-    /// Recommended `EventBus::new(capacity)` broadcast ring size.
-    pub broadcast_capacity: usize,
-    /// Recommended `BackpressurePolicy::session_channel_capacity` value.
-    pub session_channel_capacity: usize,
-}
-
-#[inline]
-fn ceil_div_u128(numerator: u128, denominator: u128) -> u128 {
-    numerator.div_ceil(denominator)
-}
-
-/// Recommend channel capacities for deployment-specific event rates.
-///
-/// This helper is intentionally conservative and deterministic:
-/// - computes a pause backlog from peak rate and tolerated pause
-/// - multiplies by `burst_multiplier` (min 1)
-/// - adds 25% headroom
-/// - enforces minimum floors (`16` broadcast, `64` per-session)
-///
-/// Example:
-///
-/// ```
-/// # use asx_rs::observability::{
-/// #   BackpressurePolicy, EventBusCapacitySizingInput, recommend_event_bus_capacity,
-/// # };
-/// let sizing = recommend_event_bus_capacity(EventBusCapacitySizingInput {
-///     peak_events_per_sec: 2_000,
-///     max_subscriber_pause_ms: 100,
-///     burst_multiplier: 2,
-/// });
-/// let backpressure = BackpressurePolicy {
-///     session_channel_capacity: sizing.session_channel_capacity,
-///     ..BackpressurePolicy::regulated()
-/// };
-/// let _ = (sizing.broadcast_capacity, backpressure.session_channel_capacity);
-/// ```
-#[must_use]
-pub fn recommend_event_bus_capacity(
-    input: EventBusCapacitySizingInput,
-) -> EventBusCapacityRecommendation {
-    let peak = u128::from(input.peak_events_per_sec.max(1));
-    let pause_ms = u128::from(input.max_subscriber_pause_ms.max(1));
-    let burst = u128::from(input.burst_multiplier.max(1));
-
-    let pause_backlog = ceil_div_u128(peak.saturating_mul(pause_ms), 1_000);
-    let burst_backlog = pause_backlog.saturating_mul(burst);
-    // Add 25% headroom: ceil(burst_backlog * 1.25)
-    let with_headroom = ceil_div_u128(burst_backlog.saturating_mul(5), 4);
-
-    let bounded = with_headroom.min(usize::MAX as u128) as usize;
-    EventBusCapacityRecommendation {
-        broadcast_capacity: bounded.max(16),
-        session_channel_capacity: bounded.max(64),
-    }
-}
-
 #[derive(Clone)]
 pub struct EventBus {
     scoped_senders: Arc<DashMap<u64, mpsc::Sender<ScopedAsxEvent>>>,
@@ -444,11 +375,28 @@ pub struct EventBus {
     metrics_sink: Arc<dyn MetricsSink>,
     audit_sink: Option<Arc<dyn DurableAuditSink>>,
     audit_sequence: Arc<AtomicU64>,
-    taxonomy_alert_dedup_epoch_secs: Arc<DashMap<String, u64>>,
     emission_mode: EventEmissionMode,
     backpressure: BackpressurePolicy,
     scoped_channel_capacity: usize,
     session_channel_capacity: usize,
+}
+
+/// Hand-written because the bus holds trait objects that are not required to
+/// be printable, and because a derived `Debug` over the subscriber maps would
+/// dump every live session id into a log line. What is useful in a diagnostic
+/// is the configuration and the shape of the fan-out, not its contents.
+impl std::fmt::Debug for EventBus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EventBus")
+            .field("emission_mode", &self.emission_mode)
+            .field("backpressure", &self.backpressure)
+            .field("scoped_channel_capacity", &self.scoped_channel_capacity)
+            .field("session_channel_capacity", &self.session_channel_capacity)
+            .field("has_audit_sink", &self.audit_sink.is_some())
+            .field("scoped_subscriptions", &self.scoped_senders.len())
+            .field("subscribed_sessions", &self.session_senders.len())
+            .finish()
+    }
 }
 
 impl EventBus {

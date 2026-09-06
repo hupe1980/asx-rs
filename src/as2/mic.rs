@@ -47,7 +47,7 @@ pub(crate) fn compute_mic(bytes: &[u8], algorithm: As2MicAlgorithm) -> (String, 
 /// `content_transfer_encoding` is emitted when supplied. AS2 payloads are sent
 /// with `binary` transfer encoding over HTTP (RFC 4130 §5) — HTTP is 8-bit
 /// clean, so there is no reason to base64-inflate an EDI document by a third.
-pub fn build_mime_entity(
+pub(super) fn build_mime_entity(
     content_type: &str,
     content_transfer_encoding: Option<&str>,
     content: &[u8],
@@ -77,7 +77,7 @@ pub fn build_mime_entity(
 ///
 /// Text-shaped payloads (EDI, XML, CSV) keep `binary` transfer encoding, which
 /// is what AS2 partners expect and avoids inflating them by a third.
-pub fn build_outbound_entity(content_type: &str, content: &[u8]) -> Vec<u8> {
+pub(super) fn build_outbound_entity(content_type: &str, content: &[u8]) -> Vec<u8> {
     if content_requires_base64(content) {
         let encoded = wrap_base64_lines(&STANDARD.encode(content));
         build_mime_entity(content_type, Some("base64"), encoded.as_bytes())

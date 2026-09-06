@@ -308,7 +308,7 @@ fn signed_push_with_nrr_roundtrips_against_holodeck_b2b() {
         )
         .build()
         .expect("session")
-        .with_strict_runtime_bootstrap_validated(true)
+        .test_only_mark_strict_runtime_bootstrap_validated()
         .with_cert_handle(CertHandle {
             trust_anchor_pems: vec![String::from_utf8(partyb_cert.clone()).expect("utf8")],
             fingerprint_sha256: partyb_fingerprint,

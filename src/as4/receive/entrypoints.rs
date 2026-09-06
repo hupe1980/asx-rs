@@ -1,12 +1,14 @@
 use super::super::coordination::ConversationOrderGate;
 use super::super::large_message::As4FragmentJoiner;
 use super::super::types::{As4ReceiveOutcome, As4ReceivePushProgress, As4ReceivePushRequest};
+use super::ordered::As4Ordered;
 use super::ordered_async;
 use super::{As4WsSecVerifier, EventBus, SessionContext, sync_core};
 use crate::core::Result;
 use crate::storage::DedupStorage;
 use std::sync::Arc;
 
+#[derive(Debug)]
 pub struct As4ReceivePushOrderedRequest<'a> {
     pub request: As4ReceivePushRequest,
     pub dedup_backend: Arc<dyn crate::storage::DedupStorage>,
@@ -19,6 +21,7 @@ pub struct As4ReceivePushOrderedRequest<'a> {
     pub gate: &'a dyn ConversationOrderGate,
 }
 
+#[derive(Debug)]
 pub struct As4ReceivePushOrderedFragmentAwareRequest<'a> {
     pub request: As4ReceivePushRequest,
     pub dedup_backend: Arc<dyn crate::storage::DedupStorage>,
@@ -27,17 +30,20 @@ pub struct As4ReceivePushOrderedFragmentAwareRequest<'a> {
     pub fragment_joiner: Arc<std::sync::Mutex<As4FragmentJoiner>>,
 }
 
+#[derive(Debug)]
 pub struct As4ReceivePushAsyncFragmentAwareRequest {
     pub request: As4ReceivePushRequest,
     pub dedup_backend: Arc<dyn DedupStorage>,
     pub fragment_joiner: Arc<std::sync::Mutex<As4FragmentJoiner>>,
 }
 
+#[derive(Debug)]
 pub struct As4ReceivePushSyncRequest<'a> {
     pub request: As4ReceivePushRequest,
     pub dedup_backend: &'a dyn DedupStorage,
 }
 
+#[derive(Debug)]
 pub struct As4ReceivePushSyncFragmentAwareRequest<'a> {
     pub request: As4ReceivePushRequest,
     pub dedup_backend: &'a dyn DedupStorage,
@@ -127,17 +133,25 @@ pub async fn receive_push_with_dedup_async_fragment_aware(
     .await
 }
 
-/// Receive an inbound AS4 push message, serializing concurrent calls that
-/// share the same <eb:ConversationId> through the provided gate.
+/// Receive an inbound AS4 push message, preserving per-conversation arrival
+/// order (ebMS3 §5.1.5).
 ///
-/// This is the high-level entry point for deployments that require
-/// per-conversation ordered delivery as defined by ebMS3 section 5.1.5.
+/// The conversation's place in the queue is reserved from the raw bytes on
+/// arrival, *before* parsing, verification and decryption — which run in
+/// parallel with other messages — and the returned [`As4Ordered`] **holds the
+/// turn** until it is dropped. Deliver the message to the application first;
+/// dropping the value is what lets the next message in the conversation
+/// through.
+///
+/// Both halves are load-bearing: reserving after the work orders by processing
+/// time rather than arrival, and releasing before returning leaves delivery
+/// unserialized (D54).
 #[cfg_attr(feature = "trace", tracing::instrument(skip_all, fields(partner_id = %session.partner_id())))]
 pub async fn receive_push_ordered(
     session: &SessionContext,
     event_bus: &EventBus,
     request: As4ReceivePushOrderedRequest<'_>,
-) -> crate::core::Result<As4ReceiveOutcome> {
+) -> crate::core::Result<As4Ordered<As4ReceiveOutcome>> {
     let As4ReceivePushOrderedRequest {
         request,
         dedup_backend,
@@ -156,11 +170,15 @@ pub async fn receive_push_ordered(
 }
 
 #[cfg_attr(feature = "trace", tracing::instrument(skip_all, fields(partner_id = %session.partner_id())))]
+/// Ordered receive that also reassembles ebMS3 Part 2 message fragments.
+///
+/// Only a *completed* message takes a turn: an incomplete fragment group and a
+/// duplicate are never delivered, so neither holds the conversation open.
 pub async fn receive_push_ordered_fragment_aware(
     session: &SessionContext,
     event_bus: &EventBus,
     request: As4ReceivePushOrderedFragmentAwareRequest<'_>,
-) -> crate::core::Result<As4ReceivePushProgress> {
+) -> crate::core::Result<As4Ordered<As4ReceivePushProgress>> {
     let As4ReceivePushOrderedFragmentAwareRequest {
         request,
         dedup_backend,

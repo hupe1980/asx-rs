@@ -14,33 +14,3 @@ pub mod signing;
 pub mod soap_builder;
 #[cfg(any(feature = "as2", feature = "as4"))]
 pub mod wssec;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CryptoPolicy {
-    pub require_signing: bool,
-    pub require_encryption: bool,
-}
-
-impl Default for CryptoPolicy {
-    fn default() -> Self {
-        Self {
-            require_signing: true,
-            require_encryption: true,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CertificateRef {
-    pub subject: String,
-    pub fingerprint_sha256: String,
-}
-
-impl CertificateRef {
-    pub fn new(subject: impl Into<String>, fingerprint_sha256: impl Into<String>) -> Self {
-        Self {
-            subject: subject.into(),
-            fingerprint_sha256: fingerprint_sha256.into(),
-        }
-    }
-}

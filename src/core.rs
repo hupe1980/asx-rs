@@ -443,19 +443,35 @@ impl ErrorCode {
     }
 }
 
+/// The crate's single error type.
+///
+/// `code` is the machine-readable part and is load-bearing: ingress handlers map
+/// it to an HTTP status, [`RetryDecision`](crate::reliability::RetryDecision)
+/// classifies on it, and the incident taxonomies group on it. `message` is for
+/// operators, never for matching.
+///
+/// The context is boxed. Every fallible function in this crate returns
+/// `Result<T, AsxError>`, so the error variant's size is paid on the success
+/// path too — an inline [`ErrorContext`] made *every* `Result` in the crate
+/// 120 bytes wide, including `Result<()>`. Boxing brings that to 40 while
+/// leaving `err.context.session_id` working through `Deref`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AsxError {
+    /// Machine-readable classification. Match on this, not on `message`.
     pub code: ErrorCode,
+    /// Operator-facing description of what went wrong.
     pub message: String,
-    pub context: ErrorContext,
+    /// Correlation context: stage, and optionally session, partner and message id.
+    pub context: Box<ErrorContext>,
 }
 
 impl AsxError {
+    /// Construct an error.
     pub fn new(code: ErrorCode, message: impl Into<String>, context: ErrorContext) -> Self {
         Self {
             code,
             message: message.into(),
-            context,
+            context: Box::new(context),
         }
     }
 
@@ -476,7 +492,7 @@ impl AsxError {
     /// ```
     #[must_use]
     pub fn with_partner_id(mut self, partner_id: impl Into<String>) -> Self {
-        self.context = self.context.with_partner_id(partner_id);
+        self.context = Box::new(self.context.with_partner_id(partner_id));
         self
     }
 
@@ -485,7 +501,7 @@ impl AsxError {
     /// Delegates to [`ErrorContext::with_session_id`].
     #[must_use]
     pub fn with_session_id(mut self, session_id: impl Into<String>) -> Self {
-        self.context = self.context.with_session_id(session_id);
+        self.context = Box::new(self.context.with_session_id(session_id));
         self
     }
 
@@ -498,9 +514,10 @@ impl AsxError {
         session_id: impl Into<String>,
         partner_id: impl Into<String>,
     ) -> Self {
-        self.context = self
-            .context
-            .with_session_and_partner(session_id, partner_id);
+        self.context = Box::new(
+            self.context
+                .with_session_and_partner(session_id, partner_id),
+        );
         self
     }
 
@@ -509,7 +526,7 @@ impl AsxError {
     /// Delegates to [`ErrorContext::with_message_id`].
     #[must_use]
     pub fn with_message_id(mut self, message_id: impl Into<String>) -> Self {
-        self.context = self.context.with_message_id(message_id);
+        self.context = Box::new(self.context.with_message_id(message_id));
         self
     }
 
@@ -610,7 +627,7 @@ pub enum InteropMode {
     ///
     /// ```toml
     /// [dependencies]
-    /// asx-rs = { version = "0.13", features = ["interop-relaxed"] }
+    /// asx-rs = { version = "0.14", features = ["interop-relaxed"] }
     /// ```
     #[cfg(feature = "interop-relaxed")]
     Relaxed,
@@ -691,10 +708,84 @@ pub struct SessionContext {
     x509_store_cache: X509StoreCache,
 }
 
+/// Decode base64 that came out of an XML text node.
+///
+/// XML Signature §6.1 and XML Encryption both define their base64 content by
+/// reference to RFC 2045, which **line-wraps**, and any XML pretty-printer will
+/// happily fold a long `ds:DigestValue` or `ds:SignatureValue` anyway. The
+/// `base64` crate's standard engine rejects embedded whitespace, so decoding
+/// such a value directly turns a conformant counterparty into a parse failure —
+/// or, worse, into a digest "mismatch" reported as a security incident.
+///
+/// Strip ASCII whitespace first, then decode. Every base64 value that arrives
+/// inside an XML document goes through here.
+// XML-carried base64 only: the AS2 side unfolds and decodes inline, because a
+// folded MIME header is a different shape from a wrapped `ds:DigestValue`.
+#[cfg(feature = "as4")]
+pub(crate) fn decode_xml_base64(value: &str, label: &str, stage: &'static str) -> Result<Vec<u8>> {
+    use base64::Engine as _;
+    let normalized: String = value.chars().filter(|c| !c.is_ascii_whitespace()).collect();
+    base64::engine::general_purpose::STANDARD
+        .decode(normalized)
+        .map_err(|err| {
+            AsxError::new(
+                ErrorCode::ParseFailed,
+                format!("failed to decode base64 {label}: {err}"),
+                ErrorContext::new(stage),
+            )
+        })
+}
+
+/// Render secret material for `Debug` without printing it.
+///
+/// Every type in this crate that holds a private key or a shared secret writes
+/// its `Debug` by hand and routes the secret-bearing fields through here. A
+/// `#[derive(Debug)]` on such a type writes the key into whatever consumed the
+/// output — a log line, a panic message, a `tracing` field, a bug report.
+#[must_use]
+pub(crate) fn redact_present(present: bool) -> &'static str {
+    if present { "<redacted>" } else { "<none>" }
+}
+
+/// Constant-time byte-slice equality.
+///
+/// The single implementation in the crate: digest comparison, fingerprint pins
+/// and shared-secret checks all route through it. Backed by
+/// [`subtle::ConstantTimeEq`], which is written to survive the optimiser — a
+/// hand-rolled XOR-accumulate loop is not, because nothing stops LLVM from
+/// turning it back into an early-exit `memcmp`.
+///
+/// Length is compared first and therefore leaks: constant-time equality is
+/// undefined for differing lengths, and in every use here the length is already
+/// public (a digest's length is fixed by its algorithm; an `AuthorizationInfo`
+/// value's length is visible on the wire).
+#[must_use]
+#[inline]
+pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    use subtle::ConstantTimeEq;
+    if a.len() != b.len() {
+        return false;
+    }
+    a.ct_eq(b).into()
+}
+
+/// Session-scoped metadata that is derived rather than configured.
+///
+/// The strict-runtime marker is deliberately **not** publicly settable: the
+/// only way to raise it is
+/// [`StrictRuntimeBootstrapToken::bind`], and the only way to obtain that token
+/// is [`StrictRuntimeBootstrap::validate`]. A marker any caller could set would
+/// assert that validation ran without it having run, which is worse than no
+/// marker at all.
+///
+/// [`StrictRuntimeBootstrapToken::bind`]: crate::presets::StrictRuntimeBootstrapToken::bind
+/// [`StrictRuntimeBootstrap::validate`]: crate::presets::StrictRuntimeBootstrap::validate
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub struct SessionMetadata {
+    /// The resolved effective-policy snapshot attached to this session, if any.
     pub effective_policy_snapshot_json: Option<String>,
-    pub strict_runtime_bootstrap_validated: bool,
+    pub(crate) strict_runtime_bootstrap_validated: bool,
 }
 
 /// Builder for ergonomic incremental construction of [`SessionContext`].
@@ -1229,6 +1320,7 @@ pub struct CorrelationScope {
 /// Consolidates the previously separate `As2PayloadInput` and `PushPayloadInput` types.
 /// `Shared` avoids a copy when the caller already holds an `Arc<[u8]>`.
 #[non_exhaustive]
+#[derive(Debug)]
 pub enum PayloadInput<'a> {
     Owned(Vec<u8>),
     Shared(Arc<[u8]>),
@@ -1755,15 +1847,30 @@ impl SessionContext {
         self.metadata.strict_runtime_bootstrap_validated
     }
 
-    /// Return a cloned session marked with strict-runtime bootstrap validation state.
-    pub fn with_strict_runtime_bootstrap_validated(mut self, validated: bool) -> Self {
-        self.metadata.strict_runtime_bootstrap_validated = validated;
-        self
+    /// Mark this session as startup-validated **without** running startup
+    /// validation.
+    ///
+    /// Test scaffolding only. It is gated behind the `testing` feature, which
+    /// raises a `compile_error!` in release builds, so it cannot reach a
+    /// production binary — the same guarantee that covers
+    /// [`crate::as4::InsecureBypassAs4Verifier`].
+    ///
+    /// Production code marks a session by presenting the token that
+    /// [`crate::presets::StrictRuntimeBootstrap`] mints.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn test_only_mark_strict_runtime_bootstrap_validated(self) -> Self {
+        self.with_strict_runtime_bootstrap_validated(true)
     }
 
-    /// Set strict-runtime bootstrap validation state on an existing session.
-    pub fn set_strict_runtime_bootstrap_validated(&mut self, validated: bool) {
+    /// Return a cloned session carrying the strict-runtime bootstrap marker.
+    ///
+    /// Crate-internal on purpose. The public path is
+    /// [`crate::presets::StrictRuntimeBootstrapToken::bind`], which demands the
+    /// token that startup validation mints.
+    pub(crate) fn with_strict_runtime_bootstrap_validated(mut self, validated: bool) -> Self {
         self.metadata.strict_runtime_bootstrap_validated = validated;
+        self
     }
 
     pub fn session_id(&self) -> &str {

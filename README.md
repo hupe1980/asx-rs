@@ -41,6 +41,7 @@ cargo add asx-rs --features as4,client,server
 | `interop-relaxed` | Relaxed-mode helpers for legacy partners | ❌ |
 | `trace` | `tracing` instrumentation on hot paths | ✅ |
 | `prometheus` / `opentelemetry` | Metrics sink adapters | ❌ |
+| `dns` | Built-in BDXL/NAPTR resolver for Peppol participant discovery | ❌ |
 | `testing` | Bypass verifiers, mock endpoint, keypair generators | ❌ |
 
 > The `testing` feature raises a `compile_error!` in release builds. It cannot
@@ -95,16 +96,24 @@ profiles refuse to run without a key — until you explicitly choose otherwise.
 Every relaxation is a named variant you select, never a field you forgot.
 
 **Integration points are traits, not built-ins.** Dedup, reconciliation, durable
-audit and spool-encryption keys are interfaces you implement against your own
-PostgreSQL, Redis, KMS or HSM. The crate does not guess at their protocols.
+audit, DNS resolution and spool-encryption keys are interfaces you implement
+against your own PostgreSQL, Redis, resolver, KMS or HSM. The crate does not
+guess at their protocols — it ships a conformance suite instead, so "durable"
+and "cluster-safe" are things your backend *demonstrates* rather than declares.
+And it does not ship what it cannot know: there is no retry scheduler, no
+storage backend and no alerting engine, because a retry budget and a failure-rate
+threshold are properties of your partners and your topology, not of a protocol.
 
 See the **[security model](https://hupe1980.github.io/asx-rs/docs/security/)** for
 trust boundaries, defaults, and what the library does *not* protect against.
 
 ## Status
 
-**Beta.** Core AS2 and AS4 flows are implemented and covered by 1,000+ unit and
-integration tests.
+**Beta.** Core AS2 and AS4 flows are implemented and covered by ~1,000 unit and
+integration tests, plus property, fuzz, golden-vector and cross-implementation
+gates. The library contains no `unsafe` — `#![forbid(unsafe_code)]` keeps it
+that way — and is clippy-clean at `--all-features --all-targets`.
+MSRV is Rust 1.88, and CI builds on that exact floor.
 
 Implemented:
 
@@ -120,6 +129,11 @@ Implemented:
 - OCSP and PKIX chain validation
 - Multi-payload AS4, both directions — every `eb:PartInfo` attachment signed,
   verified, and independently compressed/encrypted
+- ebMS3 Test Service (§5.2.2): a connectivity ping is acknowledged and reported
+  as one, never delivered as a business document
+- Peppol/CEF dynamic discovery — BDXL U-NAPTR participant lookup against the
+  OpenPeppol SML zones, plus SMP 1.0 **and** 2.0 `ServiceMetadata`, with the
+  DNS query behind a trait so DNSSEC validation stays your choice
 
 Known gaps:
 
@@ -127,7 +141,9 @@ Known gaps:
   loop passes; the free EC eDelivery conformance service is the next step —
   see the [conformance guide](https://hupe1980.github.io/asx-rs/docs/conformance/).
 - **No storage backends ship in-tree.** `DedupStorage`, `ReconciliationStorage`
-  and `DurableAuditSink` are trait-defined; you supply the implementation.
+  and `DurableAuditSink` are trait-defined; you supply the implementation —
+  and `asx_rs::storage::conformance` is the suite that proves yours is durable
+  and its `first_seen` atomic, rather than taking your word for it.
 
 ## Development
 

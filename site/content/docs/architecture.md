@@ -10,28 +10,39 @@ description = "How asx-rs is layered: the transport boundary, wire format, proto
 ## Module Map
 
 ```text
-+------------------------- asx-rs crate -------------------------+
-|                                                             |
-|  +---------+   +------+   +------+   +------------------+  |
-|  |  core   |<->| wire |<->| http |<->| transport        |  |
-|  +----+----+   +------+   +------+   +------------------+  |
-|       |                                                     |
-|       v                                                     |
-|  +---------+   +------------+   +------------------------+ |
-|  | crypto  |<->| reliability|<->| interop profile stack  | |
-|  +----+----+   +------------+   +------------------------+ |
-|       |                                                     |
-|       v                                                     |
-|  +---------------- lifecycle (type-state) ----------------+  |
-|  |  Untrusted -> Parsed -> Verified -> Decrypted -> Ready |  |
-|  +-----------------------------+--------------------------+  |
-|                                |                            |
-|                    +-----------+-----------+                |
-|                    |as2                   |as4|             |
-|                    +---+               +---+               |
-|                                                             |
-+-------------------------------------------------------------+
+        inbound HTTP                                    outbound HTTP
+              │                                               ▲
+              ▼                                               │
+   ┌──────────────────────┐                     ┌──────────────────────┐
+   │ transport::ingress   │                     │ transport::egress    │
+   │ framework-agnostic   │                     │ `client` · SSRF +    │
+   │                      │                     │ pinned DNS           │
+   └──────────┬───────────┘                     └──────────────────────┘
+              ▼
+   ┌──────────────────────┐   ┌──────────┐   ┌──────────────────────┐
+   │ wire  bounded reads  │   │ http     │   │ interop              │
+   │ content-type, limits │   │ headers  │   │ profile stack + floor│
+   └──────────┬───────────┘   └──────────┘   └──────────────────────┘
+              ▼
+   ┌────────────────────── core ───────────────────────┐
+   │ AsxError · SessionContext · CertHandle            │
+   └──────────┬────────────────────────────┬───────────┘
+              ▼                            ▼
+   ┌──────────────────────┐   ┌──────────────────────────────────────┐
+   │ crypto               │   │ lifecycle  (type-state)              │
+   │ s/mime · wssec       │──▶│ Untrusted → Parsed → Verified →      │
+   │ xmlenc · ocsp        │   │ Decrypted → DomainReady              │
+   └──────────────────────┘   └──────────────┬───────────────────────┘
+                                 ┌───────────┴───────────┐
+                                 ▼                       ▼
+                          ┌────────────┐          ┌────────────┐
+                          │ as2        │          │ as4        │
+                          └────────────┘          └────────────┘
+
+   seams the embedder implements:
+   storage · reliability · observability
 ```
+
 
 | Module | Responsibility |
 |---|---|
@@ -41,10 +52,11 @@ description = "How asx-rs is layered: the transport boundary, wire format, proto
 | `transport` | Framework-agnostic ingress (`As2HttpIngress`, `As4HttpIngress`); async egress clients (`client` feature); axum server routers (`server` feature) |
 | `crypto` | S/MIME, WS-Security XML signatures, XML encryption/decryption, OCSP, compression |
 | `crypto/wssec` | XML Exclusive C14N, signature reference handling, WS-Security transforms, InclusiveNamespaces PrefixList |
-| `reliability` | Retry classification (`RetryDecision`), dedup key strategy, storage trait abstractions |
-| `storage` | `DedupStorage`, `ReconciliationStorage` traits; in-memory implementations with optional TTL |
+| `reliability` | Delivery outcomes, retry classification (`RetryDecision`), idempotency-key derivation, dead-letter sink |
+| `storage` | `DedupStorage` and `ReconciliationStorage` traits, in-memory implementations, and the [conformance suite](@/docs/persistence.md#conformance-kit-run-this-against-your-backend) an embedder runs against its own backend |
 | `interop` | Profile stack (base → extension → override → partner overlay), `InteropMode` (`Strict`/`Relaxed`), exception policies |
-| `observability` | `EventBus`, `AuditEvent`, `DurableAuditSink`, backpressure policy, metrics |
+| `observability` | `EventBus`, `AuditEvent`, `DurableAuditSink`, backpressure policy, metrics, and the incident-channel traits |
+| `presets` | `StrictRuntimeBootstrap` — the regulated startup gate and the token it mints |
 | `lifecycle` | Type-state progression: `UntrustedBytes` → `StructurallyParsed` → `CryptographicallyVerified` → `ContentDecrypted` → `DomainReady` |
 | `as2` | AS2 MIME packaging, MIC computation, MDN generation/parsing, S/MIME crypto (behind `as2` feature) |
 | `as4` | AS4 SOAP envelope, ebMS3 headers, WS-Security signing/verification, pull store, P-Mode registry, Test Service, SBDH (behind `as4` feature) |
@@ -55,7 +67,7 @@ description = "How asx-rs is layered: the transport boundary, wire format, proto
 
 ### Single crate, feature-gated
 
-All protocol code lives in one crate to share the crypto, canonicalization, and session model without version skew. Feature flags (`as2`, `as4`, `client`, `server`, etc.) allow users to compile only what they need. Binary footprint is ~5 MB for a dual-protocol deployment.
+All protocol code lives in one crate to share the crypto, canonicalization, and session model without version skew. Feature flags (`as2`, `as4`, `client`, `server`, …) compile only what you use; neither protocol is on by default.
 
 ### Async-only public API
 
@@ -91,13 +103,13 @@ All inbound reads use `read_bounded_stream` with a hard ceiling (default 256 MiB
 The `transport` module is split into three independent layers:
 - **Ingress** (`ingress.rs`): framework-agnostic header validation — usable without either `client` or `server` features.
 - **Egress** (`egress.rs`, `client` feature): reqwest-based async HTTP clients.
-- **Server** (`server.rs`, `server` feature): axum 0.7 router builders with typed handler traits.
+- **Server** (`server.rs`, `server` feature): axum router builders with typed handler traits.
 
 This means protocol logic never depends on a specific HTTP framework.
 
 ## Envelope Lifecycle
 
-The sole lifecycle mechanism is the type-state pattern in `lifecycle.rs`. The earlier `envelope.rs` enum-based state machine has been removed. Protocol functions (`asx_rs::as2::receive_sync`, `asx_rs::as4::receive_push_with_dedup_sync`) use `lifecycle.rs` type-states exclusively.
+The type-state pattern in `lifecycle.rs` is the only lifecycle mechanism. Protocol functions (`asx_rs::as2::receive_sync`, `asx_rs::as4::receive_push_with_dedup_sync`) use it exclusively.
 
 Allowed progression (forward-only):
 
@@ -111,7 +123,28 @@ UntrustedBytes<T>
 
 ## Error Model
 
-All errors are `AsxError { code: ErrorCode, message: String, context: Option<ErrorContext> }`. Error codes are machine-readable strings (e.g., `"as4.parse.missing_message_id"`). `ErrorContext` carries `session_id`, optional `partner_id`, and optional freeform message for structured logging. The `?` operator propagates errors through a `Result<T, AsxError>` alias.
+Every fallible function returns `Result<T, AsxError>`:
+
+```rust
+pub struct AsxError {
+    pub code: ErrorCode,          // match on this
+    pub message: String,          // for operators, never for matching
+    pub context: Box<ErrorContext>,
+}
+```
+
+`ErrorCode` is a closed enum — `ParseFailed`, `SecurityVerificationFailed`,
+`DecryptionFailed`, `PolicyViolation`, `InteropViolation`,
+`ReliabilityFailure`, `PayloadTooLarge`, `CertificateRevoked` and a few more.
+It is load-bearing rather than decorative: ingress handlers map it to an HTTP
+status, `RetryDecision` classifies on it, and the incident taxonomies group on
+it. `ErrorContext` carries the `stage` plus optional `session_id`,
+`partner_id` and `message_id` for correlation.
+
+The context is boxed on purpose. The error variant's width is paid on the
+success path too, so an inline `ErrorContext` made *every* `Result` in the
+crate 120 bytes wide, `Result<()>` included. Boxing brings that to 40 while
+`err.context.session_id` keeps working through `Deref`.
 
 ## Session Context
 

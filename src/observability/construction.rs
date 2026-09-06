@@ -81,7 +81,6 @@ pub(super) fn new_with_config_and_mode_and_metrics(
         metrics_sink,
         audit_sink,
         audit_sequence: Arc::new(AtomicU64::new(0)),
-        taxonomy_alert_dedup_epoch_secs: Arc::new(DashMap::new()),
         emission_mode,
         backpressure,
         scoped_channel_capacity: capacity,

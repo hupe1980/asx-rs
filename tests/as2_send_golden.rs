@@ -1,4 +1,8 @@
 #![cfg(feature = "as2")]
+
+#[path = "common/strict_bootstrap.rs"]
+mod strict_bootstrap;
+
 use asx_rs::as2::send_sync;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use sha2::{Digest, Sha256};
@@ -11,9 +15,8 @@ use asx_rs::observability::{AsxEvent, EventBus};
 
 #[tokio::test]
 async fn as2_send_matches_golden_payload_and_mic() {
-    let session = SessionContext::new("sess-1", "partner-a", "strict")
-        .expect("session")
-        .with_strict_runtime_bootstrap_validated(true);
+    let session = SessionContext::new("sess-1", "partner-a", "strict").expect("session");
+    let session = strict_bootstrap::strict_bound(session);
     let bus = EventBus::new(64).expect("event bus");
     let mut scoped_rx = bus.subscribe_scoped_events();
 
@@ -66,9 +69,8 @@ async fn as2_send_matches_golden_payload_and_mic() {
 #[cfg(feature = "interop-relaxed")]
 #[tokio::test]
 async fn strict_and_relaxed_policy_differs_only_when_configured() {
-    let session = SessionContext::new("sess-2", "partner-b", "strict")
-        .expect("session")
-        .with_strict_runtime_bootstrap_validated(true);
+    let session = SessionContext::new("sess-2", "partner-b", "strict").expect("session");
+    let session = strict_bootstrap::strict_bound(session);
     let bus = EventBus::new(64).expect("event bus");
 
     let strict = send_sync(
@@ -120,9 +122,8 @@ async fn strict_and_relaxed_policy_differs_only_when_configured() {
 
 #[tokio::test]
 async fn mic_uses_exact_octet_boundary_without_payload_rewrite() {
-    let session = SessionContext::new("sess-3", "partner-c", "strict")
-        .expect("session")
-        .with_strict_runtime_bootstrap_validated(true);
+    let session = SessionContext::new("sess-3", "partner-c", "strict").expect("session");
+    let session = strict_bootstrap::strict_bound(session);
     let bus = EventBus::new(64).expect("event bus");
 
     let payload = b"Content-Transfer-Encoding: binary\r\n\r\nA\r\nB\r\n--x--".to_vec();

@@ -166,7 +166,7 @@ pub struct PMode {
     /// When `Some`, send pipelines can retrieve the endpoint directly from the
     /// P-Mode registration, eliminating the need for a separate partner-address
     /// registry.  Startup validation
-    /// (`presets::validate_strict_production_topology`) will assert that all
+    /// ([`presets::StrictRuntimeBootstrap`](crate::presets::StrictRuntimeBootstrap)) asserts that all
     /// outbound P-Modes have a non-`None` endpoint URL when present.
     ///
     /// `None` preserves the existing behaviour where the endpoint URL is

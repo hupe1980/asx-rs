@@ -1,26 +1,60 @@
+//! Startup validation for regulated deployments.
+//!
+//! A deployment that is *configured* strictly but never *validated* strictly is
+//! indistinguishable from a correct one until the first message that depends on
+//! the difference. This module turns that into a startup error.
+//!
+//! ```no_run
+//! use asx_rs::presets::{DeploymentTopology, StrictRuntimeBootstrap};
+//!
+//! # fn main() -> asx_rs::Result<()> {
+//! # let (event_bus, dedup, reconciliation, session): (
+//! #     asx_rs::observability::EventBus,
+//! #     std::sync::Arc<dyn asx_rs::storage::DedupStorage>,
+//! #     std::sync::Arc<dyn asx_rs::storage::ReconciliationStorage>,
+//! #     asx_rs::core::SessionContext,
+//! # ) = unimplemented!();
+//! let token = StrictRuntimeBootstrap::new("startup")
+//!     .event_bus(&event_bus)
+//!     .dedup(dedup.as_ref())
+//!     .reconciliation(reconciliation.as_ref())
+//!     .topology(DeploymentTopology::SingleNode)
+//!     .validate()?;
+//!
+//! // Only a token-bound session may enter a strict protocol entry point.
+//! let session = token.bind(&session);
+//! # let _ = session;
+//! # Ok(())
+//! # }
+//! ```
+
 use std::any::type_name_of_val;
-use std::sync::Arc;
 use std::time::SystemTime;
 
 #[cfg(feature = "as4")]
 use crate::as4::As4TopologyCoordination;
 use crate::core::SessionContext;
 use crate::core::{AsxError, ErrorCode, ErrorContext, InteropMode, Result};
-use crate::observability::audit_sink::DurableAuditSink;
 use crate::observability::{EventBus, EventEmissionMode};
 use crate::storage::{DedupStorage, ReconciliationStorage};
 
-/// Runtime deployment topology used by strict-production startup validators.
+/// Runtime deployment topology used by strict-production startup validation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum DeploymentTopology {
-    /// Single process / single replica deployment.
+    /// Single process / single replica.
     SingleNode,
-    /// Multi-replica deployment where cross-node coordination is required.
+    /// Multiple replicas, where cross-node coordination is required for the
+    /// AS4 pull store and the conversation ordering gate.
     Clustered,
 }
 
-/// Typed proof that strict-production startup validation succeeded.
+/// Unforgeable proof that strict-production startup validation succeeded.
+///
+/// The only way to obtain one is [`StrictRuntimeBootstrap::validate`], and the
+/// only thing it is good for is [`bind`](Self::bind)ing a session so that
+/// strict protocol entry points will accept it. There is no public
+/// constructor, no `Default`, and no way to set the session marker without it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StrictRuntimeBootstrapToken {
     issued_at: SystemTime,
@@ -29,98 +63,345 @@ pub struct StrictRuntimeBootstrapToken {
 }
 
 impl StrictRuntimeBootstrapToken {
-    /// Stage used when the token was minted.
+    /// The stage label validation ran under.
+    #[must_use]
     pub fn stage(&self) -> &'static str {
         self.stage
     }
 
-    /// Timestamp at which startup validation succeeded.
+    /// When validation succeeded.
+    #[must_use]
     pub fn issued_at(&self) -> SystemTime {
         self.issued_at
     }
 
-    /// AS4 topology scope validated during token issuance (if any).
+    /// The AS4 topology this token covers, if AS4 coordination was validated.
+    #[must_use]
     pub fn as4_topology(&self) -> Option<DeploymentTopology> {
         self.as4_topology
     }
+
+    /// Return a clone of `session` marked as startup-validated.
+    ///
+    /// Strict protocol entry points refuse a session that carries no marker.
+    #[must_use]
+    pub fn bind(&self, session: &SessionContext) -> SessionContext {
+        session
+            .clone()
+            .with_strict_runtime_bootstrap_validated(true)
+    }
 }
 
-/// Strict production preset components shared across protocol stacks.
+/// Startup validator for regulated deployments.
 ///
-/// This constructor intentionally uses `EventBus::new_regulated` so callers
-/// cannot accidentally deploy fail-open observability behavior in regulated
-/// environments.
-pub fn strict_production_event_bus(
-    capacity: usize,
-    audit_sink: Arc<dyn DurableAuditSink>,
-) -> Result<EventBus> {
-    EventBus::new_regulated(capacity, audit_sink)
-}
-
-/// Enforce durable reconciliation backend requirements for strict production
-/// receive/reconciliation paths.
-pub fn require_durable_reconciliation_backend(
+/// Checks, in one place, that the runtime a deployment is about to accept
+/// traffic on is the one its profile assumes:
+///
+/// | Component | Requirement |
+/// |---|---|
+/// | [`EventBus`] | Strict emission (not `BestEffort`) and a production-durable audit sink |
+/// | [`DedupStorage`] | `is_durable()` **and** `cluster_safe()` |
+/// | [`ReconciliationStorage`] | `is_durable()` **and** `cluster_safe()` |
+/// | AS4 pull store / conversation gate | `cluster_safe()`, when the topology is [`DeploymentTopology::Clustered`] |
+///
+/// Those last two are self-declarations: this validates that the operator made
+/// a claim, not that the claim is true. The restart tests a backend must
+/// actually pass are the embedder's to run.
+pub struct StrictRuntimeBootstrap<'a> {
     stage: &'static str,
-    reconciliation: &dyn ReconciliationStorage,
+    event_bus: Option<&'a EventBus>,
+    dedup: Option<&'a dyn DedupStorage>,
+    reconciliation: Option<&'a dyn ReconciliationStorage>,
+    topology: DeploymentTopology,
+    #[cfg(feature = "as4")]
+    as4_pull_store: Option<&'a dyn As4TopologyCoordination>,
+    #[cfg(feature = "as4")]
+    as4_conversation_gate: Option<&'a dyn As4TopologyCoordination>,
+    #[cfg(not(feature = "as4"))]
+    _marker: std::marker::PhantomData<&'a ()>,
+}
+
+impl std::fmt::Debug for StrictRuntimeBootstrap<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StrictRuntimeBootstrap")
+            .field("stage", &self.stage)
+            .field("event_bus", &self.event_bus.is_some())
+            .field("dedup", &self.dedup.is_some())
+            .field("reconciliation", &self.reconciliation.is_some())
+            .field("topology", &self.topology)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<'a> StrictRuntimeBootstrap<'a> {
+    /// Begin validation. `stage` labels the errors this produces.
+    #[must_use]
+    pub fn new(stage: &'static str) -> Self {
+        Self {
+            stage,
+            event_bus: None,
+            dedup: None,
+            reconciliation: None,
+            topology: DeploymentTopology::SingleNode,
+            #[cfg(feature = "as4")]
+            as4_pull_store: None,
+            #[cfg(feature = "as4")]
+            as4_conversation_gate: None,
+            #[cfg(not(feature = "as4"))]
+            _marker: std::marker::PhantomData,
+        }
+    }
+
+    /// The bus protocol operations will emit through. Required.
+    #[must_use]
+    pub fn event_bus(mut self, event_bus: &'a EventBus) -> Self {
+        self.event_bus = Some(event_bus);
+        self
+    }
+
+    /// The duplicate-detection backend. Required.
+    #[must_use]
+    pub fn dedup(mut self, dedup: &'a dyn DedupStorage) -> Self {
+        self.dedup = Some(dedup);
+        self
+    }
+
+    /// The reconciliation backend. Required.
+    #[must_use]
+    pub fn reconciliation(mut self, reconciliation: &'a dyn ReconciliationStorage) -> Self {
+        self.reconciliation = Some(reconciliation);
+        self
+    }
+
+    /// Declare the deployment topology. Defaults to
+    /// [`DeploymentTopology::SingleNode`]; declaring `Clustered` turns on the
+    /// AS4 coordination checks below.
+    #[must_use]
+    pub fn topology(mut self, topology: DeploymentTopology) -> Self {
+        self.topology = topology;
+        self
+    }
+
+    /// The AS4 pull store. Required when the topology is `Clustered`.
+    #[cfg(feature = "as4")]
+    #[must_use]
+    pub fn as4_pull_store(mut self, pull_store: &'a dyn As4TopologyCoordination) -> Self {
+        self.as4_pull_store = Some(pull_store);
+        self
+    }
+
+    /// The AS4 conversation ordering gate. Required when the topology is
+    /// `Clustered`.
+    #[cfg(feature = "as4")]
+    #[must_use]
+    pub fn as4_conversation_gate(mut self, gate: &'a dyn As4TopologyCoordination) -> Self {
+        self.as4_conversation_gate = Some(gate);
+        self
+    }
+
+    /// Run every configured check and mint a token.
+    ///
+    /// # Errors
+    ///
+    /// [`ErrorCode::InvalidInput`] when a required component was not supplied,
+    /// and [`ErrorCode::ReliabilityFailure`] when one of them does not meet the
+    /// strict-production requirement. Every message names the component, its
+    /// concrete type and the properties it declared.
+    pub fn validate(self) -> Result<StrictRuntimeBootstrapToken> {
+        let stage = self.stage;
+        let event_bus = self.event_bus.ok_or_else(|| {
+            missing_component(stage, "event_bus", "StrictRuntimeBootstrap::event_bus")
+        })?;
+        let dedup = self
+            .dedup
+            .ok_or_else(|| missing_component(stage, "dedup", "StrictRuntimeBootstrap::dedup"))?;
+        let reconciliation = self.reconciliation.ok_or_else(|| {
+            missing_component(
+                stage,
+                "reconciliation",
+                "StrictRuntimeBootstrap::reconciliation",
+            )
+        })?;
+
+        validate_event_bus(stage, event_bus)?;
+        require_durable_backend(stage, "reconciliation", reconciliation.as_durability())?;
+        require_durable_backend(stage, "dedup", dedup.as_durability())?;
+
+        #[cfg(feature = "as4")]
+        let as4_topology = {
+            validate_as4_topology(
+                stage,
+                self.topology,
+                self.as4_pull_store,
+                self.as4_conversation_gate,
+            )?;
+            Some(self.topology)
+        };
+        #[cfg(not(feature = "as4"))]
+        let as4_topology = None;
+
+        Ok(StrictRuntimeBootstrapToken {
+            issued_at: SystemTime::now(),
+            stage,
+            as4_topology,
+        })
+    }
+}
+
+fn missing_component(stage: &'static str, component: &str, setter: &str) -> AsxError {
+    AsxError::new(
+        ErrorCode::InvalidInput,
+        format!(
+            "strict runtime bootstrap requires a {component}; call {setter}(..) before validate()"
+        ),
+        ErrorContext::new(stage),
+    )
+}
+
+/// The durability properties a storage backend declares about itself.
+#[derive(Debug, Clone, Copy)]
+pub struct BackendDurability {
+    /// Survives a process restart.
+    pub durable: bool,
+    /// Coordinates correctly across replicas.
+    pub cluster_safe: bool,
+    /// The concrete backend type, for error messages.
+    pub backend_type: &'static str,
+}
+
+trait DeclaredDurability {
+    fn as_durability(&self) -> BackendDurability;
+}
+
+impl DeclaredDurability for &dyn DedupStorage {
+    fn as_durability(&self) -> BackendDurability {
+        BackendDurability {
+            durable: self.is_durable(),
+            cluster_safe: self.cluster_safe(),
+            backend_type: type_name_of_val(*self),
+        }
+    }
+}
+
+impl DeclaredDurability for &dyn ReconciliationStorage {
+    fn as_durability(&self) -> BackendDurability {
+        BackendDurability {
+            durable: self.is_durable(),
+            cluster_safe: self.cluster_safe(),
+            backend_type: type_name_of_val(*self),
+        }
+    }
+}
+
+fn require_durable_backend(
+    stage: &'static str,
+    component: &str,
+    d: BackendDurability,
 ) -> Result<()> {
-    let durable = reconciliation.is_durable();
-    let cluster_safe = reconciliation.cluster_safe();
-    let backend_type = type_name_of_val(reconciliation);
+    let missing = if !d.durable {
+        "durable"
+    } else if !d.cluster_safe {
+        "cluster-safe"
+    } else {
+        return Ok(());
+    };
+    Err(AsxError::new(
+        ErrorCode::ReliabilityFailure,
+        format!(
+            "strict production requires a {missing} {component} backend; backend_type={}; durable={}; cluster_safe={}",
+            d.backend_type, d.durable, d.cluster_safe
+        ),
+        ErrorContext::new(stage),
+    ))
+}
 
-    if !durable {
+fn validate_event_bus(stage: &'static str, event_bus: &EventBus) -> Result<()> {
+    let mode = event_bus.emission_mode();
+    let has_durable_audit_sink = event_bus.has_production_durable_audit_sink();
+
+    // `StrictWithAuditFallback` is a *strict* mode: it cannot be constructed
+    // without a production-durable sink, and it persists every event there when
+    // no subscriber is live. Rejecting it here would have forced regulated
+    // deployments that follow its own documentation to fail this gate.
+    if matches!(mode, EventEmissionMode::BestEffort) {
         return Err(AsxError::new(
             ErrorCode::ReliabilityFailure,
             format!(
-                "strict production preset requires a durable reconciliation backend; backend_type={backend_type}; durable={durable}; cluster_safe={cluster_safe}"
+                "strict production requires a strict event emission mode \
+                 (StrictTransactional or StrictWithAuditFallback); emission_mode={mode:?}; \
+                 durable_audit_sink={has_durable_audit_sink}"
             ),
             ErrorContext::new(stage),
         ));
     }
-    if !cluster_safe {
+
+    if !has_durable_audit_sink {
         return Err(AsxError::new(
             ErrorCode::ReliabilityFailure,
             format!(
-                "strict production preset requires a cluster-safe reconciliation backend; backend_type={backend_type}; durable={durable}; cluster_safe={cluster_safe}"
+                "strict production requires a durable audit sink; emission_mode={mode:?}; \
+                 durable_audit_sink={has_durable_audit_sink}"
             ),
             ErrorContext::new(stage),
         ));
     }
+
     Ok(())
 }
 
-/// Enforce durable dedup backend requirements for strict production receive
-/// paths that rely on replay protection.
-pub fn require_durable_dedup_backend(stage: &'static str, dedup: &dyn DedupStorage) -> Result<()> {
-    let durable = dedup.is_durable();
-    let cluster_safe = dedup.cluster_safe();
-    let backend_type = type_name_of_val(dedup);
+#[cfg(feature = "as4")]
+fn validate_as4_topology(
+    stage: &'static str,
+    topology: DeploymentTopology,
+    pull_store: Option<&dyn As4TopologyCoordination>,
+    conversation_gate: Option<&dyn As4TopologyCoordination>,
+) -> Result<()> {
+    if topology == DeploymentTopology::SingleNode {
+        return Ok(());
+    }
 
-    if !durable {
-        return Err(AsxError::new(
-            ErrorCode::ReliabilityFailure,
-            format!(
-                "strict production preset requires a durable dedup backend; backend_type={backend_type}; durable={durable}; cluster_safe={cluster_safe}"
-            ),
-            ErrorContext::new(stage),
-        ));
+    for (component, coordination, setter) in [
+        (
+            "pull-store",
+            pull_store,
+            "StrictRuntimeBootstrap::as4_pull_store",
+        ),
+        (
+            "conversation-ordering",
+            conversation_gate,
+            "StrictRuntimeBootstrap::as4_conversation_gate",
+        ),
+    ] {
+        let Some(coordination) = coordination else {
+            return Err(AsxError::new(
+                ErrorCode::ReliabilityFailure,
+                format!(
+                    "clustered topology requires a cluster-safe AS4 {component} backend; \
+                     supply one via {setter}(..)"
+                ),
+                ErrorContext::new(stage),
+            ));
+        };
+        if !coordination.cluster_safe() {
+            return Err(AsxError::new(
+                ErrorCode::ReliabilityFailure,
+                format!(
+                    "clustered topology requires cluster-safe AS4 {} coordination",
+                    coordination.topology_component()
+                ),
+                ErrorContext::new(stage),
+            ));
+        }
     }
-    if !cluster_safe {
-        return Err(AsxError::new(
-            ErrorCode::ReliabilityFailure,
-            format!(
-                "strict production preset requires a cluster-safe dedup backend; backend_type={backend_type}; durable={durable}; cluster_safe={cluster_safe}"
-            ),
-            ErrorContext::new(stage),
-        ));
-    }
+
     Ok(())
 }
 
-/// Enforce strict production runtime guards for receive/enqueue paths.
+/// Enforce strict production runtime guards on receive and enqueue paths.
 ///
-/// This centralizes fail-closed runtime checks to keep AS2/AS4 call sites
-/// consistent and prevent drift between backend and observability guards.
-pub fn enforce_strict_production_runtime_receive_guards(
+/// Centralised so AS2 and AS4 call sites cannot drift apart on which guards
+/// they run.
+pub(crate) fn enforce_strict_production_runtime_receive_guards(
     stage: &'static str,
     session: &SessionContext,
     event_bus: &EventBus,
@@ -131,10 +412,10 @@ pub fn enforce_strict_production_runtime_receive_guards(
     #[cfg(not(feature = "testing"))]
     {
         if let Some(reconciliation) = reconciliation {
-            require_durable_reconciliation_backend(stage, reconciliation)?;
+            require_durable_backend(stage, "reconciliation", reconciliation.as_durability())?;
         }
         if let Some(dedup) = dedup {
-            require_durable_dedup_backend(stage, dedup)?;
+            require_durable_backend(stage, "dedup", dedup.as_durability())?;
         }
     }
 
@@ -158,166 +439,9 @@ pub fn enforce_strict_production_runtime_receive_guards(
     }
 }
 
-/// Validate strict production startup/readiness invariants in one call.
-///
-/// This check is intended for host bootstrap gates before accepting protocol
-/// traffic in regulated deployments.
-pub fn validate_strict_production_startup_readiness(
-    stage: &'static str,
-    event_bus: &EventBus,
-    reconciliation: &dyn ReconciliationStorage,
-    dedup: &dyn DedupStorage,
-) -> Result<()> {
-    let mode = event_bus.emission_mode();
-    let has_durable_audit_sink = event_bus.has_production_durable_audit_sink();
-
-    if mode != EventEmissionMode::StrictTransactional {
-        return Err(AsxError::new(
-            ErrorCode::ReliabilityFailure,
-            format!(
-                "strict production preset requires StrictTransactional event emission mode; emission_mode={mode:?}; durable_audit_sink={has_durable_audit_sink}"
-            ),
-            ErrorContext::new(stage),
-        ));
-    }
-
-    if !has_durable_audit_sink {
-        return Err(AsxError::new(
-            ErrorCode::ReliabilityFailure,
-            format!(
-                "strict production preset requires a durable audit sink; emission_mode={mode:?}; durable_audit_sink={has_durable_audit_sink}"
-            ),
-            ErrorContext::new(stage),
-        ));
-    }
-
-    require_durable_reconciliation_backend(stage, reconciliation)?;
-    require_durable_dedup_backend(stage, dedup)
-}
-
-/// Validate strict-production startup and mint a typed runtime bootstrap token.
-pub fn issue_strict_runtime_bootstrap_token(
-    stage: &'static str,
-    event_bus: &EventBus,
-    reconciliation: &dyn ReconciliationStorage,
-    dedup: &dyn DedupStorage,
-) -> Result<StrictRuntimeBootstrapToken> {
-    validate_strict_production_startup_readiness(stage, event_bus, reconciliation, dedup)?;
-    Ok(StrictRuntimeBootstrapToken {
-        issued_at: SystemTime::now(),
-        stage,
-        as4_topology: None,
-    })
-}
-
-/// Validate strict-production AS4 distributed-topology readiness.
-///
-/// This check fails closed when clustered deployments use process-local
-/// ordering/pull components that cannot coordinate across replicas.
-#[cfg(feature = "as4")]
-pub fn validate_strict_production_as4_topology_readiness(
-    stage: &'static str,
-    topology: DeploymentTopology,
-    pull_store: Option<&dyn As4TopologyCoordination>,
-    conversation_gate: Option<&dyn As4TopologyCoordination>,
-) -> Result<()> {
-    if topology == DeploymentTopology::SingleNode {
-        return Ok(());
-    }
-
-    let Some(pull_store) = pull_store else {
-        return Err(AsxError::new(
-            ErrorCode::ReliabilityFailure,
-            "strict production clustered topology requires a cluster-safe AS4 pull-store coordination backend",
-            ErrorContext::new(stage),
-        ));
-    };
-    if !pull_store.cluster_safe() {
-        return Err(AsxError::new(
-            ErrorCode::ReliabilityFailure,
-            format!(
-                "strict production clustered topology requires cluster-safe AS4 {} coordination",
-                pull_store.topology_component()
-            ),
-            ErrorContext::new(stage),
-        ));
-    }
-
-    let Some(conversation_gate) = conversation_gate else {
-        return Err(AsxError::new(
-            ErrorCode::ReliabilityFailure,
-            "strict production clustered topology requires distributed AS4 conversation ordering coordination backend",
-            ErrorContext::new(stage),
-        ));
-    };
-    if !conversation_gate.cluster_safe() {
-        return Err(AsxError::new(
-            ErrorCode::ReliabilityFailure,
-            format!(
-                "strict production clustered topology requires distributed AS4 {} coordination",
-                conversation_gate.topology_component()
-            ),
-            ErrorContext::new(stage),
-        ));
-    }
-
-    Ok(())
-}
-
-/// Validate strict-production startup + AS4 topology and mint a typed token.
-#[cfg(feature = "as4")]
-pub fn issue_strict_runtime_bootstrap_token_with_as4_topology(
-    stage: &'static str,
-    event_bus: &EventBus,
-    reconciliation: &dyn ReconciliationStorage,
-    dedup: &dyn DedupStorage,
-    topology: DeploymentTopology,
-    pull_store: Option<&dyn As4TopologyCoordination>,
-    conversation_gate: Option<&dyn As4TopologyCoordination>,
-) -> Result<StrictRuntimeBootstrapToken> {
-    validate_strict_production_startup_readiness(stage, event_bus, reconciliation, dedup)?;
-    validate_strict_production_as4_topology_readiness(
-        stage,
-        topology,
-        pull_store,
-        conversation_gate,
-    )?;
-    Ok(StrictRuntimeBootstrapToken {
-        issued_at: SystemTime::now(),
-        stage,
-        as4_topology: Some(topology),
-    })
-}
-
-/// Require a strict runtime bootstrap token at protocol entry points.
-pub fn require_strict_runtime_bootstrap_token(
-    stage: &'static str,
-    token: &StrictRuntimeBootstrapToken,
-) -> Result<()> {
-    if token.stage.trim().is_empty() {
-        return Err(AsxError::new(
-            ErrorCode::ReliabilityFailure,
-            "strict runtime bootstrap token is invalid: empty stage",
-            ErrorContext::new(stage),
-        ));
-    }
-    Ok(())
-}
-
-/// Return a cloned session marked as startup-validated by the provided token.
-pub fn session_with_strict_runtime_bootstrap_token(
-    stage: &'static str,
-    token: &StrictRuntimeBootstrapToken,
-    session: &SessionContext,
-) -> Result<SessionContext> {
-    require_strict_runtime_bootstrap_token(stage, token)?;
-    Ok(session
-        .clone()
-        .with_strict_runtime_bootstrap_validated(true))
-}
-
-/// Fail closed for strict-interop entry points unless startup validation was bound to the session.
-pub fn enforce_strict_runtime_bootstrap_for_strict_interop(
+/// Fail closed at a strict-interop entry point unless startup validation was
+/// bound to the session by [`StrictRuntimeBootstrapToken::bind`].
+pub(crate) fn enforce_strict_runtime_bootstrap_for_strict_interop(
     stage: &'static str,
     session: &SessionContext,
     interop: InteropMode,
@@ -333,7 +457,9 @@ pub fn enforce_strict_runtime_bootstrap_for_strict_interop(
         if interop == InteropMode::Strict && !session.strict_runtime_bootstrap_validated() {
             return Err(AsxError::new(
                 ErrorCode::PolicyViolation,
-                "strict interop entry point requires strict-runtime bootstrap token binding; bind startup token via presets::session_with_strict_runtime_bootstrap_token(...) before invoking strict protocol APIs",
+                "strict interop entry point requires a strict-runtime bootstrap token; \
+                 validate startup with presets::StrictRuntimeBootstrap and bind the session \
+                 with StrictRuntimeBootstrapToken::bind(..)",
                 ErrorContext::for_session(stage, session),
             ));
         }
@@ -341,64 +467,15 @@ pub fn enforce_strict_runtime_bootstrap_for_strict_interop(
     }
 }
 
-#[cfg(feature = "as2")]
-#[derive(Debug, Clone)]
-pub struct As2StrictProductionPreset {
-    pub send_policy: crate::as2::As2SendPolicy,
-    pub receive_policy: crate::as2::As2ReceivePolicy,
-}
-
-#[cfg(feature = "as2")]
-impl As2StrictProductionPreset {
-    pub fn new() -> Self {
-        Self {
-            send_policy: crate::as2::As2SendPolicy::regulated(),
-            receive_policy: crate::as2::As2ReceivePolicy::regulated(),
-        }
-    }
-}
-
-#[cfg(feature = "as2")]
-impl Default for As2StrictProductionPreset {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-#[cfg(feature = "as4")]
-#[derive(Debug, Clone)]
-pub struct As4StrictProductionPreset {
-    pub send_policy: crate::as4::As4SendPolicy,
-    pub push_policy: crate::as4::As4PushPolicy,
-    pub pull_policy: crate::as4::As4PullPolicy,
-}
-
-#[cfg(feature = "as4")]
-impl As4StrictProductionPreset {
-    pub fn new() -> Self {
-        Self {
-            send_policy: crate::as4::As4SendPolicy::regulated(),
-            push_policy: crate::as4::As4PushPolicy::regulated(),
-            pull_policy: crate::as4::As4PullPolicy::regulated(),
-        }
-    }
-}
-
-#[cfg(feature = "as4")]
-impl Default for As4StrictProductionPreset {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::observability::BackpressurePolicy;
     use crate::observability::audit_sink::{
         AuditEvent, AuditSinkDurability, DurableAuditSink, ReplayCursor,
     };
     use crate::storage::BoxFuture;
+
+    #[derive(Debug)]
 
     struct DurableTestAuditSink;
 
@@ -441,11 +518,19 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+
     struct NonDurableReconciliation;
+
+    #[derive(Debug)]
 
     struct NonDurableDedup;
 
+    #[derive(Debug)]
+
     struct DurableClusterSafeReconciliation;
+
+    #[derive(Debug)]
 
     struct DurableClusterSafeDedup;
 
@@ -529,42 +614,7 @@ mod tests {
         }
     }
 
-    #[test]
-    fn strict_production_event_bus_uses_regulated_mode() {
-        let bus = strict_production_event_bus(16, Arc::new(DurableTestAuditSink)).expect("bus");
-        assert_eq!(
-            bus.emission_mode(),
-            crate::observability::EventEmissionMode::StrictTransactional
-        );
-        assert!(bus.has_production_durable_audit_sink());
-    }
-
-    #[test]
-    fn strict_production_reconciliation_requires_durability() {
-        let err = require_durable_reconciliation_backend(
-            "strict_production_test",
-            &NonDurableReconciliation,
-        )
-        .expect_err("non-durable backend must be rejected");
-
-        assert_eq!(err.code, ErrorCode::ReliabilityFailure);
-        assert!(err.message.contains("durable reconciliation backend"));
-        assert!(err.message.contains("backend_type="));
-        assert!(err.message.contains("durable=false"));
-        assert!(err.message.contains("cluster_safe=false"));
-    }
-
-    #[test]
-    fn strict_production_dedup_requires_durability() {
-        let err = require_durable_dedup_backend("strict_production_test", &NonDurableDedup)
-            .expect_err("non-durable dedup backend must be rejected");
-
-        assert_eq!(err.code, ErrorCode::ReliabilityFailure);
-        assert!(err.message.contains("durable dedup backend"));
-        assert!(err.message.contains("backend_type="));
-        assert!(err.message.contains("durable=false"));
-        assert!(err.message.contains("cluster_safe=false"));
-    }
+    #[derive(Debug)]
 
     struct DurableButNonClusterReconciliation;
 
@@ -591,6 +641,8 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+
     struct DurableButNonClusterDedup;
 
     impl DedupStorage for DurableButNonClusterDedup {
@@ -606,405 +658,341 @@ mod tests {
         }
     }
 
-    #[test]
-    fn strict_production_reconciliation_requires_cluster_safety() {
-        let err = require_durable_reconciliation_backend(
-            "strict_production_test",
-            &DurableButNonClusterReconciliation,
-        )
-        .expect_err("non-cluster-safe backend must be rejected");
+    fn regulated_bus() -> EventBus {
+        EventBus::new_regulated(16, std::sync::Arc::new(DurableTestAuditSink)).expect("bus")
+    }
 
+    fn ready() -> StrictRuntimeBootstrap<'static> {
+        StrictRuntimeBootstrap::new("strict_production_test")
+    }
+
+    #[test]
+    fn regulated_bus_is_strict_and_durable() {
+        let bus = regulated_bus();
+        assert_eq!(bus.emission_mode(), EventEmissionMode::StrictTransactional);
+        assert!(bus.has_production_durable_audit_sink());
+    }
+
+    #[test]
+    fn validate_requires_every_component() {
+        let bus = regulated_bus();
+
+        let err = ready().validate().expect_err("event bus is required");
+        assert_eq!(err.code, ErrorCode::InvalidInput);
+        assert!(err.message.contains("event_bus"));
+
+        let err = ready()
+            .event_bus(&bus)
+            .validate()
+            .expect_err("dedup is required");
+        assert_eq!(err.code, ErrorCode::InvalidInput);
+        assert!(err.message.contains("dedup"));
+
+        let err = ready()
+            .event_bus(&bus)
+            .dedup(&DurableClusterSafeDedup)
+            .validate()
+            .expect_err("reconciliation is required");
+        assert_eq!(err.code, ErrorCode::InvalidInput);
+        assert!(err.message.contains("reconciliation"));
+    }
+
+    #[test]
+    fn validate_rejects_non_durable_backends() {
+        let bus = regulated_bus();
+
+        let err = ready()
+            .event_bus(&bus)
+            .dedup(&DurableClusterSafeDedup)
+            .reconciliation(&NonDurableReconciliation)
+            .validate()
+            .expect_err("non-durable reconciliation must be rejected");
+        assert_eq!(err.code, ErrorCode::ReliabilityFailure);
+        assert!(err.message.contains("durable reconciliation backend"));
+        assert!(err.message.contains("backend_type="));
+
+        let err = ready()
+            .event_bus(&bus)
+            .dedup(&NonDurableDedup)
+            .reconciliation(&DurableClusterSafeReconciliation)
+            .validate()
+            .expect_err("non-durable dedup must be rejected");
+        assert_eq!(err.code, ErrorCode::ReliabilityFailure);
+        assert!(err.message.contains("durable dedup backend"));
+    }
+
+    #[test]
+    fn validate_rejects_non_cluster_safe_backends() {
+        let bus = regulated_bus();
+
+        let err = ready()
+            .event_bus(&bus)
+            .dedup(&DurableClusterSafeDedup)
+            .reconciliation(&DurableButNonClusterReconciliation)
+            .validate()
+            .expect_err("non-cluster-safe reconciliation must be rejected");
         assert_eq!(err.code, ErrorCode::ReliabilityFailure);
         assert!(err.message.contains("cluster-safe reconciliation backend"));
-        assert!(err.message.contains("backend_type="));
         assert!(err.message.contains("durable=true"));
         assert!(err.message.contains("cluster_safe=false"));
-    }
 
-    #[test]
-    fn strict_production_dedup_requires_cluster_safety() {
-        let err =
-            require_durable_dedup_backend("strict_production_test", &DurableButNonClusterDedup)
-                .expect_err("non-cluster-safe dedup must be rejected");
-
+        let err = ready()
+            .event_bus(&bus)
+            .dedup(&DurableButNonClusterDedup)
+            .reconciliation(&DurableClusterSafeReconciliation)
+            .validate()
+            .expect_err("non-cluster-safe dedup must be rejected");
         assert_eq!(err.code, ErrorCode::ReliabilityFailure);
         assert!(err.message.contains("cluster-safe dedup backend"));
-        assert!(err.message.contains("backend_type="));
-        assert!(err.message.contains("durable=true"));
-        assert!(err.message.contains("cluster_safe=false"));
     }
 
     #[test]
-    fn strict_runtime_receive_guards_pass_for_durable_cluster_safe_backends() {
-        let session = SessionContext::new("sess", "partner-a", "strict").expect("session");
-        let bus = strict_production_event_bus(16, Arc::new(DurableTestAuditSink)).expect("bus");
+    fn validate_rejects_best_effort_emission() {
+        let bus = EventBus::builder()
+            .capacity(16)
+            .emission_mode(EventEmissionMode::BestEffort)
+            .build()
+            .expect("bus");
 
-        let result = enforce_strict_production_runtime_receive_guards(
-            "strict_production_runtime_guard",
+        let err = ready()
+            .event_bus(&bus)
+            .dedup(&DurableClusterSafeDedup)
+            .reconciliation(&DurableClusterSafeReconciliation)
+            .validate()
+            .expect_err("best-effort emission must be rejected");
+
+        assert_eq!(err.code, ErrorCode::ReliabilityFailure);
+        assert!(err.message.contains("strict event emission mode"));
+    }
+
+    /// `StrictWithAuditFallback` is a strict mode that cannot be built without a
+    /// production-durable sink, so the startup gate must accept it. Rejecting it
+    /// made the mode its own documentation recommends unusable in a regulated
+    /// deployment.
+    #[test]
+    fn validate_accepts_strict_with_audit_fallback() {
+        let bus = EventBus::builder()
+            .capacity(16)
+            .audit_sink(std::sync::Arc::new(DurableTestAuditSink))
+            .emission_mode(EventEmissionMode::StrictWithAuditFallback)
+            .build()
+            .expect("bus");
+
+        ready()
+            .event_bus(&bus)
+            .dedup(&DurableClusterSafeDedup)
+            .reconciliation(&DurableClusterSafeReconciliation)
+            .validate()
+            .expect("audit-fallback strict mode is a strict mode");
+    }
+
+    #[test]
+    fn validate_rejects_missing_durable_audit_sink() {
+        let bus = EventBus::new(16).expect("bus");
+
+        let err = ready()
+            .event_bus(&bus)
+            .dedup(&DurableClusterSafeDedup)
+            .reconciliation(&DurableClusterSafeReconciliation)
+            .validate()
+            .expect_err("missing durable audit sink must be rejected");
+
+        assert_eq!(err.code, ErrorCode::ReliabilityFailure);
+        assert!(err.message.contains("durable audit sink"));
+    }
+
+    #[test]
+    fn validate_mints_a_token_on_success() {
+        let bus = regulated_bus();
+        let token = ready()
+            .event_bus(&bus)
+            .dedup(&DurableClusterSafeDedup)
+            .reconciliation(&DurableClusterSafeReconciliation)
+            .validate()
+            .expect("startup validation must succeed");
+
+        assert_eq!(token.stage(), "strict_production_test");
+        assert!(token.issued_at() <= SystemTime::now());
+    }
+
+    #[test]
+    fn receive_guards_pass_for_durable_cluster_safe_backends() {
+        let session = SessionContext::new("s", "p", "strict").expect("session");
+        let bus = regulated_bus();
+
+        enforce_strict_production_runtime_receive_guards(
+            "strict_production_test",
             &session,
             &bus,
             true,
             Some(&DurableClusterSafeReconciliation),
             Some(&DurableClusterSafeDedup),
-        );
-
-        assert!(result.is_ok());
+        )
+        .expect("durable cluster-safe backends must pass");
     }
 
-    #[test]
     #[cfg(not(feature = "testing"))]
-    fn strict_runtime_receive_guards_fail_closed_for_non_durable_dedup() {
-        let session = SessionContext::new("sess", "partner-a", "strict").expect("session");
-        let bus = strict_production_event_bus(16, Arc::new(DurableTestAuditSink)).expect("bus");
+    #[test]
+    fn receive_guards_fail_closed_for_non_durable_dedup() {
+        let session = SessionContext::new("s", "p", "strict").expect("session");
+        let bus = regulated_bus();
 
         let err = enforce_strict_production_runtime_receive_guards(
-            "strict_production_runtime_guard",
+            "strict_production_test",
             &session,
             &bus,
             true,
             Some(&DurableClusterSafeReconciliation),
             Some(&NonDurableDedup),
         )
-        .expect_err("non-durable dedup must be rejected at startup");
+        .expect_err("non-durable dedup must fail closed");
 
         assert_eq!(err.code, ErrorCode::ReliabilityFailure);
-        assert!(err.message.contains("durable dedup backend"));
-        assert!(err.message.contains("backend_type="));
-        assert!(err.message.contains("durable=false"));
-        assert!(err.message.contains("cluster_safe=false"));
     }
 
-    #[test]
     #[cfg(feature = "testing")]
-    fn strict_runtime_receive_guards_allow_non_durable_backends_in_testing_mode() {
-        let session = SessionContext::new("sess", "partner-a", "strict").expect("session");
-        let bus = strict_production_event_bus(16, Arc::new(DurableTestAuditSink)).expect("bus");
+    #[test]
+    fn receive_guards_allow_non_durable_backends_under_testing_feature() {
+        let session = SessionContext::new("s", "p", "strict").expect("session");
+        let bus = regulated_bus();
 
-        let result = enforce_strict_production_runtime_receive_guards(
-            "strict_production_runtime_guard",
+        enforce_strict_production_runtime_receive_guards(
+            "strict_production_test",
             &session,
             &bus,
-            true,
-            Some(&DurableClusterSafeReconciliation),
+            false,
+            Some(&NonDurableReconciliation),
             Some(&NonDurableDedup),
-        );
-
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn strict_production_startup_readiness_passes_for_regulated_event_bus_and_durable_backends() {
-        let bus = strict_production_event_bus(16, Arc::new(DurableTestAuditSink)).expect("bus");
-
-        let result = validate_strict_production_startup_readiness(
-            "strict_production_startup",
-            &bus,
-            &DurableClusterSafeReconciliation,
-            &DurableClusterSafeDedup,
-        );
-
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn strict_production_startup_readiness_rejects_non_strict_emission_mode() {
-        let bus = EventBus::new_with_config_and_mode(
-            16,
-            None,
-            BackpressurePolicy::default(),
-            EventEmissionMode::BestEffort,
         )
-        .expect("best effort bus");
-
-        let err = validate_strict_production_startup_readiness(
-            "strict_production_startup",
-            &bus,
-            &DurableClusterSafeReconciliation,
-            &DurableClusterSafeDedup,
-        )
-        .expect_err("best-effort event bus must be rejected");
-
-        assert_eq!(err.code, ErrorCode::ReliabilityFailure);
-        assert!(err.message.contains("StrictTransactional"));
-        assert!(err.message.contains("durable_audit_sink=false"));
+        .expect("the testing feature relaxes backend durability");
     }
 
+    #[cfg(all(feature = "as4", not(feature = "testing")))]
     #[test]
-    fn strict_production_startup_readiness_rejects_missing_durable_audit_sink() {
-        let bus = EventBus::new(16).expect("strict bus");
-
-        let err = validate_strict_production_startup_readiness(
-            "strict_production_startup",
-            &bus,
-            &DurableClusterSafeReconciliation,
-            &DurableClusterSafeDedup,
-        )
-        .expect_err("strict bus without durable audit sink must be rejected");
-
-        assert_eq!(err.code, ErrorCode::ReliabilityFailure);
-        assert!(err.message.contains("durable audit sink"));
-        assert!(err.message.contains("StrictTransactional"));
-        assert!(err.message.contains("durable_audit_sink=false"));
-    }
-
-    #[test]
-    fn issue_strict_runtime_bootstrap_token_mints_token_after_validation() {
-        let bus = strict_production_event_bus(16, Arc::new(DurableTestAuditSink)).expect("bus");
-
-        let token = issue_strict_runtime_bootstrap_token(
-            "strict_bootstrap_issue",
-            &bus,
-            &DurableClusterSafeReconciliation,
-            &DurableClusterSafeDedup,
-        )
-        .expect("token");
-
-        assert_eq!(token.stage(), "strict_bootstrap_issue");
-        assert_eq!(token.as4_topology(), None);
-    }
-
-    #[test]
-    fn require_strict_runtime_bootstrap_token_accepts_issued_token() {
-        let bus = strict_production_event_bus(16, Arc::new(DurableTestAuditSink)).expect("bus");
-
-        let token = issue_strict_runtime_bootstrap_token(
-            "strict_bootstrap_issue",
-            &bus,
-            &DurableClusterSafeReconciliation,
-            &DurableClusterSafeDedup,
-        )
-        .expect("token");
-
-        let result = require_strict_runtime_bootstrap_token("strict_token_check", &token);
-        assert!(result.is_ok());
-    }
-
-    #[cfg(not(feature = "testing"))]
-    #[test]
-    fn strict_interop_enforcement_rejects_unbound_session() {
-        let session = SessionContext::new("sess", "partner-a", "strict").expect("session");
-
-        let err = enforce_strict_runtime_bootstrap_for_strict_interop(
-            "strict_entrypoint",
-            &session,
-            InteropMode::Strict,
-        )
-        .expect_err("strict interop must require runtime bootstrap token binding");
-
-        assert_eq!(err.code, ErrorCode::PolicyViolation);
-        assert!(
-            err.message
-                .contains("strict-runtime bootstrap token binding")
-        );
-        assert!(
-            err.message
-                .contains("session_with_strict_runtime_bootstrap_token"),
-            "guidance should point to session-first strict bootstrap flow"
-        );
-        assert!(
-            !err.message.contains("*_with_strict_runtime_token"),
-            "guidance must not reference removed strict wrapper APIs"
-        );
-    }
-
-    #[test]
-    fn strict_interop_enforcement_accepts_token_bound_session() {
-        let bus = strict_production_event_bus(16, Arc::new(DurableTestAuditSink)).expect("bus");
-        let session = SessionContext::new("sess", "partner-a", "strict").expect("session");
-        let token = issue_strict_runtime_bootstrap_token(
-            "strict_bootstrap_issue",
-            &bus,
-            &DurableClusterSafeReconciliation,
-            &DurableClusterSafeDedup,
-        )
-        .expect("token");
-
-        let bound_session =
-            session_with_strict_runtime_bootstrap_token("strict_bind", &token, &session)
-                .expect("bound session");
-
-        let result = enforce_strict_runtime_bootstrap_for_strict_interop(
-            "strict_entrypoint",
-            &bound_session,
-            InteropMode::Strict,
-        );
-        assert!(result.is_ok());
-    }
-
-    #[cfg(feature = "as4")]
-    #[test]
-    fn strict_production_as4_topology_readiness_allows_single_node() {
-        struct TestCoordination;
-
-        impl As4TopologyCoordination for TestCoordination {
+    fn clustered_topology_requires_cluster_safe_as4_coordination() {
+        struct NotClusterSafe(&'static str);
+        impl As4TopologyCoordination for NotClusterSafe {
             fn cluster_safe(&self) -> bool {
                 false
             }
-
             fn topology_component(&self) -> &'static str {
-                "test-component"
+                self.0
             }
         }
-
-        let pull_store = TestCoordination;
-        let conversation_gate = TestCoordination;
-        let result = validate_strict_production_as4_topology_readiness(
-            "strict_production_topology",
-            DeploymentTopology::SingleNode,
-            Some(&pull_store),
-            Some(&conversation_gate),
-        );
-
-        assert!(result.is_ok());
-    }
-
-    #[cfg(feature = "as4")]
-    #[test]
-    fn strict_production_as4_topology_readiness_rejects_non_cluster_safe_pull_store() {
-        struct PullStoreCoordination;
-        struct ConversationGateCoordination;
-
-        impl As4TopologyCoordination for PullStoreCoordination {
-            fn cluster_safe(&self) -> bool {
-                false
-            }
-
-            fn topology_component(&self) -> &'static str {
-                "pull-store"
-            }
-        }
-
-        impl As4TopologyCoordination for ConversationGateCoordination {
+        struct ClusterSafe(&'static str);
+        impl As4TopologyCoordination for ClusterSafe {
             fn cluster_safe(&self) -> bool {
                 true
             }
-
-            fn topology_component(&self) -> &'static str {
-                "conversation-order-gate"
-            }
-        }
-
-        let pull_store = PullStoreCoordination;
-        let conversation_gate = ConversationGateCoordination;
-        let err = validate_strict_production_as4_topology_readiness(
-            "strict_production_topology",
-            DeploymentTopology::Clustered,
-            Some(&pull_store),
-            Some(&conversation_gate),
-        )
-        .expect_err("clustered topology must reject non-cluster-safe pull store");
-
-        assert_eq!(err.code, ErrorCode::ReliabilityFailure);
-        assert!(err.message.contains("cluster-safe AS4 pull-store"));
-    }
-
-    #[cfg(feature = "as4")]
-    #[test]
-    fn strict_production_as4_topology_readiness_rejects_non_cluster_safe_conversation_gate() {
-        struct PullStoreCoordination;
-        struct ConversationGateCoordination;
-
-        impl As4TopologyCoordination for PullStoreCoordination {
-            fn cluster_safe(&self) -> bool {
-                true
-            }
-
-            fn topology_component(&self) -> &'static str {
-                "pull-store"
-            }
-        }
-
-        impl As4TopologyCoordination for ConversationGateCoordination {
-            fn cluster_safe(&self) -> bool {
-                false
-            }
-
-            fn topology_component(&self) -> &'static str {
-                "conversation-order-gate"
-            }
-        }
-
-        let pull_store = PullStoreCoordination;
-        let conversation_gate = ConversationGateCoordination;
-        let err = validate_strict_production_as4_topology_readiness(
-            "strict_production_topology",
-            DeploymentTopology::Clustered,
-            Some(&pull_store),
-            Some(&conversation_gate),
-        )
-        .expect_err("clustered topology must reject process-local conversation gate");
-
-        assert_eq!(err.code, ErrorCode::ReliabilityFailure);
-        assert!(
-            err.message
-                .contains("distributed AS4 conversation-order-gate coordination"),
-            "unexpected error message: {}",
-            err.message
-        );
-    }
-
-    #[cfg(feature = "as4")]
-    #[test]
-    fn issue_strict_runtime_bootstrap_token_with_as4_topology_sets_scope() {
-        let bus = strict_production_event_bus(16, Arc::new(DurableTestAuditSink)).expect("bus");
-
-        struct ClusterSafeCoordination(&'static str);
-
-        impl As4TopologyCoordination for ClusterSafeCoordination {
-            fn cluster_safe(&self) -> bool {
-                true
-            }
-
             fn topology_component(&self) -> &'static str {
                 self.0
             }
         }
 
-        let pull_store = ClusterSafeCoordination("postgres-pull-store");
-        let conversation_gate = ClusterSafeCoordination("postgres-conversation-order-gate");
+        let bus = regulated_bus();
+        let base = || {
+            StrictRuntimeBootstrap::new("strict_production_test")
+                .dedup(&DurableClusterSafeDedup)
+                .reconciliation(&DurableClusterSafeReconciliation)
+                .topology(DeploymentTopology::Clustered)
+        };
 
-        let token = issue_strict_runtime_bootstrap_token_with_as4_topology(
-            "strict_bootstrap_issue",
-            &bus,
-            &DurableClusterSafeReconciliation,
-            &DurableClusterSafeDedup,
-            DeploymentTopology::Clustered,
-            Some(&pull_store),
-            Some(&conversation_gate),
-        )
-        .expect("token");
+        // No coordination supplied at all.
+        let err = base()
+            .event_bus(&bus)
+            .validate()
+            .expect_err("clustered topology needs a pull store");
+        assert_eq!(err.code, ErrorCode::ReliabilityFailure);
+        assert!(err.message.contains("pull-store"));
 
+        // Pull store present but process-local.
+        let err = base()
+            .event_bus(&bus)
+            .as4_pull_store(&NotClusterSafe("pull-store"))
+            .as4_conversation_gate(&ClusterSafe("conversation-ordering"))
+            .validate()
+            .expect_err("process-local pull store must be rejected");
+        assert!(err.message.contains("pull-store"));
+
+        // Conversation gate present but process-local.
+        let err = base()
+            .event_bus(&bus)
+            .as4_pull_store(&ClusterSafe("pull-store"))
+            .as4_conversation_gate(&NotClusterSafe("conversation-ordering"))
+            .validate()
+            .expect_err("process-local conversation gate must be rejected");
+        assert!(err.message.contains("conversation-ordering"));
+
+        // Both cluster-safe.
+        let token = base()
+            .event_bus(&bus)
+            .as4_pull_store(&ClusterSafe("pull-store"))
+            .as4_conversation_gate(&ClusterSafe("conversation-ordering"))
+            .validate()
+            .expect("cluster-safe coordination must pass");
         assert_eq!(token.as4_topology(), Some(DeploymentTopology::Clustered));
-    }
-
-    #[cfg(feature = "as2")]
-    #[test]
-    fn as2_strict_production_preset_defaults_are_fail_closed() {
-        let preset = As2StrictProductionPreset::new();
-        assert_eq!(
-            preset.send_policy.interop_mode,
-            crate::core::InteropMode::Strict
-        );
-        assert_eq!(
-            preset.receive_policy.interop_mode,
-            crate::core::InteropMode::Strict
-        );
-        assert!(preset.send_policy.fail_closed_audit_events);
-        assert!(preset.receive_policy.fail_closed_audit_events);
     }
 
     #[cfg(feature = "as4")]
     #[test]
-    fn as4_strict_production_preset_defaults_are_fail_closed() {
-        let preset = As4StrictProductionPreset::new();
-        assert_eq!(preset.send_policy, crate::as4::As4SendPolicy::regulated());
-        assert_eq!(preset.send_policy.interop, crate::core::InteropMode::Strict);
-        assert_eq!(preset.push_policy.interop, crate::core::InteropMode::Strict);
-        assert_eq!(preset.pull_policy.interop, crate::core::InteropMode::Strict);
-        assert!(preset.send_policy.fail_closed_audit_events);
-        assert!(preset.push_policy.fail_closed_audit_events);
-        assert!(preset.pull_policy.fail_closed_audit_events);
-        assert!(preset.push_policy.require_signed_push);
-        assert!(preset.pull_policy.require_signed_push);
+    fn single_node_topology_needs_no_as4_coordination() {
+        let bus = regulated_bus();
+        let token = ready()
+            .event_bus(&bus)
+            .dedup(&DurableClusterSafeDedup)
+            .reconciliation(&DurableClusterSafeReconciliation)
+            .topology(DeploymentTopology::SingleNode)
+            .validate()
+            .expect("single node needs no distributed coordination");
+        assert_eq!(token.as4_topology(), Some(DeploymentTopology::SingleNode));
+    }
+
+    #[cfg(not(feature = "testing"))]
+    #[test]
+    fn strict_interop_rejects_an_unbound_session() {
+        let session = SessionContext::new("s", "p", "strict").expect("session");
+        let err = enforce_strict_runtime_bootstrap_for_strict_interop(
+            "as4_receive_push_sync",
+            &session,
+            InteropMode::Strict,
+        )
+        .expect_err("an unbound session must be refused");
+
+        assert_eq!(err.code, ErrorCode::PolicyViolation);
+        assert!(err.message.contains("StrictRuntimeBootstrap"));
+    }
+
+    #[cfg(not(feature = "testing"))]
+    #[test]
+    fn strict_interop_accepts_a_token_bound_session() {
+        let bus = regulated_bus();
+        let token = ready()
+            .event_bus(&bus)
+            .dedup(&DurableClusterSafeDedup)
+            .reconciliation(&DurableClusterSafeReconciliation)
+            .validate()
+            .expect("startup validation");
+
+        let session = token.bind(&SessionContext::new("s", "p", "strict").expect("session"));
+        assert!(session.strict_runtime_bootstrap_validated());
+
+        enforce_strict_runtime_bootstrap_for_strict_interop(
+            "as4_receive_push_sync",
+            &session,
+            InteropMode::Strict,
+        )
+        .expect("a token-bound session must be accepted");
+    }
+
+    #[cfg(feature = "interop-relaxed")]
+    #[test]
+    fn relaxed_interop_needs_no_token() {
+        let session = SessionContext::new("s", "p", "relaxed").expect("session");
+        enforce_strict_runtime_bootstrap_for_strict_interop(
+            "as4_receive_push_sync",
+            &session,
+            InteropMode::Relaxed,
+        )
+        .expect("relaxed interop is not gated on startup validation");
     }
 }

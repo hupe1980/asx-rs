@@ -1,9 +1,6 @@
 use std::sync::atomic::Ordering;
 
-use super::{
-    AS2_PROVIDER_HEALTH_ALERT_TOTAL, AS4_RECEIPT_TAXONOMY_ALERT_TOTAL,
-    AS4_RECEIPT_TAXONOMY_OUTCOME_TOTAL, AsxEvent, EventBusMetrics, MetricsSink,
-};
+use super::{AS4_RECEIPT_TAXONOMY_OUTCOME_TOTAL, AsxEvent, EventBusMetrics, MetricsSink};
 
 pub(super) fn observe_event(metrics: &EventBusMetrics, event: &AsxEvent, sink: &dyn MetricsSink) {
     if let AsxEvent::ReceiptTaxonomyOutcome {
@@ -41,25 +38,6 @@ pub(super) fn observe_event(metrics: &EventBusMetrics, event: &AsxEvent, sink: &
         }
     }
 
-    if let AsxEvent::ReceiptTaxonomyAlertRaised {
-        signal,
-        severity,
-        category,
-        ..
-    } = event
-    {
-        sink.increment_counter(
-            AS4_RECEIPT_TAXONOMY_ALERT_TOTAL,
-            1,
-            &[
-                ("protocol", "as4"),
-                ("signal", *signal),
-                ("severity", *severity),
-                ("category", *category),
-            ],
-        );
-    }
-
     if let AsxEvent::SpoolKeyProviderHealthStateChanged { current_state, .. } = event {
         metrics
             .provider_health_transition_total
@@ -69,20 +47,5 @@ pub(super) fn observe_event(metrics: &EventBusMetrics, event: &AsxEvent, sink: &
                 .provider_health_transition_to_failing
                 .fetch_add(1, Ordering::Relaxed);
         }
-    }
-
-    if let AsxEvent::SpoolProviderHealthAlertRaised {
-        severity, category, ..
-    } = event
-    {
-        sink.increment_counter(
-            AS2_PROVIDER_HEALTH_ALERT_TOTAL,
-            1,
-            &[
-                ("protocol", "as2"),
-                ("severity", *severity),
-                ("category", *category),
-            ],
-        );
     }
 }

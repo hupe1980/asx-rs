@@ -191,7 +191,7 @@ impl As2SendPolicy {
 ///
 /// Use `As2SendCredentials` directly only when you are already in AS2-only
 /// code that does not need the unified API.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct As2SendCredentials {
     /// PEM-encoded signing certificate (required if policy.sign = true)
     pub signing_cert_pem: Option<Arc<[u8]>>,
@@ -200,6 +200,20 @@ pub struct As2SendCredentials {
     /// PEM-encoded recipient certificate for encryption (required if
     /// policy.encrypt = true)
     pub recipient_cert_pem: Option<Arc<[u8]>>,
+}
+
+impl std::fmt::Debug for As2SendCredentials {
+    /// Never prints `signing_key_pem`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("As2SendCredentials")
+            .field("signing_cert_pem", &self.signing_cert_pem)
+            .field(
+                "signing_key_pem",
+                &crate::core::redact_present(self.signing_key_pem.is_some()),
+            )
+            .field("recipient_cert_pem", &self.recipient_cert_pem)
+            .finish()
+    }
 }
 
 impl Drop for As2SendCredentials {
@@ -617,10 +631,23 @@ pub struct As2GeneratedMdn {
 }
 
 /// Signing credentials for MDN generation.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct As2MdnSigningCredentials {
     pub signing_cert_pem: Vec<u8>,
     pub signing_key_pem: Vec<u8>,
+}
+
+impl std::fmt::Debug for As2MdnSigningCredentials {
+    /// Never prints `signing_key_pem`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("As2MdnSigningCredentials")
+            .field("signing_cert_pem", &self.signing_cert_pem)
+            .field(
+                "signing_key_pem",
+                &crate::core::redact_present(!self.signing_key_pem.is_empty()),
+            )
+            .finish()
+    }
 }
 
 impl Drop for As2MdnSigningCredentials {

@@ -109,9 +109,15 @@ rejected outright: that is what an unset or truncated secret looks like, and it
 would "encrypt" a regulated spool while protecting nothing.
 
 A durable backend must return `true` from both `is_durable()` and
-`cluster_safe()` so it passes the strict production startup gate
-(`issue_strict_runtime_bootstrap_token`). A minimal PostgreSQL implementation
-wraps a connection pool and satisfies the trait as follows:
+`cluster_safe()` so it passes the [strict production startup
+gate](@/docs/getting-started.md#regulated-startup-gate-strict-production).
+
+Those two methods are **self-declarations**: the gate checks that you made a
+claim, not that the claim is true. What actually establishes it is the
+[test checklist](#minimum-test-checklist) below — run it against your backend.
+
+A minimal PostgreSQL implementation wraps a connection pool and satisfies the
+trait as follows:
 
 ```rust,ignore
 struct PostgresDedupStorage { /* pool, namespace */ }
@@ -332,7 +338,84 @@ impl DurableAuditSink for SqliteReliabilityStore {
 - Configure `EventBus::new_with_audit_sink` with `Some(Arc<dyn DurableAuditSink>)`.
 - Keep one shared store instance per process.
 
-## Minimum Test Checklist
+## Conformance kit (run this against your backend)
+
+`is_durable()` and `cluster_safe()` are self-declarations: the startup gate can
+only check that you made a claim. `asx_rs::storage::conformance` (behind the
+`testing` feature) is what establishes it. Implement one trait — a factory that
+hands out a **fresh handle onto the same store** — and run the suite:
+
+```rust
+use asx_rs::storage::conformance::{DedupConformance, StorageFactory};
+use asx_rs::storage::DedupStorage;
+use std::sync::Arc;
+
+struct PostgresDedupFactory { pool: PgPool }
+
+impl StorageFactory<dyn DedupStorage> for PostgresDedupFactory {
+    // A new connection, not a clone of one in-memory map — the reconnect
+    // checks are vacuous otherwise.
+    fn connect(&self) -> Arc<dyn DedupStorage> {
+        Arc::new(PostgresDedupStorage::new(self.pool.clone()))
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn our_dedup_backend_conforms() {
+    let report = DedupConformance::new(&PostgresDedupFactory { pool }).run().await;
+    assert!(report.passed(), "{report}");
+}
+```
+
+What it establishes:
+
+| Check | Why it is in the suite |
+|---|---|
+| `first_seen` is true once, false after | The basic replay guarantee |
+| Distinct keys are independent | Catches key-namespace collisions |
+| **`first_seen` is atomic under concurrency** | The one that matters. A `SELECT`-then-`INSERT` backend passes every serial test and admits duplicate business documents the moment two replicas process one message. The suite races 16 tasks for one key and requires exactly one `true` |
+| **State survives a reconnect** | A durable backend must answer the same through a fresh handle. Skipped, not failed, when the backend declares `is_durable() == false` — losing state is then correct |
+| `cluster_safe()` implies `is_durable()` | A store shared across replicas is out of process by definition |
+
+`AuditSinkConformance` covers the audit trail the same way:
+
+```rust
+use asx_rs::storage::conformance::AuditSinkConformance;
+
+#[tokio::test]
+async fn our_audit_sink_conforms() {
+    let report = AuditSinkConformance::new(&PostgresAuditFactory { pool }).run().await;
+    assert!(report.passed(), "{report}");
+}
+```
+
+| Audit-sink check | Why it is in the suite |
+|---|---|
+| A stored event is readable | A trail that accepts writes it cannot produce as evidence |
+| **Replay resumes from the cursor** | A sink that re-delivers the whole log on reconnect makes a consumer process the trail twice after a restart |
+| The cursor advances as events are stored | Otherwise a consumer cannot tell that new evidence exists |
+| **State survives a reconnect** | A sink declared `Durable` that keeps the trail in process memory |
+| **A tampered cursor is refused** | A cursor is a claim about how far a consumer has read. If it can be forged, so can that claim. Skipped when the sink declares no integrity protection |
+
+`ReconciliationConformance` covers the queue: enqueue is visible, `resolve`
+removes exactly one record and leaves the others, an unknown key returns
+`Ok(false)` rather than an error, and the queue survives a reconnect.
+
+Each suite's own tests require the broken cases to fail — a backend that lies
+about durability, one that races `first_seen`, one that forgets on reconnect,
+one that accepts a forged cursor.
+
+The report is a value, not a panic — print it and every check appears with its
+id and, on failure, what went wrong and usually how to fix it.
+
+**What it cannot prove:** durability across a real crash or a power loss. A
+fresh handle is as close as a library can get, and the module says so rather
+than implying otherwise.
+
+## Minimum test checklist
+
+The suite covers 1–2 and the atomicity property. The audit-sink items are still
+yours to check:
 
 1. Dedup survives restart (same idempotency key after restart returns duplicate).
 2. Reconciliation queue survives restart and `resolve` removes exactly one key.

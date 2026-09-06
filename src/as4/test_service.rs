@@ -94,6 +94,79 @@ pub fn test_service_send_policy() -> As4SendPolicyBuilder {
 }
 
 #[cfg(test)]
+mod ping_detection_tests {
+    use super::*;
+    use crate::as4::ParsedAs4UserMessage;
+
+    fn user_message(service: Option<&str>, action: &str) -> ParsedAs4UserMessage {
+        ParsedAs4UserMessage {
+            message_id: "m1".into(),
+            action: action.into(),
+            from_party_ids: vec!["a".into()],
+            to_party_ids: vec!["b".into()],
+            mpc: None,
+            conversation_id: None,
+            has_ws_security_header: false,
+            service: service.map(str::to_string),
+            ref_to_message_id: None,
+            original_sender: None,
+            final_recipient: None,
+            tracking_identifier: None,
+            timestamp: None,
+            wsa_headers: None,
+        }
+    }
+
+    /// ebMS3 §5.2.2: a Test Service message is acknowledged, never delivered.
+    /// `As4ReceivePushOutput::is_test_service_ping` delegates here, so a
+    /// receiver can tell a connectivity ping from a business document instead
+    /// of handing an empty payload to its application pipeline.
+    #[test]
+    fn a_test_service_message_is_detected() {
+        assert!(is_test_service_message(&user_message(
+            Some(TEST_SERVICE_URI),
+            TEST_ACTION_URI
+        )));
+    }
+
+    /// Both halves are required. A ping must not be mistaken for a business
+    /// message, and a business message reusing one URI must not be swallowed.
+    #[test]
+    fn one_matching_uri_is_not_a_ping() {
+        assert!(!is_test_service_message(&user_message(
+            Some(TEST_SERVICE_URI),
+            "urn:example:action"
+        )));
+        assert!(!is_test_service_message(&user_message(
+            Some("urn:example:service"),
+            TEST_ACTION_URI
+        )));
+        assert!(!is_test_service_message(&user_message(
+            Some("urn:example:service"),
+            "urn:example:action"
+        )));
+        assert!(!is_test_service_message(&user_message(
+            None,
+            TEST_ACTION_URI
+        )));
+    }
+
+    /// ebMS3 §5.2.2 specifies these URIs exactly; a typo here is a silently
+    /// undetected ping, so they are pinned as literals.
+    #[test]
+    fn the_reserved_uris_match_the_specification() {
+        assert_eq!(
+            TEST_SERVICE_URI,
+            "http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/service"
+        );
+        assert_eq!(
+            TEST_ACTION_URI,
+            "http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/test"
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::as4::ParsedAs4UserMessage;

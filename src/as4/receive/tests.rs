@@ -1,5 +1,6 @@
 #![cfg_attr(not(feature = "interop-relaxed"), allow(unused_imports, dead_code))]
 use super::*;
+use crate::as4::As4ReceiveOutcome;
 use crate::as4::conversation_gate::As4ConversationOrderGate;
 use crate::as4::send::As4SendRequest;
 #[cfg(feature = "interop-relaxed")]
@@ -22,6 +23,7 @@ use roxmltree::Document;
 use std::sync::Arc;
 use std::time::Duration;
 
+#[derive(Debug)]
 struct DurableTestDedup(InMemoryDedupBackend);
 
 impl DedupStorage for DurableTestDedup {
@@ -264,21 +266,6 @@ impl As4Verifier for SlowVerifier {
     }
 }
 
-fn ordered_test_payload(message_id: &str, ref_to_message_id: Option<&str>) -> Arc<[u8]> {
-    let ref_to_xml = ref_to_message_id
-        .map(|value| format!("<eb:RefToMessageId>{value}</eb:RefToMessageId>"))
-        .unwrap_or_default();
-    Arc::from(
-        format!(
-            "<s:Envelope xmlns:s='http://www.w3.org/2003/05/soap-envelope' xmlns:eb='http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/' xmlns:wsse='http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd'><s:Header><wsse:Security/><eb:Messaging s:mustUnderstand='true'><eb:UserMessage><eb:MessageInfo><eb:MessageId>{}</eb:MessageId>{}</eb:MessageInfo><eb:CollaborationInfo><eb:Action>urn:test:action</eb:Action><eb:ConversationId>conv-stage-e</eb:ConversationId></eb:CollaborationInfo><eb:PartyInfo><eb:From><eb:PartyId>from-a</eb:PartyId></eb:From><eb:To><eb:PartyId>to-b</eb:PartyId></eb:To></eb:PartyInfo><eb:MessageProperties><eb:Property name='originalSender' value='from-a'/><eb:Property name='finalRecipient' value='to-b'/><eb:Property name='trackingIdentifier' value='{}'/></eb:MessageProperties></eb:UserMessage></eb:Messaging></s:Header><s:Body/></s:Envelope>",
-            message_id,
-            ref_to_xml,
-            message_id,
-        )
-        .into_bytes(),
-    )
-}
-
 fn ordered_test_multipart_payload(
     message_id: &str,
     ref_to_message_id: Option<&str>,
@@ -306,28 +293,177 @@ fn ordered_test_multipart_payload(
     )
 }
 
+/// The turn must still be held when the caller gets the message.
+///
+/// A turn released inside the receive call leaves the application delivering
+/// with no lock at all, so nothing about delivery is ordered however careful
+/// the gate is (D54).
+#[tokio::test]
+async fn ordered_receive_still_holds_the_turn_when_it_returns() {
+    let session = SessionContext::new("sess-ordered-hold", "partner-a", "strict").expect("session");
+    let bus = EventBus::new(16).expect("bus");
+    let policy = As4PushPolicyBuilder::new()
+        .fail_closed_audit_events(false)
+        .build()
+        .expect("policy");
+    let dedup: Arc<dyn crate::storage::DedupStorage> = Arc::new(DurableTestDedup(
+        InMemoryDedupBackend::new(Duration::from_secs(60)),
+    ));
+    let gate = Arc::new(As4ConversationOrderGate::new(64));
+    let (payload, content_type) = ordered_test_multipart_payload("msg-hold", None);
+
+    let ordered = ordered_async::receive_push_ordered_with_verifier(
+        &session,
+        &bus,
+        As4ReceivePushRequest {
+            http_content_type: content_type,
+            payload,
+            receipt_payload: None,
+            policy,
+            authenticated_sender_scope: None,
+        },
+        dedup,
+        gate.as_ref(),
+        Arc::new(SlowVerifier::new()),
+    )
+    .await
+    .expect("receive");
+
+    assert!(
+        ordered.holds_turn(),
+        "the conversation turn must outlive the receive call, or delivery is unserialized"
+    );
+    assert!(matches!(ordered.get(), As4ReceiveOutcome::FirstSeen(_)));
+
+    // A second arrival in the same conversation cannot proceed while the first
+    // turn is held.
+    let (payload2, content_type2) = ordered_test_multipart_payload("msg-hold-2", None);
+    let session2 = session.clone();
+    let bus2 = bus.clone();
+    let gate2 = gate.clone();
+    let dedup2: Arc<dyn crate::storage::DedupStorage> = Arc::new(DurableTestDedup(
+        InMemoryDedupBackend::new(Duration::from_secs(60)),
+    ));
+    let policy2 = As4PushPolicyBuilder::new()
+        .fail_closed_audit_events(false)
+        .build()
+        .expect("policy");
+    let blocked = tokio::spawn(async move {
+        ordered_async::receive_push_ordered_with_verifier(
+            &session2,
+            &bus2,
+            As4ReceivePushRequest {
+                http_content_type: content_type2,
+                payload: payload2,
+                receipt_payload: None,
+                policy: policy2,
+                authenticated_sender_scope: None,
+            },
+            dedup2,
+            gate2.as_ref(),
+            Arc::new(SlowVerifier::new()),
+        )
+        .await
+        .map(|ordered| ordered.holds_turn())
+    });
+
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    assert!(
+        !blocked.is_finished(),
+        "the second message must wait for the first turn to be released"
+    );
+
+    drop(ordered);
+    assert!(
+        blocked.await.expect("join").expect("second receive"),
+        "the second message takes the turn once the first releases it"
+    );
+}
+
+/// A second `eb:ConversationId` is refused rather than resolved by document
+/// order.
+///
+/// It is `maxOccurs="1"` in ebMS3 Core, and it is the key the ordering gate
+/// queues on — so "first wins" lets document order decide which conversation a
+/// message belongs to, and a byte scanner, a schema validator and a downstream
+/// MSH need not pick the same one (D5). Found by a test written for the
+/// mismatch guard, which could not construct a mismatch because the parser
+/// happily accepted the decoy.
+#[tokio::test]
+async fn ordered_receive_rejects_a_duplicated_conversation_id() {
+    let session = SessionContext::new("sess-ordered-swap", "partner-a", "strict").expect("session");
+    let bus = EventBus::new(16).expect("bus");
+    let policy = As4PushPolicyBuilder::new()
+        .fail_closed_audit_events(false)
+        .build()
+        .expect("policy");
+    let dedup: Arc<dyn crate::storage::DedupStorage> = Arc::new(DurableTestDedup(
+        InMemoryDedupBackend::new(Duration::from_secs(60)),
+    ));
+    let gate = Arc::new(As4ConversationOrderGate::new(64));
+
+    // Two `eb:ConversationId` elements: the bounded scanner reserves under the
+    // first it sees, the parser resolves the message to another.
+    let (payload, content_type) = ordered_test_multipart_payload("msg-swap", None);
+    let swapped = String::from_utf8_lossy(&payload).replace(
+        "<eb:CollaborationInfo><eb:Action>",
+        "<eb:CollaborationInfo><eb:ConversationId>conv-decoy</eb:ConversationId><eb:Action>",
+    );
+
+    let err = ordered_async::receive_push_ordered_with_verifier(
+        &session,
+        &bus,
+        As4ReceivePushRequest {
+            http_content_type: content_type,
+            payload: Arc::from(swapped.into_bytes()),
+            receipt_payload: None,
+            policy,
+            authenticated_sender_scope: None,
+        },
+        dedup,
+        gate.as_ref(),
+        Arc::new(SlowVerifier::new()),
+    )
+    .await
+    .expect_err("a UserMessage with two ConversationIds must be refused");
+    assert_eq!(err.code, ErrorCode::InteropViolation, "{err:?}");
+    assert!(
+        err.message.contains("duplicate ConversationId"),
+        "{}",
+        err.message
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ordered_receive_reserves_arrival_order_but_allows_parallel_heavy_verify() {
     let session =
         SessionContext::new("sess-ordered-stage-e", "partner-a", "strict").expect("session");
     let bus = EventBus::new(16).expect("bus");
-    let policy = As4PushPolicyBuilder::new().build().expect("policy");
+    let policy = As4PushPolicyBuilder::new()
+        // Without this the receive fails on the very first emission and the
+        // whole ordering scenario below never runs — which is how this test
+        // passed for a long time while asserting nothing (R15).
+        .fail_closed_audit_events(false)
+        .build()
+        .expect("policy");
     let dedup: Arc<dyn crate::storage::DedupStorage> = Arc::new(DurableTestDedup(
         InMemoryDedupBackend::new(Duration::from_secs(60)),
     ));
     let gate = Arc::new(As4ConversationOrderGate::new(64));
     let verifier = Arc::new(SlowVerifier::new());
 
+    let (payload_a, content_type_a) = ordered_test_multipart_payload("msg-1", None);
+    let (payload_b, content_type_b) = ordered_test_multipart_payload("msg-2", None);
     let request_a = As4ReceivePushRequest {
-        http_content_type: "application/soap+xml".into(),
-        payload: ordered_test_payload("msg-1", None),
+        http_content_type: content_type_a,
+        payload: payload_a,
         receipt_payload: None,
         policy: policy.clone(),
         authenticated_sender_scope: None,
     };
     let request_b = As4ReceivePushRequest {
-        http_content_type: "application/soap+xml".into(),
-        payload: ordered_test_payload("msg-2", None),
+        http_content_type: content_type_b,
+        payload: payload_b,
         receipt_payload: None,
         policy,
         authenticated_sender_scope: None,
@@ -342,15 +478,12 @@ async fn ordered_receive_reserves_arrival_order_but_allows_parallel_heavy_verify
     let v1 = verifier.clone();
     let tx1 = tx.clone();
     let t1 = tokio::spawn(async move {
-        let _ = ordered_async::receive_push_ordered_with_verifier(
-            &s1,
-            &b1,
-            request_a,
-            d1,
-            g1.as_ref(),
-            v1,
-        )
-        .await;
+        ordered_async::receive_push_ordered_with_verifier(&s1, &b1, request_a, d1, g1.as_ref(), v1)
+            .await
+            .expect(
+                "msg-1 must actually be received; a discarded error makes the \
+                 ordering assertion below meaningless",
+            );
         tx1.send("msg-1".to_string()).await.expect("send msg-1");
     });
 
@@ -363,15 +496,12 @@ async fn ordered_receive_reserves_arrival_order_but_allows_parallel_heavy_verify
     let v2 = verifier.clone();
     let tx2 = tx.clone();
     let t2 = tokio::spawn(async move {
-        let _ = ordered_async::receive_push_ordered_with_verifier(
-            &s2,
-            &b2,
-            request_b,
-            d2,
-            g2.as_ref(),
-            v2,
-        )
-        .await;
+        ordered_async::receive_push_ordered_with_verifier(&s2, &b2, request_b, d2, g2.as_ref(), v2)
+            .await
+            .expect(
+                "msg-2 must actually be received; a discarded error makes the \
+                 ordering assertion below meaningless",
+            );
         tx2.send("msg-2".to_string()).await.expect("send msg-2");
     });
 
@@ -534,7 +664,11 @@ async fn ordered_fragment_aware_receive_completes_in_conversation_turn_order() {
     .await
     .expect("ordered fragment-aware receive");
 
-    match progress {
+    assert!(
+        !progress.holds_turn(),
+        "an incomplete fragment group is not delivered, so it must not hold the conversation"
+    );
+    match progress.get() {
         As4ReceivePushProgress::PendingFragment { .. } => {}
         As4ReceivePushProgress::Complete(_) => {}
         As4ReceivePushProgress::Duplicate { .. } => panic!("unexpected duplicate"),

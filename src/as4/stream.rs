@@ -1,14 +1,9 @@
 //! Low-level stream-processing helpers for the AS4 receive pipeline.
 //!
-//! **P0 Streaming Refactor (May 21, 2026)**:
-//! This module implements streaming-aware MIME parsing with minimal intermediate allocation.
-//! Instead of materializing ALL multipart parts into a Vec, we only materialize the parts
-//! we actually need (root SOAP + referenced attachment). This dramatically reduces memory
-//! pressure for large payloads (10MB+) and eliminates unnecessary cloning in the hot path.
-//!
-//! Architecture: StreamingMimeParser yields part references (slices) without materializing.
-//! Only the SOAP root and the parts referenced by an `xop:Include` are kept;
-//! unreferenced parts are skipped without allocation.
+//! MIME parsing here is streaming-aware: the parser yields part references
+//! rather than materializing every part. Only the SOAP root and the parts an
+//! `xop:Include` refers to are kept; unreferenced parts are skipped without
+//! allocation, which is what keeps memory flat on large payloads.
 //!
 //! All functions are `pub(super)` — they are implementation details of the
 //! `as4` module family and must not be part of the public API.
@@ -42,13 +37,13 @@ pub(super) struct MultipartAs4Payload<'a> {
 impl<'a> MultipartAs4Payload<'a> {
     /// The first payload attachment — the common single-payload case.
     #[cfg(test)]
-    pub fn primary(&self) -> Option<InboundAttachment<'a>> {
+    pub(super) fn primary(&self) -> Option<InboundAttachment<'a>> {
         self.payloads.first().copied()
     }
 
     /// `(content_id, part_content_type, bytes)` triples for WS-Security
     /// `cid:` reference resolution.
-    pub fn external_references(&self) -> Vec<(&'a str, Option<&'a str>, &'a [u8])> {
+    pub(super) fn external_references(&self) -> Vec<(&'a str, Option<&'a str>, &'a [u8])> {
         self.payloads
             .iter()
             .map(|p| (p.content_id, p.content_type, p.bytes))
@@ -110,10 +105,9 @@ pub(super) fn extract_xop_cid_href_bytes(soap_xml: &[u8]) -> Option<&str> {
 ///
 /// Accepts both XML quoting styles and optional whitespace around `=`, so
 /// `href="cid:x"`, `href='cid:x'` and `href = "cid:x"` are all recognised. A
-/// single-quoted `href` is legal XML and several stacks emit it; matching only
-/// the double-quoted form used to leave the attachment unidentified, which in
-/// turn meant it could not be tied to a `ds:Reference URI="cid:…"` and so could
-/// never be proven signature-covered.
+/// single-quoted `href` is legal XML and several stacks emit it. An
+/// unidentified attachment cannot be tied to a `ds:Reference URI="cid:…"`, and
+/// so can never be proven signature-covered.
 ///
 /// Duplicate references are collapsed — one attachment referenced twice is
 /// still one attachment.
@@ -640,18 +634,7 @@ pub(super) fn normalize_mpc(mpc: &str) -> &str {
 ///
 /// Uses [`subtle::ConstantTimeEq`] for a well-audited, crate-standard
 /// constant-time implementation instead of a hand-rolled XOR loop.
-pub(super) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    use subtle::ConstantTimeEq;
-    // Length comparison leaks length via branching, but constant-time
-    // equality is undefined for different-length slices — any comparison that
-    // requires equal length must first verify the lengths match.
-    // Timing-leaking the length of `AuthorizationInfo` is acceptable because
-    // the value's length is also visible in the SOAP envelope.
-    if a.len() != b.len() {
-        return false;
-    }
-    a.ct_eq(b).into()
-}
+pub(super) use crate::core::constant_time_eq;
 
 #[cfg(test)]
 mod xop_href_tests {

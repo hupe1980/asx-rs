@@ -183,7 +183,7 @@ pub(crate) fn parse_spool_key_hex(hex_key: &str) -> Result<Arc<[u8; 32]>> {
     }
 
     let mut out = [0u8; 32];
-    for (idx, chunk) in hex_key.as_bytes().chunks_exact(2).enumerate() {
+    for (idx, chunk) in hex_key.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         let hi = (chunk[0] as char).to_digit(16);
         let lo = (chunk[1] as char).to_digit(16);
         let (Some(hi), Some(lo)) = (hi, lo) else {

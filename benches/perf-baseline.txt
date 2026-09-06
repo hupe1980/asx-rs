@@ -1,7 +1,18 @@
-# ns_per_op baseline (measured on CI Linux runner; local macOS is faster)
+# ns_per_op baseline for `xtask perf-gate --check-baseline`.
+#
+# Measured on the CI Linux runner, in **release**, with the feature set
+# `.github/workflows/ci.yml` invokes the gate with:
+#
+#   as2,as4,client,server,trace,compression,async-ocsp,interop-strict
+#
+# Local macOS runs come out faster; the gate allows a 25 % regression, so a
+# local check passing says little and a local check failing is worth reading.
+#
+# Only benchmarks this configuration compiles may appear here: an entry with no
+# matching measurement is a gate failure, not a skip. The receive-path
+# benchmarks are behind `testing`, which is a `compile_error!` in release, so
+# they run under a debug `just perf-gate` and are not baselined.
 as2_sign_encrypt=2600000.000
 as2_mdn_generation=500.000
-as2_verify_decrypt_mdn=1779.438
-as4_verify_decrypt=6477.604
 as4_precheck_markers=640.000
 as4_receipt_generation=550.000

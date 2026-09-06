@@ -326,25 +326,6 @@ fn is_valid_uri_scheme(scheme: &str) -> bool {
     bytes.all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.'))
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HttpResponse {
-    pub status: u16,
-    pub headers: HttpHeaders,
-    pub body: Vec<u8>,
-}
-
-impl HttpResponse {
-    pub fn is_success(&self) -> bool {
-        (200..300).contains(&self.status)
-    }
-}
-
-#[cfg(feature = "client")]
-#[derive(Debug, Clone, Default)]
-pub struct ClientRuntime {
-    pub user_agent: String,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -123,7 +123,7 @@ fn signed_as4_message() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
         )
         .build()
         .expect("session")
-        .with_strict_runtime_bootstrap_validated(true);
+        .test_only_mark_strict_runtime_bootstrap_validated();
 
     let bus = EventBus::new_for_testing();
 

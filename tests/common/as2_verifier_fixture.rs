@@ -8,13 +8,13 @@ use asx_rs::lifecycle::TrustEvidence;
 
 #[cfg(all(feature = "as2", feature = "testing"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct DeterministicTrustVerifier {
+pub(crate) struct DeterministicTrustVerifier {
     trust: TrustEvidence,
 }
 
 #[cfg(all(feature = "as2", feature = "testing"))]
 impl DeterministicTrustVerifier {
-    pub fn new(trust: TrustEvidence) -> Self {
+    pub(crate) fn new(trust: TrustEvidence) -> Self {
         Self { trust }
     }
 }
@@ -38,7 +38,7 @@ impl As2TrustVerifier for DeterministicTrustVerifier {
 }
 
 #[inline]
-pub fn fixture(name: &str) -> Vec<u8> {
+pub(crate) fn fixture(name: &str) -> Vec<u8> {
     let path = format!("tests/fixtures/{name}");
     std::fs::read(&path).unwrap_or_else(|_| panic!("failed to read fixture: {path}"))
 }

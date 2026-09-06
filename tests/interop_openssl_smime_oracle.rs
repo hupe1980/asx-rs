@@ -79,7 +79,7 @@ fn session(id: &Identity) -> asx_rs::core::SessionContext {
         .with_ocsp_mode(OcspMode::Disabled)
         .build()
         .expect("session")
-        .with_strict_runtime_bootstrap_validated(true)
+        .test_only_mark_strict_runtime_bootstrap_validated()
 }
 
 fn send(id: &Identity, sign: bool, encrypt: bool) -> asx_rs::as2::As2SendOutput {

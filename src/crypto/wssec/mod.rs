@@ -520,6 +520,22 @@ mod tests {
         BASE64_STANDARD.encode(signer.sign_to_vec().expect("sign"))
     }
 
+    /// The `<ds:Transforms>` a real signer writes for this reference.
+    ///
+    /// A same-document reference must state the exclusive algorithm, because
+    /// XMLDSig §4.3.3.2 makes *inclusive* C14N the default for one that states
+    /// nothing (D2). A `cid:` reference dereferences to an octet stream and
+    /// correctly carries no C14N transform at all.
+    fn reference_transforms(reference_uri: &str) -> &'static str {
+        if reference_uri.starts_with("cid:") {
+            ""
+        } else {
+            "\n                    <ds:Transforms>\
+             \n                        <ds:Transform Algorithm=\"http://www.w3.org/2001/10/xml-exc-c14n#\"/>\
+             \n                    </ds:Transforms>"
+        }
+    }
+
     fn signed_xml_with_rsa_keyvalue(
         reference_uri: &str,
         payload_xml: &str,
@@ -528,6 +544,7 @@ mod tests {
         modulus_base64: &str,
         exponent_base64: &str,
     ) -> String {
+        let transforms = reference_transforms(reference_uri);
         format!(
             r#"<soap:Envelope xmlns:soap="http://www.w3.org/2003/05/soap-envelope"
         xmlns:wsu="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd"
@@ -538,7 +555,7 @@ mod tests {
             <ds:SignedInfo>
                 <ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>
                 <ds:SignatureMethod Algorithm="{RSA_SHA256_URI}"/>
-                <ds:Reference URI="{reference_uri}">
+                <ds:Reference URI="{reference_uri}">{transforms}
                     <ds:DigestMethod Algorithm="{SHA256_URI}"/>
                     <ds:DigestValue>{digest_base64}</ds:DigestValue>
                 </ds:Reference>
@@ -570,6 +587,7 @@ mod tests {
         exponent_base64: &str,
         x509_certificate_base64: &str,
     ) -> String {
+        let transforms = reference_transforms(reference_uri);
         format!(
             r#"<soap:Envelope xmlns:soap="http://www.w3.org/2003/05/soap-envelope"
         xmlns:wsu="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd"
@@ -580,7 +598,7 @@ mod tests {
             <ds:SignedInfo>
                 <ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>
                 <ds:SignatureMethod Algorithm="{RSA_SHA256_URI}"/>
-                <ds:Reference URI="{reference_uri}">
+                <ds:Reference URI="{reference_uri}">{transforms}
                     <ds:DigestMethod Algorithm="{SHA256_URI}"/>
                     <ds:DigestValue>{digest_base64}</ds:DigestValue>
                 </ds:Reference>
@@ -613,6 +631,7 @@ mod tests {
         signature_value_base64: &str,
         x509_certificate_base64: &str,
     ) -> String {
+        let transforms = reference_transforms(reference_uri);
         format!(
             r#"<soap:Envelope xmlns:soap="http://www.w3.org/2003/05/soap-envelope"
         xmlns:wsu="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd"
@@ -623,7 +642,7 @@ mod tests {
             <ds:SignedInfo>
                 <ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>
                 <ds:SignatureMethod Algorithm="{RSA_SHA256_URI}"/>
-                <ds:Reference URI="{reference_uri}">
+                <ds:Reference URI="{reference_uri}">{transforms}
                     <ds:DigestMethod Algorithm="{SHA256_URI}"/>
                     <ds:DigestValue>{digest_base64}</ds:DigestValue>
                 </ds:Reference>
@@ -641,6 +660,62 @@ mod tests {
     </soap:Body>
 </soap:Envelope>"#
         )
+    }
+
+    /// XMLDSig §4.3.3.2: a same-document reference that declares no transform
+    /// is digested over **inclusive** Canonical XML. Defaulting to exclusive
+    /// rejects a conformant peer's signature as a forgery whenever an ancestor
+    /// declares a namespace the signed subtree does not use — the ordinary
+    /// shape of a SOAP envelope.
+    #[test]
+    fn transformless_same_document_reference_digests_over_inclusive_c14n() {
+        let payload = "    <eb:Payload wsu:Id=\"payload-1\">ABC</eb:Payload>";
+        let skeleton = signed_xml_with_x509_only("#payload-1", payload, "placeholder", "AA==", "");
+        // Strip the transform the fixture writes, leaving a bare reference.
+        let bare = skeleton
+            .replace(
+                "\n                    <ds:Transforms>\
+                 \n                        <ds:Transform Algorithm=\"http://www.w3.org/2001/10/xml-exc-c14n#\"/>\
+                 \n                    </ds:Transforms>",
+                "",
+            );
+        assert!(!bare.contains("ds:Transforms"), "the fixture must be bare");
+
+        let inclusive = canonicalize_reference(
+            &bare,
+            "#payload-1",
+            WsSecCanonicalizationProfile {
+                kind: WsSecCanonicalizationKind::Inclusive,
+                include_comments: false,
+                inclusive_ns_prefixes: Vec::new(),
+            },
+        )
+        .expect("inclusive digest")
+        .digest_value_base64;
+
+        let exclusive =
+            canonicalize_reference(&bare, "#payload-1", WsSecCanonicalizationProfile::default())
+                .expect("exclusive digest")
+                .digest_value_base64;
+
+        assert_ne!(
+            inclusive, exclusive,
+            "the fixture must be one where the two algorithms disagree, or it \
+             proves nothing"
+        );
+
+        // What the reference parser resolves the bare reference to is what
+        // decides which of the two digests the verifier will compute.
+        let references = parse_signature_references(&bare).expect("references parse");
+        let reference = references
+            .iter()
+            .find(|r| r.uri == "#payload-1")
+            .expect("the reference is present");
+        assert_eq!(
+            reference.c14n_kind,
+            WsSecCanonicalizationKind::Inclusive,
+            "a transform-less same-document reference defaults to inclusive C14N"
+        );
     }
 
     #[test]

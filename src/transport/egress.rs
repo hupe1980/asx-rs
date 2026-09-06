@@ -55,27 +55,97 @@ use crate::observability::EventBus;
 
 // ── SSRF protection ─────────────────────────────────────────────────────────
 
-/// Validate an outbound URL before sending.
+/// Validate an **OCSP responder URL** and return a client pinned to the
+/// addresses that were validated.
 ///
-/// Rejects:
-/// - Non-HTTP(S) schemes.
-/// - All plain-HTTP URLs.
-/// - Private / loopback / link-local IP ranges (RFC 1918, RFC 4291 §2.5.3,
-///   RFC 3927) to prevent Server-Side Request Forgery (SSRF).
-/// - Hostnames that DNS-resolve to any private / loopback address (DNS-rebinding
-///   defence).
+/// The responder URL comes out of the certificate's AIA extension, so on an
+/// inbound message it is chosen by whoever presented the certificate — and
+/// revocation checking runs *while* trust is being established, i.e. before
+/// that party is trusted at all. Without this check a peer could point the
+/// responder at `169.254.169.254` or any internal address and have the server
+/// POST to it: a textbook SSRF with an attacker-supplied target.
+///
+/// Plain HTTP is permitted here and nowhere else; see [`EgressSchemePolicy`].
 ///
 /// # Errors
-/// Returns [`ErrorCode::InvalidInput`] for malformed URLs, disallowed schemes,
-/// or private-range IP hosts. Returns [`ErrorCode::PolicyViolation`] when
-/// plain HTTP is attempted.
-#[cfg_attr(not(feature = "as4"), allow(dead_code))]
-pub(crate) async fn validate_egress_url(url: &str, context: &'static str) -> Result<()> {
+///
+/// [`ErrorCode::InvalidInput`] for a malformed URL, a non-HTTP scheme, or a
+/// host that is (or resolves to) a private, loopback or link-local address.
+// Only the OCSP fetcher uses these, and it exists only under `async-ocsp`.
+#[cfg(feature = "async-ocsp")]
+pub(crate) async fn validated_pinned_ocsp_client(
+    url: &str,
+    config: &TransportConfig,
+    context: &'static str,
+) -> Result<reqwest::Client> {
+    let target = validate_egress_target(
+        url,
+        context,
+        EgressSchemePolicy::AllowPlaintextForSignedOcsp,
+    )
+    .await?;
+    let pinned = target
+        .resolved_host
+        .as_deref()
+        .map(|host| (host, target.resolved_addrs.as_slice()));
+    build_ocsp_http_client(config, context, pinned)
+}
+
+#[cfg(feature = "async-ocsp")]
+fn build_ocsp_http_client(
+    config: &TransportConfig,
+    context: &'static str,
+    pinned_resolution: Option<(&str, &[SocketAddr])>,
+) -> Result<reqwest::Client> {
+    let mut builder = reqwest::Client::builder()
+        // Not `https_only`: RFC 6960 responders are commonly plain HTTP and the
+        // response is signed.
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(config.connect_timeout)
+        .timeout(config.request_timeout)
+        .user_agent(&config.user_agent);
+
+    if let Some((host, addrs)) = pinned_resolution {
+        builder = builder.resolve_to_addrs(host, addrs);
+    }
+
+    builder.build().map_err(|err| {
+        AsxError::new(
+            ErrorCode::TransportFailure,
+            format!("failed to build OCSP HTTP client: {err}"),
+            ErrorContext::new(context),
+        )
+    })
+}
+
+/// Validate `url` and return a client **pinned to the addresses that were
+/// validated**.
+///
+/// Validating DNS and then letting the HTTP client resolve again is a
+/// time-of-check/time-of-use hole: an attacker controlling the DNS response
+/// answers with a public address for the check and a private one for the
+/// connection, and the SSRF control has done nothing. Everything that makes an
+/// outbound request must go through this, not through
+/// [`validate_egress_target_with_policy`] plus a client of its own.
+///
+/// # Errors
+///
+/// Whatever [`validate_egress_target_with_policy`] rejects, plus a
+/// client-construction failure.
+// Only the SMP client uses this; the AS2/AS4 transports pin inline because they
+// already hold a shared client for the IP-literal case.
+#[cfg(feature = "as4")]
+pub(crate) async fn validated_pinned_client(
+    url: &str,
+    config: &TransportConfig,
+    context: &'static str,
+) -> Result<reqwest::Client> {
     let target = validate_egress_target_with_policy(url, context).await?;
-    // In client-only builds without AS2/AS4 transport features enabled, this
-    // keeps the validated target fields live so warning hygiene stays clean.
-    let _ = (&target.url, &target.resolved_host, &target.resolved_addrs);
-    Ok(())
+    match target.resolved_host.as_deref() {
+        Some(host) => build_http_client(config, context, Some((host, &target.resolved_addrs))),
+        // A bare-IP target was validated literally; there is no name to pin.
+        None => build_http_client(config, context, None),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -128,9 +198,45 @@ fn enforce_loopback_target(url: &str, context: &'static str) -> Result<()> {
     Ok(())
 }
 
+/// Whether an egress target may use plain HTTP.
+///
+/// Almost nothing may: business payloads and SMP metadata go over TLS. OCSP is
+/// the exception the standard itself carves out — RFC 6960 responses are signed
+/// by the responder, so their integrity does not depend on the transport, and
+/// responders are routinely published as `http://` URLs in a certificate's AIA
+/// extension. Requiring HTTPS there would break revocation checking against
+/// most public PKIs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EgressSchemePolicy {
+    /// HTTPS only.
+    HttpsOnly,
+    /// HTTPS or plain HTTP. Only for RFC 6960 OCSP.
+    AllowPlaintextForSignedOcsp,
+}
+
 async fn validate_egress_target_with_policy(
     url: &str,
     context: &'static str,
+) -> Result<ValidatedEgressTarget> {
+    validate_egress_target(url, context, EgressSchemePolicy::HttpsOnly).await
+}
+
+/// Validation-only entry point for the tests below.
+///
+/// Production code must use [`validated_pinned_client`] instead: validating a
+/// URL and then letting a separate client re-resolve DNS is the rebinding hole
+/// this whole module exists to close.
+#[cfg(test)]
+async fn validate_egress_url(url: &str, context: &'static str) -> Result<()> {
+    validate_egress_target_with_policy(url, context)
+        .await
+        .map(|_| ())
+}
+
+async fn validate_egress_target(
+    url: &str,
+    context: &'static str,
+    scheme_policy: EgressSchemePolicy,
 ) -> Result<ValidatedEgressTarget> {
     let parsed = reqwest::Url::parse(url).map_err(|_| {
         AsxError::new(
@@ -142,6 +248,7 @@ async fn validate_egress_target_with_policy(
 
     match parsed.scheme() {
         "https" => {}
+        "http" if scheme_policy == EgressSchemePolicy::AllowPlaintextForSignedOcsp => {}
         "http" => {
             return Err(AsxError::new(
                 ErrorCode::PolicyViolation,
@@ -442,6 +549,7 @@ fn reqwest_to_asx(err: reqwest::Error, context: &'static str) -> AsxError {
 ///
 /// Use [`As2HttpTransport::new`] with a [`TransportConfig`] (or
 /// `TransportConfig::default()`) to construct an instance.
+#[derive(Debug)]
 pub struct As2HttpTransport {
     client: reqwest::Client,
     runtime_config: TransportConfig,
@@ -696,6 +804,7 @@ pub struct As2AsyncMdnRequest {
 /// - `Content-Length: <bytes>`
 ///
 /// where `<action>` is taken from [`As4SendOutput::action`].
+#[derive(Debug)]
 pub struct As4HttpTransport {
     client: reqwest::Client,
     runtime_config: TransportConfig,

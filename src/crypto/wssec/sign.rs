@@ -162,7 +162,7 @@ pub fn generate_xmlsig_signature_with_external_references_preparsed(
 /// This is the recommended API for new code. Pass a [`PemSigningKeyProvider`]
 /// for in-memory keys, or any custom type implementing [`SigningKeyProvider`]
 /// for HSM / cloud KMS backends.
-pub fn generate_xmlsig_signature_with_provider(
+pub(crate) fn generate_xmlsig_signature_with_provider(
     envelope_xml: &str,
     reference_uris: &[&str],
     external_references: &[(&str, &[u8])],

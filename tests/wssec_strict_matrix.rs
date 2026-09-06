@@ -18,6 +18,9 @@ fn signed_xml(reference_uri: &str, payload_xml: &str, digest_base64: &str) -> St
     <ds:Signature>
       <ds:SignedInfo>
         <ds:Reference URI="{reference_uri}">
+          <ds:Transforms>
+            <ds:Transform Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>
+          </ds:Transforms>
           <ds:DigestMethod Algorithm="{SHA256_URI}"/>
           <ds:DigestValue>{digest_base64}</ds:DigestValue>
         </ds:Reference>

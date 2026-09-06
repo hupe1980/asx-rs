@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 /// Validate that `message_id` is non-empty and return a trimmed copy.
 /// `context` is the error context label (e.g. `"as2_send_validate"`).
-pub fn validate_message_id(
+pub(crate) fn validate_message_id(
     message_id: &str,
     context: &'static str,
     session: &SessionContext,
@@ -35,7 +35,7 @@ pub fn validate_message_id(
 }
 
 /// Validate that signing credentials are present when `sign = true`.
-pub fn validate_signing_credentials(
+pub(crate) fn validate_signing_credentials(
     sign: bool,
     has_key: bool,
     has_cert: bool,
@@ -54,7 +54,7 @@ pub fn validate_signing_credentials(
 }
 
 /// Validate that encryption credentials are present when `encrypt = true`.
-pub fn validate_encryption_credentials(
+pub(crate) fn validate_encryption_credentials(
     encrypt: bool,
     has_recipient_cert: bool,
     context: &'static str,
@@ -72,7 +72,7 @@ pub fn validate_encryption_credentials(
 }
 
 /// Emit `AsxEvent::OutboundPrepared` for the given protocol and message.
-pub fn emit_outbound_prepared(
+pub(crate) fn emit_outbound_prepared(
     event_bus: &EventBus,
     session: &SessionContext,
     message_id: &str,
@@ -92,7 +92,7 @@ pub fn emit_outbound_prepared(
 }
 
 /// Emit `AsxEvent::MessageSigned` for the given message (only when signing was applied).
-pub fn emit_message_signed(
+pub(crate) fn emit_message_signed(
     event_bus: &EventBus,
     session: &SessionContext,
     message_id: &str,
@@ -110,7 +110,7 @@ pub fn emit_message_signed(
 }
 
 /// Emit `AsxEvent::MessageEncrypted` for the given message (only when encryption was applied).
-pub fn emit_message_encrypted(
+pub(crate) fn emit_message_encrypted(
     event_bus: &EventBus,
     session: &SessionContext,
     message_id: &str,
@@ -129,7 +129,7 @@ pub fn emit_message_encrypted(
 
 /// Classify a send-path error into a retry decision used by default async
 /// send orchestration.
-pub fn classify_send_retry(err: &AsxError) -> RetryDecision {
+pub(crate) fn classify_send_retry(err: &AsxError) -> RetryDecision {
     let class = match err.code {
         ErrorCode::TransportFailure | ErrorCode::CapacityExhausted | ErrorCode::Timeout => {
             RetryClass::Transient

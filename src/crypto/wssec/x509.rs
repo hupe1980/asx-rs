@@ -472,16 +472,7 @@ pub(crate) fn sha256_hex_lower(input: &[u8]) -> String {
     out
 }
 
-pub(crate) fn secure_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (lhs, rhs) in a.iter().zip(b.iter()) {
-        diff |= lhs ^ rhs;
-    }
-    diff == 0
-}
+pub(crate) use crate::core::constant_time_eq as secure_eq;
 
 #[cfg(test)]
 mod key_strength_tests {

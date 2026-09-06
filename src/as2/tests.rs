@@ -35,6 +35,7 @@ fn session() -> SessionContext {
         .with_strict_runtime_bootstrap_validated(true)
 }
 
+#[derive(Debug)]
 struct DurableTestDedup(InMemoryDedupBackend);
 
 impl DedupStorage for DurableTestDedup {
@@ -53,6 +54,8 @@ impl DedupStorage for DurableTestDedup {
         self.0.first_seen(idempotency_key)
     }
 }
+
+#[derive(Debug)]
 
 struct DurableTestReconciliationWrapper(InMemoryReconciliationHook);
 
@@ -99,9 +102,12 @@ fn strict_bus() -> EventBus {
     .expect("bus")
 }
 
+#[derive(Debug)]
+
 struct AlwaysFailReconciliation;
 
 #[cfg(not(feature = "testing"))]
+#[derive(Debug)]
 struct DurableTestReconciliation(InMemoryReconciliationHook);
 
 #[cfg(not(feature = "testing"))]

@@ -76,13 +76,24 @@ fn mic_values_match(actual: &str, expected: &str) -> bool {
     let (actual_digest, actual_alg) = normalize_received_mic_value(actual);
     let (expected_digest, expected_alg) = normalize_received_mic_value(expected);
 
-    // Compare digest bytes (base64-decoded when both sides decode successfully).
+    // Strip whitespace before decoding. A `Received-Content-MIC` travels in a
+    // MIME header, and RFC 5322 §2.2.3 lets a header fold across lines — so a
+    // conformant partner's digest can arrive with a CRLF and a space inside it.
+    // Decoding that with the strict engine fails, which used to drop the
+    // comparison to raw string equality and report a MIC mismatch: a delivered
+    // message declared undelivered. Same defect class as the XML base64 path.
+    let unfold = |v: &str| -> String { v.chars().filter(|c| !c.is_ascii_whitespace()).collect() };
+    let actual_compact = unfold(actual_digest);
+    let expected_compact = unfold(expected_digest);
+
+    // Compare digest bytes (base64-decoded when both sides decode successfully),
+    // in constant time.
     let digests_match = match (
-        STANDARD.decode(actual_digest),
-        STANDARD.decode(expected_digest),
+        STANDARD.decode(&actual_compact),
+        STANDARD.decode(&expected_compact),
     ) {
-        (Ok(a), Ok(b)) => a == b,
-        _ => actual_digest == expected_digest,
+        (Ok(a), Ok(b)) => crate::core::constant_time_eq(&a, &b),
+        _ => crate::core::constant_time_eq(actual_compact.as_bytes(), expected_compact.as_bytes()),
     };
 
     if !digests_match {
@@ -598,4 +609,43 @@ fn resolve_mdn_notification_part<'a>(
     }
 
     Ok(None)
+}
+
+#[cfg(test)]
+mod mic_match_tests {
+    use super::mic_values_match;
+
+    /// RFC 5322 §2.2.3 lets a MIME header fold across lines, so a conformant
+    /// partner's `Received-Content-MIC` can arrive with a CRLF and a space
+    /// inside the base64. Strict decoding failed on that and the comparison
+    /// fell back to raw string equality — reporting a MIC mismatch, i.e. a
+    /// delivered message declared undelivered.
+    #[test]
+    fn folded_received_content_mic_header_still_matches() {
+        let digest = "hvfkN/qlp/zhXR3cuerq6jd2Z7g+/Z9nDkNbLmXcU0k=";
+        let unfolded = format!("{digest}, sha-256");
+        let folded = "hvfkN/qlp/zhXR3cuerq\r\n 6jd2Z7g+/Z9nDkNbLmXcU0k=, sha-256";
+
+        assert!(
+            mic_values_match(folded, &unfolded),
+            "a folded header carries the same digest"
+        );
+    }
+
+    #[test]
+    fn a_different_digest_still_fails() {
+        let a = "hvfkN/qlp/zhXR3cuerq6jd2Z7g+/Z9nDkNbLmXcU0k=, sha-256";
+        let b = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=, sha-256";
+        assert!(!mic_values_match(a, b));
+    }
+
+    /// A weaker algorithm with the same digest field must not pass.
+    #[test]
+    fn algorithm_mismatch_fails() {
+        let digest = "hvfkN/qlp/zhXR3cuerq6jd2Z7g+/Z9nDkNbLmXcU0k=";
+        assert!(!mic_values_match(
+            &format!("{digest}, sha-256"),
+            &format!("{digest}, md5")
+        ));
+    }
 }

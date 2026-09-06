@@ -34,16 +34,16 @@ AS4 (OASIS ebMS3 + eDelivery) EDI transport protocols. The crate is published as
 
 ```toml
 # AS2 only (sign, encrypt, OCSP; compression is enabled by default):
-asx-rs = { version = "0.13", features = ["as2", "async-ocsp"] }
+asx-rs = { version = "0.14", features = ["as2", "async-ocsp"] }
 
 # AS4 only (sign, encrypt; compression is enabled by default):
-asx-rs = { version = "0.13", features = ["as4", "async-ocsp"] }
+asx-rs = { version = "0.14", features = ["as4", "async-ocsp"] }
 
 # Both protocols with compression:
-asx-rs = { version = "0.13", features = ["as2", "as4", "compression", "async-ocsp"] }
+asx-rs = { version = "0.14", features = ["as2", "as4", "compression", "async-ocsp"] }
 
 # Both protocols, relaxed interop for legacy partners:
-asx-rs = { version = "0.13", features = ["as2", "as4", "interop-relaxed", "async-ocsp"] }
+asx-rs = { version = "0.14", features = ["as2", "as4", "interop-relaxed", "async-ocsp"] }
 
 ```
 
@@ -63,7 +63,11 @@ asx-rs = { version = "0.13", features = ["as2", "as4", "interop-relaxed", "async
 - HTTP egress transports are HTTPS-only.
 */
 
-pub mod alerting;
+// The crate parses MIME, SOAP, XML and CMS straight off the network. Memory
+// safety there is the entire point, so `unsafe` is not merely absent — it
+// cannot be added.
+#![forbid(unsafe_code)]
+
 pub mod core;
 #[cfg(any(feature = "as2", feature = "as4"))]
 pub mod credentials;
@@ -116,9 +120,6 @@ pub mod as4;
 #[cfg(feature = "client")]
 #[cfg(feature = "as4")]
 pub mod smp;
-
-#[cfg(feature = "client")]
-pub mod incident_channels;
 
 pub use core::{AsxError, CryptoAdmissionControl, ErrorCode, ErrorContext, Result};
 #[cfg(any(feature = "as2", feature = "as4"))]

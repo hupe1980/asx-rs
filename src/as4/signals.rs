@@ -505,12 +505,22 @@ pub fn generate_pull_request(
 /// [`generate_signed_receipt_for_output`] instead.
 ///
 /// # Example
-/// ```rust,ignore
-/// let outcome = asx_rs::as4::receive_push_with_dedup_async(&session, &bus, req, dedup).await?;
+/// ```no_run
+/// use asx_rs::as4::{generate_receipt_for_output, As4ReceiveOutcome};
+/// use asx_rs::core::SessionContext;
+///
+/// # fn example(
+/// #     session: &SessionContext,
+/// #     outcome: As4ReceiveOutcome,
+/// # ) -> asx_rs::Result<()> {
 /// if let As4ReceiveOutcome::FirstSeen(output) = outcome {
+///     // A ping is acknowledged but never delivered (ebMS3 §5.2.2).
 ///     let receipt_id = format!("receipt@{}", uuid::Uuid::new_v4());
-///     let receipt_bytes = generate_receipt_for_output(&session, &receipt_id, &output)?;
+///     let receipt_bytes = generate_receipt_for_output(session, &receipt_id, &output)?;
+///     let _ = receipt_bytes;
 /// }
+/// # Ok(())
+/// # }
 /// ```
 pub fn generate_receipt_for_output(
     session: &SessionContext,
@@ -541,14 +551,28 @@ pub fn generate_receipt_for_output(
 /// [`generate_receipt_for_output`].
 ///
 /// # Example
-/// ```rust,ignore
-/// let outcome = asx_rs::as4::receive_push_with_dedup_async(&session, &bus, req, dedup).await?;
+/// ```no_run
+/// use asx_rs::as4::{
+///     generate_signed_receipt_for_output, As4ReceiptCredentials, As4ReceiveOutcome,
+/// };
+/// use asx_rs::core::SessionContext;
+///
+/// # fn example(
+/// #     session: &SessionContext,
+/// #     outcome: As4ReceiveOutcome,
+/// #     raw_body: &[u8],
+/// #     content_type: &str,
+/// #     credentials: &As4ReceiptCredentials,
+/// # ) -> asx_rs::Result<()> {
 /// if let As4ReceiveOutcome::FirstSeen(output) = outcome {
 ///     let receipt_id = format!("receipt@{}", uuid::Uuid::new_v4());
 ///     let receipt_bytes = generate_signed_receipt_for_output(
-///         &session, &receipt_id, &output, &raw_body, &content_type, &credentials,
+///         session, &receipt_id, &output, raw_body, content_type, credentials,
 ///     )?;
+///     let _ = receipt_bytes;
 /// }
+/// # Ok(())
+/// # }
 /// ```
 #[cfg_attr(feature = "trace", tracing::instrument(skip_all, fields(message_id = %receipt_message_id, partner_id = %session.partner_id())))]
 pub fn generate_signed_receipt_for_output(

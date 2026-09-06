@@ -17,16 +17,15 @@ fn build_bus_with_subscribers(
 ) -> BenchState {
     let capacity = events_per_sample.saturating_mul(2).max(1024);
     let per_session_capacity = events_per_sample.saturating_mul(2).max(1024);
-    let bus = EventBus::new_with_config_and_mode(
-        capacity,
-        None,
-        BackpressurePolicy {
+    let bus = EventBus::builder()
+        .capacity(capacity)
+        .backpressure(BackpressurePolicy {
             session_channel_capacity: per_session_capacity,
             ..BackpressurePolicy::default()
-        },
-        emission_mode,
-    )
-    .expect("event bus");
+        })
+        .emission_mode(emission_mode)
+        .build()
+        .expect("event bus");
 
     // Keep one broadcast subscriber active so strict modes can emit.
     let broadcast = bus.subscribe_scoped_events();

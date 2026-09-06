@@ -17,13 +17,20 @@ insert_anchor_links = "heading"
 
 [search]
 index_format = "elasticlunr_json"
+# Full page bodies are indexed, deliberately. Truncating shrinks the file a lot
+# but turns full-text search into title search — a reader looking for "digest"
+# or "replay window" gets nothing, which is worse than a larger file.
+#
+# The size does not reach the critical path: `search.js` fetches the index only
+# on the first search interaction, so it never affects page load or Core Web
+# Vitals, and GitHub Pages serves it compressed.
 
 [extra]
 repo = "https://github.com/hupe1980/asx-rs"
 crate = "https://crates.io/crates/asx-rs"
 api_docs = "https://docs.rs/asx-rs"
 # Shown in the page footer and the JSON-LD `softwareVersion`.
-version = "0.13.0"
+version = "0.14.0"
 # Fallback social-card text when a page sets no description.
 default_description = "Async-native AS2 and AS4 (ebMS3) B2B messaging for Rust."
 
@@ -71,10 +78,6 @@ path = "/docs/observability/"
 [[extra.nav.items]]
 title = "Persistence"
 path = "/docs/persistence/"
-[[extra.nav.items]]
-title = "Incident channels"
-path = "/docs/incident-channels/"
-
 [[extra.nav]]
 title = "Contributing"
 [[extra.nav.items]]

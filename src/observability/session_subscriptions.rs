@@ -18,6 +18,7 @@ pub(super) struct SessionSenderEntry {
     pub(super) sender: mpsc::Sender<SharedAsxEvent>,
 }
 
+#[derive(Debug)]
 pub struct SessionEventSubscription {
     receiver: mpsc::Receiver<SharedAsxEvent>,
     senders: Arc<DashMap<String, Vec<SessionSenderEntry>>>,

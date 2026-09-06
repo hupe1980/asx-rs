@@ -25,7 +25,7 @@ const SOAP12_NAMESPACE: &str = "http://www.w3.org/2003/05/soap-envelope";
 const SOAP12_HTTP_CONTENT_TYPE: &str = "application/soap+xml";
 const SOAP12_MUST_UNDERSTAND_TOKEN: &str = "true";
 
-#[derive(Clone, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct As4SendRequest {
     pub message_id: String,
     pub payload: Vec<u8>,
@@ -109,7 +109,7 @@ impl As4AdditionalPayload {
     }
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct As4SendPreparedRequest {
     pub message_id: String,
     pub payload: Vec<u8>,
@@ -568,7 +568,14 @@ fn send_sync_prepared_ref(
         .as_deref()
         .unwrap_or_else(|| session.partner_id());
 
-    let build_soap_xml = |payload: Vec<u8>, ws_header: Option<String>| -> Result<String> {
+    // Pin `eb:MessageInfo/eb:Timestamp` once. The envelope is built twice below
+    // — unsigned to compute the `eb:Messaging` digest, then again with the
+    // `wsse:Security` header — and reading the clock inside each build let the
+    // two straddle a second boundary, shipping an envelope whose `eb:Messaging`
+    // no longer matched the digest that was signed. About one send in a
+    // thousand went out unverifiable.
+    let message_timestamp = crate::time_utils::format_rfc3339_secs(std::time::SystemTime::now());
+    let build_soap_xml = |payload: Vec<u8>, reserve_ws_security: bool| -> Result<String> {
         let extra_part_infos: Vec<(String, String, Option<String>)> = extra_parts
             .iter()
             .map(|part| {
@@ -610,9 +617,10 @@ fn send_sync_prepared_ref(
         if let Some(wsa) = &policy.ws_addressing {
             builder = builder.with_ws_addressing(wsa.clone());
         }
-        if let Some(header) = ws_header {
-            builder = builder.with_ws_security_header(header);
+        if reserve_ws_security {
+            builder = builder.with_ws_security_placeholder();
         }
+        builder = builder.with_message_timestamp(message_timestamp.clone());
         let built = builder.build().map_err(|err| {
             AsxError::new(
                 ErrorCode::ParseFailed,
@@ -628,7 +636,13 @@ fn send_sync_prepared_ref(
     // empty. (Through 0.12.0 asx emitted MTOM-style `xop:Include` in the Body with
     // an `application/xop+xml` root part, which WSS4J-based receivers reject
     // at DOM conversion.)
-    let unsigned_xml = build_soap_xml(Vec::new(), None)?;
+    // Built exactly once. When signing, the `wsse:Security` slot is reserved with
+    // a placeholder and the finished header is spliced in after the signature is
+    // computed — the placeholder sits outside both signed subtrees, so it cannot
+    // move a digest. Rebuilding the envelope to add the header is what let
+    // `eb:Timestamp` differ between the bytes that were digested and the bytes
+    // that shipped, roughly once in a thousand sends (D42).
+    let unsigned_xml = build_soap_xml(Vec::new(), policy.sign)?;
 
     let mut soap_xml = if policy.sign {
         let signing_key = signing_key.ok_or_else(|| {
@@ -733,9 +747,9 @@ fn send_sync_prepared_ref(
         })?;
         let wsse_header = generated_xml_bytes_to_string(wsse_header);
 
-        // Rebuild the SOAP envelope with the structured WS-Security header.
-        // This avoids brittle string-marker insertion into generated XML.
-        build_soap_xml(Vec::new(), Some(wsse_header))?
+        // Splice, do not rebuild. `splice_ws_security_header` requires exactly
+        // one placeholder, so the insertion cannot silently miss.
+        crate::crypto::soap_builder::splice_ws_security_header(&unsigned_xml, &wsse_header)?
     } else {
         unsigned_xml
     };

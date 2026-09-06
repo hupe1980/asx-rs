@@ -495,8 +495,37 @@ pub async fn receive_push_ordered(
     session: &SessionContext,
     event_bus: &EventBus,
     request: As4ReceivePushOrderedRequest<'_>,
-) -> Result<As4ReceivePushOutput>
+) -> Result<As4Ordered<As4ReceiveOutcome>>
 ```
+
+Ordered delivery (ebMS3 §5.1.5), with two properties the signature encodes:
+
+- **The place in the queue is taken on arrival.** The `eb:ConversationId` is
+  read from the raw bytes with a bounded scan *before* parse, verification and
+  decryption, which still run in parallel across messages.
+- **The turn is held until you drop it.** `As4Ordered<T>` is a guard — deliver
+  the message while you hold it.
+
+```rust
+let ordered = receive_push_ordered(&session, &bus, request).await?;
+
+if let As4ReceiveOutcome::FirstSeen(output) = ordered.get() {
+    application.deliver(output).await?;   // turn still held
+}
+
+drop(ordered);                            // next message may proceed
+```
+
+| Method | Behaviour |
+|---|---|
+| `get()` | Borrow the outcome; the turn stays held |
+| `holds_turn()` | `false` for a duplicate or an incomplete fragment group — neither is delivered |
+| `into_inner()` | Take the outcome and **end the turn** |
+
+The scanned conversation id is unauthenticated, so it is compared against the
+verified `eb:ConversationId` after parsing; a mismatch is a
+`SecurityVerificationFailed`. A `UserMessage` carrying two `eb:ConversationId`
+elements is rejected rather than resolved by document order.
 
 ### Receive pull with reliability
 
@@ -552,11 +581,7 @@ For regulated deployments that require explicit startup proof, bind validated
 session context once and then use standard AS4 entry points:
 
 ```rust
-let strict_session = asx_rs::presets::session_with_strict_runtime_bootstrap_token(
-    "as4_receive_push_sync",
-    &bootstrap_token,
-    &session,
-)?;
+let strict_session = bootstrap_token.bind(&session);
 
 let out = asx_rs::as4::receive_push_with_dedup_sync(
     &strict_session,
@@ -568,28 +593,29 @@ let out = asx_rs::as4::receive_push_with_dedup_sync(
 )?;
 ```
 
-In non-testing builds, strict interop AS4 entry points fail closed unless the
-session is startup-validated with
-`asx_rs::presets::session_with_strict_runtime_bootstrap_token(...)`.
+`bootstrap_token` comes from
+[`StrictRuntimeBootstrap::validate`](@/docs/getting-started.md#regulated-startup-gate-strict-production).
+In non-testing builds, strict-interop AS4 entry points refuse a session with no
+token binding, and there is no other way to set the marker.
 
 ### Strict production clustered topology gate
 
-`As4PullStore` and `As4ConversationOrderGate` are process-local components.
-Before accepting traffic in clustered deployments, fail closed unless you have
-distributed replacements:
+`As4PullStore` and `As4ConversationOrderGate` are process-local components: in a
+cluster each replica would believe it holds the whole queue, or the whole
+conversation. Declaring the topology makes that a startup error rather than a
+silent correctness loss:
 
 ```rust
-use asx_rs::presets::{
-    DeploymentTopology,
-    validate_strict_production_as4_topology_readiness,
-};
+use asx_rs::presets::{DeploymentTopology, StrictRuntimeBootstrap};
 
-validate_strict_production_as4_topology_readiness(
-    "startup",
-    DeploymentTopology::Clustered,
-    Some(pull_store),
-    Some(conversation_gate),
-)?;
+let token = StrictRuntimeBootstrap::new("startup")
+    .event_bus(&event_bus)
+    .dedup(dedup.as_ref())
+    .reconciliation(reconciliation.as_ref())
+    .topology(DeploymentTopology::Clustered)
+    .as4_pull_store(pull_store)
+    .as4_conversation_gate(conversation_gate)
+    .validate()?;
 ```
 
 ### Queue pull payload with reliability
@@ -645,26 +671,82 @@ Signal *verification* on the send side is
 
 ## Test Service and P-Mode
 
-`asx_rs::as4::test_service` and `asx_rs::as4::pmode` provide profile/test-service helpers for standards-aligned partner agreements and conformance workflows.
+ebMS3 Core §5.2.2 reserves a Service and Action URI for connectivity testing,
+and the eDelivery conformance suite exercises it as the `PING` profile. A
+conformant MSH acknowledges such a message with a receipt and **does not deliver
+it to the application** — its payload is empty or a loopback, so handing it to a
+business pipeline manufactures a document out of a health check.
+
+`asx_rs::as4::test_service` carries the reserved URIs, a send-policy helper and
+the detector. To send a ping:
+
+```rust
+use asx_rs::as4::test_service::test_service_send_policy;
+
+let (policy, creds) = test_service_send_policy()
+    .signing_cert_pem(cert_pem)
+    .signing_key_pem(key_pem)
+    .build()?;
+```
+
+On receive, ask the output before delivering anything:
+
+```rust
+if out.is_test_service_ping() {
+    // The receipt is already generated. Stop here — do not deliver.
+    return;
+}
+```
+
+`is_test_service_ping` is derived from the parsed `eb:Service` and `eb:Action`,
+so it cannot drift from what was on the wire, and **both** must match: a
+business message that happens to reuse one of the URIs is not a ping.
+
+`asx_rs::as4::pmode` provides the P-Mode registry for standards-aligned partner
+agreements.
 
 ## SMP Integration: Dynamic Partner Discovery (PEPPOL / CEF)
 
-In PEPPOL and CEF eDelivery networks, Access Points (APs) discover each other
-dynamically via the **Service Metadata Publisher (SMP)** protocol
-([OASIS BDX SMP 1.0](https://docs.peppol.eu/edelivery/smp/)).  Before sending
-an AS4 message, the sender resolves the recipient's endpoint URL and signing
-certificate from the SMP.
+In Peppol and CEF eDelivery networks, Access Points discover each other
+dynamically. Before sending, the sender resolves the recipient's endpoint URL
+and signing certificate — and that takes two steps, not one.
 
-Enable the `smp` module with the `client` feature:
+**1. Find the SMP (BDXL).** The participant identifier is hashed into a DNS
+name, and a U-NAPTR record there names the SMP that holds the metadata:
+
+```text
+name = strip-trailing(base32(sha256(lowercase(ID-VALUE))), "=") + "." + ID-SCHEME + "." + ZONE
+
+2M2UFGZNGSS25JOOMOV2S4VGG7PW64KIVYNONDSVZSRT4EAZVCLQ.iso6523-actorid-upis.participant.sml.prod.tech.peppol.org.
+    IN NAPTR 100 10 "U" "Meta:SMP" "!.*!https://smp.example.org!" .
+```
+
+Only the identifier **value** is hashed — not `scheme::value` — and the scheme
+appears as its own DNS label.
+
+**2. Ask the SMP** for the `ServiceMetadata` of that participant, document type
+and process, and verify its signature.
+
+Enable the `smp` module with the `client` feature, and `dns` for the built-in
+resolver:
 
 ```toml
-asx-rs = { version = "0.13", features = ["as4", "client", "async-ocsp"] }
+asx-rs = { version = "0.14", features = ["as4", "client", "async-ocsp", "dns"] }
 ```
+
+| Network | SML zone |
+|---|---|
+| Peppol production | `participant.sml.prod.tech.peppol.org` |
+| Peppol test (SMK) | `participant.sml.test.tech.peppol.org` |
+
+`SmpConfig::peppol_production()` and `peppol_test()` carry these. The European
+Commission zones (`edelivery.tech.ec.europa.eu`) stopped answering participant
+lookups on 31 August 2026 and are not usable.
 
 ### Lookup and Register a Runtime P-Mode
 
 ```rust
-use asx_rs::smp::{SmpClient, SmpConfig, SmpLookupRequest, SmpSignaturePolicy};
+use asx_rs::smp::{HickoryBdxlResolver, SmpClient, SmpConfig, SmpLookupRequest, SmpSignaturePolicy};
 use asx_rs::as4::pmode::{PMode, PModeRegistry, MepType, PModeSecurity};
 use std::sync::Arc;
 
@@ -680,8 +762,13 @@ async fn build_registry_from_smp(smp_ca_pem: String) -> asx_rs::Result<Arc<PMode
         signature_policy: SmpSignaturePolicy::verify_with_trust_anchors(vec![smp_ca_pem]),
         ..SmpConfig::peppol_test()
     };
-    let client = SmpClient::with_config(config);
-    let endpoint = client.lookup_endpoint(SmpLookupRequest::peppol(
+    let client = SmpClient::with_config(config)
+        // BDXL needs a NAPTR query, which `getaddrinfo` cannot serve. The
+        // built-in resolver comes from the `dns` feature; implement
+        // `BdxlResolver` yourself to use a DNSSEC-validating or mesh-aware
+        // client instead.
+        .with_resolver(Arc::new(HickoryBdxlResolver::from_system_config()?));
+    let endpoint = client.lookup_endpoint(SmpLookupRequest::new(
         "0088:1234567890123",       // recipient participant ID
         "urn:cen.eu:en16931:2017#compliant#urn:fdc:peppol.eu:2017:poacc:billing:3.0::2.1",
         "urn:fdc:peppol.eu:2017:poacc:billing:01:1.0",
@@ -744,12 +831,32 @@ the endpoint fields are unauthenticated.
 identity — SML zone, participant scheme, transport profile — but not its trust
 anchors, which belong to your deployment. Set `signature_policy` yourself.
 
+### Discovery modes
+
+| Mode | Finds the SMP by |
+|---|---|
+| `SmlDiscovery::Naptr` (**default**) | A BDXL U-NAPTR record in the SML zone. Needs a `BdxlResolver`. |
+| `SmlDiscovery::LegacyCname` | `https://B-<md5>.<scheme>.<zone>/` used directly. Closed networks only — the public Peppol zones do not publish these records. |
+| `SmlDiscovery::Static { .. }` | A fixed SMP base URL — a bilateral agreement or a test SMP. No DNS, no resolver. |
+
+`SmpClient::discovery_dns_name(participant_id)` returns the name a lookup will
+query — worth logging, since an unregistered participant and a misconfigured
+zone look identical otherwise.
+
 ### SSRF Considerations
 
-The SMP client validates the constructed URL (scheme, host, path) before
-making any network request.  The `sml_zone` value in `SmpClient::new(...)` is
-**operator-controlled** — never pass user-supplied data as the SML zone.  See
-the `smp` module documentation for the full SSRF mitigation notes.
+The SMP URL is validated **and pinned** to the addresses that were checked
+before any request is issued, so a host that passed validation cannot be
+swapped for a private address on the connection.
+
+With NAPTR discovery the SMP URL comes *out of a DNS record*, so the record
+decides where metadata is fetched from. A U-NAPTR replacement is taken
+literally: backreferences are refused (RFC 4848 §2.2 forbids them), and a
+non-`https` replacement is refused rather than used.
+
+DNSSEC validation is the resolver's job — the Peppol SML zones are signed;
+supply a validating `BdxlResolver` if you need it. `sml_zone` is
+operator-controlled; never pass user-supplied data as the SML zone.
 
 ### Certificate Pinning After SMP Lookup
 

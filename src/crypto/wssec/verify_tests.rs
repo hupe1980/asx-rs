@@ -7,7 +7,7 @@
 use super::{
     WsSecCanonicalizationProfile, WsSecDigestMethod, WsSecVerifyOptions,
     build_external_reference_cid_index, parse_signature_material_from_doc,
-    parse_signature_references, resolve_external_reference_bytes, verify_enveloped_signature,
+    parse_signature_references, verify_enveloped_signature,
 };
 use crate::crypto::wssec::canonicalize::canonicalize_reference_digest_base64_from_doc_with_inclusive_ns;
 use base64::Engine;
@@ -199,8 +199,8 @@ fn verify_enveloped_signature_accepts_x509pkipathv1_binary_security_token() {
 /// The default WSS4J/phase4/Domibus KeyInfo shape: a `wsse:BinarySecurityToken`
 /// with `ValueType="...#X509v3"` (a single DER certificate), referenced from
 /// `ds:KeyInfo` via `wsse:SecurityTokenReference/wsse:Reference`. This shape
-/// used to be rejected with "ValueType must be X509PKIPathv1", making every
-/// stock Java-stack AS4 signature unverifiable.
+/// This is the stock Java-stack shape; demanding `X509PKIPathv1` instead makes
+/// those signatures unverifiable.
 #[test]
 fn verify_enveloped_signature_accepts_x509v3_binary_security_token() {
     let (pkey, cert_der) = generate_test_signing_identity("asx-wssec-x509v3-test");
@@ -453,26 +453,37 @@ fn split_x509_pkipath_rejects_inner_length_overrun_without_panicking() {
     assert_eq!(err.code, crate::core::ErrorCode::ParseFailed);
 }
 
+/// `cid:` reference matching is normalization-insensitive.
+///
+/// Exercised through `build_external_reference_cid_index`, which is what the
+/// verification path actually uses. These assertions used to run against a
+/// linear-scan helper that production had already been replaced with, so the
+/// normalization they check and the normalization that runs were only
+/// incidentally the same function.
 #[test]
-fn resolve_external_reference_bytes_normalizes_cid_wrappers() {
+fn external_reference_cid_index_normalizes_cid_wrappers() {
     let alpha = b"alpha";
     let beta = b"beta";
     let refs: [(&str, &[u8]); 2] = [
         ("<payload@example.com>", alpha.as_slice()),
         ("cid:other@example.com", beta.as_slice()),
     ];
+    let index = super::build_external_reference_cid_index(&refs).expect("index");
 
-    let resolved = resolve_external_reference_bytes("cid:payload@example.com", &refs)
-        .expect("cid URI should match angle-bracket wrapped candidate");
-    assert_eq!(resolved, alpha.as_slice());
-
-    let resolved = resolve_external_reference_bytes("CID:<payload@example.com>", &refs)
-        .expect("CID + angle-bracket wrapped URI should normalize");
-    assert_eq!(resolved, alpha.as_slice());
-
-    let resolved = resolve_external_reference_bytes("<other@example.com>", &refs)
-        .expect("angle-bracket URI should match cid-prefixed candidate");
-    assert_eq!(resolved, beta.as_slice());
+    for uri in ["cid:payload@example.com", "CID:<payload@example.com>"] {
+        assert_eq!(
+            index.get(super::normalize_cid_uri(uri)).copied(),
+            Some(alpha.as_slice()),
+            "{uri} must resolve to the angle-bracket-wrapped candidate"
+        );
+    }
+    assert_eq!(
+        index
+            .get(super::normalize_cid_uri("<other@example.com>"))
+            .copied(),
+        Some(beta.as_slice()),
+        "an angle-bracket URI must match a cid-prefixed candidate"
+    );
 }
 
 #[test]
@@ -686,10 +697,9 @@ fn verify_tolerates_extra_ds_signature_outside_wssec_security_header() {
         .expect("dual-signed SOAP must verify against primary wsse:Security signature");
 }
 
-/// `ds:CanonicalizationMethod` used to be written on send and never read on
-/// verify. Verification always canonicalizes `SignedInfo` as exclusive
-/// C14N, so a signature declaring anything else failed later with an opaque
-/// "signature value mismatch". Reject it where it can be named.
+/// Verification canonicalizes `SignedInfo` as exclusive C14N, so a signature
+/// declaring anything else must be rejected where it can be named — otherwise
+/// it fails later as an opaque "signature value mismatch".
 mod canonicalization_method {
     use super::super::parse_signed_info_canonicalization_method;
     use crate::core::ErrorCode;
