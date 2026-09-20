@@ -15,7 +15,292 @@ Versioning follows the [SemVer policy](#semver-policy) below.
 
 ---
 
-## [0.14.0] — unreleased
+## [0.15.0] — unreleased
+
+Deduplication became two-phase, which is a breaking change to the storage seam
+and to both receive outcomes. The change was forced by a delivery-correctness
+defect: a message this crate *rejected* had already spent its replay
+protection, so the sender's retransmission was answered as a duplicate and the
+message was lost.
+
+### Added
+
+- **A foreign-implementation oracle for the SMP signature path**
+  (`tests/interop_peppol_smp_oracle.rs`). A `SignedServiceMetadata` captured
+  from the **live Peppol production network**, verified against the real Peppol
+  PKI (root and issuing CA), with tamper cases. The specimen differs from
+  everything this crate generates in ways that exercise real paths: the
+  signature uses the **default `xmlns`** rather than a `ds:` prefix, inclusive
+  C14N, and a reference with no explicit canonicalization transform — the D49
+  path, confirmed by an independent implementation for the first time. It found
+  a defect immediately; see the wire section.
+
+- **The storage seam, against a real network-backed store**
+  (`tests/interop_redis_storage_conformance.rs`). A Redis `DedupStorage`
+  written the way the persistence guide says to — atomic claim and abandon as
+  Lua scripts — run through the whole `DedupConformance` contract in a
+  container, plus a deliberately `GET`-then-`SET` implementation that must
+  **fail** the race check. Closes the residual of D61 out of tree: only
+  in-memory backends had ever driven the async half of the trait.
+
+  Both run in a new `interop-docker-oracles` CI job, alongside the Holodeck
+  exchange, which until now ran nowhere.
+
+- **`asx_rs::peppol::mls` — the Peppol Message Level Status seam.** Network
+  Policy 1.0.0 rule MLS-1 makes MLS mandatory for every Service Provider.
+  Resolving *who* it goes to (`MLS_TO`, else the sender's registered SPIS ID),
+  *whether* it is wanted (`MLS_TYPE`, absent meaning `FAILURE_ONLY` per rule
+  MLS-3), and *when* it is due (milestone M1 is the original message's
+  `eb:MessageInfo/Timestamp`; SLR windows 20 and 25 minutes) is transport and
+  lives here. Building the MLS document is not: it is a Peppol business
+  document, and belongs where UBL does (D69).
+
+- **The SBDH module produces a Peppol Business Message Envelope.**
+  `SbdhHeader::business_scope` carries `<Scope>` entries, which is how Peppol
+  expresses every envelope parameter — `DOCUMENTID`, `PROCESSID`, `COUNTRY_C1`,
+  and the `MLS_TO` / `MLS_TYPE` customisations that Network Policy 1.0.0 made
+  mandatory. `asx_rs::sbdh::peppol_scope` has the reserved keys.
+
+  The module previously emitted none of them, so every envelope it produced was
+  rejected by every Peppol access point — while its documentation said
+  "Peppol-compatible". Nothing in-tree could see it: the only test was our
+  serializer round-tripping through our own parser. The regression test now
+  parses the **specification's own printed example** (BME 2.0.2 §3.1).
+
+  `wrap_binary_payload` / `wrap_text_payload` cover the non-XML payload
+  wrappers (BME §2.3.1–2.3.2). An empty `business_scope` emits no
+  `<BusinessScope>` element, because the schema gives `Scope` a lower bound of
+  1 (D67).
+
+- **Per-partner signer pinning** (`As4SignerPins`, `As4SignerPinMap`,
+  `As4ReceivePush::signer_pins`). Every access point on a network shares that
+  network's trust anchors, so a signature that verifies and chains to one
+  proves *membership*, not the identity of the sender. The pin is what
+  attributes it — and it was a single string on the session's `CertHandle`, so
+  a receiver with N counterparties needed N sessions, each costing a
+  `rotate_cert_handle` that drops the trust-anchor and X509-store caches, and
+  had to pick the right session from the claimed `eb:From` before calling
+  receive. That put the claimed-sender ↔ verified-signer binding outside the
+  library, where nothing checked it.
+
+  The resolver is keyed on the claimed `eb:From` and compared against the
+  verified signer, so a match *is* the proof. Several fingerprints per party
+  are permitted, which is what a certificate rollover needs. `None` falls back
+  to the session pin (D64).
+
+- **`CertFingerprint`** (`asx_rs::crypto`) — `from_cert_pem`, `from_cert_der`,
+  `parse`. A pinned fingerprint is required to receive signed AS4 and the crate
+  offered no public way to compute one: the only PEM → DER → SHA-256 was a
+  `cfg(test)` helper, so every integrator reimplemented it. `parse` requires
+  exactly **64 hex digits**, so a truncated or SHA-1 value is rejected where it
+  is configured rather than surfacing later as "signature does not match" and
+  reading as the counterparty's fault (D65).
+
+- **Mutual TLS on egress** (`ClientIdentity`, `TransportConfig::with_client_identity`).
+  Several AS4 profiles require client-certificate authentication on the wire in
+  addition to the WS-Security signature — BDEW's *Regelungen zum
+  Übertragungsweg* among them — and `TransportConfig` had nowhere to put the
+  certificate, so the only way to satisfy them was to abandon this crate's
+  transport and reimplement its SSRF and DNS-pinning guards. The pair goes in as
+  PEM and is parsed **once**, at construction, so a bad certificate/key fails
+  where it is configured rather than at the first message. The OCSP fetcher
+  deliberately does **not** present it: a responder is a third party and its
+  response is signed, not client-authenticated. Inbound mTLS remains the
+  terminator's — this crate never owns a listener (D60).
+
+### Wire / crypto — SMP signature verification
+
+- **No conformant Peppol SMP response could be verified.** `SignedInfo` was
+  canonicalized as exclusive C14N unconditionally, and a signature declaring
+  anything else was rejected with an error citing "the AS4 profiles". But the
+  same verifier serves the **SMP** path, and Peppol SMP §5.5.1 *mandates*
+  inclusive Canonical XML 1.0 — it changed it from exclusive in SMP 1.4.0. So
+  `SmpSignaturePolicy::Verify` could not verify a single conformant response:
+  the path that decides **where a message goes and which key it is encrypted
+  to** was unusable against the live network.
+
+  `SignedInfo` is now canonicalized with the algorithm the signer **declared**,
+  which is the only correct input — the signature was computed over whatever
+  `ds:CanonicalizationMethod` names. A prefix list under inclusive
+  canonicalization is rejected as the contradiction it is, and the
+  comment-preserving variants of both algorithms remain refused.
+
+  Nothing caught this because the tests signed with our own signer using
+  exclusive C14N — and one of them, `inclusive_c14n_is_rejected_by_name`,
+  asserted the defect as correct. Found on first contact by the new oracle
+  (D68).
+
+### Wire / crypto — deduplication and retransmission
+
+- **A message this crate rejected could never be redelivered.** The dedup key
+  was recorded by a single `first_seen(key) -> bool` call placed immediately
+  after WS-Security verification, with three fallible steps still to run:
+  timestamp freshness, payload materialization and receipt verification. Any of
+  them failing returned an error to the caller — but the key was already spent.
+  The sender's `ReceptionAwareness` retransmission carries the **same**
+  `eb:MessageId`, so it came back as `Duplicate`, and this crate's own
+  documentation told callers to acknowledge a duplicate with a receipt. A
+  verified message from a real partner was therefore rejected, acknowledged as
+  received, and lost. The AS2 MDN path had the same shape: every audit emission
+  and the reconciliation enqueue after the dedup call is fallible under
+  `fail_closed_audit_events`.
+
+  Signature verification runs *before* the dedup call, then and now, so this was
+  never reachable by an unauthenticated peer — it takes a validly signed message
+  from a real partner. It is a delivery-correctness defect, not a replay hole.
+
+  **Deduplication is now two-phase.** `claim` takes the key, `accept` settles it
+  as handled, `abandon` releases it. `claim` answers with three verdicts rather
+  than a boolean: `Claimed`, `Duplicate` (previously **accepted**), and
+  `InFlight` (a concurrent delivery holds an unsettled claim — neither a replay
+  nor a first sight, and the one case the old shape could not express). A
+  first-seen message hands the caller an unsettled `DedupClaim`, because this
+  crate knows a message parsed, verified and decrypted, and only the caller
+  knows whether it was *handled*. An unsettled claim expires by lease, so a
+  process that dies mid-handling delays redelivery instead of wedging that
+  `eb:MessageId` forever (D59).
+
+  A receiver should now answer `InFlight` with **no receipt** — 503 — so the
+  sender retransmits once the other attempt settles.
+
+### Fixed — async storage backends were unusable
+
+- **A durable, cluster-safe dedup backend panicked on the first inbound
+  message.** `DedupStorage` and `ReconciliationStorage` return `BoxFuture` so
+  that Redis/PostgreSQL/DynamoDB backends can implement them natively, and
+  `cluster_safe()` — which the strict production startup gate *requires* —
+  means an out-of-process store by definition. Every such store yields at least
+  once. The internal bridge polled the future exactly once with a no-op waker
+  and panicked on `Poll::Pending`, so the only backends that worked were the
+  in-memory ones the gate rejects. Both entry points were affected:
+  `receive_push_with_dedup_async` runs the pipeline inside `spawn_blocking` and
+  drove the future synchronously too — and the panic message named it as the
+  remedy.
+
+  Nothing caught this because every in-tree backend resolves immediately. The
+  bridge now polls once (so the in-memory fast path stays free and needs no
+  runtime at all) and then drives a genuinely pending future on the current
+  runtime, via `block_in_place` + `block_on` — the same pattern the OCSP client
+  already used. The regression test drives the **end-to-end AS4 receive path**
+  with a yielding backend and fails against the previous implementation (D61).
+
+### Fixed — documentation contradicted the specification
+
+- **Five places said Peppol is sign-only.** The Peppol AS4 profile says the
+  opposite in its first paragraph — the Peppol PKI is used "for signature and
+  encryption on AS4 message level", and `PMode[].Security.X509.Encryption.Certificate`
+  is the receiving AP's certificate fetched from the SMP (§1, §4.7). One of the
+  five was a **code example in the published docs** that set `encrypt: false`
+  with the comment "PEPPOL BIS Billing 3.0 mandates sign-only", so anyone
+  following it produced non-conformant Peppol traffic.
+
+  `src/interop.rs` had it right (`SIGN_AND_ENCRYPT` is the default floor "which
+  is what PEPPOL, CEF eDelivery and BDEW require"), so the crate contradicted
+  itself. Corrected in the AS4 guide, `concepts/MARKET_LANDSCAPE.md`,
+  `concepts/INTEROP.md`, `concepts/ROADMAP.md` and the reference index (R19).
+
+### Fixed — test isolation
+
+- **Two fixture-repository tests could share a scratch directory.** Both named
+  it from `SystemTime::now().as_nanos()`, and `SystemTime` is microsecond-granular
+  on macOS, so two tests running on different threads could land on the same
+  value, share a directory and overwrite each other's `catalog.json`. The
+  result was a gate that failed a few times out of a hundred for no reason
+  attributable to the code under test. The name is now keyed on the test as
+  well as the clock.
+
+### API — hard cuts
+
+- **`SbdhHeader` gained `business_scope: Vec<SbdhScope>`.** Existing struct
+  literals need the field; `Vec::new()` reproduces the old (non-Peppol)
+  output.
+
+- **`PModeSecurity::default()` now encrypts**, and P-Mode materialization
+  refuses `encrypt = false` in non-testing builds on the same terms as
+  `sign = false`. The check looked like a security floor and was half of one: a
+  P-Mode with encryption off materialized cleanly and sent signed plaintext,
+  and the *default* was itself `encrypt: false`. All four target networks
+  mandate both — see the Peppol correction above (D66).
+- **`As4Verifier::verify_security` takes one `As4SecurityVerification`** instead
+  of eight positional parameters, and carries the claimed `from_party_id` and
+  the resolved `permitted_signers`.
+- **`WsSecVerifyOptions::with_expected_fingerprint(Option<&str>)` is
+  `with_expected_fingerprints(&[CertFingerprint])`** — pinning is a set, so a
+  certificate rollover does not need a flag day.
+- **`As4IngressReceivePushSyncRequest::dedup_backend` is `dedup`**, and the
+  struct gained `signer_pins`.
+
+- **Six AS4 push-receive entry points and five request structs become four and
+  two.** Conversation ordering is now a **field** on one request rather than a
+  separate pair of functions, because whether a deployment preserves
+  per-conversation arrival order is a property of that deployment — encoding it
+  in the function name put a deployment decision at every call site.
+
+  | Was | Now |
+  |---|---|
+  | `receive_push_with_dedup_async(s, b, req, dedup)` | `receive_push(s, b, As4ReceivePush { request, dedup, ordering: None })` |
+  | `receive_push_ordered(s, b, As4ReceivePushOrderedRequest { .., gate })` | `receive_push(s, b, As4ReceivePush { request, dedup, ordering: Some(gate) })` |
+  | `receive_push_with_dedup_async_fragment_aware(..)` | `receive_push_fragment_aware(s, b, push, fragments)` |
+  | `receive_push_ordered_fragment_aware(..)` | `receive_push_fragment_aware(s, b, push, fragments)` |
+  | `receive_push_with_dedup_sync(s, b, As4ReceivePushSyncRequest { .. })` | `receive_push_sync(s, b, As4ReceivePushSync { request, dedup })` |
+  | `receive_push_with_dedup_sync_fragment_aware(..)` | `receive_push_sync_fragment_aware(s, b, push, fragments)` |
+
+  Every **async** receive now returns `As4Ordered<T>`. With `ordering: None`
+  the guard holds no turn and `.into_inner()` is free; with a gate it holds the
+  conversation's turn until dropped, as `receive_push_ordered` did. The async
+  entry point also takes a request struct instead of positional arguments, like
+  its siblings.
+
+  Fragment-awareness stays a separate method: it is the one axis that changes
+  the answer, because an incomplete group produces `PendingFragment`.
+
+  `As4ReceivePushSyncRequest`, `As4ReceivePushSyncFragmentAwareRequest`,
+  `As4ReceivePushAsyncFragmentAwareRequest`, `As4ReceivePushOrderedRequest` and
+  `As4ReceivePushOrderedFragmentAwareRequest` are replaced by `As4ReceivePush`
+  and `As4ReceivePushSync`. The `dedup_backend` field is `dedup` on all of them,
+  including `As4IngressReceivePushSyncRequest` (D63).
+- **Two of the three in-memory dedup backends are gone.**
+  `InMemoryDedupStorage` grew without bound and its own documentation told you
+  not to use it in production — while carrying the name most likely to be
+  picked. `BoundedFifoDedupStorage` evicted by insertion order, so it could
+  drop a key that was still inside the replay window: bounded memory bought
+  with a silent replay hole, in the component whose only job is preventing
+  replays. Neither was used anywhere outside its own tests.
+
+  `TtlDedupStorage` is the one in-tree backend. Its memory is bounded by the
+  replay window, which is what RFC 4130 §5.2.1 actually specifies — a duration,
+  not a count. `asx_rs::storage::DEFAULT_CLAIM_LEASE` is now exported alongside
+  it (D62).
+- **`DedupStorage` is a three-method trait.** `first_seen(&str) -> Result<bool>`
+  is replaced by `claim(&str) -> Result<DedupVerdict>`, `accept(&str)` and
+  `abandon(&str)`. Every backend must be updated; `DedupConformance` gained five
+  checks covering the new settlement rules and will tell you which one is wrong.
+  The reference SQL schema in the [persistence
+  guide](https://hupe1980.github.io/asx-rs/docs/persistence/) gained a `state`
+  column and a claim-lease expiry.
+- **`As4ReceiveOutcome::FirstSeen` is a struct variant** carrying `output` and
+  the unsettled `claim`, and has a third variant `InFlight { message_id }`.
+  `As4ReceivePushProgress::Complete` changed the same way. `into_output` and
+  `unwrap_output` return `(As4ReceivePushOutput, DedupClaim)`. The enums no
+  longer derive `Clone`/`PartialEq`/`Eq` — a claim is an obligation and cannot
+  be duplicated.
+- **`As2ReceiveMdnOutput::dedup`** is a new field of type `As2MdnDedup`
+  (`FirstSeen(DedupClaim)` / `Duplicate` / `InFlight`), and the struct no longer
+  derives `Clone`/`PartialEq`/`Eq`. `As4ReceivePullOutput` gained `claim:
+  Option<DedupClaim>` for the message it dequeued, on the same terms.
+- **The dedup backend is `Arc<dyn DedupStorage>` on every receive path**, where
+  the synchronous half previously borrowed `&dyn DedupStorage`. This affects
+  `As4ReceivePushSyncRequest` (which lost its lifetime parameter),
+  `As4ReceivePushSyncFragmentAwareRequest`, `As4IngressReceivePushSyncRequest`
+  and `receive_with_mdn_with_reliability`. A claim outlives the call that
+  produced it, so it has to own its handle to the backend.
+- **`AsxEvent::DuplicateInFlight`** joins the taxonomy beside
+  `DuplicateDetected`. A sustained rate of it means claims are being dropped
+  unsettled, or the claim lease outlasts the sender's retransmission interval.
+
+---
+
+## [0.14.0] — 2026-09-06
 
 Everything since 0.13.0. It is a **hard cut**: wire format, defaults and APIs
 changed without compatibility shims.

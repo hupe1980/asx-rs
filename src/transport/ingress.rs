@@ -250,7 +250,7 @@ impl As2HttpIngress {
 
 /// Data extracted from an HTTP `POST` carrying an AS4 SOAP message.
 ///
-/// Feed `body` into [`crate::as4::receive_push_with_dedup_sync`].
+/// Feed `body` into [`crate::as4::receive_push_sync`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct As4HttpIngress {
     /// Raw SOAP envelope bytes.
@@ -273,7 +273,10 @@ pub struct As4IngressReceivePushSyncRequest<'a> {
     pub session: &'a crate::core::SessionContext,
     pub event_bus: &'a crate::observability::EventBus,
     pub policy: crate::as4::As4PushPolicy,
-    pub dedup_backend: &'a dyn crate::storage::DedupStorage,
+    pub dedup: std::sync::Arc<dyn crate::storage::DedupStorage>,
+    /// Permitted signers per claimed `eb:From`. See
+    /// [`As4ReceivePush::signer_pins`](crate::as4::As4ReceivePush::signer_pins).
+    pub signer_pins: Option<std::sync::Arc<dyn crate::as4::As4SignerPins>>,
     pub receipt_payload: Option<Vec<u8>>,
 }
 
@@ -370,16 +373,17 @@ impl As4HttpIngress {
     ///
     /// `receipt_payload` is optional and can be supplied when the caller has an
     /// associated receipt envelope to correlate with this push processing step.
-    pub fn receive_push_with_dedup_sync(
+    pub fn receive_push_sync(
         &self,
         request: As4IngressReceivePushSyncRequest<'_>,
     ) -> crate::core::Result<crate::as4::As4ReceiveOutcome> {
-        crate::as4::receive_push_with_dedup_sync(
+        crate::as4::receive_push_sync(
             request.session,
             request.event_bus,
-            crate::as4::As4ReceivePushSyncRequest {
+            crate::as4::As4ReceivePushSync {
                 request: self.make_receive_push_request(request.policy, request.receipt_payload),
-                dedup_backend: request.dedup_backend,
+                dedup: request.dedup,
+                signer_pins: request.signer_pins,
             },
         )
     }
@@ -591,7 +595,7 @@ mod tests {
     #[cfg(feature = "as4")]
     use crate::reliability::ReconciliationRequest;
     #[cfg(feature = "as4")]
-    use crate::storage::{BoxFuture, DedupStorage, ReconciliationStorage};
+    use crate::storage::{BoxFuture, DedupStorage, DedupVerdict, ReconciliationStorage};
     #[cfg(all(feature = "as4", feature = "testing"))]
     use sha2::{Digest, Sha256};
     #[cfg(feature = "as4")]
@@ -1231,11 +1235,25 @@ mod tests {
             true
         }
 
-        fn first_seen<'a>(
+        fn claim<'a>(
             &'a self,
             _idempotency_key: &'a str,
-        ) -> BoxFuture<'a, crate::core::Result<bool>> {
-            Box::pin(async move { Ok(true) })
+        ) -> BoxFuture<'a, crate::core::Result<DedupVerdict>> {
+            Box::pin(async move { Ok(DedupVerdict::Claimed) })
+        }
+
+        fn accept<'a>(
+            &'a self,
+            _idempotency_key: &'a str,
+        ) -> BoxFuture<'a, crate::core::Result<()>> {
+            Box::pin(async move { Ok(()) })
+        }
+
+        fn abandon<'a>(
+            &'a self,
+            _idempotency_key: &'a str,
+        ) -> BoxFuture<'a, crate::core::Result<()>> {
+            Box::pin(async move { Ok(()) })
         }
     }
 
@@ -1315,14 +1333,15 @@ mod tests {
         let ingress = as4_ingress_from_http(req).expect("as4 ingress");
 
         let err = ingress
-            .receive_push_with_dedup_sync(As4IngressReceivePushSyncRequest {
+            .receive_push_sync(As4IngressReceivePushSyncRequest {
                 session: &strict_session(),
                 event_bus: &crate::observability::EventBus::new(16).expect("bus"),
                 policy: crate::as4::As4PushPolicy {
                     interop: InteropMode::Strict,
                     ..crate::as4::As4PushPolicy::default()
                 },
-                dedup_backend: &crate::reliability::InMemoryDedupBackend::default(),
+                dedup: std::sync::Arc::new(crate::reliability::InMemoryDedupBackend::default()),
+                signer_pins: None,
                 receipt_payload: None,
             })
             .expect_err("strict helper without token must fail closed");
@@ -1347,14 +1366,15 @@ mod tests {
         let strict_session = token.bind(&strict_session());
 
         let err = ingress
-            .receive_push_with_dedup_sync(As4IngressReceivePushSyncRequest {
+            .receive_push_sync(As4IngressReceivePushSyncRequest {
                 session: &strict_session,
                 event_bus: &crate::observability::EventBus::new(16).expect("bus"),
                 policy: crate::as4::As4PushPolicy {
                     interop: InteropMode::Strict,
                     ..crate::as4::As4PushPolicy::default()
                 },
-                dedup_backend: &crate::reliability::InMemoryDedupBackend::default(),
+                dedup: std::sync::Arc::new(crate::reliability::InMemoryDedupBackend::default()),
+                signer_pins: None,
                 receipt_payload: None,
             })
             .expect_err("invalid payload should fail after runtime token validation");
@@ -1375,7 +1395,7 @@ mod tests {
         let _events = bus.subscribe_scoped_events();
 
         let out = ingress
-            .receive_push_with_dedup_sync(As4IngressReceivePushSyncRequest {
+            .receive_push_sync(As4IngressReceivePushSyncRequest {
                 session: &strict_session(),
                 event_bus: &bus,
                 policy: crate::as4::As4PushPolicyBuilder::new()
@@ -1384,11 +1404,13 @@ mod tests {
                     .fail_closed_audit_events(false)
                     .build()
                     .expect("policy"),
-                dedup_backend: &crate::reliability::InMemoryDedupBackend::default(),
+                dedup: std::sync::Arc::new(crate::reliability::InMemoryDedupBackend::default()),
+                signer_pins: None,
                 receipt_payload: None,
             })
             .expect("valid multipart push payload must succeed")
-            .unwrap_output();
+            .unwrap_output()
+            .0;
 
         assert_eq!(out.user_message.message_id, "msg-push-1");
         assert_eq!(out.user_message.action, "SubmitOrder");
@@ -1412,7 +1434,7 @@ mod tests {
         let _events = bus.subscribe_scoped_events();
 
         let out = ingress
-            .receive_push_with_dedup_sync(As4IngressReceivePushSyncRequest {
+            .receive_push_sync(As4IngressReceivePushSyncRequest {
                 session: &strict_session,
                 event_bus: &bus,
                 policy: crate::as4::As4PushPolicyBuilder::new()
@@ -1421,11 +1443,13 @@ mod tests {
                     .fail_closed_audit_events(false)
                     .build()
                     .expect("policy"),
-                dedup_backend: &crate::reliability::InMemoryDedupBackend::default(),
+                dedup: std::sync::Arc::new(crate::reliability::InMemoryDedupBackend::default()),
+                signer_pins: None,
                 receipt_payload: Some(signed_receipt_fixture("msg-push-1")),
             })
             .expect("valid multipart push + signed receipt must succeed")
-            .unwrap_output();
+            .unwrap_output()
+            .0;
 
         let receipt = out.receipt.expect("receipt");
         assert!(receipt.is_signed);

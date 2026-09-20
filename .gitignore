@@ -29,14 +29,13 @@ FINDINGS.md
 REVIEW.md
 .DS_Store
 
-# Internal-only documents (not published) — the architecture notes and the backlog
+# Internal-only documents (not published) — the architecture notes, the backlog,
+# and under references/ the third-party specifications, standards, profiles and
+# law the crate is written against (copyrighted, and in several cases
+# redistributable only from the publisher; indexed with retrieval URLs in
+# concepts/references/README.md and rebuilt with `just specs`, so the folder
+# never needs to be committed).
 concepts/
-
-# Third-party specifications, standards, profiles and law (copyrighted, and in
-# several cases redistributable only from the publisher; indexed with retrieval
-# URLs in specs/README.md and rebuilt with `just specs`, so the folder never
-# needs to be committed).
-specs/
 
 # Feedback for sibling crates (bug reports / feature requests; always internal —
 # sent to their teams)

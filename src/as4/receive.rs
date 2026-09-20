@@ -24,8 +24,8 @@
 //!
 //! ```text
 //! HTTP layer
-//!   └─ entrypoints::receive_push_with_dedup_sync / async
-//!        └─ sync_core::receive_push_with_dedup_inner
+//!   └─ entrypoints::receive_push_sync / async
+//!        └─ sync_core::receive_push_inner
 //!             ├─ processing::maybe_handle_fragment_message
 //!             │    ├─ [fragment] → large_message::As4FragmentJoiner
 //!             │    └─ [complete] → verifier + payload + metadata
@@ -74,19 +74,14 @@ use super::types::{As4PushPolicy, As4ReceivePushProgress};
 use crate::core::{PayloadInput, Result, SessionContext};
 use crate::observability::EventBus;
 use crate::storage::DedupStorage;
+use std::sync::Arc;
 
 pub use entrypoints::{
-    As4ReceivePushAsyncFragmentAwareRequest, As4ReceivePushOrderedFragmentAwareRequest,
-    As4ReceivePushOrderedRequest, As4ReceivePushSyncFragmentAwareRequest,
-    As4ReceivePushSyncRequest, receive_push_ordered, receive_push_ordered_fragment_aware,
-    receive_push_with_dedup_async, receive_push_with_dedup_async_fragment_aware,
-    receive_push_with_dedup_sync, receive_push_with_dedup_sync_fragment_aware,
+    As4ReceivePush, As4ReceivePushSync, receive_push, receive_push_fragment_aware,
+    receive_push_sync, receive_push_sync_fragment_aware,
 };
 #[cfg(feature = "testing")]
-pub use entrypoints::{
-    receive_push_with_dedup_async_with_custom_verifier,
-    receive_push_with_dedup_sync_with_custom_verifier,
-};
+pub use entrypoints::{receive_push_sync_with_custom_verifier, receive_push_with_custom_verifier};
 #[cfg(feature = "testing")]
 pub use verifier::InsecureBypassAs4Verifier;
 #[cfg(all(test, not(feature = "testing")))]
@@ -94,9 +89,7 @@ pub(crate) use verifier::private;
 #[cfg(feature = "testing")]
 pub use verifier::private;
 pub use verifier::{As4Verifier, As4WsSecVerifier};
-use verifier_wrappers::{
-    receive_push_with_dedup_async_with_verifier, receive_push_with_dedup_sync_with_verifier,
-};
+use verifier_wrappers::receive_push_sync_with_verifier;
 
 /// Bundled context passed through the inner receive pipeline.
 ///
@@ -108,11 +101,14 @@ pub(super) struct As4PushReceiveCtx<'a> {
     pub(super) session: &'a SessionContext,
     pub(super) event_bus: &'a EventBus,
     pub(super) policy: &'a As4PushPolicy,
-    pub(super) dedup_backend: &'a dyn DedupStorage,
+    pub(super) dedup_backend: &'a Arc<dyn DedupStorage>,
     pub(super) verifier: &'a (dyn As4Verifier + Send + Sync),
+    /// Per-partner permitted signers. `None` falls back to the session's
+    /// single-partner pin.
+    pub(super) signer_pins: Option<&'a Arc<dyn super::As4SignerPins>>,
 }
 
-fn receive_push_with_dedup_inner(
+fn receive_push_inner(
     ctx: &As4PushReceiveCtx<'_>,
     payload_input: PayloadInput<'_>,
     receipt_payload: Option<&[u8]>,
@@ -124,7 +120,7 @@ fn receive_push_with_dedup_inner(
         ctx.session,
         ctx.event_bus,
         ctx.policy,
-        ctx.dedup_backend,
+        ctx.dedup_backend.as_ref(),
     )?;
 
     let payload_bytes = payload_input.as_slice();

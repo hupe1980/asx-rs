@@ -720,7 +720,7 @@ impl RetryScheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::{DedupStorage, ReconciliationStorage, drive_dedup_future};
+    use crate::storage::{DedupStorage, DedupVerdict, ReconciliationStorage, drive_dedup_future};
     use std::sync::Arc;
     use std::thread;
 
@@ -881,23 +881,21 @@ mod tests {
 
     #[test]
     fn lock_poison_fails_closed_in_dedup_backend() {
-        // This test validates the fix for the critical idempotency bug:
-        // Previously, InMemoryDedupBackend silently recovered from lock poison.
-        // Now it fails hard, preventing duplicate messages from being accepted.
+        // Infrastructure failure in the dedup backend must surface as Err
+        // rather than being silently recovered into "not seen", which would
+        // let a duplicate through.
         let backend = InMemoryDedupBackend::default();
         let key = "dedup:critical:msg-1";
 
-        // First call succeeds
-        assert!(drive_dedup_future(backend.first_seen(key)).unwrap());
+        assert_eq!(
+            drive_dedup_future(backend.claim(key)).unwrap(),
+            DedupVerdict::Claimed
+        );
 
-        // Poison the lock by deliberately causing a panic during lock acquisition
-        // (We can't directly poison in tests, but we validate the Result-based API allows proper error propagation)
-        // In production, if lock poison occurs, first_seen now returns Err instead of silently continuing.
-        let result = drive_dedup_future(backend.first_seen(key));
+        // The claim is still unsettled, so a second attempt is a race, not a
+        // replay — and either way the call returns a verdict, never a panic.
+        let result = drive_dedup_future(backend.claim(key));
         assert!(result.is_ok());
-
-        // The critical semantic: any lock poison error would now bubble up as Err(AsxError)
-        // instead of silently recovering and potentially accepting a duplicate.
     }
 
     #[test]
@@ -955,8 +953,32 @@ mod tests {
     fn in_memory_dedup_backend_accepts_first_and_rejects_duplicate() {
         let backend = InMemoryDedupBackend::default();
         let key = "dedup:partner-a:as2:msg-1";
-        assert!(drive_dedup_future(backend.first_seen(key)).unwrap());
-        assert!(!drive_dedup_future(backend.first_seen(key)).unwrap());
+        assert_eq!(
+            drive_dedup_future(backend.claim(key)).unwrap(),
+            DedupVerdict::Claimed
+        );
+        drive_dedup_future(backend.accept(key)).unwrap();
+        assert_eq!(
+            drive_dedup_future(backend.claim(key)).unwrap(),
+            DedupVerdict::Duplicate
+        );
+    }
+
+    #[test]
+    fn abandoned_key_is_claimable_again() {
+        // The recovery path: a message that could not be handled must be
+        // processable when the sender retransmits it (D59).
+        let backend = InMemoryDedupBackend::default();
+        let key = "dedup:partner-a:as4:msg-abandon";
+        assert_eq!(
+            drive_dedup_future(backend.claim(key)).unwrap(),
+            DedupVerdict::Claimed
+        );
+        drive_dedup_future(backend.abandon(key)).unwrap();
+        assert_eq!(
+            drive_dedup_future(backend.claim(key)).unwrap(),
+            DedupVerdict::Claimed
+        );
     }
 
     #[test]
@@ -968,14 +990,14 @@ mod tests {
         for _ in 0..16 {
             let backend = Arc::clone(&backend);
             handles.push(thread::spawn(move || {
-                drive_dedup_future(backend.first_seen(key)).unwrap()
+                drive_dedup_future(backend.claim(key)).unwrap()
             }));
         }
 
         let accepted = handles
             .into_iter()
-            .map(|h: std::thread::JoinHandle<bool>| h.join().expect("thread join"))
-            .filter(|accepted| *accepted)
+            .map(|h: std::thread::JoinHandle<DedupVerdict>| h.join().expect("thread join"))
+            .filter(|verdict| *verdict == DedupVerdict::Claimed)
             .count();
 
         assert_eq!(accepted, 1);

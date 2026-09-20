@@ -693,9 +693,13 @@ fn verify_tolerates_extra_ds_signature_outside_wssec_security_header() {
         .expect("dual-signed SOAP must verify against primary wsse:Security signature");
 }
 
-/// Verification canonicalizes `SignedInfo` as exclusive C14N, so a signature
-/// declaring anything else must be rejected where it can be named — otherwise
-/// it fails later as an opaque "signature value mismatch".
+/// `SignedInfo` is canonicalized with the algorithm the signer **declared**.
+///
+/// Both W3C algorithms are legitimate and the networks disagree: AS4
+/// WS-Security profiles require exclusive C14N, Peppol SMP requires inclusive
+/// (SMP 1.4.0 §5.5.1, which changed it *from* exclusive in that release).
+/// Anything else is rejected where it can be named, rather than failing later
+/// as an opaque "signature value mismatch" (D68).
 mod canonicalization_method {
     use super::super::parse_signed_info_canonicalization_method;
     use crate::core::ErrorCode;
@@ -704,7 +708,9 @@ mod canonicalization_method {
         roxmltree::Document::parse(inner).expect("fixture parses")
     }
 
-    fn check(algorithm_attr: &str) -> crate::core::Result<Vec<String>> {
+    type Parsed = (crate::crypto::wssec::WsSecCanonicalizationKind, Vec<String>);
+
+    fn check(algorithm_attr: &str) -> crate::core::Result<Parsed> {
         let xml = format!(
             r#"<ds:SignedInfo xmlns:ds="http://www.w3.org/2000/09/xmldsig#">{algorithm_attr}</ds:SignedInfo>"#
         );
@@ -714,10 +720,14 @@ mod canonicalization_method {
 
     #[test]
     fn inclusive_namespaces_prefix_list_is_parsed() {
-        let prefixes = check(
+        let (kind, prefixes) = check(
             r#"<ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"><ec:InclusiveNamespaces PrefixList="soapenv wsu" xmlns:ec="http://www.w3.org/2001/10/xml-exc-c14n#"/></ds:CanonicalizationMethod>"#,
         )
         .expect("exclusive c14n with a PrefixList is the default WSS4J shape");
+        assert_eq!(
+            kind,
+            crate::crypto::wssec::WsSecCanonicalizationKind::Exclusive
+        );
         assert_eq!(prefixes, vec!["soapenv".to_string(), "wsu".to_string()]);
     }
 
@@ -733,20 +743,64 @@ mod canonicalization_method {
 
     #[test]
     fn exclusive_c14n_is_accepted() {
-        check(
+        let (kind, _) = check(
             r#"<ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>"#,
         )
         .expect("exclusive c14n is the AS4-mandated algorithm");
+        assert_eq!(
+            kind,
+            crate::crypto::wssec::WsSecCanonicalizationKind::Exclusive
+        );
+    }
+
+    /// Peppol SMP signs with inclusive C14N and **mandates** it (SMP 1.4.0
+    /// §5.5.1). Rejecting it meant no conformant SMP response could be
+    /// verified; `tests/interop_peppol_smp_oracle.rs` is the real-world
+    /// witness, and this is the unit-level statement of the same rule.
+    #[test]
+    fn inclusive_c14n_is_accepted() {
+        let (kind, prefixes) = check(
+            r#"<ds:CanonicalizationMethod Algorithm="http://www.w3.org/TR/2001/REC-xml-c14n-20010315"/>"#,
+        )
+        .expect("inclusive c14n is what Peppol SMP mandates");
+        assert_eq!(
+            kind,
+            crate::crypto::wssec::WsSecCanonicalizationKind::Inclusive
+        );
+        assert!(prefixes.is_empty());
+    }
+
+    /// A prefix list is an exclusive-C14N construct; under inclusive
+    /// canonicalization the whole in-scope context is emitted, so declaring one
+    /// is a contradiction rather than a redundancy.
+    #[test]
+    fn inclusive_c14n_with_a_prefix_list_is_rejected() {
+        let err = check(
+            r#"<ds:CanonicalizationMethod Algorithm="http://www.w3.org/TR/2001/REC-xml-c14n-20010315"><ec:InclusiveNamespaces PrefixList="soapenv" xmlns:ec="http://www.w3.org/2001/10/xml-exc-c14n#"/></ds:CanonicalizationMethod>"#,
+        )
+        .expect_err("a PrefixList under inclusive c14n is meaningless");
+        assert_eq!(err.code, ErrorCode::InteropViolation);
+        assert!(err.message.contains("PrefixList"), "{}", err.message);
     }
 
     #[test]
-    fn inclusive_c14n_is_rejected_by_name() {
-        let err = check(
-            r#"<ds:CanonicalizationMethod Algorithm="http://www.w3.org/TR/2001/REC-xml-c14n-20010315"/>"#,
-        )
-        .expect_err("inclusive c14n must be rejected");
+    fn an_unknown_canonicalization_algorithm_is_rejected_by_name() {
+        let err = check(r#"<ds:CanonicalizationMethod Algorithm="urn:made:up"/>"#)
+            .expect_err("an unknown algorithm must be named, not guessed at");
         assert_eq!(err.code, ErrorCode::InteropViolation);
-        assert!(err.message.contains("Exclusive"), "{}", err.message);
+        assert!(err.message.contains("urn:made:up"), "{}", err.message);
+    }
+
+    /// Comment-preserving **inclusive** C14N is rejected for the same reason as
+    /// the exclusive variant: the canonicalizer strips comments.
+    #[test]
+    fn comment_preserving_inclusive_c14n_is_rejected() {
+        let err = check(
+            r#"<ds:CanonicalizationMethod Algorithm="http://www.w3.org/TR/2001/REC-xml-c14n-20010315#WithComments"/>"#,
+        )
+        .expect_err("WithComments must be rejected");
+        assert_eq!(err.code, ErrorCode::InteropViolation);
+        assert!(err.message.contains("comment"), "{}", err.message);
     }
 
     #[test]

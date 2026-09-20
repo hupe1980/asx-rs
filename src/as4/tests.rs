@@ -19,7 +19,7 @@ use crate::interop::{InteropExceptionCode, InteropExceptionPolicy};
 use crate::observability::{AsxEvent, EventBus};
 use crate::reliability::{InMemoryDedupBackend, InMemoryReconciliationHook};
 use crate::sbdh::{SBDH_NAMESPACE, SbdhDocumentIdentification, SbdhHeader, SbdhParty};
-use crate::storage::{BoxFuture, DedupStorage, ReconciliationStorage};
+use crate::storage::{BoxFuture, DedupStorage, DedupVerdict, ReconciliationStorage};
 use openssl::asn1::Asn1Time;
 use openssl::bn::BigNum;
 use openssl::hash::MessageDigest;
@@ -27,8 +27,6 @@ use openssl::nid::Nid;
 use openssl::pkey::PKey;
 use openssl::rsa::Rsa;
 use openssl::x509::{X509, X509NameBuilder};
-#[cfg(feature = "interop-relaxed")]
-use sha2::{Digest as _, Sha256 as sha2_Sha256};
 use std::sync::Arc;
 
 use tokio::time::{Duration, timeout};
@@ -50,6 +48,7 @@ fn test_sbdh_header(instance_identifier: &str) -> SbdhHeader {
             identifier: "0007:9876543210987".into(),
             authority: "iso6523-actorid-upis".into(),
         },
+        business_scope: Vec::new(),
         document_identification: SbdhDocumentIdentification {
             standard: "urn:oasis:names:specification:ubl:schema:xsd:Invoice-2".into(),
             type_version: "2.1".into(),
@@ -267,18 +266,29 @@ impl DedupStorage for DurableTestDedup {
         true
     }
 
-    fn first_seen<'a>(
+    fn claim<'a>(
         &'a self,
         idempotency_key: &'a str,
-    ) -> BoxFuture<'a, crate::core::Result<bool>> {
-        self.0.first_seen(idempotency_key)
+    ) -> BoxFuture<'a, crate::core::Result<DedupVerdict>> {
+        self.0.claim(idempotency_key)
+    }
+
+    fn accept<'a>(&'a self, idempotency_key: &'a str) -> BoxFuture<'a, crate::core::Result<()>> {
+        self.0.accept(idempotency_key)
+    }
+
+    fn abandon<'a>(&'a self, idempotency_key: &'a str) -> BoxFuture<'a, crate::core::Result<()>> {
+        self.0.abandon(idempotency_key)
     }
 }
 
-fn reliability() -> (DurableTestReconciliation, DurableTestDedup) {
+fn reliability() -> (
+    DurableTestReconciliation,
+    std::sync::Arc<dyn crate::storage::DedupStorage>,
+) {
     (
         DurableTestReconciliation(InMemoryReconciliationHook::default()),
-        DurableTestDedup(InMemoryDedupBackend::default()),
+        std::sync::Arc::new(DurableTestDedup(InMemoryDedupBackend::default())),
     )
 }
 
@@ -313,10 +323,13 @@ impl ReconciliationStorage for DurableTestReconciliation {
     }
 }
 
-fn durable_reliability() -> (DurableTestReconciliation, DurableTestDedup) {
+fn durable_reliability() -> (
+    DurableTestReconciliation,
+    std::sync::Arc<dyn crate::storage::DedupStorage>,
+) {
     (
         DurableTestReconciliation(InMemoryReconciliationHook::default()),
-        DurableTestDedup(InMemoryDedupBackend::default()),
+        std::sync::Arc::new(DurableTestDedup(InMemoryDedupBackend::default())),
     )
 }
 
@@ -372,19 +385,10 @@ fn session_with_trust(
         .expect("test creds must have signing cert");
     let cert_pem_str = String::from_utf8(cert_pem.to_vec()).expect("cert pem must be valid utf8");
 
-    // Compute SHA-256 fingerprint of the cert DER so the verifier can pin it.
-    let cert = openssl::x509::X509::from_pem(cert_pem).expect("valid certificate PEM");
-    let der = cert.to_der().expect("valid certificate DER");
-    let digest = sha2_Sha256::digest(&der);
-    let fingerprint: String = digest
-        .iter()
-        .flat_map(|b| {
-            [
-                char::from_digit((b >> 4) as u32, 16).unwrap(),
-                char::from_digit((b & 0x0f) as u32, 16).unwrap(),
-            ]
-        })
-        .collect();
+    // The pinnable fingerprint, via the crate's own public helper.
+    let fingerprint = crate::crypto::CertFingerprint::from_cert_pem(cert_pem)
+        .expect("valid certificate PEM")
+        .to_string();
 
     SessionContext::new(session_id, partner_id, "strict")
         .expect("session")
@@ -400,17 +404,18 @@ fn session_with_trust(
 }
 
 #[test]
-fn receive_push_with_dedup_rejects_empty_payload() {
+fn receive_push_rejects_empty_payload() {
     let session = SessionContext::new("s1", "p1", "strict")
         .expect("session")
         .with_strict_runtime_bootstrap_validated(true);
     let bus = EventBus::new(16).expect("bus");
     let _events = bus.subscribe_scoped_events();
-    let dedup = DurableTestDedup(InMemoryDedupBackend::default());
-    let err = receive_push_with_dedup_sync(
+    let dedup: std::sync::Arc<dyn crate::storage::DedupStorage> =
+        std::sync::Arc::new(DurableTestDedup(InMemoryDedupBackend::default()));
+    let err = receive_push_sync(
         &session,
         &bus,
-        As4ReceivePushSyncRequest {
+        As4ReceivePushSync {
             request: As4ReceivePushRequest {
                 http_content_type: "application/soap+xml".into(),
                 payload: Arc::from([]),
@@ -422,7 +427,8 @@ fn receive_push_with_dedup_rejects_empty_payload() {
                 },
                 authenticated_sender_scope: None,
             },
-            dedup_backend: &dedup,
+            dedup: dedup.clone(),
+            signer_pins: None,
         },
     )
     .expect_err("empty payload must fail");
@@ -433,17 +439,18 @@ fn receive_push_with_dedup_rejects_empty_payload() {
 }
 
 #[test]
-fn receive_push_with_dedup_rejects_non_xml_payload() {
+fn receive_push_rejects_non_xml_payload() {
     let session = SessionContext::new("s1", "p1", "strict")
         .expect("session")
         .with_strict_runtime_bootstrap_validated(true);
     let bus = EventBus::new(16).expect("bus");
     let _events = bus.subscribe_scoped_events();
-    let dedup = DurableTestDedup(InMemoryDedupBackend::default());
-    let err = receive_push_with_dedup_sync(
+    let dedup: std::sync::Arc<dyn crate::storage::DedupStorage> =
+        std::sync::Arc::new(DurableTestDedup(InMemoryDedupBackend::default()));
+    let err = receive_push_sync(
         &session,
         &bus,
-        As4ReceivePushSyncRequest {
+        As4ReceivePushSync {
             request: As4ReceivePushRequest {
                 http_content_type: "application/soap+xml".into(),
                 payload: Arc::from(b"\x00\x01\x02garbage bytes not xml".as_slice()),
@@ -455,7 +462,8 @@ fn receive_push_with_dedup_rejects_non_xml_payload() {
                 },
                 authenticated_sender_scope: None,
             },
-            dedup_backend: &dedup,
+            dedup: dedup.clone(),
+            signer_pins: None,
         },
     )
     .expect_err("non-XML payload must fail");
@@ -809,10 +817,10 @@ fn two_way_mep_receive_extracts_ref_to_message_id() {
     .expect("send");
 
     let (_, dedup) = reliability();
-    let received = receive_push_with_dedup_sync(
+    let received = receive_push_sync(
         &session,
         &bus,
-        As4ReceivePushSyncRequest {
+        As4ReceivePushSync {
             request: As4ReceivePushRequest {
                 http_content_type: out.http_content_type.clone(),
                 payload: out.soap_envelope.body,
@@ -830,11 +838,13 @@ fn two_way_mep_receive_extracts_ref_to_message_id() {
                 },
                 authenticated_sender_scope: None,
             },
-            dedup_backend: &dedup,
+            dedup: dedup.clone(),
+            signer_pins: None,
         },
     )
     .expect("receive")
-    .unwrap_output();
+    .unwrap_output()
+    .0;
     assert_eq!(
         received.user_message.ref_to_message_id.as_deref(),
         Some("original-msg-002"),
@@ -1067,10 +1077,10 @@ fn as4_receive_push_decrypts_outbound_xmlenc_loop() {
     .expect("send encrypt+sign");
 
     let (_, dedup) = reliability();
-    let received = receive_push_with_dedup_sync(
+    let received = receive_push_sync(
         &session,
         &bus,
-        As4ReceivePushSyncRequest {
+        As4ReceivePushSync {
             request: As4ReceivePushRequest {
                 http_content_type: outbound.http_content_type.clone(),
                 payload: outbound.soap_envelope.body,
@@ -1088,11 +1098,13 @@ fn as4_receive_push_decrypts_outbound_xmlenc_loop() {
                 },
                 authenticated_sender_scope: None,
             },
-            dedup_backend: &dedup,
+            dedup: dedup.clone(),
+            signer_pins: None,
         },
     )
     .expect("receive and decrypt")
-    .unwrap_output();
+    .unwrap_output()
+    .0;
 
     assert_eq!(received.payload.as_ref().as_ref(), b"payload");
 }
@@ -1140,10 +1152,10 @@ fn as4_compressed_payload_round_trips_with_compression_type_property() {
     );
 
     let (_, dedup) = reliability();
-    let received = receive_push_with_dedup_sync(
+    let received = receive_push_sync(
         &session,
         &bus,
-        As4ReceivePushSyncRequest {
+        As4ReceivePushSync {
             request: As4ReceivePushRequest {
                 http_content_type: outbound.http_content_type.clone(),
                 payload: outbound.soap_envelope.body,
@@ -1161,11 +1173,13 @@ fn as4_compressed_payload_round_trips_with_compression_type_property() {
                 },
                 authenticated_sender_scope: None,
             },
-            dedup_backend: &dedup,
+            dedup: dedup.clone(),
+            signer_pins: None,
         },
     )
     .expect("receive compressed")
-    .unwrap_output();
+    .unwrap_output()
+    .0;
 
     assert_eq!(
         received.payload.as_ref().as_ref(),
@@ -1243,10 +1257,10 @@ fn as4_multi_payload_send_round_trips_all_parts() {
     );
 
     let (_, dedup) = reliability();
-    let received = receive_push_with_dedup_sync(
+    let received = receive_push_sync(
         &session,
         &bus,
-        As4ReceivePushSyncRequest {
+        As4ReceivePushSync {
             request: As4ReceivePushRequest {
                 http_content_type: outbound.http_content_type.clone(),
                 payload: outbound.soap_envelope.body,
@@ -1264,11 +1278,13 @@ fn as4_multi_payload_send_round_trips_all_parts() {
                 },
                 authenticated_sender_scope: None,
             },
-            dedup_backend: &dedup,
+            dedup: dedup.clone(),
+            signer_pins: None,
         },
     )
     .expect("multi-payload receive")
-    .unwrap_output();
+    .unwrap_output()
+    .0;
 
     assert_eq!(received.payload_count(), 4, "all four parts must arrive");
     let expect = [
@@ -1331,10 +1347,10 @@ fn as4_multi_payload_compressed_encrypted_round_trips() {
     .expect("multi-payload compressed+encrypted send");
 
     let (_, dedup) = reliability();
-    let received = receive_push_with_dedup_sync(
+    let received = receive_push_sync(
         &session,
         &bus,
-        As4ReceivePushSyncRequest {
+        As4ReceivePushSync {
             request: As4ReceivePushRequest {
                 http_content_type: outbound.http_content_type.clone(),
                 payload: outbound.soap_envelope.body,
@@ -1352,11 +1368,13 @@ fn as4_multi_payload_compressed_encrypted_round_trips() {
                 },
                 authenticated_sender_scope: None,
             },
-            dedup_backend: &dedup,
+            dedup: dedup.clone(),
+            signer_pins: None,
         },
     )
     .expect("multi-payload compressed+encrypted receive")
-    .unwrap_output();
+    .unwrap_output()
+    .0;
 
     assert_eq!(received.payload_count(), 2);
     assert_eq!(received.payload.as_ref().as_ref(), primary.as_slice());
@@ -1410,10 +1428,10 @@ fn as4_compressed_and_encrypted_payload_round_trips() {
     );
 
     let (_, dedup) = reliability();
-    let received = receive_push_with_dedup_sync(
+    let received = receive_push_sync(
         &session,
         &bus,
-        As4ReceivePushSyncRequest {
+        As4ReceivePushSync {
             request: As4ReceivePushRequest {
                 http_content_type: outbound.http_content_type.clone(),
                 payload: outbound.soap_envelope.body,
@@ -1431,11 +1449,13 @@ fn as4_compressed_and_encrypted_payload_round_trips() {
                 },
                 authenticated_sender_scope: None,
             },
-            dedup_backend: &dedup,
+            dedup: dedup.clone(),
+            signer_pins: None,
         },
     )
     .expect("receive compressed+encrypted")
-    .unwrap_output();
+    .unwrap_output()
+    .0;
 
     assert_eq!(
         received.payload.as_ref().as_ref(),
@@ -1475,10 +1495,10 @@ fn as4_receive_push_accepts_multipart_related_payload() {
     .expect("send mime");
 
     let (_, dedup) = reliability();
-    let received = receive_push_with_dedup_sync(
+    let received = receive_push_sync(
         &session,
         &bus,
-        As4ReceivePushSyncRequest {
+        As4ReceivePushSync {
             request: As4ReceivePushRequest {
                 http_content_type: outbound.http_content_type.clone(),
                 payload: outbound.soap_envelope.body,
@@ -1496,11 +1516,13 @@ fn as4_receive_push_accepts_multipart_related_payload() {
                 },
                 authenticated_sender_scope: None,
             },
-            dedup_backend: &dedup,
+            dedup: dedup.clone(),
+            signer_pins: None,
         },
     )
     .expect("receive mime")
-    .unwrap_output();
+    .unwrap_output()
+    .0;
 
     assert_eq!(received.payload.as_ref().as_ref(), b"payload-mime");
     assert_eq!(received.user_message.message_id, "msg-send-mime-recv");
@@ -1537,10 +1559,10 @@ fn as4_receive_unwraps_sbdh_payload_when_present() {
     .expect("send sbdh payload");
 
     let (_, dedup) = reliability();
-    let received = receive_push_with_dedup_sync(
+    let received = receive_push_sync(
         &session,
         &bus,
-        As4ReceivePushSyncRequest {
+        As4ReceivePushSync {
             request: As4ReceivePushRequest {
                 http_content_type: outbound.http_content_type.clone(),
                 payload: outbound.soap_envelope.body,
@@ -1558,11 +1580,13 @@ fn as4_receive_unwraps_sbdh_payload_when_present() {
                 },
                 authenticated_sender_scope: None,
             },
-            dedup_backend: &dedup,
+            dedup: dedup.clone(),
+            signer_pins: None,
         },
     )
     .expect("receive sbdh payload")
-    .unwrap_output();
+    .unwrap_output()
+    .0;
 
     let sbdh = received.sbdh_header.expect("sbdh header parsed");
     assert_eq!(sbdh.sender.identifier, "0007:1234567890123");
@@ -1576,7 +1600,7 @@ fn as4_receive_unwraps_sbdh_payload_when_present() {
 
 #[cfg(feature = "interop-relaxed")]
 #[tokio::test]
-async fn as4_receive_push_with_dedup_async_accepts_multipart_related_payload() {
+async fn as4_receive_push_async_accepts_multipart_related_payload() {
     let bus = EventBus::new(16).expect("bus");
     let _events = bus.subscribe_scoped_events();
     let creds = test_as4_credentials();
@@ -1604,33 +1628,38 @@ async fn as4_receive_push_with_dedup_async_accepts_multipart_related_payload() {
     )
     .expect("send mime");
 
-    let (_, dedup) = reliability();
-    let dedup_backend: Arc<dyn crate::storage::DedupStorage> = Arc::new(dedup);
-    let received = receive_push_with_dedup_async(
+    let (_, dedup_backend) = reliability();
+    let received = receive_push(
         &session,
         &bus,
-        As4ReceivePushRequest {
-            http_content_type: outbound.http_content_type.clone(),
-            payload: outbound.soap_envelope.body,
-            receipt_payload: None,
-            policy: As4PushPolicy {
-                interop: InteropMode::Relaxed,
-                interop_exceptions: InteropExceptionPolicy::default(),
-                require_signed_receipt: false,
-                require_signed_push: true,
-                fail_closed_audit_events: false,
-                inbound_decryption_key_pem: None,
-                require_encrypted_inbound: false,
-                timestamp_freshness_window: None,
-                fragment_scope_policy: FragmentScopePolicy::UseSoapSenderId,
+        As4ReceivePush {
+            request: As4ReceivePushRequest {
+                http_content_type: outbound.http_content_type.clone(),
+                payload: outbound.soap_envelope.body,
+                receipt_payload: None,
+                policy: As4PushPolicy {
+                    interop: InteropMode::Relaxed,
+                    interop_exceptions: InteropExceptionPolicy::default(),
+                    require_signed_receipt: false,
+                    require_signed_push: true,
+                    fail_closed_audit_events: false,
+                    inbound_decryption_key_pem: None,
+                    require_encrypted_inbound: false,
+                    timestamp_freshness_window: None,
+                    fragment_scope_policy: FragmentScopePolicy::UseSoapSenderId,
+                },
+                authenticated_sender_scope: None,
             },
-            authenticated_sender_scope: None,
+            dedup: dedup_backend,
+            ordering: None,
+            signer_pins: None,
         },
-        dedup_backend,
     )
     .await
     .expect("receive mime")
-    .unwrap_output();
+    .into_inner()
+    .unwrap_output()
+    .0;
 
     assert_eq!(received.payload.as_ref().as_ref(), b"payload-mime-async");
     assert_eq!(received.user_message.message_id, "msg-send-mime-recv-async");
@@ -1676,10 +1705,10 @@ fn as4_receive_push_rejects_multipart_root_part_with_non_xop_content_type() {
         .into_bytes();
 
     let (_, dedup) = reliability();
-    let err = receive_push_with_dedup_sync(
+    let err = receive_push_sync(
         &session,
         &bus,
-        As4ReceivePushSyncRequest {
+        As4ReceivePushSync {
             request: As4ReceivePushRequest {
                 http_content_type: outbound.http_content_type.clone(),
                 payload: Arc::from(tampered),
@@ -1697,7 +1726,8 @@ fn as4_receive_push_rejects_multipart_root_part_with_non_xop_content_type() {
                 },
                 authenticated_sender_scope: None,
             },
-            dedup_backend: &dedup,
+            dedup: dedup.clone(),
+            signer_pins: None,
         },
     )
     .expect_err("multipart root part with non-xop content type must be rejected");
@@ -1746,10 +1776,10 @@ fn as4_receive_push_rejects_tampered_multipart_payload_reference_digest() {
     }
 
     let (_, dedup) = reliability();
-    let err = receive_push_with_dedup_sync(
+    let err = receive_push_sync(
         &session,
         &bus,
-        As4ReceivePushSyncRequest {
+        As4ReceivePushSync {
             request: As4ReceivePushRequest {
                 http_content_type: outbound.http_content_type.clone(),
                 payload: Arc::from(tampered),
@@ -1767,7 +1797,8 @@ fn as4_receive_push_rejects_tampered_multipart_payload_reference_digest() {
                 },
                 authenticated_sender_scope: None,
             },
-            dedup_backend: &dedup,
+            dedup: dedup.clone(),
+            signer_pins: None,
         },
     )
     .expect_err("tampered mime attachment must fail signature verification");
@@ -1791,10 +1822,10 @@ async fn as4_receive_push_parses_user_message_and_receipt() {
 </S12:Header><S12:Body/></S12:Envelope>"#;
 
     let (_, dedup) = reliability();
-    let out = receive_push_with_dedup_sync(
+    let out = receive_push_sync(
         &session,
         &bus,
-        As4ReceivePushSyncRequest {
+        As4ReceivePushSync {
             request: As4ReceivePushRequest {
                 http_content_type: "multipart/related; boundary=asx-test-boundary".into(),
                 payload: Arc::from(payload),
@@ -1812,11 +1843,13 @@ async fn as4_receive_push_parses_user_message_and_receipt() {
                 },
                 authenticated_sender_scope: None,
             },
-            dedup_backend: &dedup,
+            dedup: dedup.clone(),
+            signer_pins: None,
         },
     )
     .expect("push receive")
-    .unwrap_output();
+    .unwrap_output()
+    .0;
 
     assert_eq!(out.user_message.message_id, "msg-1");
     assert_eq!(out.user_message.action, "SubmitOrder");
@@ -2079,10 +2112,10 @@ async fn generate_signed_receipt_for_output_echoes_inbound_digests() {
     let payload =
         multipart_user_message_payload("msg-1", "SubmitOrder", Some("conv-7"), b"payload-msg-1");
     let (_, dedup) = reliability();
-    let out = receive_push_with_dedup_sync(
+    let out = receive_push_sync(
         &session,
         &bus,
-        As4ReceivePushSyncRequest {
+        As4ReceivePushSync {
             request: As4ReceivePushRequest {
                 http_content_type: "multipart/related; boundary=asx-test-boundary".into(),
                 payload: Arc::from(payload),
@@ -2100,11 +2133,13 @@ async fn generate_signed_receipt_for_output_echoes_inbound_digests() {
                 },
                 authenticated_sender_scope: None,
             },
-            dedup_backend: &dedup,
+            dedup: dedup.clone(),
+            signer_pins: None,
         },
     )
     .expect("push receive")
-    .unwrap_output();
+    .unwrap_output()
+    .0;
 
     // Build a *signed* inbound wire message to extract NRI digests from.
     let sent = send_sync(
@@ -2182,10 +2217,10 @@ async fn generate_signed_receipt_for_output_rejects_unsigned_inbound() {
     let payload =
         multipart_user_message_payload("msg-unsigned-1", "SubmitOrder", None, b"payload-unsigned");
     let (_, dedup) = reliability();
-    let out = receive_push_with_dedup_sync(
+    let out = receive_push_sync(
         &session,
         &bus,
-        As4ReceivePushSyncRequest {
+        As4ReceivePushSync {
             request: As4ReceivePushRequest {
                 http_content_type: "multipart/related; boundary=asx-test-boundary".into(),
                 payload: Arc::from(payload.clone()),
@@ -2203,11 +2238,13 @@ async fn generate_signed_receipt_for_output_rejects_unsigned_inbound() {
                 },
                 authenticated_sender_scope: None,
             },
-            dedup_backend: &dedup,
+            dedup: dedup.clone(),
+            signer_pins: None,
         },
     )
     .expect("push receive")
-    .unwrap_output();
+    .unwrap_output()
+    .0;
 
     let creds = test_receipt_credentials();
     let err = generate_signed_receipt_for_output(
@@ -2248,10 +2285,10 @@ fn strict_mode_rejects_missing_wsse_security_header_even_with_scoped_exception()
 </S12:Envelope>"#;
 
     let (_, dedup) = reliability();
-    let err = receive_push_with_dedup_sync(
+    let err = receive_push_sync(
         &session,
         &bus,
-        As4ReceivePushSyncRequest {
+        As4ReceivePushSync {
             request: As4ReceivePushRequest {
                 http_content_type: "application/soap+xml".into(),
                 payload: Arc::from(payload.to_vec()),
@@ -2266,7 +2303,8 @@ fn strict_mode_rejects_missing_wsse_security_header_even_with_scoped_exception()
                 },
                 authenticated_sender_scope: None,
             },
-            dedup_backend: &dedup,
+            dedup: dedup.clone(),
+            signer_pins: None,
         },
     )
     .expect_err("strict mode must reject missing wsse:Security even with exception policy");
@@ -2296,10 +2334,10 @@ fn strict_mode_rejects_missing_messaging_must_understand() {
 </S12:Envelope>"#;
 
     let (_, dedup) = reliability();
-    let err = receive_push_with_dedup_sync(
+    let err = receive_push_sync(
         &session,
         &bus,
-        As4ReceivePushSyncRequest {
+        As4ReceivePushSync {
             request: As4ReceivePushRequest {
                 http_content_type: "application/soap+xml".into(),
                 payload: Arc::from(payload.to_vec()),
@@ -2310,7 +2348,8 @@ fn strict_mode_rejects_missing_messaging_must_understand() {
                 },
                 authenticated_sender_scope: None,
             },
-            dedup_backend: &dedup,
+            dedup: dedup.clone(),
+            signer_pins: None,
         },
     )
     .expect_err("strict mode must reject missing mustUnderstand");
@@ -2333,10 +2372,10 @@ fn strict_mode_surfaces_crypto_failures() {
     );
 
     let (_, dedup) = reliability();
-    let err = receive_push_with_dedup_sync(
+    let err = receive_push_sync(
         &session,
         &bus,
-        As4ReceivePushSyncRequest {
+        As4ReceivePushSync {
             request: As4ReceivePushRequest {
                 http_content_type: "multipart/related; boundary=asx-test-boundary".into(),
                 payload: Arc::from(payload),
@@ -2348,7 +2387,8 @@ fn strict_mode_surfaces_crypto_failures() {
                 },
                 authenticated_sender_scope: None,
             },
-            dedup_backend: &dedup,
+            dedup: dedup.clone(),
+            signer_pins: None,
         },
     )
     .expect_err("strict runtime should continue to crypto verification");
@@ -2371,10 +2411,10 @@ fn strict_mode_rejects_interop_exception_overrides_runtime_policy() {
     );
 
     let (_, dedup) = reliability();
-    let err = receive_push_with_dedup_sync(
+    let err = receive_push_sync(
         &session,
         &bus,
-        As4ReceivePushSyncRequest {
+        As4ReceivePushSync {
             request: As4ReceivePushRequest {
                 http_content_type: "multipart/related; boundary=asx-test-boundary".into(),
                 payload: Arc::from(payload),
@@ -2390,7 +2430,8 @@ fn strict_mode_rejects_interop_exception_overrides_runtime_policy() {
                 },
                 authenticated_sender_scope: None,
             },
-            dedup_backend: &dedup,
+            dedup: dedup.clone(),
+            signer_pins: None,
         },
     )
     .expect_err("strict runtime policy must reject interop exception overrides");
@@ -2409,10 +2450,10 @@ fn strict_mode_rejects_runtime_push_policy_with_unsigned_receipt_requirement() {
     let _events = bus.subscribe_scoped_events();
     let (_, dedup) = durable_reliability();
 
-    let err = receive_push_with_dedup_sync(
+    let err = receive_push_sync(
         &session,
         &bus,
-        As4ReceivePushSyncRequest {
+        As4ReceivePushSync {
             request: As4ReceivePushRequest {
                 http_content_type: "application/soap+xml".into(),
                 payload: Arc::from(b"not-xml".to_vec()),
@@ -2425,7 +2466,8 @@ fn strict_mode_rejects_runtime_push_policy_with_unsigned_receipt_requirement() {
                 },
                 authenticated_sender_scope: None,
             },
-            dedup_backend: &dedup,
+            dedup: dedup.clone(),
+            signer_pins: None,
         },
     )
     .expect_err("strict runtime policy must reject require_signed_receipt=false");
@@ -2593,7 +2635,8 @@ async fn strict_mode_rejects_runtime_pull_policy_with_unsigned_receipt_requireme
                 authorization_info: None,
             },
             reconciliation_hook: &hook,
-            dedup_backend: Arc::new(dedup_backend),
+            dedup_backend,
+            signer_pins: None,
         },
     )
     .await
@@ -2631,10 +2674,10 @@ async fn relaxed_missing_security_header_is_security_blocked_and_audited() {
 </S12:Envelope>"#;
 
     let (_, dedup) = reliability();
-    let denied = receive_push_with_dedup_sync(
+    let denied = receive_push_sync(
         &session,
         &bus,
-        As4ReceivePushSyncRequest {
+        As4ReceivePushSync {
             request: As4ReceivePushRequest {
                 http_content_type: "application/soap+xml".into(),
                 payload: Arc::from(payload.to_vec()),
@@ -2652,16 +2695,17 @@ async fn relaxed_missing_security_header_is_security_blocked_and_audited() {
                 },
                 authenticated_sender_scope: None,
             },
-            dedup_backend: &dedup,
+            dedup: dedup.clone(),
+            signer_pins: None,
         },
     )
     .expect_err("relaxed path should be security-blocked");
     assert_eq!(denied.code, ErrorCode::PolicyViolation);
 
-    let blocked = receive_push_with_dedup_sync(
+    let blocked = receive_push_sync(
         &session,
         &bus,
-        As4ReceivePushSyncRequest {
+        As4ReceivePushSync {
             request: As4ReceivePushRequest {
                 http_content_type: "application/soap+xml".into(),
                 payload: Arc::from(payload.to_vec()),
@@ -2679,7 +2723,8 @@ async fn relaxed_missing_security_header_is_security_blocked_and_audited() {
                 },
                 authenticated_sender_scope: None,
             },
-            dedup_backend: &dedup,
+            dedup: dedup.clone(),
+            signer_pins: None,
         },
     )
     .expect_err("scoped exception should still be security-blocked");
@@ -2720,10 +2765,10 @@ async fn relaxed_mode_emits_no_wssec_relaxation_audit() {
         multipart_user_message_payload("msg-compat", "SubmitOrder", None, b"payload-compat");
 
     let (_, dedup) = reliability();
-    receive_push_with_dedup_sync(
+    receive_push_sync(
         &session,
         &bus,
-        As4ReceivePushSyncRequest {
+        As4ReceivePushSync {
             request: As4ReceivePushRequest {
                 http_content_type: "multipart/related; boundary=asx-test-boundary".into(),
                 payload: Arc::from(payload),
@@ -2741,7 +2786,8 @@ async fn relaxed_mode_emits_no_wssec_relaxation_audit() {
                 },
                 authenticated_sender_scope: None,
             },
-            dedup_backend: &dedup,
+            dedup: dedup.clone(),
+            signer_pins: None,
         },
     )
     .expect("push receive");
@@ -2782,10 +2828,10 @@ fn missing_security_header_fails_closed_when_audit_emit_fails() {
 </S12:Envelope>"#;
 
     let (_, dedup) = reliability();
-    let err = receive_push_with_dedup_sync(
+    let err = receive_push_sync(
         &session,
         &bus,
-        As4ReceivePushSyncRequest {
+        As4ReceivePushSync {
             request: As4ReceivePushRequest {
                 http_content_type: "application/soap+xml".into(),
                 payload: Arc::from(payload.to_vec()),
@@ -2803,7 +2849,8 @@ fn missing_security_header_fails_closed_when_audit_emit_fails() {
                 },
                 authenticated_sender_scope: None,
             },
-            dedup_backend: &dedup,
+            dedup: dedup.clone(),
+            signer_pins: None,
         },
     )
     .expect_err("audit emission failure must fail closed");
@@ -2853,8 +2900,7 @@ async fn pull_store_queue_limit_rejects_new_message_by_default() {
         .expect_err("enqueue must reject when queue is full");
     assert_eq!(err.code, ErrorCode::CapacityExhausted);
 
-    let (hook, dedup) = durable_reliability();
-    let dedup_backend: Arc<dyn crate::storage::DedupStorage> = Arc::new(dedup);
+    let (hook, dedup_backend) = durable_reliability();
     let out = receive_pull_with_reliability(
         &session,
         &bus,
@@ -2873,6 +2919,7 @@ async fn pull_store_queue_limit_rejects_new_message_by_default() {
             },
             reconciliation_hook: &hook,
             dedup_backend,
+            signer_pins: None,
         },
     )
     .await
@@ -2913,6 +2960,7 @@ async fn durable_dedup_receive_pull_rejects_non_durable_backend() {
             },
             reconciliation_hook: &hook,
             dedup_backend,
+            signer_pins: None,
         },
     )
     .await
@@ -2968,8 +3016,7 @@ async fn pull_store_queue_limit_can_evict_oldest_when_configured() {
         As4PullEnqueueOutcome::EvictedOldestAndEnqueued { .. }
     ));
 
-    let (hook, dedup) = durable_reliability();
-    let dedup_backend: Arc<dyn crate::storage::DedupStorage> = Arc::new(dedup);
+    let (hook, dedup_backend) = durable_reliability();
     let out = receive_pull_with_reliability(
         &session,
         &bus,
@@ -2988,6 +3035,7 @@ async fn pull_store_queue_limit_can_evict_oldest_when_configured() {
             },
             reconciliation_hook: &hook,
             dedup_backend,
+            signer_pins: None,
         },
     )
     .await
@@ -3224,8 +3272,7 @@ async fn pull_store_served_cache_limit_evicts_oldest_pull_id() {
         .expect("enqueue msg-2");
     assert_eq!(second, As4PullEnqueueOutcome::Enqueued);
 
-    let (hook, dedup) = durable_reliability();
-    let dedup_backend: Arc<dyn crate::storage::DedupStorage> = Arc::new(dedup);
+    let (hook, dedup_backend) = durable_reliability();
     let first = receive_pull_with_reliability(
         &session,
         &bus,
@@ -3244,6 +3291,7 @@ async fn pull_store_served_cache_limit_evicts_oldest_pull_id() {
             },
             reconciliation_hook: &hook,
             dedup_backend: Arc::clone(&dedup_backend),
+            signer_pins: None,
         },
     )
     .await
@@ -3268,6 +3316,7 @@ async fn pull_store_served_cache_limit_evicts_oldest_pull_id() {
             },
             reconciliation_hook: &hook,
             dedup_backend: Arc::clone(&dedup_backend),
+            signer_pins: None,
         },
     )
     .await
@@ -3292,6 +3341,7 @@ async fn pull_store_served_cache_limit_evicts_oldest_pull_id() {
             },
             reconciliation_hook: &hook,
             dedup_backend,
+            signer_pins: None,
         },
     )
     .await
@@ -3327,8 +3377,7 @@ async fn pull_receive_requeues_message_when_push_processing_fails() {
         .await
         .expect("enqueue invalid payload");
 
-    let (hook, dedup) = durable_reliability();
-    let dedup_backend: Arc<dyn crate::storage::DedupStorage> = Arc::new(dedup);
+    let (hook, dedup_backend) = durable_reliability();
 
     let first_err = receive_pull_with_reliability(
         &session,
@@ -3348,6 +3397,7 @@ async fn pull_receive_requeues_message_when_push_processing_fails() {
             },
             reconciliation_hook: &hook,
             dedup_backend: Arc::clone(&dedup_backend),
+            signer_pins: None,
         },
     )
     .await
@@ -3372,6 +3422,7 @@ async fn pull_receive_requeues_message_when_push_processing_fails() {
             },
             reconciliation_hook: &hook,
             dedup_backend,
+            signer_pins: None,
         },
     )
     .await
@@ -3960,4 +4011,231 @@ fn constant_time_eq_returns_false_for_differing_slices() {
     assert!(!constant_time_eq(b"secret", b"wrong_"));
     assert!(!constant_time_eq(b"secret", b"secre")); // different length
     assert!(!constant_time_eq(b"", b"x"));
+}
+
+// ---------------------------------------------------------------------------
+// Signer pinning (D64)
+//
+// A signature that verifies against the network's trust anchors proves
+// membership of the network, not the identity of the sender — every access
+// point shares those anchors. Pinning is what attributes a verified signature
+// to the party that claimed to send it.
+// ---------------------------------------------------------------------------
+
+/// Build a genuinely signed AS4 push, and a session that trusts the signer's
+/// certificate as an anchor but pins **nothing**.
+#[cfg(feature = "interop-relaxed")]
+fn signed_push_with_unpinned_session(
+    bus: &EventBus,
+    message_id: &str,
+) -> (SessionContext, As4SendOutput, As4SendCredentials) {
+    let creds = test_as4_credentials();
+    let signer = session_with_trust("s-pin", "p1", &creds);
+
+    let outbound = send_sync(
+        &signer,
+        bus,
+        As4SendRequest {
+            message_id: message_id.to_string(),
+            payload: b"pinning-payload".to_vec(),
+            policy: As4SendPolicy {
+                interop: InteropMode::Strict,
+                outbound_key_info_profile: WsSecOutboundKeyInfoProfile::X509DataOnly,
+                sign: true,
+                encrypt: false,
+                compress: false,
+                payload_packaging_mode: super::pmode::PayloadPackagingMode::MimeAttachment,
+                ..As4SendPolicy::default()
+            },
+            credentials: Some(creds.clone()),
+            payload_filename: None,
+            ..As4SendRequest::default()
+        },
+    )
+    .expect("send signed");
+
+    // Same trust anchor, no fingerprint pin.
+    let cert_pem = creds
+        .signing_cert_pem
+        .as_ref()
+        .expect("signing cert")
+        .clone();
+    let unpinned = SessionContext::new("s-pin-recv", "p1", "strict")
+        .expect("session")
+        .with_strict_runtime_bootstrap_validated(true)
+        .with_cert_handle(CertHandle {
+            trust_anchor_pems: vec![String::from_utf8(cert_pem.to_vec()).expect("utf8")],
+            ocsp_mode: OcspMode::Disabled,
+            ocsp_failure_mode: OcspFailureMode::HardFail,
+            // Deliberately empty.
+            fingerprint_sha256: String::new(),
+            ..CertHandle::new("unpinned")
+        })
+        .expect("cert handle");
+
+    (unpinned, outbound, creds)
+}
+
+#[cfg(feature = "interop-relaxed")]
+fn pinning_receive_policy() -> As4PushPolicy {
+    As4PushPolicy {
+        interop: InteropMode::Relaxed,
+        interop_exceptions: InteropExceptionPolicy::default(),
+        require_signed_receipt: false,
+        require_signed_push: true,
+        fail_closed_audit_events: false,
+        inbound_decryption_key_pem: None,
+        require_encrypted_inbound: false,
+        timestamp_freshness_window: None,
+        fragment_scope_policy: FragmentScopePolicy::UseSoapSenderId,
+    }
+}
+
+/// A validly signed message whose claimed sender has no pin is refused, and
+/// the error names the party and the remedy.
+#[cfg(feature = "interop-relaxed")]
+#[test]
+fn signed_push_from_an_unpinned_sender_is_refused() {
+    let bus = EventBus::new(16).expect("bus");
+    let _events = bus.subscribe_scoped_events();
+    let (session, outbound, _creds) = signed_push_with_unpinned_session(&bus, "msg-unpinned");
+    let (_, dedup) = reliability();
+
+    let err = receive_push_sync(
+        &session,
+        &bus,
+        As4ReceivePushSync {
+            request: As4ReceivePushRequest {
+                http_content_type: outbound.http_content_type.clone(),
+                payload: outbound.soap_envelope.body,
+                receipt_payload: None,
+                policy: pinning_receive_policy(),
+                authenticated_sender_scope: None,
+            },
+            dedup,
+            signer_pins: None,
+        },
+    )
+    .expect_err("a signature that cannot be attributed must not be accepted");
+
+    assert_eq!(err.code, ErrorCode::PolicyViolation);
+    assert!(
+        err.message.contains("no signing certificate is pinned"),
+        "must say what is missing: {}",
+        err.message
+    );
+    assert!(
+        err.message.contains("signer_pins") || err.message.contains("with_fingerprint_sha256"),
+        "must name the remedy: {}",
+        err.message
+    );
+}
+
+/// The resolver accepts the message when the claimed sender's pin matches the
+/// verified signer — one session, keyed per partner.
+#[cfg(feature = "interop-relaxed")]
+#[test]
+fn signer_pins_resolve_per_claimed_sender() {
+    let bus = EventBus::new(16).expect("bus");
+    let _events = bus.subscribe_scoped_events();
+    let (session, outbound, creds) = signed_push_with_unpinned_session(&bus, "msg-resolved");
+    let (_, dedup) = reliability();
+
+    let cert_pem = creds.signing_cert_pem.as_ref().expect("signing cert");
+    let fingerprint = crate::crypto::CertFingerprint::from_cert_pem(cert_pem).expect("fingerprint");
+
+    // The signed envelope's own eb:From party id.
+    let from = "s-pin";
+    let pins = std::sync::Arc::new(super::As4SignerPinMap::new().pin(from, fingerprint));
+
+    let outcome = receive_push_sync(
+        &session,
+        &bus,
+        As4ReceivePushSync {
+            request: As4ReceivePushRequest {
+                http_content_type: outbound.http_content_type.clone(),
+                payload: outbound.soap_envelope.body,
+                receipt_payload: None,
+                policy: pinning_receive_policy(),
+                authenticated_sender_scope: None,
+            },
+            dedup,
+            signer_pins: Some(pins),
+        },
+    )
+    .expect("a pinned sender must be accepted");
+
+    assert!(outcome.is_first_seen());
+}
+
+/// Pinning party B's certificate does not authorize a message claiming to be
+/// from party A — the lookup is keyed on the claimed `eb:From`.
+#[cfg(feature = "interop-relaxed")]
+#[test]
+fn a_pin_for_another_party_does_not_authorize_this_sender() {
+    let bus = EventBus::new(16).expect("bus");
+    let _events = bus.subscribe_scoped_events();
+    let (session, outbound, creds) = signed_push_with_unpinned_session(&bus, "msg-wrong-party");
+    let (_, dedup) = reliability();
+
+    let cert_pem = creds.signing_cert_pem.as_ref().expect("signing cert");
+    let fingerprint = crate::crypto::CertFingerprint::from_cert_pem(cert_pem).expect("fingerprint");
+
+    // The real signer, pinned against a party the message does not claim.
+    let pins =
+        std::sync::Arc::new(super::As4SignerPinMap::new().pin("some-other-party", fingerprint));
+
+    let err = receive_push_sync(
+        &session,
+        &bus,
+        As4ReceivePushSync {
+            request: As4ReceivePushRequest {
+                http_content_type: outbound.http_content_type.clone(),
+                payload: outbound.soap_envelope.body,
+                receipt_payload: None,
+                policy: pinning_receive_policy(),
+                authenticated_sender_scope: None,
+            },
+            dedup,
+            signer_pins: Some(pins),
+        },
+    )
+    .expect_err("a pin for another party must not authorize this sender");
+
+    assert_eq!(err.code, ErrorCode::PolicyViolation);
+}
+
+/// A pinned party whose message is signed by a *different* certificate is
+/// refused — the pin is checked against the verified signer, not merely
+/// present.
+#[cfg(feature = "interop-relaxed")]
+#[test]
+fn a_pinned_party_signed_by_the_wrong_certificate_is_refused() {
+    let bus = EventBus::new(16).expect("bus");
+    let _events = bus.subscribe_scoped_events();
+    let (session, outbound, _creds) = signed_push_with_unpinned_session(&bus, "msg-wrong-cert");
+    let (_, dedup) = reliability();
+
+    // A well-formed pin that is not the signer's.
+    let wrong = crate::crypto::CertFingerprint::parse(&"ab".repeat(32)).expect("fingerprint");
+    let pins = std::sync::Arc::new(super::As4SignerPinMap::new().pin("s-pin", wrong));
+
+    let err = receive_push_sync(
+        &session,
+        &bus,
+        As4ReceivePushSync {
+            request: As4ReceivePushRequest {
+                http_content_type: outbound.http_content_type.clone(),
+                payload: outbound.soap_envelope.body,
+                receipt_payload: None,
+                policy: pinning_receive_policy(),
+                authenticated_sender_scope: None,
+            },
+            dedup,
+            signer_pins: Some(pins),
+        },
+    )
+    .expect_err("the pinned certificate must actually be the signer");
+
+    assert_eq!(err.code, ErrorCode::SecurityVerificationFailed);
 }

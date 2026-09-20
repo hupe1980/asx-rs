@@ -58,7 +58,7 @@ use crate::core::{AsxError, ErrorCode, ErrorContext, Result};
 ///
 /// ```rust
 /// # use asx_rs::as4::{
-/// #     receive_push_ordered, As4ConversationOrderGate, As4ReceivePushOrderedRequest,
+/// #     receive_push, As4ConversationOrderGate, As4ReceivePush,
 /// #     As4ReceivePushRequest,
 /// # };
 /// # async fn example(
@@ -71,18 +71,24 @@ use crate::core::{AsxError, ErrorCode, ErrorContext, Result};
 ///
 /// // Serializes all messages for the same ConversationId, lets distinct
 /// // conversations through without contention.
-/// let output = receive_push_ordered(
+/// let output = receive_push(
 ///     session,
 ///     bus,
-///     As4ReceivePushOrderedRequest {
+///     As4ReceivePush {
 ///         request,
-///         dedup_backend: dedup,
-///         gate: &gate,
+///         dedup,
+///         ordering: Some(&gate),
+///         signer_pins: None,
 ///     },
 /// )
 /// .await?;
+///
+/// // The guard holds the conversation's turn: deliver first, then drop it.
+/// deliver(output.get()).await;
+/// drop(output);
 /// # Ok(())
 /// # }
+/// # async fn deliver(_: &asx_rs::as4::As4ReceiveOutcome) {}
 /// ```
 pub struct As4ConversationOrderGate {
     /// Map from `conversation_id` → `Weak<ConversationTurnSlot>`.
@@ -252,7 +258,7 @@ impl As4ConversationOrderGate {
                     "ordered AS4 Two-Way response references unknown predecessor MessageId '{}'; expected predecessor completion on this replica before response processing",
                     ref_to
                 ),
-                ErrorContext::new("as4_receive_push_ordered"),
+                ErrorContext::new("as4_receive_push"),
             ));
         }
 

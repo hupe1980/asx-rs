@@ -473,7 +473,7 @@ mod tests {
     use crate::observability::audit_sink::{
         AuditEvent, AuditSinkDurability, DurableAuditSink, ReplayCursor,
     };
-    use crate::storage::BoxFuture;
+    use crate::storage::{BoxFuture, DedupVerdict};
 
     #[derive(Debug)]
 
@@ -539,11 +539,25 @@ mod tests {
             false
         }
 
-        fn first_seen<'a>(
+        fn claim<'a>(
             &'a self,
             _idempotency_key: &'a str,
-        ) -> BoxFuture<'a, crate::core::Result<bool>> {
-            Box::pin(async move { Ok(true) })
+        ) -> BoxFuture<'a, crate::core::Result<DedupVerdict>> {
+            Box::pin(async move { Ok(DedupVerdict::Claimed) })
+        }
+
+        fn accept<'a>(
+            &'a self,
+            _idempotency_key: &'a str,
+        ) -> BoxFuture<'a, crate::core::Result<()>> {
+            Box::pin(async move { Ok(()) })
+        }
+
+        fn abandon<'a>(
+            &'a self,
+            _idempotency_key: &'a str,
+        ) -> BoxFuture<'a, crate::core::Result<()>> {
+            Box::pin(async move { Ok(()) })
         }
     }
 
@@ -556,11 +570,25 @@ mod tests {
             true
         }
 
-        fn first_seen<'a>(
+        fn claim<'a>(
             &'a self,
             _idempotency_key: &'a str,
-        ) -> BoxFuture<'a, crate::core::Result<bool>> {
-            Box::pin(async move { Ok(true) })
+        ) -> BoxFuture<'a, crate::core::Result<DedupVerdict>> {
+            Box::pin(async move { Ok(DedupVerdict::Claimed) })
+        }
+
+        fn accept<'a>(
+            &'a self,
+            _idempotency_key: &'a str,
+        ) -> BoxFuture<'a, crate::core::Result<()>> {
+            Box::pin(async move { Ok(()) })
+        }
+
+        fn abandon<'a>(
+            &'a self,
+            _idempotency_key: &'a str,
+        ) -> BoxFuture<'a, crate::core::Result<()>> {
+            Box::pin(async move { Ok(()) })
         }
     }
 
@@ -650,11 +678,25 @@ mod tests {
             true
         }
 
-        fn first_seen<'a>(
+        fn claim<'a>(
             &'a self,
             _idempotency_key: &'a str,
-        ) -> BoxFuture<'a, crate::core::Result<bool>> {
-            Box::pin(async move { Ok(true) })
+        ) -> BoxFuture<'a, crate::core::Result<DedupVerdict>> {
+            Box::pin(async move { Ok(DedupVerdict::Claimed) })
+        }
+
+        fn accept<'a>(
+            &'a self,
+            _idempotency_key: &'a str,
+        ) -> BoxFuture<'a, crate::core::Result<()>> {
+            Box::pin(async move { Ok(()) })
+        }
+
+        fn abandon<'a>(
+            &'a self,
+            _idempotency_key: &'a str,
+        ) -> BoxFuture<'a, crate::core::Result<()>> {
+            Box::pin(async move { Ok(()) })
         }
     }
 

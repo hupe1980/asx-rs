@@ -31,7 +31,7 @@ cargo add asx-rs --features as2,as4,interop-relaxed
 | Feature | Enables | Default |
 |---|---|---|
 | `as2` | `as2::send_sync` / `as2::receive_sync`, async wrappers, MDN generation/parsing, MIC computation | No |
-| `as4` | `as4::send_sync` / `as4::receive_push_with_dedup_sync`, pull APIs, P-Mode registry, Test Service, SBDH | No |
+| `as4` | `as4::send_sync` / `as4::receive_push_sync`, pull APIs, P-Mode registry, Test Service, SBDH | No |
 | `compression` | Zlib/GZIP payload compression via `flate2` | **Yes** |
 | `async-ocsp` | Async OCSP responder fetching via reqwest | **Yes** |
 | `interop-strict` | Strict interop mode as the default profile | **Yes** |
@@ -297,7 +297,7 @@ use asx_rs::as2::{
 };
 use asx_rs::core::SessionContext;
 use asx_rs::observability::{BackpressurePolicy, EventBus, EventEmissionMode};
-use asx_rs::storage::{InMemoryDedupStorage, InMemoryReconciliationStorage};
+use asx_rs::storage::{InMemoryReconciliationStorage, TtlDedupStorage};
 use std::sync::Arc;
 
 fn end_to_end_as2() -> asx_rs::Result<()> {
@@ -338,7 +338,8 @@ fn end_to_end_as2() -> asx_rs::Result<()> {
 
     // 5. Verify the MDN and check the MIC matches.
     //    Use TtlDedupStorage / durable backends instead of in-memory in production.
-    let dedup = InMemoryDedupStorage::default();
+    let dedup: Arc<dyn asx_rs::storage::DedupStorage> =
+        Arc::new(TtlDedupStorage::new(std::time::Duration::from_secs(48 * 3600)));
     let reconciliation = InMemoryReconciliationStorage::new(1024);
     let verifier = CmsSmimeTrustVerifier::default();
 
@@ -355,12 +356,19 @@ fn end_to_end_as2() -> asx_rs::Result<()> {
             original_message_id: Some(msg_id.to_string()),
         },
         &reconciliation,
-        &dedup,
+        Arc::clone(&dedup),
         &verifier,
     )?;
 
     // mdn_result.outcome — SuccessConfirmed, Indeterminate, or AcceptedPendingVerification
     println!("AS2 message {} MDN outcome: {:?}", msg_id, mdn_result.outcome);
+
+    // 6. Settle the dedup claim once the outcome is durably recorded. Use
+    //    `abandon()` instead if recording it failed, so a retransmitted MDN is
+    //    processed rather than swallowed as a duplicate.
+    if let Some(claim) = mdn_result.dedup.into_claim() {
+        claim.accept_blocking()?;
+    }
     Ok(())
 }
 ```
@@ -369,12 +377,13 @@ fn end_to_end_as2() -> asx_rs::Result<()> {
 - `output.as_received_content_mic()` returns the RFC 4130 MIC string — pass it to `expected_mic` so the MDN cross-check validates both digest value and algorithm.
 - `receive_with_mdn_with_reliability` verifies the MDN signature, checks the MIC, emits audit events, and queues a `ReconciliationRequest` for indeterminate outcomes.
 - The `session` is long-lived; recreating it per message wastes cert-validation work.
-- Use `TtlDedupStorage` (or a distributed backend) rather than `InMemoryDedupStorage` in production.
+- `TtlDedupStorage` is in-memory: use a durable `DedupStorage` backend in production, and set the TTL to the replay window you need (48h per RFC 4130 §5.2.1)
+- Deduplication is two-phase: settle the claim on `mdn_result.dedup` once the delivery outcome is durable — see [Reliability](@/docs/reliability.md#deduplication).
 
 ## Quick Start: AS4 Receive (Push)
 
 ```rust
-use asx_rs::as4::As4PushPolicy;
+use asx_rs::as4::{As4PushPolicy, As4ReceiveOutcome};
 use asx_rs::transport::ingress::{As4HttpIngress, As4IngressReceivePushSyncRequest};
 use asx_rs::core::SessionContext;
 use asx_rs::observability::EventBus;
@@ -387,13 +396,26 @@ fn receive_as4_push(
     session: &SessionContext,
     bus: &EventBus,
 ) -> asx_rs::Result<()> {
-    let received = ingress.receive_push_with_dedup_sync(As4IngressReceivePushSyncRequest {
+    let outcome = ingress.receive_push_sync(As4IngressReceivePushSyncRequest {
         session,
         event_bus: bus,
         policy: As4PushPolicy::default(),
-        dedup_backend: dedup.as_ref(),
+        dedup: Arc::clone(&dedup),
+        // A signed message from an unpinned sender is refused; None uses the
+        // session's single-partner pin.
+        signer_pins: None,
         receipt_payload: None,
     })?;
+
+    let (received, claim) = match outcome {
+        // First sight: the claim is unsettled and is yours to resolve.
+        As4ReceiveOutcome::FirstSeen { output, claim } => (output, claim),
+        // Previously accepted — return a receipt without re-dispatching.
+        As4ReceiveOutcome::Duplicate { .. } => return Ok(()),
+        // A concurrent delivery holds the claim. Do NOT acknowledge: answer 503
+        // so the sender retransmits once that attempt settles.
+        _ => return Ok(()),
+    };
 
     // received.payload — DomainReady<Arc<[u8]>>: verified, decrypted domain payload
     // received.user_message.message_id — ebMS3 MessageId (dedup-checked)
@@ -403,6 +425,11 @@ fn receive_as4_push(
         received.user_message.message_id,
         received.payload.as_ref().len(),
     );
+
+    // Settle only after the payload is durably yours — persisted, queued, or
+    // dead-lettered. On failure, `claim.abandon_blocking()` lets the sender's
+    // retransmission be processed instead of answered as a duplicate.
+    claim.accept_blocking()?;
     Ok(())
 }
 ```

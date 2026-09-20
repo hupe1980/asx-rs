@@ -140,7 +140,7 @@ pub fn receive_with_mdn_with_reliability(
     event_bus: &EventBus,
     request: As2ReceiveMdnRequest,
     reconciliation_hook: &dyn ReconciliationStorage,
-    dedup_backend: &dyn DedupStorage,
+    dedup_backend: Arc<dyn DedupStorage>,
     verifier: &dyn As2TrustVerifier,
 ) -> Result<As2ReceiveMdnOutput>
 ```
@@ -153,9 +153,28 @@ pub fn receive_with_mdn_with_reliability_mdn_ref(
     event_bus: &EventBus,
     request: As2ReceiveMdnRefRequest<'_>,
     reconciliation_hook: &dyn ReconciliationStorage,
-    dedup_backend: &dyn DedupStorage,
+    dedup_backend: Arc<dyn DedupStorage>,
     verifier: &dyn As2TrustVerifier,
 ) -> Result<As2ReceiveMdnOutput>
+```
+
+`As2ReceiveMdnOutput::dedup` reports how the MDN's idempotency key resolved:
+
+```rust
+use asx_rs::as2::As2MdnDedup;
+
+match output.dedup {
+    // First sight. Settle the claim once the delivery outcome is durably
+    // recorded — `abandon()` instead if recording it failed, so the partner's
+    // retransmission is processed rather than swallowed.
+    As2MdnDedup::FirstSeen(claim) => claim.accept().await?,
+    // A previously accepted MDN for the same original message: the downstream
+    // side effects were deliberately skipped.
+    As2MdnDedup::Duplicate => {}
+    // A concurrent delivery holds the claim; this call caused no side effects.
+    As2MdnDedup::InFlight => {}
+    _ => {}
+}
 ```
 
 ### Which MDN part carries the verdict

@@ -122,6 +122,7 @@ async fn as4_pull_is_denied_when_authorization_is_left_at_the_default() {
             },
             reconciliation_hook: &hook,
             dedup_backend: dedup.clone(),
+            signer_pins: None,
         },
     )
     .await
@@ -156,6 +157,7 @@ async fn as4_pull_empty_then_delayed_retrieval_is_correlated() {
             },
             reconciliation_hook: &hook,
             dedup_backend: Arc::clone(&dedup),
+            signer_pins: None,
         },
     )
     .await
@@ -197,6 +199,7 @@ async fn as4_pull_empty_then_delayed_retrieval_is_correlated() {
             },
             reconciliation_hook: &hook,
             dedup_backend: Arc::clone(&dedup),
+            signer_pins: None,
         },
     )
     .await
@@ -258,6 +261,7 @@ async fn as4_pull_duplicate_retrieval_replays_same_message() {
             },
             reconciliation_hook: &hook,
             dedup_backend: Arc::clone(&dedup),
+            signer_pins: None,
         },
     )
     .await
@@ -276,6 +280,7 @@ async fn as4_pull_duplicate_retrieval_replays_same_message() {
             },
             reconciliation_hook: &hook,
             dedup_backend: Arc::clone(&dedup),
+            signer_pins: None,
         },
     )
     .await
@@ -341,6 +346,7 @@ async fn as4_pull_timing_race_delivers_to_only_one_request() {
                     },
                     reconciliation_hook: &hook,
                     dedup_backend: Arc::clone(&dedup),
+                    signer_pins: None,
                 },
             )
             .await
@@ -400,6 +406,7 @@ async fn as4_pull_indeterminate_reconciliation_is_not_duplicated_for_same_pull_r
             },
             reconciliation_hook: &hook,
             dedup_backend: Arc::clone(&dedup),
+            signer_pins: None,
         },
     )
     .await
@@ -418,6 +425,7 @@ async fn as4_pull_indeterminate_reconciliation_is_not_duplicated_for_same_pull_r
             },
             reconciliation_hook: &hook,
             dedup_backend: Arc::clone(&dedup),
+            signer_pins: None,
         },
     )
     .await
@@ -465,6 +473,7 @@ async fn as4_pull_dedup_is_correct_under_parallel_duplicate_requests() {
                     },
                     reconciliation_hook: &*reconcile,
                     dedup_backend: Arc::clone(&dedup) as Arc<dyn DedupStorage>,
+                    signer_pins: None,
                 },
             )
             .await
@@ -571,6 +580,7 @@ async fn as4_pull_replay_past_the_served_cache_does_not_consume_another_message(
                 },
                 reconciliation_hook: &hook,
                 dedup_backend: Arc::clone(&dedup),
+                signer_pins: None,
             },
         )
         .await
@@ -659,6 +669,7 @@ async fn as4_pull_unauthorized_request_does_not_poison_the_dedup_store() {
                 },
                 reconciliation_hook: &hook,
                 dedup_backend: Arc::clone(&dedup),
+                signer_pins: None,
             },
         )
         .await
@@ -680,5 +691,107 @@ async fn as4_pull_unauthorized_request_does_not_poison_the_dedup_store() {
     assert!(
         ok.pulled.is_some(),
         "authorized pull must receive the message"
+    );
+}
+
+/// A `PullRequest` that fails *after* its dedup key is claimed must release
+/// that key.
+///
+/// The retrieval produced no response for the served-cache to replay, so the
+/// initiator's retry with the same `eb:MessageId` has to be processed. Leaving
+/// the claim unsettled instead makes every retry inside the lease window
+/// answer `InFlight` — an empty pull — which is the pull-side shape of the
+/// delivery-correctness defect D59 fixed for push.
+#[tokio::test(flavor = "current_thread")]
+async fn as4_pull_releases_its_claim_when_serving_fails() {
+    use asx_rs::core::{AsxError, ErrorCode as Code, ErrorContext};
+    use asx_rs::reliability::ReconciliationRequest;
+    use asx_rs::storage::{BoxFuture, ReconciliationStorage};
+
+    /// Fails `enqueue` on demand, to make the pull fail after it has claimed.
+    #[derive(Debug, Default)]
+    struct SwitchableHook {
+        fail: std::sync::atomic::AtomicBool,
+        inner: InMemoryReconciliationHook,
+    }
+
+    impl ReconciliationStorage for SwitchableHook {
+        fn is_durable(&self) -> bool {
+            true
+        }
+        fn cluster_safe(&self) -> bool {
+            true
+        }
+        fn enqueue<'a>(&'a self, r: ReconciliationRequest) -> BoxFuture<'a, asx_rs::Result<bool>> {
+            if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+                return Box::pin(async {
+                    Err(AsxError::new(
+                        Code::ReliabilityFailure,
+                        "reconciliation store unavailable",
+                        ErrorContext::new("test"),
+                    ))
+                });
+            }
+            self.inner.enqueue(r)
+        }
+        fn queued_requests(&self) -> BoxFuture<'_, asx_rs::Result<Vec<ReconciliationRequest>>> {
+            self.inner.queued_requests()
+        }
+        fn resolve<'a>(&'a self, key: &'a str) -> BoxFuture<'a, asx_rs::Result<bool>> {
+            self.inner.resolve(key)
+        }
+    }
+
+    let bus = EventBus::new(32).expect("bus");
+    let _events = bus.subscribe_scoped_events();
+    let store = As4PullStore::new();
+    let s = session();
+    let hook = SwitchableHook::default();
+    let dedup: Arc<dyn DedupStorage> = Arc::new(InMemoryDedupBackend::default());
+
+    async fn pull(
+        s: &SessionContext,
+        bus: &EventBus,
+        store: &As4PullStore,
+        hook: &SwitchableHook,
+        dedup: Arc<dyn DedupStorage>,
+    ) -> asx_rs::Result<asx_rs::as4::As4ReceivePullOutput> {
+        receive_pull_with_reliability(
+            s,
+            bus,
+            As4ReceivePullWithReliabilityRequest {
+                store,
+                request: As4ReceivePullRequest {
+                    // The same MessageId both times: that is the whole point.
+                    pull_message_id: "pull-retry-after-failure".to_string(),
+                    policy: pull_policy("urn:mpc:release-on-failure"),
+                    receipt_payload: None,
+                    authorization_info: None,
+                },
+                reconciliation_hook: hook,
+                dedup_backend: dedup,
+                signer_pins: None,
+            },
+        )
+        .await
+    }
+
+    // First attempt: the queue is empty and the reconciliation store is down,
+    // so serving fails after the claim was taken.
+    hook.fail.store(true, std::sync::atomic::Ordering::SeqCst);
+    let err = pull(&s, &bus, &store, &hook, dedup.clone())
+        .await
+        .expect_err("a failing reconciliation store must fail the pull");
+    assert_eq!(err.code, ErrorCode::ReliabilityFailure);
+
+    // Retry with the same MessageId, store healthy again. It must be served,
+    // not answered from a claim the failed attempt never released.
+    hook.fail.store(false, std::sync::atomic::Ordering::SeqCst);
+    let out = pull(&s, &bus, &store, &hook, dedup)
+        .await
+        .expect("the retry must be processed, not blocked by a stale claim");
+    assert!(
+        !out.duplicate_retrieval,
+        "the retry was treated as a replay: the failed attempt never released its claim"
     );
 }

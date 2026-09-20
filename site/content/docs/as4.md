@@ -331,174 +331,68 @@ pub fn send_sync(
 ) -> Result<As4SendOutput>
 ```
 
-Async-safe wrapper for Tokio services:
+### Receive push
 
 ```rust
-pub async fn send_async(
-    session: &SessionContext,
-    event_bus: &EventBus,
-    request: As4SendRequest,
-) -> Result<As4SendOutput>
-```
-
-Behavior notes:
-
-1. SOAP envelope is generated with SwA packaging: empty Body, payload referenced from the signed `eb:PartInfo`.
-2. MIME package is emitted as `multipart/related` output.
-3. The WS-Security signature covers three references: the whole `eb:Messaging`
-   header block (`wsu:Id="as4-messaging"` — all UserMessage routing/authorization
-   metadata), the SOAP Body, and a detached `cid:` reference for the MIME
-   attachment. On receive, the `eb:Messaging` block that the pipeline routes on is
-   bound to the verified signature (there must be exactly one such block and its
-   `wsu:Id` must be in the verified reference set) — an XML-Signature-Wrapping
-   defence.
-4. Optional XML encryption is applied before outbound packaging.
-
-### Verify the synchronous response
-
-```rust
-pub fn verify_sync_response(
-    session: &SessionContext,
-    event_bus: &EventBus,
-    sent: &As4SendOutput,
-    response_body: &[u8],
-    response_content_type: &str,
-    policy: &As4ReceiptPolicy,
-) -> Result<As4SyncSignal>
-```
-
-In the One-Way/Push MEP with Reception Awareness (eDelivery AS4 v1.15 §5.1,
-BDEW AS4-Profil §4.6.3) the receiving MSH answers on the same HTTP connection
-with an `eb:Receipt` or an `eb:Error`. `verify_sync_response` turns that raw
-body into a typed, verified outcome. Checks, in order:
-
-| # | Check | Failure code |
-|---|---|---|
-| 1 | Body non-empty and within `max_receipt_bytes` (256 KiB default) | `ParseFailed` / `PayloadTooLarge` |
-| 2 | Namespace-resolved parse of the `eb:SignalMessage` (prefix-agnostic, CDATA-aware) | `ParseFailed` |
-| 3 | At most one `eb:Messaging` / `eb:SignalMessage`; no repeated `eb:MessageInfo` child; `NonRepudiationInformation` only inside the `eb:Receipt` | `SecurityVerificationFailed` |
-| 4 | `eb:Error` classified and returned as `As4SyncSignal::Error`; a signal carrying both Receipt and Error is ambiguous | — / `InteropViolation` |
-| 5 | Receipt `ds:Signature` verified against the pinned partner certificate, trust anchors and revocation policy | `SecurityVerificationFailed` |
-| 6 | The `eb:SignalMessage` acted on is covered by that signature, directly or via a signed ancestor (XML Signature Wrapping defence) | `SecurityVerificationFailed` |
-| 7 | `eb:RefToMessageId` equals the sent `message_id`; an `eb:Error` correlating elsewhere is not attributed to this message | `InteropViolation` |
-| 8 | Every sent `ds:Reference` echoed by a `MessagePartNRInformation` entry with matching digest algorithm and value | `SecurityVerificationFailed` |
-| 9 | `eb:Timestamp` present and inside the replay window | `SecurityVerificationFailed` |
-
-Step 8 is what makes a receipt evidence rather than decoration: it proves the
-counterparty signed a statement about the exact bytes that were sent. The digest
-set is read from the sent message's own signature, unwrapping the
-`multipart/related` MIME package first, so `cid:` attachment references are
-covered too.
-
-There is deliberately **no** result variant for a digest mismatch — a mismatch is
-always an error, never a value the caller can ignore.
-
-Steps 3 and 6 are the wrapping defences: without them a counterparty could leave
-an element it genuinely signed in place, so the signature still verifies against
-the pinned certificate, and append an unsigned element acknowledging a different
-message. The same defences apply to the inbound `receipt_payload` path, which
-shares this parser.
-
-`As4SyncSignal::Error` reports what the connection returned, not a proven fact —
-error signals are typically unsigned. Treat one as a routing hint (retry vs
-dead-letter); only `As4VerifiedReceipt::is_non_repudiation_evidence()` asserts a
-cryptographically proven outcome.
-
-#### Presets
-
-| Preset | Signature | NRR digests | Interop | Freshness |
-|---|---|---|---|---|
-| `As4ReceiptPolicy::regulated()` (default) | required | required | Strict | 5 min |
-| `As4ReceiptPolicy::strict()` | alias for `regulated()` | | | |
-| `As4ReceiptPolicy::relaxed()` | optional | optional | Relaxed | disabled |
-
-Under `relaxed()` a signature or digest that *is* present is still fully
-verified; only their absence is tolerated.
-
-#### Transport wrapper
-
-```rust
-pub async fn send_and_verify(
-    &self,
-    url: &str,
-    session: &SessionContext,
-    event_bus: &EventBus,
-    output: &As4SendOutput,
-    policy: &As4ReceiptPolicy,
-) -> Result<As4SendAndVerifyOutcome>
-```
-
-`As4SendAndVerifyOutcome` keeps the raw `HttpSendOutcome` alongside the verified
-signal so the wire evidence can be logged or persisted. A non-2xx status whose
-body carries a parseable `eb:Error` is returned as that error signal — the ebMS3
-diagnostics are more actionable than the HTTP status. A non-2xx status with an
-unparseable body becomes `TransportFailure`.
-
-```rust
-let outcome = transport
-    .send_and_verify(&url, &session, &bus, &sent, &As4ReceiptPolicy::regulated())
-    .await?;
-
-match outcome.signal {
-    As4SyncSignal::Receipt(receipt) => assert!(receipt.is_non_repudiation_evidence()),
-    As4SyncSignal::Error(err) => {
-        // As4ErrorCode::from_ebms_code drives retry vs dead-letter.
-        for entry in &err.errors {
-            tracing::error!(code = %entry.error_code, detail = %entry.summary());
-        }
-    }
+pub struct As4ReceivePush<'a> {
+    pub request: As4ReceivePushRequest,
+    pub dedup: Arc<dyn DedupStorage>,
+    /// `None` = process on arrival. `Some(gate)` = preserve per-conversation order.
+    pub ordering: Option<&'a dyn ConversationOrderGate>,
+    /// Which certificate each claimed `eb:From` party may sign with.
+    /// `None` falls back to the session's single-partner pin.
+    pub signer_pins: Option<Arc<dyn As4SignerPins>>,
 }
-```
 
-#### Asynchronous MEP
-
-`verify_sync_response` rejects an empty body: the synchronous MEP requires a
-signal on the same connection. Deployments using the asynchronous MEP receive
-the receipt as a separate inbound request and should handle it through the
-receive path instead.
-
-### Receive push (owned)
-
-```rust
-pub fn receive_push_with_dedup_sync(
+pub async fn receive_push(
     session: &SessionContext,
     event_bus: &EventBus,
-    request: As4ReceivePushSyncRequest<'_>,
-) -> Result<As4ReceivePushOutput>
-```
-
-Sync fragment-aware wrapper for large-message reassembly:
-
-```rust
-pub fn receive_push_with_dedup_sync_fragment_aware(
-    session: &SessionContext,
-    event_bus: &EventBus,
-    request: As4ReceivePushSyncFragmentAwareRequest<'_>,
-) -> Result<As4ReceivePushProgress>
-```
-
-Async-safe wrapper for Tokio services:
-
-```rust
-pub async fn receive_push_with_dedup_async(
-    session: &SessionContext,
-    event_bus: &EventBus,
-    request: As4ReceivePushRequest,
-    dedup_backend: Arc<dyn DedupStorage>,
-) -> Result<As4ReceivePushOutput>
-```
-
-### Receive push (ordered)
-
-```rust
-pub async fn receive_push_ordered(
-    session: &SessionContext,
-    event_bus: &EventBus,
-    request: As4ReceivePushOrderedRequest<'_>,
+    push: As4ReceivePush<'_>,
 ) -> Result<As4Ordered<As4ReceiveOutcome>>
 ```
 
-Ordered delivery (ebMS3 §5.1.5), with two properties the signature encodes:
+Parse, signature verification and decryption run on Tokio's blocking pool, so
+this is safe to call from an async handler.
+
+> **A signed message from an unpinned sender is refused.** Set `signer_pins`,
+> or pin one partner on the session — see
+> [certificate fingerprint pinning](@/docs/security.md#certificate-fingerprint-pinning-required-not-optional).
+
+**Ordering is a field, not a different function.** Whether a deployment
+preserves per-conversation arrival order (ebMS3 §5.1.5) is a property of that
+deployment, so turning it on is a configuration change rather than a call-site
+rewrite.
+
+```rust
+// Unordered — the common case. The guard holds no turn.
+let outcome = receive_push(&session, &bus, As4ReceivePush {
+    request,
+    dedup,
+    ordering: None,
+    signer_pins: None,   // session pin; Some(..) for many partners
+})
+.await?
+.into_inner();
+```
+
+```rust
+// Ordered — the same call, with a gate.
+let ordered = receive_push(&session, &bus, As4ReceivePush {
+    request,
+    dedup,
+    ordering: Some(&gate),
+    signer_pins: None,
+})
+.await?;
+
+if let As4ReceiveOutcome::FirstSeen { output, .. } = ordered.get() {
+    application.deliver(output).await?;   // turn still held
+}
+
+drop(ordered);                            // next message may proceed
+```
+
+Two properties the ordered signature encodes:
 
 - **The place in the queue is taken on arrival.** The `eb:ConversationId` is
   read from the raw bytes with a bounded scan *before* parse, verification and
@@ -506,15 +400,91 @@ Ordered delivery (ebMS3 §5.1.5), with two properties the signature encodes:
 - **The turn is held until you drop it.** `As4Ordered<T>` is a guard — deliver
   the message while you hold it.
 
+### Receive push (fragments)
+
 ```rust
-let ordered = receive_push_ordered(&session, &bus, request).await?;
-
-if let As4ReceiveOutcome::FirstSeen(output) = ordered.get() {
-    application.deliver(output).await?;   // turn still held
-}
-
-drop(ordered);                            // next message may proceed
+pub async fn receive_push_fragment_aware(
+    session: &SessionContext,
+    event_bus: &EventBus,
+    push: As4ReceivePush<'_>,
+    fragments: Arc<Mutex<As4FragmentJoiner>>,
+) -> Result<As4Ordered<As4ReceivePushProgress>>
 ```
+
+Fragment-awareness *is* a different method, because it is the axis that changes
+the answer: an incomplete group produces `As4ReceivePushProgress::PendingFragment`,
+which `receive_push` has no way to report. Only a completed message takes a turn.
+
+### The Peppol envelope (SBDH)
+
+Peppol carries the business document inside a Standard Business Document
+Header, and its parameters live in `BusinessScope` as `<Scope>` entries. An
+envelope without `DOCUMENTID` and `PROCESSID` is rejected by every access
+point.
+
+```rust
+use asx_rs::sbdh::{SbdhScope, StandardBusinessDocument, peppol_scope};
+
+let header = SbdhHeader {
+    // ... sender, receiver, document_identification ...
+    business_scope: vec![
+        SbdhScope::with_scheme(
+            peppol_scope::DOCUMENT_ID,
+            "urn:oasis:names:specification:ubl:schema:xsd:Invoice-2::Invoice##urn:cen.eu:en16931:2017#compliant#urn:fdc:peppol.eu:2017:poacc:billing:3.0::2.1",
+            "busdox-docid-qns",
+        ),
+        SbdhScope::with_scheme(
+            peppol_scope::PROCESS_ID,
+            "urn:fdc:peppol.eu:2017:poacc:billing:01:1.0",
+            "cenbii-procid-ubl",
+        ),
+        SbdhScope::new(peppol_scope::COUNTRY_C1, "BE"),
+    ],
+    ..header
+};
+
+let wrapped = StandardBusinessDocument { header, payload }.wrap()?;
+```
+
+Reading them back:
+
+```rust
+let doc = StandardBusinessDocument::unwrap(&bytes)?;
+let process = doc.header.scope_value(peppol_scope::PROCESS_ID);
+```
+
+`Scope` is the whole extensibility mechanism — reserved Peppol keys and your
+own attributes share it. [`peppol_scope`] has the reserved ones, including
+`MLS_TO` and `MLS_TYPE` for the Message Level Status customisations that Peppol
+Network Policy 1.0.0 made mandatory.
+
+An empty `business_scope` emits **no** `<BusinessScope>` element, because the
+Peppol schema gives `Scope` a lower bound of 1 — an empty container fails
+validation.
+
+[`peppol_scope`]: https://docs.rs/asx-rs/latest/asx_rs/sbdh/peppol_scope/
+
+#### Non-XML payloads
+
+The envelope expects XML. A PDF or an EDIFACT interchange needs a wrapper:
+
+```rust
+use asx_rs::sbdh::{wrap_binary_payload, wrap_text_payload};
+
+let pdf = wrap_binary_payload(pdf_bytes, "application/pdf", None);
+let edifact = wrap_text_payload(interchange, "Application/EDIFACT");
+```
+
+Neither is for XML — a plain XML payload goes in directly.
+
+### Synchronous variants
+
+`receive_push_sync` and `receive_push_sync_fragment_aware` take
+`As4ReceivePushSync` (no `ordering` — reserving a turn means waiting for it, and
+waiting is async) and block on the calling thread.
+
+The `FirstSeen` variant also carries an unsettled `DedupClaim` — settle it once
+delivery is durable. See [Reliability](@/docs/reliability.md#deduplication).
 
 | Method | Behaviour |
 |---|---|
@@ -612,13 +582,10 @@ session context once and then use standard AS4 entry points:
 ```rust
 let strict_session = bootstrap_token.bind(&session);
 
-let out = asx_rs::as4::receive_push_with_dedup_sync(
+let out = asx_rs::as4::receive_push_sync(
     &strict_session,
     &event_bus,
-    asx_rs::as4::As4ReceivePushSyncRequest {
-        request,
-        dedup_backend,
-    },
+    asx_rs::as4::As4ReceivePushSync { request, dedup },
 )?;
 ```
 
@@ -667,35 +634,32 @@ policy.
 `generate_signed_receipt_for_output`, `generate_error_signal`, and
 `generate_pull_request` are available in `asx_rs::as4`.
 
-Signal *verification* on the send side is
-[`verify_sync_response`](#verify-the-synchronous-response).
+Signal *verification* on the send side is `verify_sync_response`; see
+[AS4 send with receipt verification](@/docs/transport.md#as4-send-with-receipt-verification-recommended).
 
 ## Core Types
 
 1. `As4SendPolicy` / `As4SendPolicyBuilder`
 2. `As4PushPolicy` / `As4PushPolicyBuilder`
 3. `As4PullPolicy`
-4. `As4ReceivePushRequest`
-5. `As4ReceivePushOrderedRequest`
-6. `As4ReceivePushOrderedFragmentAwareRequest`
-7. `As4ReceivePushAsyncFragmentAwareRequest`
-8. `As4ReceivePushSyncFragmentAwareRequest`
-9. `As4ReceivePushSyncRequest`
-10. `As4SendOutput` and `As4ReceivePushOutput`
-11. `As4EnqueuePullWithReliabilityRequest`
-12. `As4ReceivePullWithReliabilityRequest`
-13. `PMode` / `PModeRegistry`
-14. `As4ReceiptPolicy` — synchronous-signal verification policy
-15. `As4SyncSignal` — verified `eb:Receipt` or typed `eb:Error`
-16. `As4VerifiedReceipt` / `As4NonRepudiation` — delivery evidence
-17. `As4ErrorSignal` / `As4ReceivedError` — parsed ebMS3 error diagnostics
+4. `As4ReceivePushRequest` — the inbound bytes, content type and push policy
+5. `As4ReceivePush` — async push receive: the request plus `dedup`, `ordering` and `signer_pins`
+6. `As4ReceivePushSync` — the blocking equivalent
+7. `As4SendOutput` and `As4ReceivePushOutput`
+8. `As4EnqueuePullWithReliabilityRequest`
+9. `As4ReceivePullWithReliabilityRequest`
+10. `PMode` / `PModeRegistry`
+11. `As4ReceiptPolicy` — synchronous-signal verification policy
+12. `As4SyncSignal` — verified `eb:Receipt` or typed `eb:Error`
+13. `As4VerifiedReceipt` / `As4NonRepudiation` — delivery evidence
+14. `As4ErrorSignal` / `As4ReceivedError` — parsed ebMS3 error diagnostics
 
 ## Interop Notes
 
 1. Strict mode is default and recommended.
 2. Relaxed interop remains available by feature/profile policy for scoped exceptions.
 3. Inbound payloads must be multipart/related with detached attachment bytes.
-4. Signed inbound messages are validated in pinned-sender mode and require `SessionContext.cert_handle.fingerprint_sha256` to be configured. The same pin is used to verify counterparty receipt signatures; override it with `As4ReceiptPolicy::with_expected_signer_fingerprint` when a partner signs receipts with a different certificate.
+4. Signed inbound messages are validated in pinned-sender mode. Set `As4ReceivePush::signer_pins` to an `As4SignerPins` resolver to pin per partner, keyed on the claimed `eb:From`; with no resolver, `SessionContext.cert_handle.fingerprint_sha256` is the single pin for the session. The session pin also verifies counterparty receipt signatures; override it with `As4ReceiptPolicy::with_expected_signer_fingerprint` when a partner signs receipts with a different certificate.
 5. Never detect a receipt by scanning the response body for `<eb:Receipt`. Prefixes are arbitrary (`eb:`, `eb3:`, `ns2:`, default namespace) and element text may be CDATA-wrapped; `verify_sync_response` resolves namespaces properly.
 
 ## Test Service and P-Mode
@@ -760,7 +724,7 @@ Enable the `smp` module with the `client` feature, and `dns` for the built-in
 resolver:
 
 ```toml
-asx-rs = { version = "0.14", features = ["as4", "client", "async-ocsp", "dns"] }
+asx-rs = { version = "0.15", features = ["as4", "client", "async-ocsp", "dns"] }
 ```
 
 | Network | SML zone |
@@ -827,8 +791,11 @@ async fn build_registry_from_smp(smp_ca_pem: String) -> asx_rs::Result<Arc<PMode
         mep:             MepType::OneWayPush,
         endpoint_url:    endpoint.url.clone(),
         security:        PModeSecurity {
+            // Peppol uses the Peppol PKI for signature *and* encryption at AS4
+            // message level (Peppol AS4 profile §1, §4.7): the encryption
+            // certificate is the receiving AP's, fetched from the SMP.
             sign:    true,
-            encrypt: false, // PEPPOL BIS Billing 3.0 mandates sign-only
+            encrypt: true,
             ..Default::default()
         },
         ..Default::default()

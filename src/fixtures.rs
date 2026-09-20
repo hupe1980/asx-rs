@@ -697,15 +697,26 @@ mod tests {
         );
     }
 
-    #[test]
-    fn malformed_catalog_is_rejected() {
-        let temp_root = std::env::temp_dir().join(format!(
-            "asx_fixture_repo_test_{}",
+    /// A unique scratch directory for one test.
+    ///
+    /// A timestamp alone is not unique: `SystemTime` is microsecond-granular on
+    /// some platforms, so two tests running on different threads can land on
+    /// the same nanosecond value, share a directory, and overwrite each other's
+    /// `catalog.json`. Keying on the test's own name as well makes the
+    /// collision impossible rather than unlikely.
+    fn scratch_root(test_name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "asx_fixture_repo_test_{test_name}_{}",
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .expect("clock")
                 .as_nanos()
-        ));
+        ))
+    }
+
+    #[test]
+    fn malformed_catalog_is_rejected() {
+        let temp_root = scratch_root("malformed_catalog_is_rejected");
         fs::create_dir_all(temp_root.join("interop")).expect("create dirs");
         fs::write(
             temp_root.join("interop/sample.mime"),
@@ -746,13 +757,7 @@ mod tests {
 
     #[test]
     fn receipt_stage_requires_multipart_payload() {
-        let temp_root = std::env::temp_dir().join(format!(
-            "asx_fixture_repo_test_{}",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos()
-        ));
+        let temp_root = scratch_root("receipt_stage_requires_multipart_payload");
         fs::create_dir_all(temp_root.join("interop/partner/strict/as4_receive_receipt"))
             .expect("create dirs");
         fs::write(

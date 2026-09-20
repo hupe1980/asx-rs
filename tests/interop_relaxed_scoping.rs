@@ -6,8 +6,7 @@ mod common;
 use asx_rs::as2::receive_with_mdn_with_reliability;
 use asx_rs::as2::{As2MdnMode, As2ReceiveMdnRequest, As2ReceivePolicy};
 use asx_rs::as4::{
-    As4PushPolicyBuilder, As4ReceivePushRequest, As4ReceivePushSyncRequest,
-    receive_push_with_dedup_sync,
+    As4PushPolicyBuilder, As4ReceivePushRequest, As4ReceivePushSync, receive_push_sync,
 };
 use asx_rs::core::{ErrorCode, InteropMode, SessionContext};
 use asx_rs::interop::{InteropExceptionCode, InteropExceptionPolicy};
@@ -21,10 +20,13 @@ fn session(session_id: &str, profile: &str) -> SessionContext {
     SessionContext::new(session_id, "partner-relaxed", profile).expect("session")
 }
 
-fn reliability() -> (InMemoryReconciliationHook, InMemoryDedupBackend) {
+fn reliability() -> (
+    InMemoryReconciliationHook,
+    std::sync::Arc<dyn asx_rs::storage::DedupStorage>,
+) {
     (
         InMemoryReconciliationHook::default(),
-        InMemoryDedupBackend::default(),
+        std::sync::Arc::new(InMemoryDedupBackend::default()),
     )
 }
 
@@ -102,7 +104,7 @@ async fn as2_relaxed_exception_is_profile_scoped_and_audited() {
             original_message_id: None,
         },
         &hook,
-        &dedup,
+        dedup.clone(),
         &verifier,
     )
     .expect("allowed relaxed profile should pass");
@@ -121,7 +123,7 @@ async fn as2_relaxed_exception_is_profile_scoped_and_audited() {
             original_message_id: None,
         },
         &hook,
-        &dedup,
+        dedup.clone(),
         &verifier,
     )
     .expect_err("exception must not leak into other profiles");
@@ -198,10 +200,10 @@ async fn as4_missing_non_repudiation_info_is_security_blocked_and_audited() {
     let multipart_content_type =
         "multipart/related; boundary=\"asx-interop-boundary\"; type=\"application/soap+xml\"";
 
-    let scoped_err = receive_push_with_dedup_sync(
+    let scoped_err = receive_push_sync(
         &blocked_scoped,
         &bus,
-        As4ReceivePushSyncRequest {
+        As4ReceivePushSync {
             request: As4ReceivePushRequest {
                 http_content_type: multipart_content_type.into(),
                 payload: multipart_payload.clone().into(),
@@ -209,7 +211,8 @@ async fn as4_missing_non_repudiation_info_is_security_blocked_and_audited() {
                 policy: policy.clone(),
                 authenticated_sender_scope: None,
             },
-            dedup_backend: &dedup_scoped,
+            dedup: dedup_scoped.clone(),
+            signer_pins: None,
         },
     )
     .expect_err("security-blocked exception must not be overridable (scoped)");
@@ -219,10 +222,10 @@ async fn as4_missing_non_repudiation_info_is_security_blocked_and_audited() {
     // (even though it failed), so reusing the same backend would make the second
     // call return Duplicate instead of reaching the policy check.
     let (_, dedup_unscoped) = reliability();
-    let unscoped_err = receive_push_with_dedup_sync(
+    let unscoped_err = receive_push_sync(
         &blocked_unscoped,
         &bus,
-        As4ReceivePushSyncRequest {
+        As4ReceivePushSync {
             request: As4ReceivePushRequest {
                 http_content_type: multipart_content_type.into(),
                 payload: multipart_payload.into(),
@@ -230,7 +233,8 @@ async fn as4_missing_non_repudiation_info_is_security_blocked_and_audited() {
                 policy,
                 authenticated_sender_scope: None,
             },
-            dedup_backend: &dedup_unscoped,
+            dedup: dedup_unscoped.clone(),
+            signer_pins: None,
         },
     )
     .expect_err("security-blocked exception must not be overridable (unscoped)");

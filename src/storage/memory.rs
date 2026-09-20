@@ -6,54 +6,51 @@
 
 use super::BoxFuture;
 use parking_lot::Mutex;
-use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
-use super::{DedupStorage, ReconciliationStorage};
+use super::{DedupStorage, DedupVerdict, ReconciliationStorage};
 use crate::reliability::ReconciliationRequest;
 
-/// In-memory dedup storage using a HashSet.
-/// Fail-closed semantics: any infrastructure failure (lock poison) fails the dedup check.
+/// Default lease on an unsettled claim for the in-memory backends.
 ///
-/// # ⚠ Unbounded memory growth
-///
-/// Every unique idempotency key is retained **indefinitely** — there is no
-/// eviction, no TTL, and no capacity limit. Over days or weeks of operation
-/// with UUID-based message IDs, memory consumption grows monotonically.
-///
-/// **For development and short-lived tests**: `InMemoryDedupStorage` is
-/// convenient and accurate.
-///
-/// **For production deployments**: use one of the bounded alternatives:
-/// - [`TtlDedupStorage`] — retains keys only for a configurable TTL window
-///   (matches the replay-attack window; typically 5–60 minutes).
-/// - [`BoundedFifoDedupStorage`] — FIFO eviction when a fixed capacity is
-///   reached (predictable memory footprint, weaker anti-replay guarantee).
-/// - A durable distributed backend (Redis, PostgreSQL, etc.) that implements
-///   [`DedupStorage`] for clustered deployments.
-#[derive(Debug, Default)]
-pub struct InMemoryDedupStorage {
-    seen: Mutex<HashSet<String>>,
+/// Long enough to outlast any plausible receive-and-persist, short enough that
+/// a process that died mid-handling does not block the retransmission for long.
+pub const DEFAULT_CLAIM_LEASE: Duration = Duration::from_secs(300);
+
+/// State of one idempotency key in an in-memory backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeyState {
+    /// Claimed but not settled; the lease expires at this instant.
+    InFlight(Instant),
+    /// Settled as accepted; the replay window expires at this instant.
+    Accepted(Instant),
 }
 
-impl DedupStorage for InMemoryDedupStorage {
-    fn is_durable(&self) -> bool {
-        false
+impl KeyState {
+    /// The instant this state stops being meaningful.
+    fn expires_at(&self) -> Instant {
+        match self {
+            Self::InFlight(at) | Self::Accepted(at) => *at,
+        }
     }
 
-    fn first_seen<'a>(
-        &'a self,
-        idempotency_key: &'a str,
-    ) -> BoxFuture<'a, crate::core::Result<bool>> {
-        Box::pin(async move {
-            let mut seen = self.seen.lock();
-            if seen.contains(idempotency_key) {
-                return Ok(false);
-            }
-            seen.insert(idempotency_key.to_owned());
-            Ok(true)
-        })
+    fn is_live(&self, now: Instant) -> bool {
+        now < self.expires_at()
+    }
+}
+
+/// The verdict for `now` given the key's current state, shared by every
+/// in-memory backend so they cannot drift apart.
+///
+/// `None` means "take the key": absent, or a lease/TTL that has run out.
+fn verdict_for(existing: Option<&KeyState>, now: Instant) -> Option<DedupVerdict> {
+    match existing {
+        Some(state) if state.is_live(now) => Some(match state {
+            KeyState::Accepted(_) => DedupVerdict::Duplicate,
+            KeyState::InFlight(_) => DedupVerdict::InFlight,
+        }),
+        _ => None,
     }
 }
 
@@ -182,81 +179,22 @@ impl ReconciliationStorage for InMemoryReconciliationStorage {
 ///
 /// `10_000` suits a deployment processing tens of thousands of messages per
 /// hour from *trusted* peers.
-/// Internal dedup state: queue of seen keys + set of current keys.
-type DedupState = (VecDeque<Arc<str>>, HashSet<Arc<str>>);
-
-#[derive(Debug)]
-pub struct BoundedFifoDedupStorage {
-    /// Combined state protected by a single lock to eliminate TOCTOU races.
-    /// Uses `Arc<str>` so both the queue and the set share one heap allocation
-    /// per key — the `Arc::clone()` is a single reference-count increment with
-    /// no additional heap allocation.
-    state: Mutex<DedupState>,
-    capacity: usize,
-}
-
-impl BoundedFifoDedupStorage {
-    /// Create a new bounded FIFO store. `capacity` must be at least 1.
-    ///
-    /// # Panics
-    /// Panics if `capacity` is 0.
-    pub fn new(capacity: usize) -> Self {
-        assert!(capacity > 0, "BoundedFifoDedupStorage capacity must be > 0");
-        Self {
-            state: Mutex::new((
-                VecDeque::with_capacity(capacity),
-                HashSet::with_capacity(capacity),
-            )),
-            capacity,
-        }
-    }
-
-    /// Returns the configured maximum capacity.
-    pub fn capacity(&self) -> usize {
-        self.capacity
-    }
-}
-
-impl DedupStorage for BoundedFifoDedupStorage {
-    fn is_durable(&self) -> bool {
-        false
-    }
-
-    fn first_seen<'a>(
-        &'a self,
-        idempotency_key: &'a str,
-    ) -> BoxFuture<'a, crate::core::Result<bool>> {
-        Box::pin(async move {
-            let mut state = self.state.lock();
-            let (queue, set) = &mut *state;
-            if set.contains(idempotency_key) {
-                return Ok(false);
-            }
-            if queue.len() >= self.capacity
-                && let Some(oldest) = queue.pop_front()
-            {
-                set.remove(&*oldest);
-            }
-            let owned: Arc<str> = Arc::from(idempotency_key);
-            queue.push_back(Arc::clone(&owned));
-            set.insert(owned);
-            Ok(true)
-        })
-    }
-}
-
 /// TTL-aware in-memory dedup storage.
 ///
 /// TTL-based deduplication store backed by a `HashMap<String, Instant>`.
 ///
-/// Each key is tracked with an expiry timestamp. On `first_seen`:
-/// - **Duplicate fast path**: if the key exists and is unexpired, returns `false` in O(1).
-/// - **New key**: inserts with `now + ttl` and returns `true`.
+/// Each key is tracked with a state and an expiry timestamp. On `claim`:
+/// - **Settled fast path**: an unexpired `accepted` key returns
+///   [`DedupVerdict::Duplicate`] in O(1); an unexpired claim returns
+///   [`DedupVerdict::InFlight`].
+/// - **New key, or an expired one**: inserts a claim leased for
+///   `claim_lease` and returns [`DedupVerdict::Claimed`]. `accept` then
+///   restamps it for `ttl`, which is the replay window.
 /// - **Sweep**: expired entries are swept lazily at most once per `sweep_interval`
 ///   (default: `min(ttl / 10, 60s)`), rather than on every insert, keeping the
 ///   amortised cost sub-linear for large windows.
 ///
-/// This prevents the unbounded memory growth of `InMemoryDedupStorage`
+/// Memory is bounded by the replay window rather than by a key count
 /// and matches real AS4 replay-window semantics (typically 1–24 hours).
 ///
 /// # ⚠ Single-process scope
@@ -293,11 +231,12 @@ pub struct TtlDedupStorage {
     inner: Mutex<TtlDedupInner>,
     ttl: Duration,
     sweep_interval: Duration,
+    claim_lease: Duration,
 }
 
 #[derive(Debug)]
 struct TtlDedupInner {
-    entries: HashMap<String, Instant>,
+    entries: HashMap<String, KeyState>,
     last_sweep: Instant,
 }
 
@@ -333,7 +272,29 @@ impl TtlDedupStorage {
             }),
             ttl,
             sweep_interval,
+            claim_lease: DEFAULT_CLAIM_LEASE,
         }
+    }
+
+    /// Override the lease on an unsettled claim (default:
+    /// [`DEFAULT_CLAIM_LEASE`]).
+    ///
+    /// Size it above the longest plausible receive-and-persist and below the
+    /// sender's retransmission interval: too short and two retransmissions
+    /// process concurrently, too long and a crashed handover blocks redelivery.
+    pub fn with_claim_lease(mut self, claim_lease: Duration) -> Self {
+        self.claim_lease = claim_lease;
+        self
+    }
+
+    /// The configured replay-protection window for accepted keys.
+    pub fn ttl(&self) -> Duration {
+        self.ttl
+    }
+
+    /// The configured lease on an unsettled claim.
+    pub fn claim_lease(&self) -> Duration {
+        self.claim_lease
     }
 }
 
@@ -349,28 +310,51 @@ impl DedupStorage for TtlDedupStorage {
         false
     }
 
-    fn first_seen<'a>(
+    fn claim<'a>(
         &'a self,
         idempotency_key: &'a str,
-    ) -> BoxFuture<'a, crate::core::Result<bool>> {
+    ) -> BoxFuture<'a, crate::core::Result<DedupVerdict>> {
         Box::pin(async move {
             let mut inner = self.inner.lock();
             let now = Instant::now();
-            if inner
-                .entries
-                .get(idempotency_key)
-                .is_some_and(|exp| now < *exp)
-            {
-                return Ok(false);
+            if let Some(verdict) = verdict_for(inner.entries.get(idempotency_key), now) {
+                return Ok(verdict);
             }
             if now.duration_since(inner.last_sweep) >= self.sweep_interval {
-                inner.entries.retain(|_, exp| now < *exp);
+                inner.entries.retain(|_, state| state.is_live(now));
                 inner.last_sweep = now;
             }
-            inner
+            inner.entries.insert(
+                idempotency_key.to_string(),
+                KeyState::InFlight(now + self.claim_lease),
+            );
+            Ok(DedupVerdict::Claimed)
+        })
+    }
+
+    fn accept<'a>(&'a self, idempotency_key: &'a str) -> BoxFuture<'a, crate::core::Result<()>> {
+        Box::pin(async move {
+            // The replay window starts at settlement, not at claim: `ttl` is
+            // "how long after handling a message is a replay of it rejected".
+            let expiry = Instant::now() + self.ttl;
+            self.inner
+                .lock()
                 .entries
-                .insert(idempotency_key.to_string(), now + self.ttl);
-            Ok(true)
+                .insert(idempotency_key.to_string(), KeyState::Accepted(expiry));
+            Ok(())
+        })
+    }
+
+    fn abandon<'a>(&'a self, idempotency_key: &'a str) -> BoxFuture<'a, crate::core::Result<()>> {
+        Box::pin(async move {
+            let mut inner = self.inner.lock();
+            if matches!(
+                inner.entries.get(idempotency_key),
+                Some(KeyState::InFlight(_))
+            ) {
+                inner.entries.remove(idempotency_key);
+            }
+            Ok(())
         })
     }
 }
@@ -410,11 +394,19 @@ impl DedupStorage for DurableInMemoryDedupBackend {
         true
     }
 
-    fn first_seen<'a>(
+    fn claim<'a>(
         &'a self,
         idempotency_key: &'a str,
-    ) -> BoxFuture<'a, crate::core::Result<bool>> {
-        self.0.first_seen(idempotency_key)
+    ) -> BoxFuture<'a, crate::core::Result<DedupVerdict>> {
+        self.0.claim(idempotency_key)
+    }
+
+    fn accept<'a>(&'a self, idempotency_key: &'a str) -> BoxFuture<'a, crate::core::Result<()>> {
+        self.0.accept(idempotency_key)
+    }
+
+    fn abandon<'a>(&'a self, idempotency_key: &'a str) -> BoxFuture<'a, crate::core::Result<()>> {
+        self.0.abandon(idempotency_key)
     }
 }
 
@@ -426,31 +418,74 @@ mod tests {
     use std::sync::Arc;
     use std::thread;
 
-    #[test]
-    fn in_memory_dedup_accepts_first_and_rejects_duplicate() {
-        let storage = InMemoryDedupStorage::default();
-        let key = "dedup:test:msg-1";
-        assert!(drive_dedup_future(storage.first_seen(key)).unwrap());
-        assert!(!drive_dedup_future(storage.first_seen(key)).unwrap());
+    /// Claim, settle as accepted, and expect a replay to be rejected.
+    fn claim_and_accept(storage: &dyn DedupStorage, key: &str) -> DedupVerdict {
+        let verdict = drive_dedup_future(storage.claim(key)).unwrap();
+        if verdict == DedupVerdict::Claimed {
+            drive_dedup_future(storage.accept(key)).unwrap();
+        }
+        verdict
     }
 
     #[test]
-    fn in_memory_dedup_is_correct_under_parallel_load() {
-        let storage = Arc::new(InMemoryDedupStorage::default());
+    fn ttl_dedup_accepts_first_and_rejects_duplicate() {
+        let storage = TtlDedupStorage::default();
+        let key = "dedup:test:msg-1";
+        assert_eq!(claim_and_accept(&storage, key), DedupVerdict::Claimed);
+        assert_eq!(claim_and_accept(&storage, key), DedupVerdict::Duplicate);
+    }
+
+    #[test]
+    fn ttl_dedup_reports_unsettled_claim_as_in_flight() {
+        let storage = TtlDedupStorage::default();
+        let key = "dedup:test:msg-unsettled";
+        assert_eq!(
+            drive_dedup_future(storage.claim(key)).unwrap(),
+            DedupVerdict::Claimed
+        );
+        // Not Duplicate: nothing has taken responsibility for this message yet.
+        assert_eq!(
+            drive_dedup_future(storage.claim(key)).unwrap(),
+            DedupVerdict::InFlight
+        );
+    }
+
+    #[test]
+    fn ttl_dedup_abandon_releases_but_accept_is_final() {
+        let storage = TtlDedupStorage::default();
+        let key = "dedup:test:msg-abandon";
+        drive_dedup_future(storage.claim(key)).unwrap();
+        drive_dedup_future(storage.abandon(key)).unwrap();
+        assert_eq!(
+            drive_dedup_future(storage.claim(key)).unwrap(),
+            DedupVerdict::Claimed
+        );
+        drive_dedup_future(storage.accept(key)).unwrap();
+        // A late abandon must not reopen a message that was really processed.
+        drive_dedup_future(storage.abandon(key)).unwrap();
+        assert_eq!(
+            drive_dedup_future(storage.claim(key)).unwrap(),
+            DedupVerdict::Duplicate
+        );
+    }
+
+    #[test]
+    fn ttl_dedup_is_correct_under_parallel_load() {
+        let storage = Arc::new(TtlDedupStorage::default());
         let key = "dedup:test:parallel-msg";
 
         let mut handles = Vec::new();
         for _ in 0..16 {
             let storage = Arc::clone(&storage);
             handles.push(thread::spawn(move || {
-                drive_dedup_future(storage.first_seen(key)).unwrap()
+                drive_dedup_future(storage.claim(key)).unwrap()
             }));
         }
 
         let accepted = handles
             .into_iter()
             .map(|h| h.join().expect("thread join"))
-            .filter(|accepted| *accepted)
+            .filter(|verdict| *verdict == DedupVerdict::Claimed)
             .count();
 
         assert_eq!(accepted, 1);
@@ -503,10 +538,11 @@ mod tests {
             TtlDedupStorage::with_sweep_interval(Duration::from_secs(2), Duration::from_secs(60));
         let key = "dedup:ttl:edge-before-expiry";
 
-        assert!(drive_dedup_future(storage.first_seen(key)).unwrap());
+        assert_eq!(claim_and_accept(&storage, key), DedupVerdict::Claimed);
         thread::sleep(Duration::from_millis(1900));
-        assert!(
-            !drive_dedup_future(storage.first_seen(key)).unwrap(),
+        assert_eq!(
+            drive_dedup_future(storage.claim(key)).unwrap(),
+            DedupVerdict::Duplicate,
             "duplicate must be rejected inside TTL window"
         );
     }
@@ -517,11 +553,39 @@ mod tests {
             TtlDedupStorage::with_sweep_interval(Duration::from_secs(2), Duration::from_secs(60));
         let key = "dedup:ttl:edge-after-expiry";
 
-        assert!(drive_dedup_future(storage.first_seen(key)).unwrap());
+        assert_eq!(claim_and_accept(&storage, key), DedupVerdict::Claimed);
         thread::sleep(Duration::from_millis(2300));
-        assert!(
-            drive_dedup_future(storage.first_seen(key)).unwrap(),
-            "key must be accepted after TTL expiry"
+        assert_eq!(
+            drive_dedup_future(storage.claim(key)).unwrap(),
+            DedupVerdict::Claimed,
+            "key must be claimable again after TTL expiry"
+        );
+    }
+
+    #[test]
+    fn ttl_dedup_expired_claim_lease_is_reclaimable() {
+        // A process that died between claim and accept must not wedge the
+        // message: the lease expires and the retransmission takes the key.
+        let storage = TtlDedupStorage::with_sweep_interval(
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+        )
+        .with_claim_lease(Duration::from_millis(200));
+        let key = "dedup:ttl:lease-expiry";
+
+        assert_eq!(
+            drive_dedup_future(storage.claim(key)).unwrap(),
+            DedupVerdict::Claimed
+        );
+        assert_eq!(
+            drive_dedup_future(storage.claim(key)).unwrap(),
+            DedupVerdict::InFlight
+        );
+        thread::sleep(Duration::from_millis(350));
+        assert_eq!(
+            drive_dedup_future(storage.claim(key)).unwrap(),
+            DedupVerdict::Claimed,
+            "an expired claim lease must be reclaimable"
         );
     }
 
@@ -616,73 +680,6 @@ mod tests {
     }
 
     #[test]
-    fn bounded_fifo_accepts_first_and_rejects_duplicate() {
-        let storage = BoundedFifoDedupStorage::new(10);
-        assert!(drive_dedup_future(storage.first_seen("msg-a")).unwrap());
-        assert!(!drive_dedup_future(storage.first_seen("msg-a")).unwrap());
-        assert!(drive_dedup_future(storage.first_seen("msg-b")).unwrap());
-    }
-
-    #[test]
-    fn bounded_fifo_evicts_oldest_at_capacity() {
-        let storage = BoundedFifoDedupStorage::new(3);
-        assert!(drive_dedup_future(storage.first_seen("k1")).unwrap());
-        assert!(drive_dedup_future(storage.first_seen("k2")).unwrap());
-        assert!(drive_dedup_future(storage.first_seen("k3")).unwrap());
-        // k1 should now be evicted; re-inserting it succeeds.
-        assert!(
-            drive_dedup_future(storage.first_seen("k4")).unwrap(),
-            "k1 evicted, k4 should insert"
-        );
-        assert!(
-            drive_dedup_future(storage.first_seen("k1")).unwrap(),
-            "k1 was evicted, should be accepted again"
-        );
-        // k2 is next oldest (after k1 was evicted and k4+k1 filled the queue)
-        assert!(
-            !drive_dedup_future(storage.first_seen("k4")).unwrap(),
-            "k4 is still in window"
-        );
-    }
-
-    #[test]
-    fn bounded_fifo_capacity_one_always_evicts_previous() {
-        let storage = BoundedFifoDedupStorage::new(1);
-        assert!(drive_dedup_future(storage.first_seen("only-key")).unwrap());
-        assert!(
-            !drive_dedup_future(storage.first_seen("only-key")).unwrap(),
-            "duplicate in window"
-        );
-        assert!(
-            drive_dedup_future(storage.first_seen("new-key")).unwrap(),
-            "evicts old, inserts new"
-        );
-        assert!(
-            drive_dedup_future(storage.first_seen("only-key")).unwrap(),
-            "evicted, accepted again"
-        );
-    }
-
-    #[test]
-    fn bounded_fifo_is_correct_under_parallel_load() {
-        let storage = Arc::new(BoundedFifoDedupStorage::new(128));
-        let key = "dedup:fifo:parallel-msg";
-        let mut handles = Vec::new();
-        for _ in 0..16 {
-            let storage = Arc::clone(&storage);
-            handles.push(thread::spawn(move || {
-                drive_dedup_future(storage.first_seen(key)).unwrap()
-            }));
-        }
-        let accepted = handles
-            .into_iter()
-            .map(|h| h.join().expect("thread join"))
-            .filter(|a| *a)
-            .count();
-        assert_eq!(accepted, 1);
-    }
-
-    #[test]
     fn queued_requests_returns_all_items() {
         let storage = InMemoryReconciliationStorage::default();
         let r1 =
@@ -704,34 +701,28 @@ mod tests {
     }
 
     #[test]
-    fn ttl_dedup_accepts_first_and_rejects_duplicate() {
-        let storage = TtlDedupStorage::new(Duration::from_secs(60));
-        assert!(drive_dedup_future(storage.first_seen("msg-1")).unwrap());
-        assert!(!drive_dedup_future(storage.first_seen("msg-1")).unwrap());
-    }
-
-    #[test]
     fn ttl_dedup_accepts_after_expiry() {
         // Use a 1-nanosecond TTL so entries expire immediately.
         let storage = TtlDedupStorage::new(Duration::from_nanos(1));
-        assert!(drive_dedup_future(storage.first_seen("msg-2")).unwrap());
+        assert_eq!(claim_and_accept(&storage, "msg-2"), DedupVerdict::Claimed);
         // Sleep long enough for the TTL to expire (even nanosecond TTLs need
         // at least one syscall round-trip to observe the expiry reliably).
         std::thread::sleep(Duration::from_millis(10));
-        // After expiry, the same key should be accepted again.
-        assert!(
-            drive_dedup_future(storage.first_seen("msg-2")).unwrap(),
-            "key should be accepted after TTL expiry"
+        // After expiry, the same key should be claimable again.
+        assert_eq!(
+            drive_dedup_future(storage.claim("msg-2")).unwrap(),
+            DedupVerdict::Claimed,
+            "key should be claimable after TTL expiry"
         );
     }
 
     #[test]
     fn ttl_dedup_distinct_keys_are_independent() {
         let storage = TtlDedupStorage::new(Duration::from_secs(60));
-        assert!(drive_dedup_future(storage.first_seen("key-a")).unwrap());
-        assert!(drive_dedup_future(storage.first_seen("key-b")).unwrap());
-        assert!(!drive_dedup_future(storage.first_seen("key-a")).unwrap());
-        assert!(!drive_dedup_future(storage.first_seen("key-b")).unwrap());
+        assert_eq!(claim_and_accept(&storage, "key-a"), DedupVerdict::Claimed);
+        assert_eq!(claim_and_accept(&storage, "key-b"), DedupVerdict::Claimed);
+        assert_eq!(claim_and_accept(&storage, "key-a"), DedupVerdict::Duplicate);
+        assert_eq!(claim_and_accept(&storage, "key-b"), DedupVerdict::Duplicate);
     }
 
     /// With sweeping disabled, an expired key is still re-accepted — the
@@ -740,12 +731,17 @@ mod tests {
     /// is never seen again is never removed.
     #[test]
     fn ttl_dedup_expiry_check_is_independent_of_sweeping() {
-        let storage = TtlDedupStorage::with_sweep_interval(Duration::from_nanos(1), Duration::MAX);
-        assert!(drive_dedup_future(storage.first_seen("msg-nosweep")).unwrap());
+        let storage = TtlDedupStorage::with_sweep_interval(Duration::from_nanos(1), Duration::MAX)
+            .with_claim_lease(Duration::from_nanos(1));
+        assert_eq!(
+            claim_and_accept(&storage, "msg-nosweep"),
+            DedupVerdict::Claimed
+        );
         std::thread::sleep(Duration::from_millis(10));
-        assert!(
-            drive_dedup_future(storage.first_seen("msg-nosweep")).unwrap(),
-            "an expired key must be re-accepted even when the sweep never fires"
+        assert_eq!(
+            drive_dedup_future(storage.claim("msg-nosweep")).unwrap(),
+            DedupVerdict::Claimed,
+            "an expired key must be re-claimable even when the sweep never fires"
         );
     }
 
@@ -754,9 +750,11 @@ mod tests {
     /// pinning so the behaviour is not mistaken for an eviction policy.
     #[test]
     fn ttl_dedup_without_sweeping_never_releases_distinct_keys() {
-        let storage = TtlDedupStorage::with_sweep_interval(Duration::from_nanos(1), Duration::MAX);
+        let storage = TtlDedupStorage::with_sweep_interval(Duration::from_nanos(1), Duration::MAX)
+            .with_claim_lease(Duration::from_nanos(1));
         for i in 0..64 {
-            assert!(drive_dedup_future(storage.first_seen(&format!("k{i}"))).unwrap());
+            let key = format!("k{i}");
+            assert_eq!(claim_and_accept(&storage, &key), DedupVerdict::Claimed);
         }
         assert_eq!(
             storage.inner.lock().entries.len(),
@@ -766,9 +764,11 @@ mod tests {
 
         // A sweeping store reclaims them instead.
         let sweeping =
-            TtlDedupStorage::with_sweep_interval(Duration::from_nanos(1), Duration::ZERO);
+            TtlDedupStorage::with_sweep_interval(Duration::from_nanos(1), Duration::ZERO)
+                .with_claim_lease(Duration::from_nanos(1));
         for i in 0..64 {
-            assert!(drive_dedup_future(sweeping.first_seen(&format!("k{i}"))).unwrap());
+            let key = format!("k{i}");
+            assert_eq!(claim_and_accept(&sweeping, &key), DedupVerdict::Claimed);
         }
         assert!(
             sweeping.inner.lock().entries.len() < 64,
@@ -781,6 +781,6 @@ mod tests {
         // ttl / 10 > 60s → sweep_interval capped at 60s
         let storage = TtlDedupStorage::new(Duration::from_secs(700));
         // Can't directly inspect sweep_interval, but construction must not panic.
-        assert!(drive_dedup_future(storage.first_seen("probe")).unwrap());
+        assert_eq!(claim_and_accept(&storage, "probe"), DedupVerdict::Claimed);
     }
 }

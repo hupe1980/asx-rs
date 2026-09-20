@@ -37,12 +37,29 @@
 //! ## Usage
 //!
 //! ```rust
-//! # use asx_rs::sbdh::{StandardBusinessDocument, SbdhHeader, SbdhParty, SbdhDocumentIdentification};
+//! # use asx_rs::sbdh::{
+//! #     StandardBusinessDocument, SbdhHeader, SbdhParty, SbdhDocumentIdentification,
+//! #     SbdhScope, peppol_scope,
+//! # };
 //! let doc = StandardBusinessDocument {
 //!     header: SbdhHeader {
 //!         header_version: "1.0".into(),
 //!         sender: SbdhParty { identifier: "0007:1234567890".into(), authority: "iso6523-actorid-upis".into() },
 //!         receiver: SbdhParty { identifier: "0007:9876543210".into(), authority: "iso6523-actorid-upis".into() },
+//!         business_scope: vec![
+//!             // Peppol requires at least these two.
+//!             SbdhScope::with_scheme(
+//!                 peppol_scope::DOCUMENT_ID,
+//!                 "urn:oasis:names:specification:ubl:schema:xsd:Invoice-2::Invoice##urn:cen.eu:en16931:2017#compliant#urn:fdc:peppol.eu:2017:poacc:billing:3.0::2.1",
+//!                 "busdox-docid-qns",
+//!             ),
+//!             SbdhScope::with_scheme(
+//!                 peppol_scope::PROCESS_ID,
+//!                 "urn:fdc:peppol.eu:2017:poacc:billing:01:1.0",
+//!                 "cenbii-procid-ubl",
+//!             ),
+//!             SbdhScope::new(peppol_scope::COUNTRY_C1, "BE"),
+//!         ],
 //!         document_identification: SbdhDocumentIdentification {
 //!             standard: "urn:oasis:names:specification:ubl:schema:xsd:Invoice-2".into(),
 //!             type_version: "2.1".into(),
@@ -116,6 +133,93 @@ pub struct SbdhDocumentIdentification {
     pub creation_date_and_time: String,
 }
 
+// ── Business scope ───────────────────────────────────────────────────────────
+
+/// Peppol's namespace for the non-XML payload wrappers.
+pub const PEPPOL_ENVELOPE_NAMESPACE: &str = "http://peppol.eu/xsd/ticc/envelope/1.0";
+
+/// Well-known `Scope/Type` values reserved by the Peppol network.
+///
+/// Peppol's Business Message Envelope carries every one of its parameters as a
+/// `<Scope>` entry keyed by `Type`, so these are the keys — not a separate
+/// mechanism. They are reserved network-wide and
+/// [MUST NOT be used for other purposes][bme] (BME 2.0.2 §2.7.1).
+///
+/// [bme]: https://docs.peppol.eu/edelivery/envelope/
+pub mod peppol_scope {
+    /// The Peppol Document Type Identifier (BME §2.4). **Required.**
+    pub const DOCUMENT_ID: &str = "DOCUMENTID";
+    /// The Peppol Process Identifier (BME §2.4). **Required.**
+    pub const PROCESS_ID: &str = "PROCESSID";
+    /// Country code of the original sender, corner 1 (BME §2.5).
+    pub const COUNTRY_C1: &str = "COUNTRY_C1";
+    /// Reserved for future use by the network.
+    pub const COUNTRY_C4: &str = "COUNTRY_C4";
+    /// A specific Message Level Status receiver (BME §2.6.1).
+    pub const MLS_TO: &str = "MLS_TO";
+    /// A specific Message Level Status usage type (BME §2.6.2).
+    ///
+    /// Absent means `FAILURE_ONLY` — Peppol Network Policy 1.0.0 rule MLS-3
+    /// says a positive MLS is sent only when the sender opted in.
+    pub const MLS_TYPE: &str = "MLS_TYPE";
+}
+
+/// One `<Scope>` entry: a key, a value, and optionally the scheme the value is
+/// expressed in.
+///
+/// This is the whole extensibility mechanism of the Peppol envelope. A scope
+/// may also carry **no** value — an indicator attribute — which is why
+/// `instance_identifier` is a `String` that is allowed to be empty rather than
+/// an `Option`: the element is present either way, and absence of the element
+/// means absence of the scope.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SbdhScope {
+    /// `<Type>` — the key. Use a [`peppol_scope`] constant for a reserved one.
+    pub scope_type: String,
+    /// `<InstanceIdentifier>` — the value. Empty for an indicator attribute.
+    pub instance_identifier: String,
+    /// `<Identifier>` — the scheme the value is expressed in, e.g.
+    /// `busdox-docid-qns` for a document type or `iso6523-actorid-upis` for a
+    /// participant.
+    ///
+    /// New in Business Message Envelope 2.0; older receivers read the scheme
+    /// from a prefix on the value instead, so emitting it is additive.
+    pub identifier: Option<String>,
+}
+
+impl SbdhScope {
+    /// A scope with a value and no scheme.
+    pub fn new(scope_type: impl Into<String>, instance_identifier: impl Into<String>) -> Self {
+        Self {
+            scope_type: scope_type.into(),
+            instance_identifier: instance_identifier.into(),
+            identifier: None,
+        }
+    }
+
+    /// A scope whose value is expressed in a named identifier scheme.
+    pub fn with_scheme(
+        scope_type: impl Into<String>,
+        instance_identifier: impl Into<String>,
+        identifier: impl Into<String>,
+    ) -> Self {
+        Self {
+            scope_type: scope_type.into(),
+            instance_identifier: instance_identifier.into(),
+            identifier: Some(identifier.into()),
+        }
+    }
+
+    /// An indicator attribute — present, with no value.
+    pub fn indicator(scope_type: impl Into<String>) -> Self {
+        Self {
+            scope_type: scope_type.into(),
+            instance_identifier: String::new(),
+            identifier: None,
+        }
+    }
+}
+
 /// Standard Business Document Header metadata.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SbdhHeader {
@@ -127,6 +231,37 @@ pub struct SbdhHeader {
     pub receiver: SbdhParty,
     /// Document identification.
     pub document_identification: SbdhDocumentIdentification,
+    /// `<BusinessScope>` — the envelope's parameters, as `<Scope>` entries.
+    ///
+    /// Empty emits no `<BusinessScope>` element at all, which is what a bare
+    /// UN/CEFACT SBDH looks like. **Peppol requires it**: a Business Message
+    /// Envelope carries at least `DOCUMENTID` and `PROCESSID`
+    /// ([`peppol_scope`]), and an access point rejects an envelope without
+    /// them. Use [`SbdhHeader::scope`] to read one back.
+    pub business_scope: Vec<SbdhScope>,
+}
+
+impl SbdhHeader {
+    /// The first scope with this `Type`, if present.
+    ///
+    /// ```
+    /// # use asx_rs::sbdh::{SbdhHeader, SbdhScope, peppol_scope};
+    /// # fn example(header: &SbdhHeader) {
+    /// let doc_type = header.scope(peppol_scope::DOCUMENT_ID);
+    /// # let _ = doc_type;
+    /// # }
+    /// ```
+    pub fn scope(&self, scope_type: &str) -> Option<&SbdhScope> {
+        self.business_scope
+            .iter()
+            .find(|s| s.scope_type == scope_type)
+    }
+
+    /// The value of the first scope with this `Type`.
+    pub fn scope_value(&self, scope_type: &str) -> Option<&str> {
+        self.scope(scope_type)
+            .map(|s| s.instance_identifier.as_str())
+    }
 }
 
 /// A business document wrapped with an SBDH envelope.
@@ -179,7 +314,7 @@ impl StandardBusinessDocument {
       <Type>{doc_type}</Type>
       <MultipleType>{multiple_type}</MultipleType>
       <CreationDateAndTime>{created_at}</CreationDateAndTime>
-    </DocumentIdentification>
+    </DocumentIdentification>{business_scope}
   </StandardBusinessDocumentHeader>
   {payload}
 </StandardBusinessDocument>"#,
@@ -195,6 +330,7 @@ impl StandardBusinessDocument {
             doc_type = escape_xml(&di.r#type),
             multiple_type = multiple_type,
             created_at = escape_xml(&di.creation_date_and_time),
+            business_scope = render_business_scope(&h.business_scope),
             payload = std::str::from_utf8(&self.payload).map_err(|_| {
                 AsxError::new(
                     ErrorCode::InvalidInput,
@@ -257,6 +393,42 @@ impl StandardBusinessDocument {
 
 /// Returns the byte offset of the first occurrence of `needle` in `haystack`,
 /// or `None` if not found.
+/// Render `<BusinessScope>`, or nothing when there are no scopes.
+///
+/// An empty `<BusinessScope/>` is not the same as an absent one: the Peppol
+/// schema gives `Scope` a lower bound of 1 (BME 2.0.1 fixed exactly this), so
+/// emitting an empty container would produce an envelope that fails schema
+/// validation at the receiving access point.
+fn render_business_scope(scopes: &[SbdhScope]) -> String {
+    if scopes.is_empty() {
+        return String::new();
+    }
+
+    let mut out = String::from("\n    <BusinessScope>");
+    for scope in scopes {
+        out.push_str("\n      <Scope>");
+        out.push_str(&format!(
+            "\n        <Type>{}</Type>",
+            escape_xml(&scope.scope_type)
+        ));
+        // Always emitted, even when empty: an indicator attribute is a present
+        // element with no value.
+        out.push_str(&format!(
+            "\n        <InstanceIdentifier>{}</InstanceIdentifier>",
+            escape_xml(&scope.instance_identifier)
+        ));
+        if let Some(identifier) = &scope.identifier {
+            out.push_str(&format!(
+                "\n        <Identifier>{}</Identifier>",
+                escape_xml(identifier)
+            ));
+        }
+        out.push_str("\n      </Scope>");
+    }
+    out.push_str("\n    </BusinessScope>");
+    out
+}
+
 fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() || needle.len() > haystack.len() {
         return None;
@@ -443,6 +615,36 @@ fn parse_sbdh_header(bytes: &[u8], ctx: impl Fn() -> ErrorContext) -> Result<Sbd
         )
     })?;
 
+    // ── BusinessScope ─────────────────────────────────────────────────────────
+    //
+    // Optional in UN/CEFACT SBDH, required by Peppol. Parsed positionally
+    // within each <Scope> by element name, never by document order across
+    // scopes: order is not significant and two scopes may share a Type.
+    let business_scope = sbdh
+        .children()
+        .find(|n| n.is_element() && n.tag_name().name() == "BusinessScope")
+        .map(|node| {
+            node.children()
+                .filter(|n| n.is_element() && n.tag_name().name() == "Scope")
+                .map(|scope| {
+                    // `InstanceIdentifier` may be legitimately empty (an
+                    // indicator attribute), so unlike every other field here it
+                    // is not filtered out when blank.
+                    let value = scope
+                        .children()
+                        .find(|n| n.is_element() && n.tag_name().name() == "InstanceIdentifier")
+                        .map(|n| n.text().unwrap_or("").trim().to_string())
+                        .unwrap_or_default();
+                    SbdhScope {
+                        scope_type: find_text(scope, "Type").unwrap_or_default(),
+                        instance_identifier: value,
+                        identifier: find_text(scope, "Identifier"),
+                    }
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
     Ok(SbdhHeader {
         header_version,
         sender: SbdhParty {
@@ -453,6 +655,7 @@ fn parse_sbdh_header(bytes: &[u8], ctx: impl Fn() -> ErrorContext) -> Result<Sbd
             identifier: receiver_identifier,
             authority: receiver_authority,
         },
+        business_scope,
         document_identification: SbdhDocumentIdentification {
             standard,
             type_version,
@@ -482,6 +685,7 @@ mod tests {
                     identifier: "0007:9876543210".into(),
                     authority: "iso6523-actorid-upis".into(),
                 },
+                business_scope: Vec::new(),
                 document_identification: SbdhDocumentIdentification {
                     standard: "urn:oasis:names:specification:ubl:schema:xsd:Invoice-2".into(),
                     type_version: "2.1".into(),
@@ -573,5 +777,313 @@ mod tests {
         assert_eq!(trim_ascii(b"  hello  "), b"hello");
         assert_eq!(trim_ascii(b"\n\t<Tag/>\n"), b"<Tag/>");
         assert_eq!(trim_ascii(b"   "), b"");
+    }
+}
+
+// ── Non-XML payloads (Peppol BME §2.3.1–2.3.2) ───────────────────────────────
+
+/// Wrap a **binary** payload for transport inside an SBDH.
+///
+/// Peppol's envelope carries the business document as XML. A payload that is
+/// not XML — a PDF, an ASiC-E container — needs a wrapper, and BME §2.3.1
+/// defines this one: base64 inside `<BinaryContent>`, with the media type as an
+/// attribute.
+///
+/// `encoding` is for *text-based* payloads whose source encoding differs from
+/// the surrounding document; leave it `None` for genuinely binary content.
+///
+/// **Not for XML.** The specification says this wrapper MUST NOT be used for a
+/// plain XML payload — that goes in directly.
+///
+/// ```
+/// use asx_rs::sbdh::wrap_binary_payload;
+///
+/// let xml = wrap_binary_payload(b"%PDF-1.7", "application/pdf", None);
+/// assert!(xml.starts_with("<BinaryContent"));
+/// assert!(xml.contains(r#"mimeType="application/pdf""#));
+/// ```
+pub fn wrap_binary_payload(payload: &[u8], mime_type: &str, encoding: Option<&str>) -> String {
+    use base64::Engine as _;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(payload);
+    let encoding_attr = encoding
+        .map(|e| format!(r#" encoding="{}""#, escape_xml(e)))
+        .unwrap_or_default();
+    format!(
+        r#"<BinaryContent xmlns="{ns}" mimeType="{mime}"{encoding_attr}>{encoded}</BinaryContent>"#,
+        ns = PEPPOL_ENVELOPE_NAMESPACE,
+        mime = escape_xml(mime_type),
+    )
+}
+
+/// Wrap a **text** payload for transport inside an SBDH (BME §2.3.2).
+///
+/// The text is XML-escaped, so a payload containing `<` or `&` stays
+/// well-formed. It must use the same character encoding as the surrounding
+/// document — if it does not, use [`wrap_binary_payload`] instead, which is
+/// what the specification says.
+///
+/// **Not for XML.**
+///
+/// ```
+/// use asx_rs::sbdh::wrap_text_payload;
+///
+/// let xml = wrap_text_payload("UNB+UNOA:2+...", "Application/EDIFACT");
+/// assert!(xml.contains("UNB+UNOA:2+..."));
+/// ```
+pub fn wrap_text_payload(payload: &str, mime_type: &str) -> String {
+    format!(
+        r#"<TextContent xmlns="{ns}" mimeType="{mime}">{body}</TextContent>"#,
+        ns = PEPPOL_ENVELOPE_NAMESPACE,
+        mime = escape_xml(mime_type),
+        body = escape_xml(payload),
+    )
+}
+
+#[cfg(test)]
+mod business_scope_tests {
+    use super::*;
+
+    fn header_with(scopes: Vec<SbdhScope>) -> SbdhHeader {
+        SbdhHeader {
+            header_version: "1.0".into(),
+            sender: SbdhParty {
+                identifier: "0088:7315458756324".into(),
+                authority: "iso6523-actorid-upis".into(),
+            },
+            receiver: SbdhParty {
+                identifier: "0088:4562458856624".into(),
+                authority: "iso6523-actorid-upis".into(),
+            },
+            business_scope: scopes,
+            document_identification: SbdhDocumentIdentification {
+                standard: "urn:oasis:names:specification:ubl:schema:xsd:Invoice-2".into(),
+                type_version: "2.1".into(),
+                instance_identifier: "123123".into(),
+                r#type: "Invoice".into(),
+                multiple_type: false,
+                creation_date_and_time: "2026-01-01T12:00:00+00:00".into(),
+            },
+        }
+    }
+
+    fn roundtrip(scopes: Vec<SbdhScope>) -> Vec<SbdhScope> {
+        let doc = StandardBusinessDocument {
+            header: header_with(scopes),
+            payload: b"<Invoice/>".to_vec(),
+        };
+        let wrapped = doc.wrap().expect("wrap");
+        StandardBusinessDocument::unwrap(&wrapped)
+            .expect("unwrap")
+            .header
+            .business_scope
+    }
+
+    /// The minimum a Peppol access point accepts.
+    #[test]
+    fn peppol_mandatory_scopes_round_trip_with_their_schemes() {
+        let scopes = vec![
+            SbdhScope::with_scheme(
+                peppol_scope::DOCUMENT_ID,
+                "urn:oasis:names:specification:ubl:schema:xsd:Invoice-2::Invoice##urn:cen.eu:en16931:2017#compliant#urn:fdc:peppol.eu:2017:poacc:billing:3.0::2.1",
+                "busdox-docid-qns",
+            ),
+            SbdhScope::with_scheme(
+                peppol_scope::PROCESS_ID,
+                "urn:fdc:peppol.eu:2017:poacc:billing:01:1.0",
+                "cenbii-procid-ubl",
+            ),
+            SbdhScope::new(peppol_scope::COUNTRY_C1, "BE"),
+        ];
+        assert_eq!(roundtrip(scopes.clone()), scopes);
+    }
+
+    /// The MLS customisations from Network Policy 1.0.0.
+    #[test]
+    fn mls_scopes_round_trip() {
+        let scopes = vec![
+            SbdhScope::with_scheme(
+                peppol_scope::MLS_TO,
+                "0242:987654-TEST",
+                "iso6523-actorid-upis",
+            ),
+            SbdhScope::new(peppol_scope::MLS_TYPE, "FAILURE_ONLY"),
+        ];
+        assert_eq!(roundtrip(scopes.clone()), scopes);
+    }
+
+    /// An indicator attribute is a present element with no value — distinct
+    /// from an absent scope, and the case BME 1.1.1 had to correct.
+    #[test]
+    fn an_indicator_attribute_survives_the_round_trip() {
+        let scopes = vec![SbdhScope::indicator("IndicatorAttribute")];
+        let back = roundtrip(scopes);
+        assert_eq!(back.len(), 1, "the scope must not vanish");
+        assert_eq!(back[0].scope_type, "IndicatorAttribute");
+        assert!(back[0].instance_identifier.is_empty());
+        assert!(back[0].identifier.is_none());
+    }
+
+    /// No scopes emits **no** `<BusinessScope>` element.
+    ///
+    /// An empty container would fail the Peppol schema, whose `Scope` has a
+    /// lower bound of 1 — the cardinality BME 2.0.1 fixed.
+    #[test]
+    fn an_empty_scope_list_emits_no_container() {
+        let doc = StandardBusinessDocument {
+            header: header_with(Vec::new()),
+            payload: b"<Invoice/>".to_vec(),
+        };
+        let wrapped = doc.wrap().expect("wrap");
+        let xml = String::from_utf8(wrapped).expect("utf8");
+        assert!(
+            !xml.contains("BusinessScope"),
+            "an empty BusinessScope must not be emitted: {xml}"
+        );
+    }
+
+    #[test]
+    fn scope_lookup_finds_by_type() {
+        let header = header_with(vec![
+            SbdhScope::new(peppol_scope::DOCUMENT_ID, "doc"),
+            SbdhScope::new(peppol_scope::PROCESS_ID, "proc"),
+        ]);
+        assert_eq!(header.scope_value(peppol_scope::PROCESS_ID), Some("proc"));
+        assert!(header.scope("NOT_PRESENT").is_none());
+    }
+
+    /// Two scopes may share a `Type` (a rollover of MLS receivers, say), so the
+    /// parser must keep both rather than collapsing them.
+    #[test]
+    fn repeated_scope_types_are_all_retained() {
+        let scopes = vec![
+            SbdhScope::new(peppol_scope::MLS_TO, "0242:a"),
+            SbdhScope::new(peppol_scope::MLS_TO, "0242:b"),
+        ];
+        assert_eq!(roundtrip(scopes).len(), 2);
+    }
+
+    #[test]
+    fn scope_values_are_xml_escaped() {
+        let scopes = vec![SbdhScope::new("CUSTOM", "a<b&c\"d")];
+        assert_eq!(roundtrip(scopes.clone()), scopes);
+    }
+
+    #[test]
+    fn binary_payload_wrapper_matches_the_specification_shape() {
+        let xml = wrap_binary_payload(
+            b"hello",
+            "application/vnd.etsi.asic-e+zip",
+            Some("iso-8859-1"),
+        );
+        assert!(xml.contains(r#"xmlns="http://peppol.eu/xsd/ticc/envelope/1.0""#));
+        assert!(xml.contains(r#"mimeType="application/vnd.etsi.asic-e+zip""#));
+        assert!(xml.contains(r#"encoding="iso-8859-1""#));
+        assert!(xml.contains("aGVsbG8="), "payload must be base64: {xml}");
+    }
+
+    #[test]
+    fn text_payload_wrapper_escapes_xml_special_characters() {
+        let xml = wrap_text_payload("a<b&c", "Application/EDIFACT");
+        assert!(xml.contains("a&lt;b&amp;c"), "must stay well-formed: {xml}");
+        assert!(!xml.contains("a<b"), "raw '<' must not survive: {xml}");
+    }
+}
+
+#[cfg(test)]
+mod peppol_example_conformance {
+    use super::*;
+
+    /// The specification's own example instance, parsed.
+    ///
+    /// Copied from Peppol Business Message Envelope 2.0.2 §3.1 (non-normative
+    /// example). Parsing the document the standard prints is the closest this
+    /// module gets to a foreign witness: the alternative is asserting that our
+    /// serializer round-trips through our own parser, which agrees with itself
+    /// by construction.
+    const BME_EXAMPLE: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<StandardBusinessDocument xmlns="http://www.unece.org/cefact/namespaces/StandardBusinessDocumentHeader">
+  <StandardBusinessDocumentHeader>
+    <HeaderVersion>1.0</HeaderVersion>
+    <Sender>
+      <Identifier Authority="iso6523-actorid-upis">0088:7315458756324</Identifier>
+    </Sender>
+    <Receiver>
+      <Identifier Authority="iso6523-actorid-upis">0088:4562458856624</Identifier>
+    </Receiver>
+    <DocumentIdentification>
+      <Standard>urn:oasis:names:specification:ubl:schema:xsd:Invoice2</Standard>
+      <TypeVersion>2.1</TypeVersion>
+      <InstanceIdentifier>123123</InstanceIdentifier>
+      <Type>Invoice</Type>
+      <CreationDateAndTime>2019-02-01T15:42:10Z</CreationDateAndTime>
+    </DocumentIdentification>
+    <BusinessScope>
+      <Scope>
+        <Type>DOCUMENTID</Type>
+        <InstanceIdentifier>urn:oasis:names:specification:ubl:schema:xsd:Invoice-2::Invoice##urn:cen.eu:en16931:2017#compliant#urn:fdc:peppol.eu:2017:poacc:billing:3.0::2.1</InstanceIdentifier>
+        <Identifier>busdox-docid-qns</Identifier>
+      </Scope>
+      <Scope>
+        <Type>PROCESSID</Type>
+        <InstanceIdentifier>urn:fdc:peppol.eu:2017:poacc:billing:01:1.0</InstanceIdentifier>
+        <Identifier>cenbii-procid-ubl</Identifier>
+      </Scope>
+      <Scope>
+        <Type>COUNTRY_C1</Type>
+        <InstanceIdentifier>BE</InstanceIdentifier>
+      </Scope>
+    </BusinessScope>
+  </StandardBusinessDocumentHeader>
+  <Invoice/>
+</StandardBusinessDocument>"#;
+
+    #[test]
+    fn the_specifications_own_example_parses_to_the_values_it_prints() {
+        let parsed = StandardBusinessDocument::unwrap(BME_EXAMPLE.as_bytes()).expect("unwrap");
+        let header = &parsed.header;
+
+        assert_eq!(header.sender.identifier, "0088:7315458756324");
+        assert_eq!(header.sender.authority, "iso6523-actorid-upis");
+
+        assert_eq!(header.business_scope.len(), 3);
+
+        let doc_id = header.scope(peppol_scope::DOCUMENT_ID).expect("DOCUMENTID");
+        assert!(
+            doc_id.instance_identifier.ends_with("billing:3.0::2.1"),
+            "value: {}",
+            doc_id.instance_identifier
+        );
+        assert_eq!(doc_id.identifier.as_deref(), Some("busdox-docid-qns"));
+
+        let process = header.scope(peppol_scope::PROCESS_ID).expect("PROCESSID");
+        assert_eq!(
+            process.instance_identifier,
+            "urn:fdc:peppol.eu:2017:poacc:billing:01:1.0"
+        );
+        assert_eq!(process.identifier.as_deref(), Some("cenbii-procid-ubl"));
+
+        // COUNTRY_C1 carries no scheme — the element is genuinely absent, not
+        // present-and-empty.
+        let country = header.scope(peppol_scope::COUNTRY_C1).expect("COUNTRY_C1");
+        assert_eq!(country.instance_identifier, "BE");
+        assert_eq!(country.identifier, None);
+    }
+
+    /// Re-emitting what we parsed must preserve every scope, so a message
+    /// forwarded through this crate stays acceptable to the next access point.
+    #[test]
+    fn re_emitting_the_specification_example_preserves_its_scopes() {
+        let parsed = StandardBusinessDocument::unwrap(BME_EXAMPLE.as_bytes()).expect("unwrap");
+        let original = parsed.header.business_scope.clone();
+
+        let rewrapped = StandardBusinessDocument {
+            header: parsed.header,
+            payload: parsed.payload,
+        }
+        .wrap()
+        .expect("wrap");
+
+        let again = StandardBusinessDocument::unwrap(&rewrapped).expect("unwrap");
+        assert_eq!(again.header.business_scope, original);
     }
 }

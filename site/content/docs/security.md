@@ -47,7 +47,8 @@ pub struct CertHandle {
     pub signing_cert_pem: String,         // PEM certificate corresponding to signing_key_pem
     pub encryption_cert_pem: String,      // PEM certificate for encrypting to this party
     pub trust_anchor_pems: Vec<String>,   // PEM CA certificates for PKIX chain validation
-    pub fingerprint_sha256: String,       // Expected SHA-256 fingerprint of partner's signing cert (empty = pinning disabled)
+    pub fingerprint_sha256: String,       // Partner's signing cert, SHA-256. REQUIRED for signed AS4 inbound;
+                                          // use As4ReceivePush::signer_pins for more than one partner
     pub ocsp_config: OcspConfig,          // OCSP mode and responder override
 }
 ```
@@ -65,9 +66,72 @@ RevocationPolicy {
 }
 ```
 
-### Certificate fingerprint pinning
+### Certificate fingerprint pinning — required, not optional
 
-When `fingerprint_sha256` is non-empty, the signer certificate's SHA-256 fingerprint is compared against this value after PKIX validation. A mismatch fails the receive.
+**A signed AS4 message whose claimed sender resolves to no pin is refused.**
+
+Every access point on a network shares that network's trust anchors, so "the
+signature verifies and chains to an anchor" proves the sender is *on the
+network*, not that it is who it claims to be. The pin is what attributes a
+verified signature to the claimed `eb:From` party. A receiver that pins nothing
+accepts nothing.
+
+#### Computing the value
+
+Do not hash by hand. A mistyped or truncated pin is otherwise accepted at
+configuration time and fails at message time as "signature does not match":
+
+```rust
+use asx_rs::crypto::CertFingerprint;
+
+let pin = CertFingerprint::from_cert_pem(partner_cert_pem)?;
+```
+
+`CertFingerprint::parse` accepts the colon-separated form `openssl x509
+-fingerprint -sha256` prints, and requires exactly 64 hex digits — so a SHA-1
+value or a truncated paste is a configuration error, not a delivery failure.
+
+#### One partner: pin on the session
+
+```rust
+CertHandle {
+    fingerprint_sha256: pin.to_string(),
+    ..
+}
+```
+
+#### Many partners: resolve per claimed sender
+
+A single fingerprint on the session means one partner per session. For a
+receiver with several counterparties, supply a resolver instead — it is keyed
+on the message's claimed `eb:From` and compared against the verified signer, so
+a match *is* the proof of identity:
+
+```rust
+use asx_rs::as4::{As4ReceivePush, As4SignerPinMap};
+use asx_rs::crypto::CertFingerprint;
+
+let pins = std::sync::Arc::new(
+    As4SignerPinMap::new()
+        .pin_cert_pem("9900000000001", partner_a_cert_pem)?
+        // Both certificates are valid during a rollover overlap.
+        .pin("9900000000002", CertFingerprint::parse(partner_b_pin)?)
+        .pin("9900000000002", CertFingerprint::parse(partner_b_next_pin)?),
+);
+
+let outcome = receive_push(&session, &bus, As4ReceivePush {
+    request,
+    dedup,
+    ordering: None,
+    signer_pins: Some(pins),
+})
+.await?
+.into_inner();
+```
+
+Implement `As4SignerPins` yourself to resolve against a partner table or an SMP
+cache. Returning **no** pin for a party refuses the message, so pinning B's
+certificate does nothing for a message claiming to be from A.
 
 ### AS4 pull authorization
 
@@ -102,14 +166,8 @@ order — which would let an attacker prepend a signature-shaped element to
 steer which signature gets verified.
 
 For AS4 push receive, `As4PushPolicy` now controls trust mode explicitly:
-1. Pinned sender mode: requires `fingerprint_sha256` to be configured for signed inbound message verification.
-
-```rust
-CertHandle {
-    fingerprint_sha256: "AA:BB:CC:...".to_string(),  // enforce pinning
-    ..
-}
-```
+1. Pinned sender mode — required for signed inbound. See
+   [certificate fingerprint pinning](#certificate-fingerprint-pinning-required-not-optional).
 
 ---
 
@@ -350,7 +408,7 @@ Never use `InsecureBypassTrustVerifier` in production. It bypasses:
 
 All inbound reads are bounded. The default limit is **256 MiB** (`DEFAULT_MAX_BODY_BYTES`). This applies to:
 - `asx_rs::as2::receive_with_mdn_with_reliability`
-- `asx_rs::as4::receive_push_with_dedup_sync`
+- `asx_rs::as4::receive_push_sync`
 - `transport::server` layer (axum handlers)
 
 Override per-session:
@@ -421,11 +479,12 @@ signature was actually verified — check it rather than assuming, since the
 other two policies leave it `None`. `SmpEndpoint::signed_document` still
 returns the exact response bytes for callers that want to verify independently.
 
-**Assurance note.** The enveloped whole-document path is newer than the AS4
-signing path and is not yet cross-validated against an independent
-implementation, so treat it accordingly. DNSSEC validation of the SML zone is
-the resolver's job — the Peppol zones are signed, and `BdxlResolver` is where a
-deployment supplies a validating client.
+**Assurance note.** The enveloped whole-document path is cross-validated
+against a foreign implementation: `tests/interop_peppol_smp_oracle.rs` verifies
+a `SignedServiceMetadata` captured from the live Peppol production network
+against the real Peppol PKI, with tamper cases. DNSSEC validation of the SML
+zone is the resolver's job — the Peppol zones are signed, and `BdxlResolver` is
+where a deployment supplies a validating client.
 
 ---
 
@@ -433,20 +492,17 @@ deployment supplies a validating client.
 
 | Limitation | Mitigation |
 |---|---|
-| SMP enveloped-signature path not yet cross-validated against another stack | Pin partner certificates out of band as defence in depth (see above) |
 | Custom XML Exclusive C14N implementation | Validated against W3C test vectors and interop compatibility matrix; not yet replaced by a vetted library |
-| In-memory dedup provides no replay protection across restarts | Use `TtlDedupStorage` with a distributed backend for production; document required 48h window per RFC 4130 §5.2.1 |
-| No TLS mutual authentication (mTLS) at the library level | Configure mTLS at the TLS terminator / reverse proxy layer |
+| In-memory dedup provides no replay protection across restarts | Use a durable `DedupStorage` backend for production; the recommended window is 48h per RFC 4130 §5.2.1 |
+| **Inbound** mTLS is not terminated by the library | The crate never owns a listener. Terminate at your reverse proxy and pass the authenticated identity in as `authenticated_sender_scope`. **Outbound** mTLS *is* supported — `TransportConfig::with_client_identity` ([transport](@/docs/transport.md#mutual-tls-on-egress)) |
 | OCSP `thisUpdate`/`nextUpdate` clock skew tolerance is fixed at ±300s / 86400s | Adjust via `OcspConfig` if partner OCSP responders have larger clock drift |
 | OCSP sync wrapper uses `block_in_place`/`block_on` (not a new OS thread) — must be called from a multi-thread Tokio runtime | Use the async `fetch_ocsp_responses_with_cache_async` entry point directly from async call sites; at very high message rates with many distinct certificates, consider a shared persistent OCSP cache backend |
 
 ---
 
-## Crypto Backend Roadmap
+## Crypto backends
 
-### Current State: Mixed OpenSSL + Pure-Rust
-
-`asx-rs` currently uses two separate crypto ecosystems:
+`asx-rs` links two crypto ecosystems:
 
 | Subsystem | Current backend | Role |
 |---|---|---|
@@ -468,23 +524,18 @@ This mixed model has several implications:
 - **Vulnerability management**: OpenSSL and `aes-gcm` have separate CVE
   timelines and patch cadences. Both must be tracked independently.
 
-### Removing the OpenSSL dependency
+### FIPS deployments
 
-Converging on a single pure-Rust crypto stack is a direction this project is
-committed to, not a dated plan: the symmetric layer already is pure Rust, and
-X.509, RSA and CMS are not. It will land as a breaking-dependency change and be
-announced in `CHANGELOG.md`.
-
-### FIPS Deployment Today
-
-If you need FIPS-validated crypto today, use the following configuration:
+The supported configuration is:
 
 1. Compile OpenSSL in FIPS mode (OpenSSL 3.x with `OPENSSL_FIPS=1`).
-2. Do **not** enable AS4 XML encryption (set `As4SendPolicy { encrypt: false, .. }` for
-   outbound; for inbound, `As4PushPolicy::default()` already allows unencrypted payloads
-   when none arrive encrypted), since the `aes-gcm` symmetric layer is not FIPS
-   140-2 validated.
-3. Contact your compliance officer before enabling AS4 payload encryption in a
-   regulated deployment: the symmetric layer it uses is not FIPS-validated.
+2. Do **not** enable AS4 payload encryption: the `aes-gcm` symmetric layer is
+   not FIPS 140-2 validated.
+
+That second point conflicts with every AS4 profile this crate targets, all of
+which mandate payload encryption — and with P-Mode materialization, which
+refuses `encrypt = false` outside test builds. FIPS and conformant AS4 are not
+simultaneously achievable here today; treat it as a documented limitation
+rather than a supported mode.
 
 

@@ -444,25 +444,6 @@ pub(crate) fn trim_leading_zeroes(bytes: &[u8]) -> &[u8] {
     &bytes[idx..]
 }
 
-pub(crate) fn normalize_fingerprint(value: &str) -> Option<String> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-
-    let normalized: String = trimmed
-        .chars()
-        .filter(char::is_ascii_hexdigit)
-        .map(|c| c.to_ascii_lowercase())
-        .collect();
-
-    if normalized.is_empty() {
-        None
-    } else {
-        Some(normalized)
-    }
-}
-
 pub(crate) fn sha256_hex_lower(input: &[u8]) -> String {
     let digest = Sha256::digest(input);
     let mut out = String::with_capacity(digest.len() * 2);

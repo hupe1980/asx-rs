@@ -34,7 +34,7 @@ cargo add asx-rs --features as4,client,server
 | `crypto` | Shared OpenSSL gate (RSA/ECDSA, X.509, CMS, OCSP) — pulled in by `as2`/`as4` | via protocol |
 | `as2` | AS2 send/receive, S/MIME, MDN | ❌ |
 | `as4` | AS4 send/receive, pull store, WS-Security, XML encryption | ❌ |
-| `client` | HTTP egress via `reqwest` | ❌ |
+| `client` | HTTP egress via `reqwest` (HTTPS-only, SSRF-validated, optional mTLS client identity) | ❌ |
 | `server` | Axum router integration for inbound | ❌ |
 | `compression` | AS2 (RFC 5402 CMS) and AS4 (gzip) payload compression | ✅ |
 | `async-ocsp` | Async OCSP responder fetching | ✅ |
@@ -68,7 +68,7 @@ let sent = send_async(&session, &bus, As4SendRequest {
     payload,
     policy,
     credentials: Some(credentials),
-    payload_filename: None,
+    ..Default::default()
 }).await?;
 
 let outcome = As4HttpTransport::new(TransportConfig::default())?
@@ -92,9 +92,19 @@ ContentDecrypted → DomainReady`. Application code cannot receive bytes that
 skipped a gate, because no value exists in that state.
 
 **Insecure configurations are unreachable by omission.** Signatures are required,
-AS4 pull is denied, SMP lookup results are not trusted, and encrypted-spool
-profiles refuse to run without a key — until you explicitly choose otherwise.
-Every relaxation is a named variant you select, never a field you forgot.
+AS4 pull is denied, SMP lookup results are not trusted, P-Modes sign *and*
+encrypt, and encrypted-spool profiles refuse to run without a key — until you
+explicitly choose otherwise. Every relaxation is a named variant you select,
+never a field you forgot.
+
+**A verified signature is not an identity.** Every access point shares its
+network's trust anchors, so "it verifies" proves membership, not who sent it. A
+signed message whose claimed `eb:From` has no pinned certificate is refused;
+`As4SignerPins` resolves the permitted signer per partner, so a match is proof.
+
+**Deduplication is two-phase.** A first-seen message hands you an unsettled
+claim: `accept` it once the message is durably yours, `abandon` it if not, and
+the partner's retransmission is processed rather than swallowed as a duplicate.
 
 **Integration points are traits, not built-ins.** Dedup, reconciliation, durable
 audit, DNS resolution and spool-encryption keys are interfaces you implement
@@ -119,15 +129,21 @@ MSRV is Rust 1.88, and CI builds on that exact floor.
 Implemented:
 
 - AS2 send/receive — signed, encrypted, compressed, sync and async MDN
-- AS4 push send/receive — signed, encrypted, dedup, fragment reassembly
+- AS4 push send/receive — signed, encrypted, two-phase dedup, fragment reassembly
 - AS4 pull with reliability classification and MPC authorization
 - WS-Security: RSA-SHA256, ECDSA-SHA256, RSA-OAEP, ECDH-ES + ConcatKDF + AES-KW
 - Cross-implementation interop, tested live: a containerized **Holodeck B2B**
   counterparty exchanges a signed AS4 push for a signed NRR receipt;
   C14N/digests are verified against **xmlsec1**; AS2 S/MIME is exchanged in
-  both directions with the **openssl** CLI
+  both directions with the **openssl** CLI; a **real production Peppol SMP
+  signature** is verified against the real Peppol PKI; and `DedupStorage` runs
+  the full conformance contract against a **real Redis**
 - Reception Awareness / Non-Repudiation of Receipt, verified end to end
 - OCSP and PKIX chain validation
+- Mutual TLS on egress — a PEM client certificate and key, parsed once at
+  construction, presented on every outbound connection
+- Per-partner signer pinning, resolved from the claimed `eb:From` and checked
+  against the verified WS-Security signer
 - Multi-payload AS4, both directions — every `eb:PartInfo` attachment signed,
   verified, and independently compressed/encrypted
 - ebMS3 Test Service (§5.2.2): a connectivity ping is acknowledged and reported
@@ -135,16 +151,20 @@ Implemented:
 - Peppol/CEF dynamic discovery — BDXL U-NAPTR participant lookup against the
   OpenPeppol SML zones, plus SMP 1.0 **and** 2.0 `ServiceMetadata`, with the
   DNS query behind a trait so DNSSEC validation stays your choice
+- Peppol Business Message Envelope — `BusinessScope` with the reserved scope
+  keys, and the Message Level Status seam that Network Policy 1.0.0 made
+  mandatory
 
 Known gaps:
 
-- **No official conformance certificate yet.** The self-hosted counterparty
-  loop passes; the free EC eDelivery conformance service is the next step —
-  see the [conformance guide](https://hupe1980.github.io/asx-rs/docs/conformance/).
+- **No official conformance certificate.** The self-hosted counterparty loop
+  passes, but the EC eDelivery conformance service tests a deployed access
+  point, and this crate ships neither a binary nor a SUT Controller — see the
+  [conformance guide](https://hupe1980.github.io/asx-rs/docs/conformance/).
 - **No storage backends ship in-tree.** `DedupStorage`, `ReconciliationStorage`
   and `DurableAuditSink` are trait-defined; you supply the implementation —
   and `asx_rs::storage::conformance` is the suite that proves yours is durable
-  and its `first_seen` atomic, rather than taking your word for it.
+  and its `claim` atomic, rather than taking your word for it.
 
 ## Development
 

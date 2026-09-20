@@ -3,7 +3,7 @@ use crate::core::{AsxError, ErrorContext};
 use crate::observability::audit_sink::{InMemoryAuditSink, ReplayCursor};
 use crate::observability::{BackpressurePolicy, EventBus, EventEmissionMode};
 use crate::reliability::{InMemoryDedupBackend, InMemoryReconciliationHook};
-use crate::storage::BoxFuture;
+use crate::storage::{BoxFuture, DedupVerdict};
 use openssl::asn1::Asn1Time;
 use openssl::bn::BigNum;
 use openssl::nid::Nid;
@@ -47,11 +47,19 @@ impl DedupStorage for DurableTestDedup {
         true
     }
 
-    fn first_seen<'a>(
+    fn claim<'a>(
         &'a self,
         idempotency_key: &'a str,
-    ) -> BoxFuture<'a, crate::core::Result<bool>> {
-        self.0.first_seen(idempotency_key)
+    ) -> BoxFuture<'a, crate::core::Result<DedupVerdict>> {
+        self.0.claim(idempotency_key)
+    }
+
+    fn accept<'a>(&'a self, idempotency_key: &'a str) -> BoxFuture<'a, crate::core::Result<()>> {
+        self.0.accept(idempotency_key)
+    }
+
+    fn abandon<'a>(&'a self, idempotency_key: &'a str) -> BoxFuture<'a, crate::core::Result<()>> {
+        self.0.abandon(idempotency_key)
     }
 }
 
@@ -84,10 +92,13 @@ impl ReconciliationStorage for DurableTestReconciliationWrapper {
     }
 }
 
-fn durable_reliability() -> (DurableTestReconciliationWrapper, DurableTestDedup) {
+fn durable_reliability() -> (
+    DurableTestReconciliationWrapper,
+    Arc<dyn crate::storage::DedupStorage>,
+) {
     (
         DurableTestReconciliationWrapper(InMemoryReconciliationHook::default()),
-        DurableTestDedup(InMemoryDedupBackend::default()),
+        Arc::new(DurableTestDedup(InMemoryDedupBackend::default())),
     )
 }
 
@@ -1165,7 +1176,7 @@ Received-content-MIC: ZXELZG2MstvZ8CzynjCRhlEuxafCsnlFN6wFAV9r8AA=, sha-256\r\n"
             original_message_id: None,
         },
         &hook,
-        &dedup,
+        dedup.clone(),
         &InsecureBypassTrustVerifier::new(TrustEvidence::verified_and_decryptable()),
     )
     .expect("receive mdn");
@@ -1199,7 +1210,7 @@ Disposition: automatic-action/MDN-sent-automatically; failed/failure: unsupporte
             original_message_id: None,
         },
         &hook,
-        &dedup,
+        dedup.clone(),
         &InsecureBypassTrustVerifier::new(TrustEvidence::verified_and_decryptable()),
     )
     .expect("receive mdn");
@@ -1232,7 +1243,7 @@ Disposition: automatic-action/MDN-sent-automatically; processed/warning: authent
             original_message_id: None,
         },
         &hook,
-        &dedup,
+        dedup.clone(),
         &InsecureBypassTrustVerifier::new(TrustEvidence::verified_and_decryptable()),
     )
     .expect("receive mdn");
@@ -1266,7 +1277,7 @@ Disposition: automatic-action/MDN-sent-automatically; partner-custom\r\n";
             original_message_id: None,
         },
         &hook,
-        &dedup,
+        dedup.clone(),
         &InsecureBypassTrustVerifier::new(TrustEvidence::verified_and_decryptable()),
     )
     .expect("receive mdn");
@@ -1299,7 +1310,7 @@ Disposition: automatic-action/MDN-sent-automatically; processed\r\n";
             original_message_id: None,
         },
         &hook,
-        &dedup,
+        dedup.clone(),
         &InsecureBypassTrustVerifier::new(TrustEvidence::verified_and_decryptable()),
     )
     .expect_err("strict mdn content-type check");
@@ -1347,7 +1358,7 @@ Disposition: automatic-action/MDN-sent-automatically; processed\r\n\
             original_message_id: None,
         },
         &hook,
-        &dedup,
+        dedup.clone(),
         &InsecureBypassTrustVerifier::new(TrustEvidence::verified_and_decryptable()),
     )
     .expect_err("strict runtime policy must reject interop exception overrides");
@@ -1361,7 +1372,7 @@ Disposition: automatic-action/MDN-sent-automatically; processed\r\n\
 fn strict_receive_with_mdn_rejects_non_durable_dedup_backend() {
     let bus = strict_bus();
     let hook = DurableTestReconciliation(InMemoryReconciliationHook::default());
-    let dedup = InMemoryDedupBackend::default();
+    let dedup: Arc<dyn crate::storage::DedupStorage> = Arc::new(InMemoryDedupBackend::default());
     let mdn =
         b"Content-Type: multipart/report; report-type=disposition-notification; boundary=mdn\r\n\
 \r\n\
@@ -1391,7 +1402,7 @@ Disposition: automatic-action/MDN-sent-automatically; processed\r\n\
             original_message_id: Some("orig-1".to_string()),
         },
         &hook,
-        &dedup,
+        dedup.clone(),
         &InsecureBypassTrustVerifier::new(TrustEvidence::verified_and_decryptable()),
     )
     .expect_err("non-durable dedup backend must be rejected");
@@ -1427,7 +1438,7 @@ fn receive_with_mdn_rejects_invalid_utf8_payload() {
             original_message_id: None,
         },
         &hook,
-        &dedup,
+        dedup.clone(),
         &InsecureBypassTrustVerifier::new(TrustEvidence::verified_and_decryptable()),
     )
     .expect_err("invalid utf8 mdn must fail");
@@ -1470,7 +1481,7 @@ Disposition: automatic-action/MDN-sent-automatically; processed\r\n";
             original_message_id: None,
         },
         &hook,
-        &dedup,
+        dedup.clone(),
         &InsecureBypassTrustVerifier::new(TrustEvidence::verified_and_decryptable()),
     )
     .expect_err("audit emission failure must fail closed");
@@ -1481,7 +1492,8 @@ Disposition: automatic-action/MDN-sent-automatically; processed\r\n";
 #[test]
 fn parse_mdn_failure_with_original_id_fails_closed_when_reconciliation_enqueue_fails() {
     let bus = strict_bus();
-    let dedup = DurableTestDedup(InMemoryDedupBackend::default());
+    let dedup: Arc<dyn crate::storage::DedupStorage> =
+        Arc::new(DurableTestDedup(InMemoryDedupBackend::default()));
     let mdn = vec![0xff, 0xfe, 0xfd, b'\n'];
 
     let err = receive_with_mdn_with_reliability(
@@ -1500,7 +1512,7 @@ fn parse_mdn_failure_with_original_id_fails_closed_when_reconciliation_enqueue_f
             original_message_id: Some("orig-1".to_string()),
         },
         &AlwaysFailReconciliation,
-        &dedup,
+        dedup.clone(),
         &InsecureBypassTrustVerifier::new(TrustEvidence::verified_and_decryptable()),
     )
     .expect_err("reconciliation enqueue failure must fail closed");

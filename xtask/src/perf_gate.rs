@@ -33,8 +33,7 @@ use asx::as2::{
 use asx::as4::generate_receipt as as4_generate_receipt;
 #[cfg(all(feature = "as4", feature = "testing"))]
 use asx::as4::{
-    As4PushPolicyBuilder, As4ReceivePushRequest, As4ReceivePushSyncRequest,
-    receive_push_with_dedup_sync,
+    As4PushPolicyBuilder, As4ReceivePushRequest, As4ReceivePushSync, receive_push_sync,
 };
 #[cfg(feature = "as2")]
 use openssl::asn1::Asn1Time;
@@ -347,7 +346,7 @@ fn strict_bench_session(session_id: &str) -> SessionContext {
     use asx::core::Result as AsxResult;
     use asx::presets::StrictRuntimeBootstrap;
     use asx::reliability::ReconciliationRequest;
-    use asx::storage::{BoxFuture, DedupStorage, ReconciliationStorage};
+    use asx::storage::{BoxFuture, DedupStorage, DedupVerdict, ReconciliationStorage};
     use std::sync::Arc;
 
     #[derive(Debug)]
@@ -359,8 +358,14 @@ fn strict_bench_session(session_id: &str) -> SessionContext {
         fn cluster_safe(&self) -> bool {
             true
         }
-        fn first_seen<'a>(&'a self, _key: &'a str) -> BoxFuture<'a, AsxResult<bool>> {
-            Box::pin(async { Ok(true) })
+        fn claim<'a>(&'a self, _key: &'a str) -> BoxFuture<'a, AsxResult<DedupVerdict>> {
+            Box::pin(async { Ok(DedupVerdict::Claimed) })
+        }
+        fn accept<'a>(&'a self, _key: &'a str) -> BoxFuture<'a, AsxResult<()>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn abandon<'a>(&'a self, _key: &'a str) -> BoxFuture<'a, AsxResult<()>> {
+            Box::pin(async { Ok(()) })
         }
     }
 
@@ -474,7 +479,8 @@ fn run_results(#[allow(unused_variables)] iterations: u64) -> Vec<BenchResult> {
             results.push(bench(
                 || {
                     let hook = InMemoryReconciliationHook::default();
-                    let dedup = InMemoryDedupBackend::default();
+                    let dedup: std::sync::Arc<dyn asx::storage::DedupStorage> =
+                        std::sync::Arc::new(InMemoryDedupBackend::default());
                     let _ = receive_with_mdn_with_reliability(
                         &session,
                         &bus,
@@ -490,7 +496,7 @@ fn run_results(#[allow(unused_variables)] iterations: u64) -> Vec<BenchResult> {
                             original_message_id: None,
                         },
                         &hook,
-                        &dedup,
+                        dedup.clone(),
                         &verifier,
                     )
                     .expect("as2 receive mdn");
@@ -524,11 +530,12 @@ fn run_results(#[allow(unused_variables)] iterations: u64) -> Vec<BenchResult> {
 
             results.push(bench(
                 || {
-                    let dedup = InMemoryDedupBackend::default();
-                    let _ = receive_push_with_dedup_sync(
+                    let dedup: std::sync::Arc<dyn asx::storage::DedupStorage> =
+                        std::sync::Arc::new(InMemoryDedupBackend::default());
+                    let _ = receive_push_sync(
                         &session,
                         &bus,
-                        As4ReceivePushSyncRequest {
+                        As4ReceivePushSync {
                             request: As4ReceivePushRequest {
                                 http_content_type: as4_bench_content_type(),
                                 payload: std::sync::Arc::clone(&payload),
@@ -536,7 +543,8 @@ fn run_results(#[allow(unused_variables)] iterations: u64) -> Vec<BenchResult> {
                                 policy: bench_policy.clone(),
                                 authenticated_sender_scope: None,
                             },
-                            dedup_backend: &dedup,
+                            dedup: dedup.clone(),
+                            signer_pins: None,
                         },
                     )
                     .expect("as4 receive");

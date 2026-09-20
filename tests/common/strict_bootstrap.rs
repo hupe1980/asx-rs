@@ -20,7 +20,7 @@ use asx_rs::observability::audit_sink::{
 };
 use asx_rs::presets::{StrictRuntimeBootstrap, StrictRuntimeBootstrapToken};
 use asx_rs::reliability::ReconciliationRequest;
-use asx_rs::storage::{BoxFuture, DedupStorage, ReconciliationStorage};
+use asx_rs::storage::{BoxFuture, DedupStorage, DedupVerdict, ReconciliationStorage};
 
 #[derive(Debug)]
 struct TestAuditSink;
@@ -68,8 +68,14 @@ impl DedupStorage for TestDedup {
     fn cluster_safe(&self) -> bool {
         true
     }
-    fn first_seen<'a>(&'a self, _key: &'a str) -> BoxFuture<'a, Result<bool>> {
-        Box::pin(async { Ok(true) })
+    fn claim<'a>(&'a self, _key: &'a str) -> BoxFuture<'a, Result<DedupVerdict>> {
+        Box::pin(async { Ok(DedupVerdict::Claimed) })
+    }
+    fn accept<'a>(&'a self, _key: &'a str) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async { Ok(()) })
+    }
+    fn abandon<'a>(&'a self, _key: &'a str) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async { Ok(()) })
     }
 }
 

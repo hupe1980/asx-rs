@@ -5,13 +5,15 @@ use super::{
 };
 #[cfg(not(feature = "testing"))]
 use crate::core::{AsxError, ErrorCode, ErrorContext};
+use std::sync::Arc;
 
-pub(super) fn receive_push_with_dedup_sync_fragment_aware_with_verifier(
+pub(super) fn receive_push_sync_fragment_aware_with_verifier(
     session: &SessionContext,
     event_bus: &EventBus,
     request: As4ReceivePushRequest,
-    dedup_backend: &dyn DedupStorage,
+    dedup_backend: &Arc<dyn DedupStorage>,
     verifier: &(dyn As4Verifier + Send + Sync),
+    signer_pins: Option<&Arc<dyn super::super::As4SignerPins>>,
     fragment_joiner: Option<&mut As4FragmentJoiner>,
 ) -> Result<As4ReceivePushProgress> {
     crate::presets::enforce_strict_runtime_bootstrap_for_strict_interop(
@@ -52,9 +54,10 @@ pub(super) fn receive_push_with_dedup_sync_fragment_aware_with_verifier(
         policy: &policy,
         dedup_backend,
         verifier,
+        signer_pins,
     };
 
-    super::receive_push_with_dedup_inner(
+    super::receive_push_inner(
         &ctx,
         PayloadInput::Shared(payload),
         receipt_payload.as_deref(),

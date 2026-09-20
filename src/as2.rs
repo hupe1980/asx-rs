@@ -23,7 +23,8 @@ use crate::reliability::{
 };
 use crate::send_pipeline as pipeline;
 use crate::storage::{
-    DedupStorage, ReconciliationStorage, drive_dedup_future, drive_reconciliation_future,
+    DedupClaim, DedupStorage, DedupVerdict, ReconciliationStorage, drive_dedup_future,
+    drive_reconciliation_future,
 };
 use crate::wire::{
     DEFAULT_MAX_BODY_BYTES, StreamBodyPolicy, StreamLimits, StreamReadMetrics,
@@ -68,10 +69,10 @@ pub use trust::{
 #[cfg(feature = "as2")]
 pub use types::validate_as2_version_header;
 pub use types::{
-    As2GeneratedMdn, As2InboundResult, As2MdnMode, As2MdnSigningCredentials, As2MicAlgorithm,
-    As2PreparedSendCredentials, As2ReceiveMdnOutput, As2ReceiveMdnRequest, As2ReceivePolicy,
-    As2ReceivePolicyBuilder, As2SendCredentials, As2SendOutput, As2SendPolicy, MimeEnvelope,
-    ParsedMdn, payload_content_type,
+    As2GeneratedMdn, As2InboundResult, As2MdnDedup, As2MdnMode, As2MdnSigningCredentials,
+    As2MicAlgorithm, As2PreparedSendCredentials, As2ReceiveMdnOutput, As2ReceiveMdnRequest,
+    As2ReceivePolicy, As2ReceivePolicyBuilder, As2SendCredentials, As2SendOutput, As2SendPolicy,
+    MimeEnvelope, ParsedMdn, payload_content_type,
 };
 
 use mdn::{classify_mdn_outcome, extract_content_type_header, parse_mdn};
@@ -319,7 +320,7 @@ pub fn receive_with_mdn_with_reliability(
     event_bus: &EventBus,
     request: As2ReceiveMdnRequest,
     reconciliation_hook: &dyn ReconciliationStorage,
-    dedup_backend: &dyn DedupStorage,
+    dedup_backend: Arc<dyn DedupStorage>,
     verifier: &dyn As2TrustVerifier,
 ) -> Result<As2ReceiveMdnOutput> {
     crate::presets::enforce_strict_runtime_bootstrap_for_strict_interop(
@@ -349,7 +350,7 @@ pub fn receive_with_mdn_with_reliability(
         event_bus,
         request.policy.fail_closed_audit_events,
         Some(reconciliation_hook),
-        Some(dedup_backend),
+        Some(dedup_backend.as_ref()),
     )?;
 
     // Extract before policy is moved into parse_mdn.
@@ -419,41 +420,138 @@ pub fn receive_with_mdn_with_reliability(
         "as2_mdn_receive",
         &reconciliation_message_id,
     );
-    if !drive_dedup_future(dedup_backend.first_seen(&dedup_key))? {
-        tracing::warn!(
-            session_id = %session.session_id(),
-            partner_id = %session.partner_id(),
-            message_id = %reconciliation_message_id,
-            "AS2 duplicate MDN detected, ignoring",
-        );
-        emit_audit_event(
-            event_bus,
-            session,
-            AsxEvent::DuplicateDetected {
-                message_id: reconciliation_message_id.clone(),
-                key: dedup_key,
-                ingress: AsxIngressStage::As2ReceiveWithMdn,
-            },
-            fail_closed,
-            "as2_mdn_dedup",
-        )?;
+    // Claimed, not consumed: everything below can still fail, and a failure
+    // here means the MDN's outcome was never recorded. Releasing the claim on
+    // the way out is what lets the partner's retransmission be processed
+    // instead of being swallowed as a duplicate (D59).
+    let claim = match drive_dedup_future(dedup_backend.claim(&dedup_key))? {
+        DedupVerdict::Claimed => {
+            DedupClaim::new(Arc::from(dedup_key.as_str()), Arc::clone(&dedup_backend))
+        }
+        DedupVerdict::Duplicate => {
+            tracing::warn!(
+                session_id = %session.session_id(),
+                partner_id = %session.partner_id(),
+                message_id = %reconciliation_message_id,
+                "AS2 duplicate MDN detected, ignoring",
+            );
+            emit_audit_event(
+                event_bus,
+                session,
+                AsxEvent::DuplicateDetected {
+                    message_id: reconciliation_message_id.clone(),
+                    key: dedup_key,
+                    ingress: AsxIngressStage::As2ReceiveWithMdn,
+                },
+                fail_closed,
+                "as2_mdn_dedup",
+            )?;
 
-        // Duplicate MDN ingress should not trigger downstream side effects.
-        return Ok(As2ReceiveMdnOutput {
-            payload,
-            mdn,
-            outcome,
-            retry_decision,
-            interop_reason_codes,
-        });
+            // Duplicate MDN ingress should not trigger downstream side effects.
+            return Ok(As2ReceiveMdnOutput {
+                payload,
+                mdn,
+                outcome,
+                retry_decision,
+                interop_reason_codes,
+                dedup: As2MdnDedup::Duplicate,
+            });
+        }
+        DedupVerdict::InFlight => {
+            emit_audit_event(
+                event_bus,
+                session,
+                AsxEvent::DuplicateInFlight {
+                    message_id: reconciliation_message_id.clone(),
+                    key: dedup_key,
+                    ingress: AsxIngressStage::As2ReceiveWithMdn,
+                },
+                fail_closed,
+                "as2_mdn_dedup",
+            )?;
+
+            return Ok(As2ReceiveMdnOutput {
+                payload,
+                mdn,
+                outcome,
+                retry_decision,
+                interop_reason_codes,
+                dedup: As2MdnDedup::InFlight,
+            });
+        }
+    };
+
+    // From here the claim is live. `mdn_side_effects` owns every remaining
+    // fallible step so exactly one place decides whether to release it.
+    let mut claim = claim;
+    if let Err(err) = mdn_side_effects(MdnSideEffects {
+        session,
+        event_bus,
+        reconciliation_hook,
+        fail_closed,
+        outcome,
+        retry_decision: retry_decision.clone(),
+        message_id: &reconciliation_message_id,
+        mdn: &mdn,
+        interop_reason_codes: &interop_reason_codes,
+    }) {
+        if let Err(release_err) = claim.abandon_in_place() {
+            tracing::error!(
+                error = %release_err,
+                "failed to release AS2 MDN dedup claim after a failed receive; \
+                 the key stays claimed until its lease expires"
+            );
+        }
+        return Err(err);
     }
 
-    for reason in &interop_reason_codes {
+    Ok(As2ReceiveMdnOutput {
+        payload,
+        mdn,
+        outcome,
+        retry_decision,
+        interop_reason_codes,
+        dedup: As2MdnDedup::FirstSeen(claim),
+    })
+}
+
+/// Invariant context for the post-dedup side effects of a received MDN.
+struct MdnSideEffects<'a> {
+    session: &'a SessionContext,
+    event_bus: &'a EventBus,
+    reconciliation_hook: &'a dyn ReconciliationStorage,
+    fail_closed: bool,
+    outcome: DeliveryOutcome,
+    retry_decision: RetryDecision,
+    message_id: &'a Arc<str>,
+    mdn: &'a ParsedMdn,
+    interop_reason_codes: &'a [&'static str],
+}
+
+/// Emit every event and reconciliation entry a first-seen MDN implies.
+///
+/// Split out so the claim has exactly one release point: each step below is
+/// fallible under `fail_closed_audit_events`, and any of them failing means the
+/// MDN's outcome was not durably recorded.
+fn mdn_side_effects(ctx: MdnSideEffects<'_>) -> Result<()> {
+    let MdnSideEffects {
+        session,
+        event_bus,
+        reconciliation_hook,
+        fail_closed,
+        outcome,
+        retry_decision,
+        message_id,
+        mdn,
+        interop_reason_codes,
+    } = ctx;
+
+    for reason in interop_reason_codes {
         emit_protocol_event(
             event_bus,
             session,
             AsxEvent::InteropRelaxationApplied {
-                message_id: reconciliation_message_id.clone(),
+                message_id: Arc::clone(message_id),
                 rule: "as2_interop_exception",
                 detail: reason,
             },
@@ -466,7 +564,7 @@ pub fn receive_with_mdn_with_reliability(
         event_bus,
         session,
         AsxEvent::MdnReceived {
-            message_id: reconciliation_message_id.clone(),
+            message_id: Arc::clone(message_id),
             disposition: mdn.disposition.clone(),
         },
         fail_closed,
@@ -478,7 +576,7 @@ pub fn receive_with_mdn_with_reliability(
             event_bus,
             session,
             AsxEvent::RetryScheduled {
-                message_id: reconciliation_message_id.clone(),
+                message_id: Arc::clone(message_id),
                 attempt: 1,
                 reason: "indeterminate_mdn",
             },
@@ -488,7 +586,7 @@ pub fn receive_with_mdn_with_reliability(
     }
 
     if let Some(recon_req) = ReconciliationRequest::for_outcome(
-        reconciliation_message_id.as_ref(),
+        message_id.as_ref(),
         session.partner_id().to_string(),
         outcome,
     ) {
@@ -501,7 +599,7 @@ pub fn receive_with_mdn_with_reliability(
                 event_bus,
                 session,
                 AsxEvent::ReconciliationQueued {
-                    message_id: reconciliation_message_id.clone(),
+                    message_id: Arc::clone(message_id),
                     reason,
                 },
                 fail_closed,
@@ -510,13 +608,7 @@ pub fn receive_with_mdn_with_reliability(
         }
     }
 
-    Ok(As2ReceiveMdnOutput {
-        payload,
-        mdn,
-        outcome,
-        retry_decision,
-        interop_reason_codes,
-    })
+    Ok(())
 }
 
 #[cfg(feature = "as2")]

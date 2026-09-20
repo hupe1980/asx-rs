@@ -2,10 +2,10 @@
 
 use super::pull_store::{As4PullEnqueueOutcome, As4PullStore};
 use super::pull_store::{PullQueueKey, PullRequestKey};
-use super::receive::receive_push_with_dedup_async;
+use super::receive::{As4Ordered, As4ReceivePush, receive_push};
 use super::services::{
-    check_duplicate_pull, enforce_strict_as4_runtime_policy_consistency, ensure_pull_mpc_matches,
-    handle_empty_pull_partition,
+    DedupDecision, claim_pull, enforce_strict_as4_runtime_policy_consistency,
+    ensure_pull_mpc_matches, handle_empty_pull_partition,
 };
 use super::stream::{constant_time_eq, normalize_mpc};
 use super::types::{
@@ -16,7 +16,9 @@ use super::types::{
 use crate::core::{AsxError, ErrorCode, ErrorContext, Result, SessionContext};
 use crate::observability::{AsxEvent, EventBus, emit_audit_event, emit_protocol_event};
 use crate::reliability::{DeliveryOutcome, ReconciliationRequest, RetryDecision};
-use crate::storage::{DedupStorage, ReconciliationStorage, drive_reconciliation_future};
+use crate::storage::{
+    DedupClaim, DedupStorage, ReconciliationStorage, drive_reconciliation_future,
+};
 use std::sync::Arc;
 
 /// Default MPC used when none is specified in the queued message.
@@ -38,6 +40,11 @@ pub struct As4ReceivePullWithReliabilityRequest<'a> {
     pub request: As4ReceivePullRequest,
     pub reconciliation_hook: &'a dyn ReconciliationStorage,
     pub dedup_backend: Arc<dyn DedupStorage>,
+    /// Permitted signers for the claimed `eb:From` of the **pulled**
+    /// `UserMessage`. See [`As4ReceivePush::signer_pins`].
+    ///
+    /// [`As4ReceivePush::signer_pins`]: crate::as4::As4ReceivePush::signer_pins
+    pub signer_pins: Option<Arc<dyn crate::as4::As4SignerPins>>,
 }
 
 /// Static label set passed to [`emit_pull_overflow_with_reconciliation`].
@@ -152,12 +159,14 @@ fn validate_pull_authorization_info(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_pull_output(
     pull_message_id: Arc<str>,
     mpc: Arc<str>,
     correlation_message_id: Option<Arc<str>>,
     duplicate_retrieval: bool,
     pulled: Option<Arc<As4ReceivePushOutput>>,
+    claim: Option<DedupClaim>,
     outcome: DeliveryOutcome,
     retry: RetryDecision,
 ) -> As4ReceivePullOutput {
@@ -167,6 +176,7 @@ fn build_pull_output(
         mpc,
         duplicate_retrieval,
         pulled,
+        claim,
         outcome,
         retry,
     }
@@ -200,13 +210,14 @@ struct QueuedPullDelivery<'a> {
     receipt_payload: Option<Vec<u8>>,
     push_policy: As4PushPolicy,
     dedup_backend: Arc<dyn DedupStorage>,
+    signer_pins: Option<Arc<dyn crate::as4::As4SignerPins>>,
 }
 
 async fn receive_queued_pull_message(
     session: &SessionContext,
     event_bus: &EventBus,
     delivery: QueuedPullDelivery<'_>,
-) -> Result<Arc<As4ReceivePushOutput>> {
+) -> Result<(Arc<As4ReceivePushOutput>, DedupClaim)> {
     let QueuedPullDelivery {
         store,
         queue_key,
@@ -214,25 +225,35 @@ async fn receive_queued_pull_message(
         receipt_payload,
         push_policy,
         dedup_backend,
+        signer_pins,
     } = delivery;
     let payload = Arc::clone(&queued.payload);
     let http_content_type = Arc::clone(&queued.http_content_type);
 
-    let push_out = match receive_push_with_dedup_async(
+    let delivered = receive_push(
         session,
         event_bus,
-        As4ReceivePushRequest {
-            http_content_type: http_content_type.to_string(),
-            payload,
-            receipt_payload,
-            policy: push_policy,
-            authenticated_sender_scope: None, // pull messages are pre-authorized by the pull store
+        As4ReceivePush {
+            request: As4ReceivePushRequest {
+                http_content_type: http_content_type.to_string(),
+                payload,
+                receipt_payload,
+                policy: push_policy,
+                // Pull messages are pre-authorized by the pull store.
+                authenticated_sender_scope: None,
+            },
+            dedup: dedup_backend,
+            // A pulled message is delivered to the initiator that asked for it;
+            // the conversation gate serializes *push* arrivals.
+            ordering: None,
+            signer_pins,
         },
-        dedup_backend,
     )
     .await
-    {
-        Ok(As4ReceiveOutcome::FirstSeen(output)) => *output,
+    .map(As4Ordered::into_inner);
+
+    let (push_out, claim) = match delivered {
+        Ok(As4ReceiveOutcome::FirstSeen { output, claim }) => (*output, claim),
         Ok(As4ReceiveOutcome::Duplicate { .. }) => {
             // Pull messages replayed through the same pull store entry are
             // idempotent by construction — the push was already processed.
@@ -243,13 +264,23 @@ async fn receive_queued_pull_message(
                 crate::core::ErrorContext::for_session("as4_pull_receive", session),
             ));
         }
+        Ok(As4ReceiveOutcome::InFlight { .. }) => {
+            // Another delivery of this UserMessage is still unsettled. Put it
+            // back and let the initiator pull again once that one resolves.
+            store.requeue_front(queue_key, queued).await?;
+            return Err(crate::core::AsxError::new(
+                ErrorCode::ReliabilityFailure,
+                "pull message delivery already in flight; retry with a fresh PullRequest",
+                crate::core::ErrorContext::for_session("as4_pull_receive", session),
+            ));
+        }
         Err(err) => {
             store.requeue_front(queue_key, queued).await?;
             return Err(err);
         }
     };
 
-    Ok(Arc::new(push_out))
+    Ok((Arc::new(push_out), claim))
 }
 
 #[cfg_attr(feature = "trace", tracing::instrument(skip_all, fields(partner_id = %session.partner_id())))]
@@ -321,6 +352,7 @@ pub async fn receive_pull_with_reliability(
     request: As4ReceivePullWithReliabilityRequest<'_>,
 ) -> Result<As4ReceivePullOutput> {
     let As4ReceivePullWithReliabilityRequest {
+        signer_pins,
         store,
         request,
         reconciliation_hook,
@@ -388,14 +420,127 @@ pub async fn receive_pull_with_reliability(
     // unauthorized peer insert arbitrary keys into a durable, shared store.
     validate_pull_authorization_info(session, &authorization, authorization_info.as_deref())?;
 
-    let duplicate_pull = check_duplicate_pull(
+    let pull_decision = claim_pull(
         session,
         event_bus,
-        dedup_backend.as_ref(),
+        &dedup_backend,
         &pull_message_id,
         fail_closed_audit_events,
     )
     .await?;
+
+    // The PullRequest's own claim is settled here rather than handed to the
+    // caller: what it deduplicates is the *retrieval*, and the served-response
+    // cache — not the application — is what makes a replayed retrieval
+    // idempotent.
+    let pull_claim = match pull_decision {
+        DedupDecision::Claimed(claim) => Some(claim),
+        DedupDecision::Duplicate => None,
+        DedupDecision::InFlight => {
+            // An identical PullRequest is still being served. Dequeuing now
+            // would hand out a second message under a MessageId the initiator
+            // may never correlate, so answer empty and let it retry.
+            return Ok(build_pull_output(
+                Arc::clone(&pull_message_id),
+                Arc::clone(&mpc),
+                None,
+                true,
+                None,
+                None,
+                DeliveryOutcome::Indeterminate,
+                RetryDecision::from_outcome(DeliveryOutcome::Indeterminate),
+            ));
+        }
+    };
+    let duplicate_pull = pull_claim.is_none();
+
+    // Everything below can fail, and a failed retrieval produced no response
+    // for the served-cache to replay — so the key must be released, not spent.
+    // One settle point, for the same reason `finish_non_fragment_push` has one
+    // (D59): an early `?` between the claim and an inline settlement is exactly
+    // how the push path lost messages.
+    let result = serve_pull_request(PullServe {
+        session,
+        event_bus,
+        store,
+        reconciliation_hook,
+        dedup_backend: &dedup_backend,
+        signer_pins: signer_pins.as_ref(),
+        pull_key: &pull_key,
+        queue_key: &queue_key,
+        pull_message_id: &pull_message_id,
+        mpc: &mpc,
+        duplicate_pull,
+        receipt_payload,
+        interop,
+        interop_exceptions,
+        require_signed_receipt,
+        require_signed_push,
+        fail_closed_audit_events,
+    })
+    .await;
+
+    match (result, pull_claim) {
+        (Ok(output), Some(claim)) => {
+            claim.accept().await?;
+            Ok(output)
+        }
+        (Ok(output), None) => Ok(output),
+        (Err(err), Some(claim)) => {
+            // Release before reporting: the initiator's retry with the same
+            // MessageId must be processed, not answered `InFlight`.
+            claim.abandon().await?;
+            Err(err)
+        }
+        (Err(err), None) => Err(err),
+    }
+}
+
+/// Invariant context for the part of a pull that runs under a live claim.
+struct PullServe<'a> {
+    session: &'a SessionContext,
+    event_bus: &'a EventBus,
+    store: &'a As4PullStore,
+    reconciliation_hook: &'a dyn ReconciliationStorage,
+    dedup_backend: &'a Arc<dyn DedupStorage>,
+    signer_pins: Option<&'a Arc<dyn crate::as4::As4SignerPins>>,
+    pull_key: &'a PullRequestKey,
+    queue_key: &'a PullQueueKey,
+    pull_message_id: &'a Arc<str>,
+    mpc: &'a Arc<str>,
+    duplicate_pull: bool,
+    receipt_payload: Option<Vec<u8>>,
+    interop: crate::core::InteropMode,
+    interop_exceptions: crate::interop::InteropExceptionPolicy,
+    require_signed_receipt: bool,
+    require_signed_push: bool,
+    fail_closed_audit_events: bool,
+}
+
+/// Serve one `PullRequest`, with the retrieval claim already held.
+///
+/// Every `?` here releases that claim, because the caller settles on the
+/// result rather than inline.
+async fn serve_pull_request(ctx: PullServe<'_>) -> Result<As4ReceivePullOutput> {
+    let PullServe {
+        session,
+        event_bus,
+        store,
+        reconciliation_hook,
+        dedup_backend,
+        signer_pins,
+        pull_key,
+        queue_key,
+        pull_message_id,
+        mpc,
+        duplicate_pull,
+        receipt_payload,
+        interop,
+        interop_exceptions,
+        require_signed_receipt,
+        require_signed_push,
+        fail_closed_audit_events,
+    } = ctx;
 
     // A replayed PullRequest must never dequeue a *second* message. Inside the
     // served-cache window `atomic_take` already returns the original response;
@@ -403,17 +548,18 @@ pub async fn receive_pull_with_reliability(
     // payload" — dequeuing would consume a message the initiator never learns
     // about. The initiator must retry with a fresh MessageId.
     let (cached_pulled, queued) = if duplicate_pull {
-        (store.cached_response(&pull_key).await, None)
+        (store.cached_response(pull_key).await, None)
     } else {
-        store.atomic_take(&pull_key, &queue_key).await?
+        store.atomic_take(pull_key, queue_key).await?
     };
 
     if duplicate_pull && cached_pulled.is_none() {
         return Ok(build_pull_output(
-            Arc::clone(&pull_message_id),
-            Arc::clone(&mpc),
+            Arc::clone(pull_message_id),
+            Arc::clone(mpc),
             None,
             true,
+            None,
             None,
             DeliveryOutcome::Indeterminate,
             RetryDecision::from_outcome(DeliveryOutcome::Indeterminate),
@@ -424,18 +570,21 @@ pub async fn receive_pull_with_reliability(
         let pulled_mpc = push_out.user_message.mpc.as_deref().unwrap_or(DEFAULT_MPC);
         ensure_pull_mpc_matches(
             session,
-            &mpc,
+            mpc,
             normalize_mpc(pulled_mpc),
             &push_out.user_message.message_id,
         )?;
 
         let outcome = DeliveryOutcome::SuccessConfirmed;
+        // Replayed retrieval: the UserMessage's own claim was settled by the
+        // call that first delivered it, so this one carries none.
         return Ok(build_pull_output(
-            Arc::clone(&pull_message_id),
-            Arc::clone(&mpc),
+            Arc::clone(pull_message_id),
+            Arc::clone(mpc),
             Some(Arc::from(push_out.user_message.message_id.as_str())),
             true,
             Some(push_out),
+            None,
             outcome,
             RetryDecision::from_outcome(outcome),
         ));
@@ -446,14 +595,15 @@ pub async fn receive_pull_with_reliability(
             session,
             event_bus,
             reconciliation_hook,
-            &pull_message_id,
+            pull_message_id,
             fail_closed_audit_events,
         )?;
         return Ok(build_pull_output(
-            Arc::clone(&pull_message_id),
-            Arc::clone(&mpc),
+            Arc::clone(pull_message_id),
+            Arc::clone(mpc),
             None,
             false,
+            None,
             None,
             outcome,
             retry,
@@ -467,38 +617,47 @@ pub async fn receive_pull_with_reliability(
         require_signed_push,
         fail_closed_audit_events,
     );
-    let push_out = receive_queued_pull_message(
+    let (push_out, message_claim) = receive_queued_pull_message(
         session,
         event_bus,
         QueuedPullDelivery {
             store,
-            queue_key: &queue_key,
+            queue_key,
             queued,
             receipt_payload,
             push_policy,
-            dedup_backend: Arc::clone(&dedup_backend),
+            dedup_backend: Arc::clone(dedup_backend),
+            signer_pins: signer_pins.cloned(),
         },
     )
     .await?;
 
     let pulled_mpc = push_out.user_message.mpc.as_deref().unwrap_or(DEFAULT_MPC);
-    ensure_pull_mpc_matches(
+    if let Err(err) = ensure_pull_mpc_matches(
         session,
-        &mpc,
+        mpc,
         normalize_mpc(pulled_mpc),
         &push_out.user_message.message_id,
-    )?;
+    ) {
+        // The message is not delivered, so its key must not stay spent — the
+        // next retrieval has to be able to process it.
+        message_claim.abandon().await?;
+        return Err(err);
+    }
 
     let correlation_message_id = Some(Arc::from(push_out.user_message.message_id.as_str()));
 
-    store.cache_pulled(pull_key, Arc::clone(&push_out)).await;
+    store
+        .cache_pulled(pull_key.clone(), Arc::clone(&push_out))
+        .await;
 
     Ok(build_pull_output(
-        Arc::clone(&pull_message_id),
-        Arc::clone(&mpc),
+        Arc::clone(pull_message_id),
+        Arc::clone(mpc),
         correlation_message_id,
         false,
         Some(push_out),
+        Some(message_claim),
         DeliveryOutcome::SuccessConfirmed,
         RetryDecision::from_outcome(DeliveryOutcome::SuccessConfirmed),
     ))

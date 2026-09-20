@@ -945,7 +945,7 @@ mod tests {
 
         verify_enveloped_signature(
             &signed,
-            WsSecVerifyOptions::new().with_expected_fingerprint(None),
+            WsSecVerifyOptions::new().with_expected_fingerprints(&[]),
         )
         .expect("verification should pass");
     }
@@ -1209,7 +1209,11 @@ mod tests {
 
         let err = verify_enveloped_signature(
             &signed,
-            WsSecVerifyOptions::new().with_expected_fingerprint(Some("ab:cd")),
+            WsSecVerifyOptions::new().with_expected_fingerprints(std::slice::from_ref(
+                // Any well-formed pin: the point is that a message with no
+                // X.509 certificate cannot satisfy one.
+                &crate::crypto::CertFingerprint::parse(&"ab".repeat(32)).unwrap(),
+            )),
         )
         .expect_err("missing x509 certificate should fail trust binding");
         assert_eq!(err.code, crate::core::ErrorCode::SecurityVerificationFailed);
@@ -1266,7 +1270,7 @@ mod tests {
 
         let err = verify_enveloped_signature(
             &signed,
-            WsSecVerifyOptions::new().with_expected_fingerprint(None),
+            WsSecVerifyOptions::new().with_expected_fingerprints(&[]),
         )
         .expect_err("malformed x509 certificate must fail");
         assert_eq!(err.code, crate::core::ErrorCode::SecurityVerificationFailed);
@@ -1323,7 +1327,7 @@ mod tests {
 
         let err = verify_enveloped_signature(
             &signed,
-            WsSecVerifyOptions::new().with_expected_fingerprint(None),
+            WsSecVerifyOptions::new().with_expected_fingerprints(&[]),
         )
         .expect_err("key mismatch must fail");
         assert_eq!(err.code, crate::core::ErrorCode::SecurityVerificationFailed);
@@ -1391,7 +1395,7 @@ mod tests {
 
         let err = verify_enveloped_signature(
             &signed,
-            WsSecVerifyOptions::new().with_expected_fingerprint(None),
+            WsSecVerifyOptions::new().with_expected_fingerprints(&[]),
         )
         .expect_err("certificate with incompatible EKU must fail signer policy");
         assert_eq!(err.code, crate::core::ErrorCode::SecurityVerificationFailed);

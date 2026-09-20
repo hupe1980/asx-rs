@@ -75,21 +75,31 @@ Skips all WS-Security checks on inbound AS4 push messages. Parity with
 
 ```toml
 [dev-dependencies]
-asx-rs = { version = "0.14", features = ["as4", "testing"] }
+asx-rs = { version = "0.15", features = ["as4", "testing"] }
 ```
 
 ```rust
 use asx_rs::as4::{
     InsecureBypassAs4Verifier,
-    receive_push_with_dedup_async_with_custom_verifier,
-    As4ReceivePushRequest,
+    receive_push_with_custom_verifier,
+    As4ReceivePush, As4ReceivePushRequest,
 };
 use std::sync::Arc;
 
-let outcome = receive_push_with_dedup_async_with_custom_verifier(
-    &session, &bus, request, dedup_backend,
+let outcome = receive_push_with_custom_verifier(
+    &session,
+    &bus,
+    As4ReceivePush { request, dedup, ordering: None },
     InsecureBypassAs4Verifier,  // ← bypasses ALL WS-Security verification
-).await?;
+)
+.await?
+.into_inner();
+
+// A first-seen outcome carries an unsettled dedup claim even in tests. Settle
+// it, or the next receive of the same message reports `InFlight` rather than
+// the `Duplicate` a replay test expects.
+let (output, claim) = outcome.unwrap_output();
+claim.accept().await?;
 ```
 
 When active, a `tracing::warn!` is emitted so test logs are auditable and production
@@ -103,7 +113,7 @@ synchronous AS4 receipt. Requires `testing + server` features.
 
 ```toml
 [dev-dependencies]
-asx-rs = { version = "0.14", features = ["as4", "testing", "server"] }
+asx-rs = { version = "0.15", features = ["as4", "testing", "server"] }
 ```
 
 ```rust
@@ -218,6 +228,49 @@ assert!(outcome.into_receipt()?.is_non_repudiation_evidence());
 
 This keeps test coverage over `As4HttpTransport`'s `Content-Type` headers, receipt
 inspection, and connection pooling — none of which are exercised by a raw `reqwest::Client`.
+
+### Foreign-implementation oracles
+
+Testing against yourself proves agreement with yourself. These are `#[ignore]`d
+so `cargo test` stays hermetic, and run in the `interop-docker-oracles` CI job:
+
+| Oracle | What it witnesses |
+|---|---|
+| `interop_xmlsec_oracle` | C14N and digests, against the XMLDSig reference implementation |
+| `interop_openssl_smime_oracle` | AS2 S/MIME, both directions, against the `openssl` CLI |
+| `interop_holodeck_counterparty` | A signed AS4 push and NRR receipt, against Holodeck B2B |
+| `interop_peppol_smp_oracle` | A **real production Peppol SMP signature**, against the real Peppol PKI |
+| `interop_redis_storage_conformance` | `DedupStorage` against a real Redis, including a non-atomic one that must fail |
+| `interop_peppol_sml_discovery` | The participant name we compute, against the live production SML |
+
+```text
+cargo test --all-features --test interop_peppol_smp_oracle
+cargo test --all-features --test interop_redis_storage_conformance -- --ignored --nocapture
+```
+
+The SMP oracle is not `#[ignore]`d: its fixture is captured, so it needs no
+network. Its signer certificate expires **2028-02-23**, and a test says so in
+those words when it does.
+
+### `DedupConformance` and friends
+
+Before trusting a durable backend, run the conformance suite against it — it
+races concurrent claims and checks every settlement rule, and reports rather
+than panics:
+
+```rust
+use asx_rs::storage::conformance::DedupConformance;
+
+#[tokio::test]
+async fn our_dedup_conforms() {
+    let report = DedupConformance::new(&MyFactory { pool }).run().await;
+    assert!(report.passed(), "{report}");
+}
+```
+
+The factory returns a **fresh handle onto the same store**, which is how the
+suite distinguishes a durable backend from one that only says it is. See the
+[persistence guide](@/docs/persistence.md).
 
 ### `DurableInMemoryDedupBackend`
 
@@ -521,7 +574,7 @@ assert_eq!(response.status(), 200);
 ## Testing Feature Flag
 
 ```toml
-asx-rs = { version = "0.14", features = ["testing"] }
+asx-rs = { version = "0.15", features = ["testing"] }
 ```
 
 The `testing` feature exposes `asx_rs::fixtures` and `asx_rs::matrix` — test scaffold modules with `InteropFixtureMetadata`, `FixtureCatalog`, `MatrixSummary`, and related helpers. These are not part of the production library surface and are absent from builds without this feature.

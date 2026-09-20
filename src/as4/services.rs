@@ -3,6 +3,7 @@ use crate::as4::pmode::PayloadPackagingMode;
 use crate::as4::types::As4SendPolicy;
 use crate::core::InteropMode;
 use crate::core::{AsxError, ErrorCode, ErrorContext, Result, SessionContext};
+use crate::crypto::CertFingerprint;
 use crate::crypto::wssec::RevocationPolicy;
 use crate::interop::InteropExceptionPolicy;
 use crate::observability::{
@@ -13,13 +14,23 @@ use crate::reliability::{
     derive_ingress_idempotency_key,
 };
 use crate::storage::{
-    DedupStorage, ReconciliationStorage, drive_dedup_future, drive_reconciliation_future,
+    DedupClaim, DedupStorage, DedupVerdict, ReconciliationStorage, drive_dedup_future,
+    drive_reconciliation_future,
 };
 use std::sync::Arc;
 
-pub(crate) fn expected_fingerprint_from_session(session: &SessionContext) -> Option<&str> {
+/// The single-partner pin configured on the session, as a permitted-signer set.
+///
+/// Empty when nothing is pinned. `SessionContextBuilder::build` rejects a
+/// malformed value, so the parse here cannot fail for a session that exists.
+pub(crate) fn session_signer_pins(session: &SessionContext) -> Vec<CertFingerprint> {
     let fp = session.cert_handle().fingerprint_sha256.trim();
-    if fp.is_empty() { None } else { Some(fp) }
+    if fp.is_empty() {
+        return Vec::new();
+    }
+    CertFingerprint::parse(fp)
+        .map(|f| vec![f])
+        .unwrap_or_default()
 }
 
 pub(crate) fn wssec_revocation_policy_from_session<'a>(
@@ -144,34 +155,96 @@ pub(crate) fn enforce_strict_as4_send_runtime_policy_consistency(
     Ok(())
 }
 
-/// Returns `Ok(true)` if the message is a **duplicate** (already seen),
-/// `Ok(false)` if it is first-seen.
-/// Emits a `DuplicateDetected` audit event on replays.
-pub(crate) async fn check_duplicate_push(
+/// The result of claiming an inbound message's idempotency key.
+///
+/// [`DedupVerdict`] plus the claim itself, so the pipeline can settle it.
+#[derive(Debug)]
+pub(crate) enum DedupDecision {
+    /// First-seen. The claim is unsettled and must be accepted or abandoned.
+    Claimed(DedupClaim),
+    /// A previous attempt was accepted: a genuine replay.
+    Duplicate,
+    /// A concurrent attempt holds the claim; neither accept nor reject.
+    InFlight,
+}
+
+/// Claim the idempotency key for an inbound push message.
+///
+/// Emits `DuplicateDetected` on a replay. The claim is deliberately taken
+/// **after** WS-Security verification, so an unauthenticated peer cannot burn
+/// a partner's `eb:MessageId`, and settled only once the message's fate is
+/// known (D59).
+pub(crate) async fn claim_push(
     session: &SessionContext,
     event_bus: &EventBus,
-    dedup_backend: &dyn DedupStorage,
+    dedup_backend: &Arc<dyn DedupStorage>,
     message_id: &str,
     ingress: AsxIngressStage,
     fail_closed_audit_events: bool,
-) -> crate::core::Result<bool> {
+) -> crate::core::Result<DedupDecision> {
     let dedup_key =
         derive_ingress_idempotency_key(session.partner_id(), "as4_push_receive", message_id);
-    if !dedup_backend.first_seen(&dedup_key).await? {
-        emit_audit_event(
-            event_bus,
-            session,
-            AsxEvent::DuplicateDetected {
-                message_id: Arc::from(message_id),
-                key: dedup_key,
-                ingress,
-            },
-            fail_closed_audit_events,
-            "as4_dedup",
-        )?;
-        Ok(true)
-    } else {
-        Ok(false)
+    decide(
+        session,
+        event_bus,
+        dedup_backend,
+        dedup_key,
+        Arc::from(message_id),
+        ingress,
+        fail_closed_audit_events,
+        "as4_dedup",
+    )
+    .await
+}
+
+/// Shared claim-and-audit step for every ingress that deduplicates.
+#[allow(clippy::too_many_arguments)]
+async fn decide(
+    session: &SessionContext,
+    event_bus: &EventBus,
+    dedup_backend: &Arc<dyn DedupStorage>,
+    dedup_key: String,
+    message_id: Arc<str>,
+    ingress: AsxIngressStage,
+    fail_closed_audit_events: bool,
+    context: &'static str,
+) -> crate::core::Result<DedupDecision> {
+    match dedup_backend.claim(&dedup_key).await? {
+        DedupVerdict::Claimed => {
+            let key: Arc<str> = Arc::from(dedup_key);
+            Ok(DedupDecision::Claimed(DedupClaim::new(
+                key,
+                Arc::clone(dedup_backend),
+            )))
+        }
+        DedupVerdict::Duplicate => {
+            emit_audit_event(
+                event_bus,
+                session,
+                AsxEvent::DuplicateDetected {
+                    message_id,
+                    key: dedup_key,
+                    ingress,
+                },
+                fail_closed_audit_events,
+                context,
+            )?;
+            Ok(DedupDecision::Duplicate)
+        }
+        DedupVerdict::InFlight => {
+            emit_audit_event(
+                event_bus,
+                session,
+                AsxEvent::DuplicateInFlight {
+                    message_id,
+                    key: dedup_key,
+                    ingress,
+                },
+                fail_closed_audit_events,
+                context,
+            )?;
+            Ok(DedupDecision::InFlight)
+        }
     }
 }
 
@@ -247,35 +320,30 @@ pub(crate) fn emit_receive_push_receipt_taxonomy_outcome(
     Ok(())
 }
 
-/// Returns `Ok(true)` if the pull message is a **duplicate**, `Ok(false)` if first-seen.
-pub(crate) async fn check_duplicate_pull(
+/// Claim the idempotency key for an inbound `PullRequest`.
+pub(crate) async fn claim_pull(
     session: &SessionContext,
     event_bus: &EventBus,
-    dedup_backend: &dyn DedupStorage,
+    dedup_backend: &Arc<dyn DedupStorage>,
     pull_message_id: &Arc<str>,
     fail_closed_audit_events: bool,
-) -> crate::core::Result<bool> {
+) -> crate::core::Result<DedupDecision> {
     let dedup_key = derive_ingress_idempotency_key(
         session.partner_id(),
         "as4_pull_receive",
         pull_message_id.as_ref(),
     );
-    if !dedup_backend.first_seen(&dedup_key).await? {
-        emit_audit_event(
-            event_bus,
-            session,
-            AsxEvent::DuplicateDetected {
-                message_id: Arc::clone(pull_message_id),
-                key: dedup_key,
-                ingress: AsxIngressStage::As4ReceivePull,
-            },
-            fail_closed_audit_events,
-            "as4_pull_dedup",
-        )?;
-        Ok(true)
-    } else {
-        Ok(false)
-    }
+    decide(
+        session,
+        event_bus,
+        dedup_backend,
+        dedup_key,
+        Arc::clone(pull_message_id),
+        AsxIngressStage::As4ReceivePull,
+        fail_closed_audit_events,
+        "as4_pull_dedup",
+    )
+    .await
 }
 
 pub(crate) fn handle_empty_pull_partition(
@@ -343,20 +411,20 @@ pub(crate) fn ensure_pull_mpc_matches(
     Ok(())
 }
 
-/// Sync wrapper for [`check_duplicate_push`] for use in the blocking receive path.
+/// Sync wrapper for [`claim_push`] for use in the blocking receive path.
 ///
 /// Drives the async dedup future synchronously.  Only works with in-memory
 /// backends (where the future is immediately ready).  For async-backed stores,
-/// use `check_duplicate_push` from an async context.
-pub(crate) fn check_duplicate_push_sync(
+/// use `claim_push` from an async context.
+pub(crate) fn claim_push_sync(
     session: &SessionContext,
     event_bus: &EventBus,
-    dedup_backend: &dyn DedupStorage,
+    dedup_backend: &Arc<dyn DedupStorage>,
     message_id: &str,
     ingress: AsxIngressStage,
     fail_closed_audit_events: bool,
-) -> crate::core::Result<bool> {
-    drive_dedup_future(check_duplicate_push(
+) -> crate::core::Result<DedupDecision> {
+    drive_dedup_future(claim_push(
         session,
         event_bus,
         dedup_backend,

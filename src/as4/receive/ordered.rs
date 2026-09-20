@@ -6,7 +6,7 @@ pub(super) fn ordered_missing_conversation_id_error(session: &SessionContext) ->
     AsxError::new(
         ErrorCode::PolicyViolation,
         "ordered AS4 receive requires eb:ConversationId",
-        ErrorContext::for_session("as4_receive_push_ordered", session),
+        ErrorContext::for_session("as4_receive_push", session),
     )
 }
 
@@ -28,7 +28,7 @@ pub(super) fn ordered_conversation_id_mismatch_error(
             "AS4 ordered receive reserved the turn for conversation '{reserved}' but the \
              verified eb:ConversationId is '{verified}'"
         ),
-        ErrorContext::for_session("as4_receive_push_ordered", session),
+        ErrorContext::for_session("as4_receive_push", session),
     )
 }
 
@@ -78,7 +78,7 @@ pub(super) async fn confirm_and_record_turn(
 /// #     ordered: asx_rs::as4::As4Ordered<asx_rs::as4::As4ReceiveOutcome>,
 /// # ) {
 /// // The turn is held here …
-/// if let asx_rs::as4::As4ReceiveOutcome::FirstSeen(output) = ordered.get() {
+/// if let asx_rs::as4::As4ReceiveOutcome::FirstSeen { output, .. } = ordered.get() {
 ///     deliver_to_application(output).await;
 /// }
 /// // … and released here, when `ordered` goes out of scope.

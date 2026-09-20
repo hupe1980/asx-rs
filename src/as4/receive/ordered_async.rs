@@ -29,16 +29,22 @@ async fn reserve_turn_for_payload(
     Ok((conversation_id, reservation))
 }
 
-pub(super) async fn receive_push_ordered_with_verifier(
+pub(super) async fn receive_push_with_verifier(
     session: &SessionContext,
     event_bus: &EventBus,
     request: As4ReceivePushRequest,
     dedup_backend: Arc<dyn crate::storage::DedupStorage>,
-    gate: &dyn ConversationOrderGate,
+    gate: Option<&dyn ConversationOrderGate>,
     verifier: Arc<dyn As4Verifier + Send + Sync>,
+    signer_pins: Option<Arc<dyn crate::as4::As4SignerPins>>,
 ) -> Result<As4Ordered<As4ReceiveOutcome>> {
-    let (conversation_id, reservation) =
-        reserve_turn_for_payload(session, gate, &request.payload).await?;
+    // `None` means the deployment does not preserve conversation order, so no
+    // turn is reserved and the returned guard holds none. Ordering is a
+    // deployment property, not a different operation.
+    let reserved = match gate {
+        Some(gate) => Some(reserve_turn_for_payload(session, gate, &request.payload).await?),
+        None => None,
+    };
 
     // Everything expensive happens here, holding only a ticket: messages in
     // different conversations never block each other, and messages in the same
@@ -47,56 +53,78 @@ pub(super) async fn receive_push_ordered_with_verifier(
     // A failure returns early and drops the reservation, which releases the
     // place rather than stalling the conversation behind a message that will
     // never be delivered.
-    let outcome = super::async_completion::receive_push_with_dedup_async_with_shared_verifier(
+    let outcome = super::async_completion::receive_push_with_shared_verifier(
         session,
         event_bus,
         request,
         dedup_backend,
         verifier,
+        signer_pins,
     )
     .await?;
 
+    let Some((conversation_id, reservation)) = reserved else {
+        return Ok(As4Ordered::untimed(outcome));
+    };
+    let gate = gate.expect("a reservation exists only when a gate was supplied");
+
     match outcome {
-        As4ReceiveOutcome::FirstSeen(output) => {
+        As4ReceiveOutcome::FirstSeen { output, claim } => {
             let turn = reservation.wait_for_turn().await?;
             ordered::confirm_and_record_turn(session, gate, &conversation_id, &output).await?;
-            Ok(As4Ordered::held(As4ReceiveOutcome::FirstSeen(output), turn))
+            Ok(As4Ordered::held(
+                As4ReceiveOutcome::FirstSeen { output, claim },
+                turn,
+            ))
         }
-        // A duplicate is not delivered, so it takes no place in the order and
-        // must not make the next arrival wait for one.
-        duplicate @ As4ReceiveOutcome::Duplicate { .. } => Ok(As4Ordered::untimed(duplicate)),
+        // Neither a settled replay nor a message another attempt still holds is
+        // delivered, so neither takes a place in the order and neither must
+        // make the next arrival wait for one.
+        other => Ok(As4Ordered::untimed(other)),
     }
 }
 
-pub(super) async fn receive_push_ordered_fragment_aware_with_verifier(
+// The private mirror of `receive_push_fragment_aware`, whose public request
+// struct already bundles what a caller supplies. Bundling again here would add
+// a type that exists only to satisfy a lint on an internal seam.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn receive_push_fragment_aware_with_verifier(
     session: &SessionContext,
     event_bus: &EventBus,
     request: As4ReceivePushRequest,
     dedup_backend: Arc<dyn crate::storage::DedupStorage>,
-    gate: &dyn ConversationOrderGate,
+    gate: Option<&dyn ConversationOrderGate>,
     verifier: Arc<dyn As4Verifier + Send + Sync>,
+    signer_pins: Option<Arc<dyn crate::as4::As4SignerPins>>,
     fragment_joiner: Arc<std::sync::Mutex<As4FragmentJoiner>>,
 ) -> Result<As4Ordered<As4ReceivePushProgress>> {
-    let (conversation_id, reservation) =
-        reserve_turn_for_payload(session, gate, &request.payload).await?;
+    let reserved = match gate {
+        Some(gate) => Some(reserve_turn_for_payload(session, gate, &request.payload).await?),
+        None => None,
+    };
 
-    let progress =
-        super::async_bridge::receive_push_with_dedup_async_fragment_aware_with_shared_verifier(
-            session,
-            event_bus,
-            request,
-            dedup_backend,
-            verifier,
-            fragment_joiner,
-        )
-        .await?;
+    let progress = super::async_bridge::receive_push_fragment_aware_with_shared_verifier(
+        session,
+        event_bus,
+        request,
+        dedup_backend,
+        verifier,
+        signer_pins,
+        fragment_joiner,
+    )
+    .await?;
+
+    let Some((conversation_id, reservation)) = reserved else {
+        return Ok(As4Ordered::untimed(progress));
+    };
+    let gate = gate.expect("a reservation exists only when a gate was supplied");
 
     match progress {
-        As4ReceivePushProgress::Complete(output) => {
+        As4ReceivePushProgress::Complete { output, claim } => {
             let turn = reservation.wait_for_turn().await?;
             ordered::confirm_and_record_turn(session, gate, &conversation_id, &output).await?;
             Ok(As4Ordered::held(
-                As4ReceivePushProgress::Complete(output),
+                As4ReceivePushProgress::Complete { output, claim },
                 turn,
             ))
         }

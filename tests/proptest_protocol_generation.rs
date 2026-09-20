@@ -4,8 +4,8 @@
 #![cfg(all(feature = "as2", feature = "as4", feature = "testing"))]
 
 use asx_rs::as4::{
-    As4PushPolicyBuilder, As4ReceivePushRequest, As4ReceivePushSyncRequest, generate_receipt,
-    receive_push_with_dedup_sync,
+    As4PushPolicyBuilder, As4ReceivePushRequest, As4ReceivePushSync, generate_receipt,
+    receive_push_sync,
 };
 
 use asx_rs::as2::{
@@ -183,13 +183,14 @@ proptest! {
         let payload = vec![0xAB; payload_size];
 
         let bus = EventBus::new(32).expect("bus");
-        let dedup = InMemoryDedupBackend::default();
+        let dedup: std::sync::Arc<dyn asx_rs::storage::DedupStorage> =
+        std::sync::Arc::new(InMemoryDedupBackend::default());
 
         // This should not panic or cause memory issues
-        let result = receive_push_with_dedup_sync(
+        let result = receive_push_sync(
             &session,
             &bus,
-            As4ReceivePushSyncRequest {
+            As4ReceivePushSync {
                 request: As4ReceivePushRequest {
                     http_content_type: "multipart/related".into(),
                     payload: payload.into(),
@@ -201,7 +202,8 @@ proptest! {
                         .expect("policy"),
                     authenticated_sender_scope: None,
                 },
-                dedup_backend: &dedup,
+                dedup: dedup.clone(),
+                signer_pins: None,
             },
         );
 

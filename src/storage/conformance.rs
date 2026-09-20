@@ -10,7 +10,7 @@
 //! the protocol paths actually depend on, including the two that are easy to
 //! get wrong and impossible to notice in a single-threaded smoke test:
 //!
-//! - **`first_seen` is atomic.** Under concurrent calls for one key, exactly one
+//! - **`claim` is atomic.** Under concurrent calls for one key, exactly one
 //!   caller may see `true`. A `SELECT`-then-`INSERT` backend passes every serial
 //!   test and admits duplicate business documents under load.
 //! - **State survives a reconnect.** A durable backend must return the same
@@ -34,8 +34,14 @@
 //! # impl DedupStorage for MyDedup {
 //! #   fn is_durable(&self) -> bool { true }
 //! #   fn cluster_safe(&self) -> bool { true }
-//! #   fn first_seen<'a>(&'a self, _k: &'a str) -> asx_rs::storage::BoxFuture<'a, asx_rs::Result<bool>> {
-//! #     Box::pin(async { Ok(true) })
+//! #   fn claim<'a>(&'a self, _k: &'a str) -> asx_rs::storage::BoxFuture<'a, asx_rs::Result<asx_rs::storage::DedupVerdict>> {
+//! #     Box::pin(async { Ok(asx_rs::storage::DedupVerdict::Claimed) })
+//! #   }
+//! #   fn accept<'a>(&'a self, _k: &'a str) -> asx_rs::storage::BoxFuture<'a, asx_rs::Result<()>> {
+//! #     Box::pin(async { Ok(()) })
+//! #   }
+//! #   fn abandon<'a>(&'a self, _k: &'a str) -> asx_rs::storage::BoxFuture<'a, asx_rs::Result<()>> {
+//! #     Box::pin(async { Ok(()) })
 //! #   }
 //! # }
 //! struct MyDedupFactory(MyPool);
@@ -63,7 +69,7 @@ use crate::observability::audit_sink::{
     AuditEvent, AuditMetadata, AuditSeverity, AuditSinkDurability, DurableAuditSink, ReplayCursor,
 };
 use crate::reliability::ReconciliationRequest;
-use crate::storage::{DedupStorage, ReconciliationStorage};
+use crate::storage::{DedupStorage, DedupVerdict, ReconciliationStorage};
 
 /// Produces a **fresh handle onto the same backing store**.
 ///
@@ -205,9 +211,14 @@ impl<'a> DedupConformance<'a> {
     /// Run every check. Never panics; failures are reported.
     pub async fn run(&self) -> ConformanceReport {
         let mut checks = Vec::new();
-        checks.push(self.first_seen_is_true_once().await);
+        checks.push(self.accepted_key_is_claimed_once().await);
         checks.push(self.distinct_keys_are_independent().await);
-        checks.push(self.concurrent_first_seen_admits_exactly_one().await);
+        checks.push(self.unsettled_claim_reports_in_flight().await);
+        checks.push(self.abandon_releases_the_key().await);
+        checks.push(self.abandon_never_reopens_an_accepted_key().await);
+        checks.push(self.accept_is_idempotent().await);
+        checks.push(self.concurrent_claim_admits_exactly_one().await);
+        checks.push(self.survives_being_driven_from_a_blocking_context().await);
         checks.push(self.state_survives_a_reconnect().await);
         checks.push(self.declares_its_properties_consistently());
         ConformanceReport {
@@ -220,48 +231,176 @@ impl<'a> DedupConformance<'a> {
         format!("{}-{name}", self.key_prefix)
     }
 
-    async fn first_seen_is_true_once(&self) -> CheckOutcome {
-        const ID: &str = "dedup.first_seen_is_true_once";
-        const WHAT: &str = "the same key is new once and a duplicate thereafter";
+    async fn accepted_key_is_claimed_once(&self) -> CheckOutcome {
+        const ID: &str = "dedup.accepted_key_is_claimed_once";
+        const WHAT: &str = "a key is claimable once, and a duplicate after it is accepted";
         let store = self.factory.connect();
         let key = self.key("once");
 
-        match store.first_seen(&key).await {
-            Ok(true) => {}
-            Ok(false) => return CheckOutcome::fail(ID, WHAT, "a fresh key reported as duplicate"),
+        match store.claim(&key).await {
+            Ok(DedupVerdict::Claimed) => {}
+            Ok(other) => {
+                return CheckOutcome::fail(ID, WHAT, format!("a fresh key reported {other:?}"));
+            }
             Err(err) => {
-                return CheckOutcome::fail(ID, WHAT, format!("first call errored: {err:?}"));
+                return CheckOutcome::fail(ID, WHAT, format!("first claim errored: {err:?}"));
             }
         }
-        match store.first_seen(&key).await {
-            Ok(false) => CheckOutcome::pass(ID, WHAT),
-            Ok(true) => CheckOutcome::fail(
+        if let Err(err) = store.accept(&key).await {
+            return CheckOutcome::fail(ID, WHAT, format!("accept errored: {err:?}"));
+        }
+        match store.claim(&key).await {
+            Ok(DedupVerdict::Duplicate) => CheckOutcome::pass(ID, WHAT),
+            Ok(DedupVerdict::Claimed) => CheckOutcome::fail(
                 ID,
                 WHAT,
-                "a repeated key reported as new — replay protection is not working",
+                "an accepted key was claimable again — replay protection is not working",
             ),
-            Err(err) => CheckOutcome::fail(ID, WHAT, format!("second call errored: {err:?}")),
+            Ok(DedupVerdict::InFlight) => CheckOutcome::fail(
+                ID,
+                WHAT,
+                "an accepted key reported InFlight — accept() did not settle the claim",
+            ),
+            Err(err) => CheckOutcome::fail(ID, WHAT, format!("second claim errored: {err:?}")),
         }
     }
 
     async fn distinct_keys_are_independent(&self) -> CheckOutcome {
         const ID: &str = "dedup.distinct_keys_are_independent";
-        const WHAT: &str = "recording one key does not mark another as seen";
+        const WHAT: &str = "claiming one key does not mark another as seen";
         let store = self.factory.connect();
         let a = self.key("independent-a");
         let b = self.key("independent-b");
 
-        if let Err(err) = store.first_seen(&a).await {
-            return CheckOutcome::fail(ID, WHAT, format!("recording key a errored: {err:?}"));
+        if let Err(err) = store.claim(&a).await {
+            return CheckOutcome::fail(ID, WHAT, format!("claiming key a errored: {err:?}"));
         }
-        match store.first_seen(&b).await {
-            Ok(true) => CheckOutcome::pass(ID, WHAT),
-            Ok(false) => CheckOutcome::fail(
+        match store.claim(&b).await {
+            Ok(DedupVerdict::Claimed) => CheckOutcome::pass(ID, WHAT),
+            Ok(other) => CheckOutcome::fail(
                 ID,
                 WHAT,
-                "an unrelated key reported as duplicate — keys are colliding",
+                format!("an unrelated key reported {other:?} — keys are colliding"),
             ),
-            Err(err) => CheckOutcome::fail(ID, WHAT, format!("recording key b errored: {err:?}")),
+            Err(err) => CheckOutcome::fail(ID, WHAT, format!("claiming key b errored: {err:?}")),
+        }
+    }
+
+    /// An unsettled claim must be visible as such, not as a duplicate.
+    ///
+    /// Reporting `Duplicate` here is the failure that loses messages: the
+    /// second delivery is acknowledged as already handled while the first one
+    /// may still fail and never be recorded.
+    async fn unsettled_claim_reports_in_flight(&self) -> CheckOutcome {
+        const ID: &str = "dedup.unsettled_claim_reports_in_flight";
+        const WHAT: &str = "a claimed but unsettled key reports InFlight, not Duplicate";
+        let store = self.factory.connect();
+        let key = self.key("inflight");
+
+        if let Err(err) = store.claim(&key).await {
+            return CheckOutcome::fail(ID, WHAT, format!("first claim errored: {err:?}"));
+        }
+        match store.claim(&key).await {
+            Ok(DedupVerdict::InFlight) => CheckOutcome::pass(ID, WHAT),
+            Ok(DedupVerdict::Duplicate) => CheckOutcome::fail(
+                ID,
+                WHAT,
+                "an unsettled claim reported Duplicate — a concurrent delivery would be \
+                 acknowledged as handled while the first attempt can still fail, and the \
+                 message would be lost",
+            ),
+            Ok(DedupVerdict::Claimed) => CheckOutcome::fail(
+                ID,
+                WHAT,
+                "an unsettled claim was handed out twice — two deliveries would process \
+                 the same message concurrently",
+            ),
+            Err(err) => CheckOutcome::fail(ID, WHAT, format!("second claim errored: {err:?}")),
+        }
+    }
+
+    /// The recovery path: an abandoned key must be processable again.
+    async fn abandon_releases_the_key(&self) -> CheckOutcome {
+        const ID: &str = "dedup.abandon_releases_the_key";
+        const WHAT: &str = "abandon() lets the same key be claimed again";
+        let store = self.factory.connect();
+        let key = self.key("abandon");
+
+        if let Err(err) = store.claim(&key).await {
+            return CheckOutcome::fail(ID, WHAT, format!("claim errored: {err:?}"));
+        }
+        if let Err(err) = store.abandon(&key).await {
+            return CheckOutcome::fail(ID, WHAT, format!("abandon errored: {err:?}"));
+        }
+        match store.claim(&key).await {
+            Ok(DedupVerdict::Claimed) => CheckOutcome::pass(ID, WHAT),
+            Ok(other) => CheckOutcome::fail(
+                ID,
+                WHAT,
+                format!(
+                    "an abandoned key reported {other:?} — a message that failed processing \
+                     could never be redelivered"
+                ),
+            ),
+            Err(err) => CheckOutcome::fail(ID, WHAT, format!("re-claim errored: {err:?}")),
+        }
+    }
+
+    /// A late `abandon` must not undo an `accept`.
+    async fn abandon_never_reopens_an_accepted_key(&self) -> CheckOutcome {
+        const ID: &str = "dedup.abandon_never_reopens_an_accepted_key";
+        const WHAT: &str = "abandon() on an accepted key leaves it deduplicated";
+        let store = self.factory.connect();
+        let key = self.key("late-abandon");
+
+        if let Err(err) = store.claim(&key).await {
+            return CheckOutcome::fail(ID, WHAT, format!("claim errored: {err:?}"));
+        }
+        if let Err(err) = store.accept(&key).await {
+            return CheckOutcome::fail(ID, WHAT, format!("accept errored: {err:?}"));
+        }
+        if let Err(err) = store.abandon(&key).await {
+            return CheckOutcome::fail(ID, WHAT, format!("late abandon errored: {err:?}"));
+        }
+        match store.claim(&key).await {
+            Ok(DedupVerdict::Duplicate) => CheckOutcome::pass(ID, WHAT),
+            Ok(other) => CheckOutcome::fail(
+                ID,
+                WHAT,
+                format!(
+                    "an accepted key reported {other:?} after a late abandon — a genuine \
+                     replay would be processed a second time"
+                ),
+            ),
+            Err(err) => CheckOutcome::fail(ID, WHAT, format!("re-claim errored: {err:?}")),
+        }
+    }
+
+    /// Settlement is retried after a transient failure, so it must be safe to
+    /// apply twice.
+    async fn accept_is_idempotent(&self) -> CheckOutcome {
+        const ID: &str = "dedup.accept_is_idempotent";
+        const WHAT: &str = "accept() twice is not an error and leaves the key deduplicated";
+        let store = self.factory.connect();
+        let key = self.key("accept-twice");
+
+        if let Err(err) = store.claim(&key).await {
+            return CheckOutcome::fail(ID, WHAT, format!("claim errored: {err:?}"));
+        }
+        if let Err(err) = store.accept(&key).await {
+            return CheckOutcome::fail(ID, WHAT, format!("first accept errored: {err:?}"));
+        }
+        if let Err(err) = store.accept(&key).await {
+            return CheckOutcome::fail(ID, WHAT, format!("second accept errored: {err:?}"));
+        }
+        match store.claim(&key).await {
+            Ok(DedupVerdict::Duplicate) => CheckOutcome::pass(ID, WHAT),
+            Ok(other) => CheckOutcome::fail(
+                ID,
+                WHAT,
+                format!("key reported {other:?} after two accepts"),
+            ),
+            Err(err) => CheckOutcome::fail(ID, WHAT, format!("re-claim errored: {err:?}")),
         }
     }
 
@@ -271,23 +410,23 @@ impl<'a> DedupConformance<'a> {
     /// admits duplicates the moment two replicas process the same message at
     /// once. The atomic forms are `INSERT … ON CONFLICT DO NOTHING`, `SET NX`,
     /// or a conditional write.
-    async fn concurrent_first_seen_admits_exactly_one(&self) -> CheckOutcome {
-        const ID: &str = "dedup.concurrent_first_seen_admits_exactly_one";
-        const WHAT: &str = "under concurrent calls for one key, exactly one caller sees `true`";
+    async fn concurrent_claim_admits_exactly_one(&self) -> CheckOutcome {
+        const ID: &str = "dedup.concurrent_claim_admits_exactly_one";
+        const WHAT: &str = "under concurrent calls for one key, exactly one caller claims it";
         let key = self.key("race");
 
         let mut handles = Vec::with_capacity(self.concurrency);
         for _ in 0..self.concurrency {
             let store = self.factory.connect();
             let key = key.clone();
-            handles.push(tokio::spawn(async move { store.first_seen(&key).await }));
+            handles.push(tokio::spawn(async move { store.claim(&key).await }));
         }
 
         let mut firsts = 0usize;
         for handle in handles {
             match handle.await {
-                Ok(Ok(true)) => firsts += 1,
-                Ok(Ok(false)) => {}
+                Ok(Ok(DedupVerdict::Claimed)) => firsts += 1,
+                Ok(Ok(_)) => {}
                 Ok(Err(err)) => {
                     return CheckOutcome::fail(ID, WHAT, format!("a racing call errored: {err:?}"));
                 }
@@ -302,19 +441,52 @@ impl<'a> DedupConformance<'a> {
             0 => CheckOutcome::fail(
                 ID,
                 WHAT,
-                "no caller saw `true` — the key was never recorded as new",
+                "no caller claimed the key — it was never recorded as new",
             ),
             n => CheckOutcome::fail(
                 ID,
                 WHAT,
                 format!(
-                    "{n} of {} concurrent callers saw `true`; `first_seen` is not atomic, so \
+                    "{n} of {} concurrent callers claimed the key; `claim` is not atomic, so \
                      {} duplicate messages would be processed under load. Use an atomic \
                      conditional write (INSERT ... ON CONFLICT DO NOTHING, SET NX)",
                     self.concurrency,
                     n - 1
                 ),
             ),
+        }
+    }
+
+    /// The receive pipeline is synchronous and runs inside `spawn_blocking`,
+    /// so a backend that yields has to be driven to completion there.
+    ///
+    /// This is the check that would have caught D61: every in-tree backend is
+    /// in-memory and resolves on the first poll, so the async half of the trait
+    /// — the half that exists for Redis and PostgreSQL — had never been
+    /// exercised at all.
+    async fn survives_being_driven_from_a_blocking_context(&self) -> CheckOutcome {
+        const ID: &str = "dedup.survives_being_driven_from_a_blocking_context";
+        const WHAT: &str = "the backend answers when driven from a blocking receive context";
+        let store = self.factory.connect();
+        let key = self.key("blocking");
+
+        let result = tokio::task::spawn_blocking(move || {
+            crate::storage::drive_dedup_future(store.claim(&key))
+        })
+        .await;
+
+        match result {
+            Ok(Ok(_)) => CheckOutcome::pass(ID, WHAT),
+            Ok(Err(err)) => CheckOutcome::fail(ID, WHAT, format!("claim errored: {err:?}")),
+            Err(err) if err.is_panic() => CheckOutcome::fail(
+                ID,
+                WHAT,
+                "the backend panicked when driven from a blocking context. The AS4 receive \
+                 pipeline runs there, so this backend cannot be used: it needs a Tokio \
+                 runtime to be current, which `spawn_blocking` provides but a bare thread \
+                 does not",
+            ),
+            Err(err) => CheckOutcome::fail(ID, WHAT, format!("the driving task failed: {err}")),
         }
     }
 
@@ -333,15 +505,23 @@ impl<'a> DedupConformance<'a> {
             );
         }
         let key = self.key("reconnect");
-        if let Err(err) = first.first_seen(&key).await {
-            return CheckOutcome::fail(ID, WHAT, format!("recording errored: {err:?}"));
+        if let Err(err) = first.claim(&key).await {
+            return CheckOutcome::fail(ID, WHAT, format!("claim errored: {err:?}"));
+        }
+        if let Err(err) = first.accept(&key).await {
+            return CheckOutcome::fail(ID, WHAT, format!("accept errored: {err:?}"));
         }
         drop(first);
 
         let reconnected = self.factory.connect();
-        match reconnected.first_seen(&key).await {
-            Ok(false) => CheckOutcome::pass(ID, WHAT),
-            Ok(true) => CheckOutcome::fail(
+        match reconnected.claim(&key).await {
+            Ok(DedupVerdict::Duplicate) => CheckOutcome::pass(ID, WHAT),
+            Ok(DedupVerdict::InFlight) => CheckOutcome::fail(
+                ID,
+                WHAT,
+                "the key came back as InFlight through a fresh handle — accept() did not                  durably settle it",
+            ),
+            Ok(DedupVerdict::Claimed) => CheckOutcome::fail(
                 ID,
                 WHAT,
                 "the key was forgotten by a fresh handle — this backend declares \
@@ -839,16 +1019,31 @@ impl<'a> AuditSinkConformance<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::{BoxFuture, InMemoryDedupStorage};
-    use std::collections::HashSet;
+    use crate::storage::{BoxFuture, TtlDedupStorage};
+    use std::collections::HashMap;
     use std::sync::Mutex;
 
     /// A shared in-memory store handed out as "fresh" handles, so the reconnect
     /// checks see the same state — the closest stand-in for a real database.
+    ///
+    /// The map value is the settled flag: `false` while claimed, `true` once
+    /// accepted.
     #[derive(Debug, Default)]
     struct SharedDedup {
-        seen: Mutex<HashSet<String>>,
+        seen: Mutex<HashMap<String, bool>>,
         durable: bool,
+    }
+
+    impl SharedDedup {
+        fn lock(&self) -> Result<std::sync::MutexGuard<'_, HashMap<String, bool>>> {
+            self.seen.lock().map_err(|_| {
+                crate::core::AsxError::new(
+                    crate::core::ErrorCode::ReliabilityFailure,
+                    "poisoned",
+                    crate::core::ErrorContext::new("test"),
+                )
+            })
+        }
     }
 
     impl DedupStorage for SharedDedup {
@@ -858,16 +1053,34 @@ mod tests {
         fn cluster_safe(&self) -> bool {
             self.durable
         }
-        fn first_seen<'a>(&'a self, key: &'a str) -> BoxFuture<'a, Result<bool>> {
+        fn claim<'a>(&'a self, key: &'a str) -> BoxFuture<'a, Result<DedupVerdict>> {
             Box::pin(async move {
-                let mut seen = self.seen.lock().map_err(|_| {
-                    crate::core::AsxError::new(
-                        crate::core::ErrorCode::ReliabilityFailure,
-                        "poisoned",
-                        crate::core::ErrorContext::new("test"),
-                    )
-                })?;
-                Ok(seen.insert(key.to_string()))
+                let mut seen = self.lock()?;
+                Ok(match seen.get(key) {
+                    Some(true) => DedupVerdict::Duplicate,
+                    Some(false) => DedupVerdict::InFlight,
+                    None => {
+                        seen.insert(key.to_string(), false);
+                        DedupVerdict::Claimed
+                    }
+                })
+            })
+        }
+
+        fn accept<'a>(&'a self, key: &'a str) -> BoxFuture<'a, Result<()>> {
+            Box::pin(async move {
+                self.lock()?.insert(key.to_string(), true);
+                Ok(())
+            })
+        }
+
+        fn abandon<'a>(&'a self, key: &'a str) -> BoxFuture<'a, Result<()>> {
+            Box::pin(async move {
+                let mut seen = self.lock()?;
+                if seen.get(key) == Some(&false) {
+                    seen.remove(key);
+                }
+                Ok(())
             })
         }
     }
@@ -901,8 +1114,14 @@ mod tests {
             fn is_durable(&self) -> bool {
                 true
             }
-            fn first_seen<'a>(&'a self, _key: &'a str) -> BoxFuture<'a, Result<bool>> {
-                Box::pin(async { Ok(true) }) // always "new"
+            fn claim<'a>(&'a self, _key: &'a str) -> BoxFuture<'a, Result<DedupVerdict>> {
+                Box::pin(async { Ok(DedupVerdict::Claimed) }) // always "new"
+            }
+            fn accept<'a>(&'a self, _key: &'a str) -> BoxFuture<'a, Result<()>> {
+                Box::pin(async { Ok(()) })
+            }
+            fn abandon<'a>(&'a self, _key: &'a str) -> BoxFuture<'a, Result<()>> {
+                Box::pin(async { Ok(()) })
             }
         }
         struct Factory;
@@ -916,7 +1135,7 @@ mod tests {
         assert!(!report.passed(), "a forgetful backend must not pass");
         let failed: Vec<_> = report.failures().iter().map(|c| c.id).collect();
         assert!(
-            failed.contains(&"dedup.first_seen_is_true_once"),
+            failed.contains(&"dedup.accepted_key_is_claimed_once"),
             "{report}"
         );
         assert!(
@@ -928,31 +1147,50 @@ mod tests {
     /// The atomicity check must actually catch a non-atomic implementation.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_non_atomic_backend_fails_the_race_check() {
+        /// Correct in every respect except that `claim` reads and writes in
+        /// two steps, so the self-test isolates the atomicity check.
         #[derive(Debug, Default)]
         struct CheckThenSet {
-            seen: Mutex<HashSet<String>>,
+            /// key -> settled (`false` while claimed, `true` once accepted).
+            seen: Mutex<HashMap<String, bool>>,
         }
         impl DedupStorage for CheckThenSet {
             fn is_durable(&self) -> bool {
                 false
             }
-            fn first_seen<'a>(&'a self, key: &'a str) -> BoxFuture<'a, Result<bool>> {
+            fn claim<'a>(&'a self, key: &'a str) -> BoxFuture<'a, Result<DedupVerdict>> {
                 Box::pin(async move {
                     // The classic SELECT-then-INSERT: correct serially, wrong
                     // the moment two callers interleave at the await point.
-                    let already = self
-                        .seen
-                        .lock()
-                        .map(|s| s.contains(key))
-                        .unwrap_or_default();
+                    let existing = self.seen.lock().ok().and_then(|s| s.get(key).copied());
                     tokio::task::yield_now().await;
-                    if already {
-                        return Ok(false);
+                    match existing {
+                        Some(true) => return Ok(DedupVerdict::Duplicate),
+                        Some(false) => return Ok(DedupVerdict::InFlight),
+                        None => {}
                     }
                     if let Ok(mut s) = self.seen.lock() {
-                        s.insert(key.to_string());
+                        s.insert(key.to_string(), false);
                     }
-                    Ok(true)
+                    Ok(DedupVerdict::Claimed)
+                })
+            }
+            fn accept<'a>(&'a self, key: &'a str) -> BoxFuture<'a, Result<()>> {
+                Box::pin(async move {
+                    if let Ok(mut s) = self.seen.lock() {
+                        s.insert(key.to_string(), true);
+                    }
+                    Ok(())
+                })
+            }
+            fn abandon<'a>(&'a self, key: &'a str) -> BoxFuture<'a, Result<()>> {
+                Box::pin(async move {
+                    if let Ok(mut s) = self.seen.lock()
+                        && s.get(key) == Some(&false)
+                    {
+                        s.remove(key);
+                    }
+                    Ok(())
                 })
             }
         }
@@ -970,7 +1208,7 @@ mod tests {
 
         let failed: Vec<_> = report.failures().iter().map(|c| c.id).collect();
         assert!(
-            failed.contains(&"dedup.concurrent_first_seen_admits_exactly_one"),
+            failed.contains(&"dedup.concurrent_claim_admits_exactly_one"),
             "a SELECT-then-INSERT backend must fail the race check: {report}"
         );
     }
@@ -979,13 +1217,13 @@ mod tests {
     /// non-durable store.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn the_in_tree_in_memory_dedup_conforms() {
-        struct Factory(Arc<InMemoryDedupStorage>);
+        struct Factory(Arc<TtlDedupStorage>);
         impl StorageFactory<dyn DedupStorage> for Factory {
             fn connect(&self) -> Arc<dyn DedupStorage> {
                 self.0.clone()
             }
         }
-        let report = DedupConformance::new(&Factory(Arc::new(InMemoryDedupStorage::default())))
+        let report = DedupConformance::new(&Factory(Arc::new(TtlDedupStorage::default())))
             .run()
             .await;
         assert!(report.passed(), "{report}");
@@ -996,9 +1234,7 @@ mod tests {
     /// write.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn every_in_tree_dedup_backend_conforms() {
-        use crate::storage::memory::{
-            BoundedFifoDedupStorage, DurableInMemoryDedupBackend, TtlDedupStorage,
-        };
+        use crate::storage::memory::{DurableInMemoryDedupBackend, TtlDedupStorage};
         use std::time::Duration;
 
         struct Factory(Arc<dyn DedupStorage>);
@@ -1010,12 +1246,8 @@ mod tests {
 
         let backends: Vec<(&str, Arc<dyn DedupStorage>)> = vec![
             (
-                "InMemoryDedupStorage",
-                Arc::new(InMemoryDedupStorage::default()),
-            ),
-            (
-                "BoundedFifoDedupStorage",
-                Arc::new(BoundedFifoDedupStorage::new(1024)),
+                "TtlDedupStorage::default",
+                Arc::new(TtlDedupStorage::default()),
             ),
             (
                 "TtlDedupStorage",

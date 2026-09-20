@@ -1,5 +1,5 @@
 use super::super::large_message::{As4FragmentJoiner, As4JoinProgress, parse_fragment_envelope};
-use super::super::services::emit_receive_push_signed_encrypted;
+use super::super::services::{DedupDecision, claim_push_sync, emit_receive_push_signed_encrypted};
 use super::super::stream::MultipartAs4Payload;
 use super::super::types::{
     As4PushPolicy, As4ReceivePushOutput, As4ReceivePushProgress, As4ReceivedPayload,
@@ -8,8 +8,9 @@ use super::super::types::{
 use super::{As4PushReceiveCtx, metadata, payload, receipt};
 use crate::core::{AsxError, ErrorCode, ErrorContext, PayloadInput, Result, SessionContext};
 use crate::lifecycle::DomainReady;
-use crate::observability::EventBus;
+use crate::observability::{AsxIngressStage, EventBus};
 use crate::sbdh::SbdhHeader;
+use crate::storage::DedupClaim;
 use memchr::memmem;
 use std::sync::Arc;
 
@@ -96,7 +97,7 @@ fn complete_fragment_joined_message(
     receipt_payload: Option<&[u8]>,
     joined: super::super::large_message::As4JoinedLargeMessage,
 ) -> Result<Option<As4ReceivePushProgress>> {
-    let progress = super::receive_push_with_dedup_inner(
+    let progress = super::receive_push_inner(
         ctx,
         PayloadInput::Owned(joined.body),
         receipt_payload,
@@ -113,52 +114,116 @@ pub(super) fn process_non_fragment_push(
     receipt_payload: Option<&[u8]>,
     http_content_type: &str,
 ) -> Result<As4ReceivePushProgress> {
-    let (multipart, soap_bytes, parsed, gate, is_duplicate) =
-        metadata::parse_verify_and_emit_receive_push_metadata(
-            ctx.session,
-            ctx.event_bus,
-            payload_bytes,
-            http_content_type,
-            ctx.policy,
-            ctx.dedup_backend,
-            ctx.verifier,
-        )?;
-
-    if is_duplicate {
-        return Ok(As4ReceivePushProgress::Duplicate {
-            message_id: parsed.message_id,
-        });
-    }
-
-    enforce_non_fragment_timestamp_freshness(ctx.session, ctx.policy, &parsed)?;
-
-    let (payload, payload_content_id, additional_payloads, sbdh_header) =
-        materialize_non_fragment_payload(
-            ctx.session,
-            ctx.event_bus,
-            ctx.policy,
-            &parsed,
-            multipart,
-            soap_bytes,
-            gate,
-        )?;
-
-    let receipt = verify_non_fragment_receipt(
+    let (multipart, soap_bytes, parsed, gate) = metadata::parse_and_verify_receive_push_metadata(
         ctx.session,
         ctx.event_bus,
-        receipt_payload,
+        payload_bytes,
+        http_content_type,
         ctx.policy,
-        &parsed,
+        ctx.verifier,
+        ctx.signer_pins,
     )?;
 
-    Ok(assemble_non_fragment_output(
-        payload,
-        payload_content_id,
-        additional_payloads,
-        sbdh_header,
+    // Claim only once the signature has been verified, so an unauthenticated
+    // peer cannot burn a partner's eb:MessageId.
+    let claim = match claim_push_sync(
+        ctx.session,
+        ctx.event_bus,
+        ctx.dedup_backend,
+        &parsed.message_id,
+        AsxIngressStage::As4ReceivePush,
+        ctx.policy.fail_closed_audit_events,
+    )? {
+        DedupDecision::Claimed(claim) => claim,
+        DedupDecision::Duplicate => {
+            return Ok(As4ReceivePushProgress::Duplicate {
+                message_id: parsed.message_id,
+            });
+        }
+        DedupDecision::InFlight => {
+            return Ok(As4ReceivePushProgress::InFlight {
+                message_id: parsed.message_id,
+            });
+        }
+    };
+
+    // Everything below can fail, and every one of those failures means the
+    // message was *not* received. Releasing the claim is what lets the
+    // sender's ReceptionAwareness retransmission be processed instead of being
+    // answered as a duplicate (D59).
+    finish_non_fragment_push(
+        ctx,
+        receipt_payload,
+        multipart,
+        soap_bytes,
         parsed,
-        receipt,
-    ))
+        gate,
+        claim,
+    )
+}
+
+/// The fallible tail of a claimed push, with the claim released on failure.
+#[allow(clippy::too_many_arguments)]
+fn finish_non_fragment_push<'a>(
+    ctx: &As4PushReceiveCtx<'_>,
+    receipt_payload: Option<&[u8]>,
+    multipart: Option<MultipartAs4Payload<'a>>,
+    soap_bytes: &'a [u8],
+    parsed: super::super::ParsedAs4UserMessage,
+    gate: payload::WsSecVerifiedGate,
+    mut claim: DedupClaim,
+) -> Result<As4ReceivePushProgress> {
+    let run = || -> Result<As4ReceivePushOutput> {
+        enforce_non_fragment_timestamp_freshness(ctx.session, ctx.policy, &parsed)?;
+
+        let (payload, payload_content_id, additional_payloads, sbdh_header) =
+            materialize_non_fragment_payload(
+                ctx.session,
+                ctx.event_bus,
+                ctx.policy,
+                &parsed,
+                multipart,
+                soap_bytes,
+                gate,
+            )?;
+
+        let receipt = verify_non_fragment_receipt(
+            ctx.session,
+            ctx.event_bus,
+            receipt_payload,
+            ctx.policy,
+            &parsed,
+        )?;
+
+        Ok(assemble_non_fragment_output(
+            payload,
+            payload_content_id,
+            additional_payloads,
+            sbdh_header,
+            parsed,
+            receipt,
+        ))
+    };
+
+    match run() {
+        Ok(output) => Ok(As4ReceivePushProgress::Complete {
+            output: Box::new(output),
+            claim,
+        }),
+        Err(err) => {
+            // A failure to release is not allowed to mask the real error: the
+            // claim lease expires on its own, so the original rejection is the
+            // one the caller needs to see.
+            if let Err(release_err) = claim.abandon_in_place() {
+                tracing::error!(
+                    error = %release_err,
+                    "failed to release AS4 dedup claim after a rejected message; \
+                     the key stays claimed until its lease expires"
+                );
+            }
+            Err(err)
+        }
+    }
 }
 
 fn enforce_non_fragment_timestamp_freshness(
@@ -289,13 +354,13 @@ fn assemble_non_fragment_output(
     sbdh_header: Option<SbdhHeader>,
     parsed: super::super::ParsedAs4UserMessage,
     receipt: Option<super::super::ParsedAs4Receipt>,
-) -> As4ReceivePushProgress {
-    As4ReceivePushProgress::Complete(Box::new(As4ReceivePushOutput {
+) -> As4ReceivePushOutput {
+    As4ReceivePushOutput {
         payload,
         payload_content_id,
         additional_payloads,
         sbdh_header,
         user_message: parsed,
         receipt,
-    }))
+    }
 }

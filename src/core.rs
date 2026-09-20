@@ -538,7 +538,7 @@ impl AsxError {
     ///
     /// # Example
     /// ```rust,ignore
-    /// if let Err(e) = receive_push_with_dedup_async(...).await {
+    /// if let Err(e) = receive_push(...).await {
     ///     if e.is_duplicate() {
     ///         // idempotent: send receipt without re-processing
     ///     }
@@ -977,15 +977,49 @@ impl SessionContextBuilder {
         self
     }
 
-    /// Pin the expected SHA-256 fingerprint (lower-case hex, no separators) of
-    /// the partner's signing certificate.
+    /// Pin the expected SHA-256 fingerprint of the partner's signing
+    /// certificate — **required** to receive signed AS4 messages.
     ///
-    /// When set, the WS-Security / S/MIME verifier rejects any message whose
-    /// signing certificate does not match this fingerprint, even when the
-    /// signature is cryptographically valid and the cert chains to a trust anchor.
+    /// # This is a precondition, not a hardening option
     ///
-    /// Useful for high-assurance deployments where the exact partner certificate
-    /// is known in advance (e.g. BDEW regulated partners, Peppol cornernodes).
+    /// A signed AS4 message whose claimed sender resolves to **no** pin is
+    /// refused, because a signature that verifies against the network's trust
+    /// anchors proves membership of the network and not the identity of the
+    /// sender: every access point shares those anchors. A receiver that pins
+    /// nothing accepts nothing, and the rejection reads as the counterparty's
+    /// fault.
+    ///
+    /// The value is compared against the **WS-Security signer** of each
+    /// inbound message.
+    ///
+    /// # One partner per session
+    ///
+    /// This pins a single certificate for the whole session. A receiver with
+    /// several counterparties should supply
+    /// [`As4ReceivePush::signer_pins`](crate::as4::As4ReceivePush::signer_pins)
+    /// instead, which resolves the permitted signer from each message's
+    /// claimed `eb:From` — one session, many partners, and the binding between
+    /// claimed sender and verified signer made explicit.
+    ///
+    /// # Computing the value
+    ///
+    /// Use [`CertFingerprint`](crate::crypto::CertFingerprint) rather than
+    /// hashing by hand; a mistyped or truncated pin is rejected here instead of
+    /// surfacing later as "signature does not match".
+    ///
+    /// ```no_run
+    /// # use asx_rs::core::SessionContext;
+    /// use asx_rs::crypto::CertFingerprint;
+    ///
+    /// # fn example(partner_cert_pem: &[u8]) -> asx_rs::Result<()> {
+    /// let pin = CertFingerprint::from_cert_pem(partner_cert_pem)?;
+    /// let session = SessionContext::builder("s1", "partner-a")
+    ///     .with_fingerprint_sha256(pin.to_string())
+    ///     .build()?;
+    /// # let _ = session;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn with_fingerprint_sha256(mut self, fingerprint: impl Into<String>) -> Self {
         self.cert_handle_or_init().fingerprint_sha256 = fingerprint.into();
         self

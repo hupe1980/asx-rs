@@ -10,7 +10,7 @@ use asx_rs::observability::audit_sink::{
 };
 use asx_rs::presets::{DeploymentTopology, StrictRuntimeBootstrap};
 use asx_rs::reliability::{InMemoryDedupBackend, ReconciliationRequest};
-use asx_rs::storage::{BoxFuture, DedupStorage, ReconciliationStorage};
+use asx_rs::storage::{BoxFuture, DedupStorage, DedupVerdict, ReconciliationStorage};
 use asx_rs::transport::ingress::As4IngressReceivePushSyncRequest;
 use asx_rs::transport::ingress::as4_ingress_from_http;
 use std::sync::Arc;
@@ -78,11 +78,19 @@ impl DedupStorage for DurableClusterSafeDedup {
         true
     }
 
-    fn first_seen<'a>(
+    fn claim<'a>(
         &'a self,
         _idempotency_key: &'a str,
-    ) -> BoxFuture<'a, asx_rs::core::Result<bool>> {
-        Box::pin(async move { Ok(true) })
+    ) -> BoxFuture<'a, asx_rs::core::Result<DedupVerdict>> {
+        Box::pin(async move { Ok(DedupVerdict::Claimed) })
+    }
+
+    fn accept<'a>(&'a self, _idempotency_key: &'a str) -> BoxFuture<'a, asx_rs::core::Result<()>> {
+        Box::pin(async move { Ok(()) })
+    }
+
+    fn abandon<'a>(&'a self, _idempotency_key: &'a str) -> BoxFuture<'a, asx_rs::core::Result<()>> {
+        Box::pin(async move { Ok(()) })
     }
 }
 
@@ -174,11 +182,12 @@ fn invalid_as4_ingress() -> asx_rs::transport::ingress::As4HttpIngress {
 fn as4_transport_helper_without_token_fails_closed_in_strict_mode() {
     let ingress = invalid_as4_ingress();
     let err = ingress
-        .receive_push_with_dedup_sync(As4IngressReceivePushSyncRequest {
+        .receive_push_sync(As4IngressReceivePushSyncRequest {
             session: &strict_session(),
             event_bus: &EventBus::new(16).expect("bus"),
             policy: As4PushPolicy::strict(),
-            dedup_backend: &InMemoryDedupBackend::default(),
+            dedup: std::sync::Arc::new(InMemoryDedupBackend::default()),
+            signer_pins: None,
             receipt_payload: None,
         })
         .expect_err("strict helper without token must fail closed");
@@ -198,11 +207,12 @@ fn as4_transport_helper_with_token_reaches_protocol_validation() {
     let strict_session = token.bind(&strict_session());
 
     let err = ingress
-        .receive_push_with_dedup_sync(As4IngressReceivePushSyncRequest {
+        .receive_push_sync(As4IngressReceivePushSyncRequest {
             session: &strict_session,
             event_bus: &EventBus::new(16).expect("bus"),
             policy: As4PushPolicy::strict(),
-            dedup_backend: &InMemoryDedupBackend::default(),
+            dedup: std::sync::Arc::new(InMemoryDedupBackend::default()),
+            signer_pins: None,
             receipt_payload: Some(b"invalid-receipt".to_vec()),
         })
         .expect_err("invalid payload should fail after token check");

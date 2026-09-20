@@ -125,10 +125,19 @@ pub struct PModeSecurity {
 }
 
 impl Default for PModeSecurity {
+    /// Sign **and** encrypt — the fail-closed default, matching
+    /// [`SecurityPolicy::SIGN_AND_ENCRYPT`](crate::interop::SecurityPolicy::SIGN_AND_ENCRYPT),
+    /// which is the default security floor and what every AS4 network this
+    /// crate targets mandates.
+    ///
+    /// It used to be sign-only, which meant the *default* P-Mode produced
+    /// signed plaintext on a network that forbids it — an insecure
+    /// configuration reachable by omission, which is precisely what this
+    /// crate's defaults exist to prevent.
     fn default() -> Self {
         Self {
             sign: true,
-            encrypt: false,
+            encrypt: true,
             encrypt_soap_headers: false,
             compress: false,
             outbound_key_info_profile: crate::crypto::wssec::WsSecOutboundKeyInfoProfile::default(),
@@ -215,11 +224,27 @@ impl PMode {
             }
         }
 
+        // All four networks this crate targets mandate both — Peppol and CEF
+        // eDelivery under the network PKI, BDEW AS4-Profil v1.2 §2.2.6.2.2,
+        // ENTSOG by inheritance. Refusing only `sign=false` looked like a
+        // floor and was half of one: a P-Mode with encryption off materialized
+        // cleanly and sent signed plaintext.
         #[cfg(not(feature = "testing"))]
         if !self.security.sign {
             return Err(AsxError::new(
                 ErrorCode::InvalidInput,
                 "P-Mode materialization forbids sign=false in non-testing builds",
+                ErrorContext::new(stage),
+            ));
+        }
+
+        #[cfg(not(feature = "testing"))]
+        if !self.security.encrypt {
+            return Err(AsxError::new(
+                ErrorCode::InvalidInput,
+                "P-Mode materialization forbids encrypt=false in non-testing builds; \
+                 every AS4 profile this crate targets mandates payload encryption \
+                 alongside signing",
                 ErrorContext::new(stage),
             ));
         }
@@ -634,6 +659,10 @@ mod tests {
                 .to_send_policy_builder()
                 .interop(InteropMode::Relaxed)
                 .sign(false)
+                // The default P-Mode now encrypts, and encryption needs a
+                // recipient certificate this test has no reason to supply:
+                // the assertion below is about the key-info profile.
+                .encrypt(false)
                 .fail_closed_audit_events(false)
                 .action("urn:act")
                 .service("urn:svc", "")

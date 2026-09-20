@@ -14,6 +14,7 @@ use crate::http::HttpHeaders;
 use crate::interop::InteropExceptionPolicy;
 use crate::lifecycle::DomainReady;
 use crate::reliability::{DeliveryOutcome, RetryDecision};
+use crate::storage::DedupClaim;
 
 /// Raw MIME envelope returned from the AS2 send path, ready for HTTP transport.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -613,13 +614,51 @@ pub struct As2InboundResult {
 }
 
 /// Output from [`receive_with_mdn_with_reliability`](crate::as2::receive_with_mdn_with_reliability).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct As2ReceiveMdnOutput {
     pub payload: DomainReady<Arc<[u8]>>,
     pub mdn: ParsedMdn,
     pub outcome: DeliveryOutcome,
     pub retry_decision: RetryDecision,
     pub interop_reason_codes: Vec<&'static str>,
+    /// How the MDN's idempotency key was resolved.
+    ///
+    /// On [`FirstSeen`](As2MdnDedup::FirstSeen) the claim is **unsettled**:
+    /// settle it once the delivery outcome has been durably recorded, so that
+    /// a retransmitted MDN is either rejected as a replay or reprocessed,
+    /// rather than silently dropped after a failure (D59).
+    pub dedup: As2MdnDedup,
+}
+
+/// Deduplication state of a received AS2 MDN.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum As2MdnDedup {
+    /// First occurrence; the claim is unsettled and must be resolved.
+    FirstSeen(DedupClaim),
+    /// A previously accepted MDN for the same original message: the
+    /// downstream side effects were deliberately skipped.
+    Duplicate,
+    /// A concurrent delivery of the same MDN holds the claim; this one caused
+    /// no side effects and the sender should retransmit.
+    InFlight,
+}
+
+impl As2MdnDedup {
+    /// Returns `true` when this MDN was neither a replay nor a race.
+    #[inline]
+    pub fn is_first_seen(&self) -> bool {
+        matches!(self, Self::FirstSeen(_))
+    }
+
+    /// Take the claim, leaving the variant in place.
+    #[inline]
+    pub fn into_claim(self) -> Option<DedupClaim> {
+        match self {
+            Self::FirstSeen(claim) => Some(claim),
+            Self::Duplicate | Self::InFlight => None,
+        }
+    }
 }
 
 /// Auto-generated MDN ready to write to an HTTP response body.

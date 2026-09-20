@@ -159,7 +159,7 @@ fn strict_profile_rejects_malformed_signature_value() {
     let err = verify_enveloped_signature(
         xml,
         WsSecVerifyOptions::new()
-            .with_expected_fingerprint(None)
+            .with_expected_fingerprints(&[])
             .with_revocation(asx_rs::crypto::wssec::RevocationPolicy {
                 trust_anchor_pems: &[],
                 revocation_crl_pems: &[],

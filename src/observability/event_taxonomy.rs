@@ -32,7 +32,8 @@ impl std::fmt::Display for AsxProtocol {
     }
 }
 
-/// Ingress stage identifier used in [`AsxEvent::DuplicateDetected`].
+/// Ingress stage identifier used in [`AsxEvent::DuplicateDetected`] and
+/// [`AsxEvent::DuplicateInFlight`].
 ///
 /// Identifies which receive path detected the duplicate, enabling monitoring
 /// dashboards to partition dedup counters by inbound channel.
@@ -125,6 +126,20 @@ pub enum AsxEvent {
         message_id: Arc<str>,
         key: String,
         /// The receive path that detected the duplicate.
+        ingress: AsxIngressStage,
+    },
+    /// A concurrent delivery of the same message holds an unsettled dedup
+    /// claim, so this one was neither processed nor rejected.
+    ///
+    /// Distinct from [`DuplicateDetected`](Self::DuplicateDetected): that one
+    /// is a settled replay of a message already handled, this one is a race
+    /// that resolves itself when the sender retransmits. A sustained rate of
+    /// these means claims are being dropped unsettled or the claim lease is
+    /// longer than the sender's retransmission interval.
+    DuplicateInFlight {
+        message_id: Arc<str>,
+        key: String,
+        /// The receive path that observed the in-flight claim.
         ingress: AsxIngressStage,
     },
     InteropRelaxationApplied {
@@ -333,6 +348,7 @@ impl AsxEvent {
             Self::RetryScheduled { .. } => "retry_scheduled",
             Self::ReconciliationQueued { .. } => "reconciliation_queued",
             Self::DuplicateDetected { .. } => "duplicate_detected",
+            Self::DuplicateInFlight { .. } => "duplicate_in_flight",
             Self::InteropRelaxationApplied { .. } => "interop_relaxation_applied",
             Self::InteropGuardrailEvaluated { .. } => "interop_guardrail_evaluated",
             Self::MaterializationApplied { .. } => "materialization_applied",

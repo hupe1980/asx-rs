@@ -47,14 +47,20 @@ refused rather than resolved.
 
 ```rust
 pub struct As2HttpIngress {
-    pub body: Vec<u8>,
+    pub body: Arc<[u8]>,
     pub content_type: String,
     pub as2_from: String,
     pub as2_to: String,
     pub message_id: Option<String>,
     pub as2_version: Option<String>,
     pub mime_version: Option<String>,
-    pub raw_headers: Vec<(String, String)>,
+    /// Set when the sender requests an MDN (RFC 4130 §6). An HTTP URL means
+    /// synchronous; `mailto:` means asynchronous.
+    pub disposition_notification_to: Option<String>,
+    /// The sender's preferred MIC algorithm.
+    pub disposition_notification_options: Option<String>,
+    pub traceparent: Option<String>,
+    pub raw_headers: HttpHeaders,
 }
 ```
 
@@ -63,42 +69,6 @@ and use the standard ingress helper APIs:
 
 1. `bootstrap_token.bind(&session)` — see the [startup gate](@/docs/getting-started.md#regulated-startup-gate-strict-production)
 2. `receive_and_generate_mdn(...)` or `receive_and_generate_mdn_with_signing(...)`
-
-### Breaking-Change Migration (Strict Runtime Default Enforcement)
-
-When strict interop entry points are fail-closed by default, migrate helper-path
-calls as follows.
-
-Before (no explicit startup-bound session):
-
-```rust
-let ingress = as2_ingress_from_http(req)?;
-let out = ingress.receive_and_generate_mdn(&session, verifier)?;
-```
-
-After (default strict enforcement):
-
-```rust
-let ingress = as2_ingress_from_http(req)?;
-let strict_session = bootstrap_token.bind(&session);
-let out = ingress.receive_and_generate_mdn(&strict_session, verifier)?;
-```
-
-For AS4 push ingress helpers:
-
-```rust
-let ingress = as4_ingress_from_http(req)?;
-let strict_session = bootstrap_token.bind(&session);
-let out = ingress.receive_push_with_dedup_sync(
-    asx_rs::transport::ingress::As4IngressReceivePushSyncRequest {
-        session: &strict_session,
-        event_bus: &event_bus,
-        policy: push_policy,
-        dedup_backend,
-        receipt_payload: None,
-    },
-)?;
-```
 
 ### AS4 ingress
 
@@ -131,12 +101,28 @@ pub struct As4HttpIngress {
 }
 ```
 
+With a strict-bound session, the ingress drives a push receive directly:
+
+```rust
+let strict_session = bootstrap_token.bind(&session);
+let out = ingress.receive_push_sync(
+    asx_rs::transport::ingress::As4IngressReceivePushSyncRequest {
+        session: &strict_session,
+        event_bus: &event_bus,
+        policy: push_policy,
+        dedup,
+        signer_pins: None,   // Some(resolver) to pin a signer per claimed `eb:From`
+        receipt_payload: None,
+    },
+)?;
+```
+
 ---
 
 ## Egress / HTTP Client (`client` feature)
 
 ```toml
-asx-rs = { version = "0.14", features = ["as2", "as4", "client"] }
+asx-rs = { version = "0.15", features = ["as2", "as4", "client"] }
 ```
 
 ### SSRF protection
@@ -220,7 +206,7 @@ match outcome.signal {
 
 Do not inspect `HttpSendOutcome::body` for `<eb:Receipt` yourself — namespace
 prefixes are arbitrary and a substring match cannot verify Non-Repudiation of
-Receipt. See [AS4 — verify the synchronous response](@/docs/as4.md#verify-the-synchronous-response).
+Receipt.
 
 A non-2xx status carrying a parseable `eb:Error` is surfaced as
 `As4SyncSignal::Error`; a non-2xx status with an unparseable body becomes
@@ -256,10 +242,45 @@ pub struct TransportConfig {
     pub user_agent: String,          // User-Agent header value
     pub pool_max_idle_per_host: usize,
     pub pool_idle_timeout: Duration,
+    pub client_identity: Option<ClientIdentity>,  // mutual TLS (default: none)
 }
 ```
 
-Default: `TransportConfig::default()` — 10s connect, 60s request, `asx/0.8`.
+Default: `TransportConfig::default()` — 10s connect, 60s request, the crate
+version as `User-Agent`, and no client certificate.
+
+### Mutual TLS on egress
+
+Several AS4 profiles require client-certificate authentication on the wire in
+addition to the WS-Security signature — BDEW's *Regelungen zum Übertragungsweg*
+among them. The two use **different keys**: the WS-Security signature proves who
+signed the message, the client certificate proves who opened the connection.
+
+```rust
+use asx_rs::transport::{As4HttpTransport, ClientIdentity, TransportConfig};
+
+// Leaf certificate first, then any intermediates the partner needs.
+let identity = ClientIdentity::from_pem(&cert_chain_pem, &key_pem)?;
+
+let transport = As4HttpTransport::new(
+    TransportConfig::default().with_client_identity(identity),
+)?;
+```
+
+The pair is parsed **once**, when `ClientIdentity::from_pem` is called, so a
+misconfigured deployment fails at startup with `ErrorCode::InvalidInput` rather
+than at the first message — and no send pays for a parse.
+
+Two deliberate boundaries:
+
+- **Inbound mTLS is not this crate's.** It never owns a listener, so a peer's
+  client certificate is presented to your terminator. Pass the authenticated
+  identity back in as `As4ReceivePushRequest::authenticated_sender_scope`, or
+  `As4PullAuthorization::EnforcedByTransport` for pull.
+- **The OCSP fetcher does not present the identity.** A responder is a third
+  party and its response is signed rather than client-authenticated; sending
+  your market-communication certificate to it would disclose your identity for
+  no gain.
 
 ### `HttpSendOutcome`
 
@@ -282,7 +303,7 @@ impl HttpSendOutcome {
 ## Server / Axum Integration (`server` feature)
 
 ```toml
-asx-rs = { version = "0.14", features = ["as2", "as4", "server"] }
+asx-rs = { version = "0.15", features = ["as2", "as4", "server"] }
 ```
 
 The server layer provides axum router builders with typed handler traits. It is built on top of the framework-agnostic ingress layer — the same validation logic runs regardless of how the request arrives.

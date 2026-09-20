@@ -109,7 +109,11 @@ pub use bdxl::{
 pub const PEPPOL_AS4_TRANSPORT_PROFILE: &str = "peppol-transport-as4-v2_0";
 
 /// Default PEPPOL participant identifier scheme.
-pub const PEPPOL_PARTICIPANT_SCHEME: &str = "iso6523-actorid-upis";
+///
+/// Re-exported from [`crate::peppol`], which is where the network's own
+/// constants live — the scheme is not a discovery concern, it just happens to
+/// be needed here.
+pub use crate::peppol::PEPPOL_PARTICIPANT_SCHEME;
 
 /// SML zone answering for the **Peppol production** network.
 ///
@@ -656,7 +660,9 @@ fn enforce_smp_signature_policy(
         SmpSignaturePolicy::Verify(revocation) => {
             let verified = crate::crypto::wssec::verify_enveloped_document_signature(
                 text,
-                None,
+                // SMP responses are pinned by the network's SMP CA (the
+                // revocation policy's anchors), not by a per-signer fingerprint.
+                &[],
                 &crate::crypto::wssec::RevocationPolicy::from(revocation.as_ref()),
             )
             .map_err(|err| {

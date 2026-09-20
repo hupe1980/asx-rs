@@ -28,19 +28,43 @@ This keeps the library modular while still enabling strong delivery guarantees.
 
 ### Dedup
 
+Deduplication is **two-phase**: claim the key before processing, settle it once
+the message's fate is durable.
+
 ```rust
+pub enum DedupVerdict { Claimed, Duplicate, InFlight }
+
 pub trait DedupStorage: Send + Sync {
     fn is_durable(&self) -> bool;
     fn cluster_safe(&self) -> bool { false }
-    fn first_seen(&self, idempotency_key: &str) -> asx_rs::core::Result<bool>;
+    fn claim(&self, idempotency_key: &str) -> asx_rs::core::Result<DedupVerdict>;
+    fn accept(&self, idempotency_key: &str) -> asx_rs::core::Result<()>;
+    fn abandon(&self, idempotency_key: &str) -> asx_rs::core::Result<()>;
 }
 ```
 
 Semantics:
 
-- `Ok(true)`: first occurrence
-- `Ok(false)`: duplicate
+- `claim` → `Claimed`: first sight; the caller owns an unsettled claim
+- `claim` → `Duplicate`: a previous attempt was **accepted** — a genuine replay
+- `claim` → `InFlight`: another attempt holds an unsettled claim
+- `accept`: the message is durably handled; replays rejected for the TTL window
+- `abandon`: the message was **not** handled; release the key
 - `Err(..)`: backend error, fail closed
+
+Four rules a backend must satisfy, all of them checked by `DedupConformance`:
+
+1. **`claim` is one atomic step.** Inspect, expire and insert in a single
+   conditional write (`INSERT … ON CONFLICT DO NOTHING`, `SET NX`). A
+   `SELECT`-then-`INSERT` admits duplicates the moment two replicas race.
+2. **An unsettled claim reports `InFlight`, never `Duplicate`.** Collapsing them
+   acknowledges a concurrent delivery as handled while the first attempt can
+   still fail.
+3. **`abandon` releases only an unsettled claim.** An already-accepted key must
+   survive a late abandon, or a processed message is delivered twice.
+4. **An unsettled claim expires.** Record a lease; treat an expired claim as
+   absent. Without it, a process that dies mid-handling wedges that
+   `eb:MessageId` forever.
 
 ### Reconciliation
 
@@ -123,18 +147,61 @@ trait as follows:
 struct PostgresDedupStorage { /* pool, namespace */ }
 
 impl asx_rs::storage::DedupStorage for PostgresDedupStorage {
-    fn first_seen<'a>(&'a self, key: &'a str)
-        -> futures::future::BoxFuture<'a, asx_rs::core::Result<bool>>
+    fn is_durable(&self) -> bool { true }
+    fn cluster_safe(&self) -> bool { true }
+
+    fn claim<'a>(&'a self, key: &'a str)
+        -> futures::future::BoxFuture<'a, asx_rs::core::Result<DedupVerdict>>
     {
         Box::pin(async move {
-            // INSERT ... ON CONFLICT DO NOTHING; RETURNING true-if-inserted
+            // One statement, so two replicas cannot both claim:
+            //
+            //   INSERT INTO dedup_keys (idempotency_key, state, expires_at)
+            //   VALUES ($1, 'inflight', now() + $2)
+            //   ON CONFLICT (idempotency_key) DO UPDATE
+            //     SET state = 'inflight', expires_at = now() + $2
+            //     WHERE dedup_keys.expires_at <= now()   -- only a dead lease
+            //   RETURNING state;
+            //
+            // A row back => Claimed. No row => SELECT state to tell
+            // Duplicate ('accepted') from InFlight ('inflight').
             todo!("run against your pool")
         })
     }
-    fn is_durable(&self) -> bool { true }
-    fn cluster_safe(&self) -> bool { true }
+
+    fn accept<'a>(&'a self, key: &'a str)
+        -> futures::future::BoxFuture<'a, asx_rs::core::Result<()>>
+    {
+        Box::pin(async move {
+            //   INSERT INTO dedup_keys (idempotency_key, state, expires_at)
+            //   VALUES ($1, 'accepted', now() + $2)
+            //   ON CONFLICT (idempotency_key) DO UPDATE
+            //     SET state = 'accepted', expires_at = now() + $2;
+            //
+            // Unconditional, so settlement stays idempotent under retry.
+            todo!()
+        })
+    }
+
+    fn abandon<'a>(&'a self, key: &'a str)
+        -> futures::future::BoxFuture<'a, asx_rs::core::Result<()>>
+    {
+        Box::pin(async move {
+            //   DELETE FROM dedup_keys
+            //   WHERE idempotency_key = $1 AND state = 'inflight';
+            //
+            // The state predicate is load-bearing: without it a late abandon
+            // reopens a message that really was processed.
+            todo!()
+        })
+    }
 }
 ```
+
+**Commit the accept with your business transaction.** That is the whole reason
+this trait is yours rather than ours: a message that is business-committed and
+dedup-accepted in *different* transactions has a window where a crash loses one
+of them.
 
 The reference SQL schema below is a starting point for such an implementation.
 
@@ -153,10 +220,18 @@ pub trait DurableAuditSink: Send + Sync {
 ## SQLite Schema (Reference)
 
 ```sql
+-- `state` is what makes the protocol two-phase: 'inflight' is a claim nobody
+-- has settled yet, 'accepted' is a message someone took responsibility for.
+-- `expires_at` is the claim lease for 'inflight' and the replay window for
+-- 'accepted' — an expired row of either kind is treated as absent.
 CREATE TABLE IF NOT EXISTS dedup_keys (
   idempotency_key TEXT PRIMARY KEY,
-  first_seen_unix INTEGER NOT NULL
+  state           TEXT NOT NULL CHECK (state IN ('inflight','accepted')),
+  claimed_at_unix INTEGER NOT NULL,
+  expires_at_unix INTEGER NOT NULL
 );
+
+CREATE INDEX IF NOT EXISTS dedup_keys_expiry ON dedup_keys (expires_at_unix);
 
 CREATE TABLE IF NOT EXISTS reconciliation_queue (
   idempotency_key TEXT PRIMARY KEY,
@@ -195,7 +270,7 @@ VALUES (1, '0', 0, 0);
 use asx_rs::core::{AsxError, ErrorCode, ErrorContext, Result};
 use asx_rs::observability::audit_sink::{AuditEvent, DurableAuditSink, ReplayCursor};
 use asx_rs::reliability::ReconciliationRequest;
-use asx_rs::storage::{DedupStorage, ReconciliationStorage};
+use asx_rs::storage::{DedupStorage, DedupVerdict, ReconciliationStorage};
 use rusqlite::{params, Connection};
 use std::sync::Mutex;
 
@@ -219,28 +294,70 @@ impl SqliteReliabilityStore {
 }
 
 impl DedupStorage for SqliteReliabilityStore {
-    fn first_seen(&self, key: &str) -> Result<bool> {
-        let conn = self.conn.lock().map_err(|_| {
-            AsxError::new(
-                ErrorCode::ReliabilityFailure,
-                "sqlite mutex poisoned",
-                ErrorContext::new("sqlite_dedup_first_seen"),
-            )
-        })?;
+    fn is_durable(&self) -> bool { true }
 
-        let changed = conn.execute(
-            "INSERT OR IGNORE INTO dedup_keys (idempotency_key, first_seen_unix)
-             VALUES (?1, strftime('%s','now'))",
+    fn claim(&self, key: &str) -> Result<DedupVerdict> {
+        let conn = self.lock("sqlite_dedup_claim")?;
+
+        // One statement: take the key when it is absent, or when the row that
+        // is there has expired (a dead claim lease, or a replay window that
+        // has run out). `WHERE excluded...` is how SQLite expresses the
+        // conditional part of the upsert.
+        let claimed = conn.execute(
+            "INSERT INTO dedup_keys
+                 (idempotency_key, state, claimed_at_unix, expires_at_unix)
+             VALUES (?1, 'inflight', strftime('%s','now'), strftime('%s','now') + ?2)
+             ON CONFLICT (idempotency_key) DO UPDATE SET
+                 state           = 'inflight',
+                 claimed_at_unix = strftime('%s','now'),
+                 expires_at_unix = strftime('%s','now') + ?2
+             WHERE dedup_keys.expires_at_unix <= strftime('%s','now')",
+            params![key, self.claim_lease_secs],
+        ).map_err(|e| self.err("sqlite_dedup_claim", e))?;
+
+        if claimed > 0 {
+            return Ok(DedupVerdict::Claimed);
+        }
+
+        // Not claimed: a live row is already there. Which kind decides whether
+        // this is a replay or a race, and the two get opposite answers.
+        let state: String = conn.query_row(
+            "SELECT state FROM dedup_keys WHERE idempotency_key = ?1",
             params![key],
-        ).map_err(|e| {
-            AsxError::new(
-                ErrorCode::ReliabilityFailure,
-                format!("dedup insert failed: {e}"),
-                ErrorContext::new("sqlite_dedup_first_seen"),
-            )
-        })?;
+            |row| row.get(0),
+        ).map_err(|e| self.err("sqlite_dedup_claim", e))?;
 
-        Ok(changed > 0)
+        Ok(match state.as_str() {
+            "accepted" => DedupVerdict::Duplicate,
+            _ => DedupVerdict::InFlight,
+        })
+    }
+
+    fn accept(&self, key: &str) -> Result<()> {
+        let conn = self.lock("sqlite_dedup_accept")?;
+        // Unconditional, so a retried settlement is not an error.
+        conn.execute(
+            "INSERT INTO dedup_keys
+                 (idempotency_key, state, claimed_at_unix, expires_at_unix)
+             VALUES (?1, 'accepted', strftime('%s','now'), strftime('%s','now') + ?2)
+             ON CONFLICT (idempotency_key) DO UPDATE SET
+                 state           = 'accepted',
+                 expires_at_unix = strftime('%s','now') + ?2",
+            params![key, self.replay_window_secs],
+        ).map_err(|e| self.err("sqlite_dedup_accept", e))?;
+        Ok(())
+    }
+
+    fn abandon(&self, key: &str) -> Result<()> {
+        let conn = self.lock("sqlite_dedup_abandon")?;
+        // `AND state = 'inflight'` is load-bearing: a late abandon must not
+        // reopen a message that was genuinely accepted.
+        conn.execute(
+            "DELETE FROM dedup_keys
+             WHERE idempotency_key = ?1 AND state = 'inflight'",
+            params![key],
+        ).map_err(|e| self.err("sqlite_dedup_abandon", e))?;
+        Ok(())
     }
 }
 
@@ -371,9 +488,14 @@ What it establishes:
 
 | Check | Why it is in the suite |
 |---|---|
-| `first_seen` is true once, false after | The basic replay guarantee |
+| Claimable once, `Duplicate` after `accept` | The basic replay guarantee |
 | Distinct keys are independent | Catches key-namespace collisions |
-| **`first_seen` is atomic under concurrency** | The one that matters. A `SELECT`-then-`INSERT` backend passes every serial test and admits duplicate business documents the moment two replicas process one message. The suite races 16 tasks for one key and requires exactly one `true` |
+| **An unsettled claim reports `InFlight`, not `Duplicate`** | The failure that loses messages. A backend that collapses the two acknowledges a concurrent delivery as already handled while the first attempt can still fail |
+| **`abandon` releases the key** | Without it, every failed dispatch becomes a permanently unreceivable message — the recovery path silently absent |
+| **`abandon` never reopens an accepted key** | The mirror image: a late abandon that reopens a processed message hands the business document to the application twice |
+| `accept` is idempotent | Settlement is retried after a transient failure, so applying it twice must not error or reopen the key |
+| **The backend answers from a blocking context** | The AS4 receive pipeline runs inside `spawn_blocking`. A network-backed store yields, and must be driven to completion there |
+| **`claim` is atomic under concurrency** | The one that matters. A `SELECT`-then-`INSERT` backend passes every serial test and admits duplicate business documents the moment two replicas process one message. The suite races 16 tasks for one key and requires exactly one `Claimed` |
 | **State survives a reconnect** | A durable backend must answer the same through a fresh handle. Skipped, not failed, when the backend declares `is_durable() == false` — losing state is then correct |
 | `cluster_safe()` implies `is_durable()` | A store shared across replicas is out of process by definition |
 
@@ -402,7 +524,7 @@ removes exactly one record and leaves the others, an unknown key returns
 `Ok(false)` rather than an error, and the queue survives a reconnect.
 
 Each suite's own tests require the broken cases to fail — a backend that lies
-about durability, one that races `first_seen`, one that forgets on reconnect,
+about durability, one that races `claim`, one that forgets on reconnect,
 one that accepts a forged cursor.
 
 The report is a value, not a panic — print it and every check appears with its

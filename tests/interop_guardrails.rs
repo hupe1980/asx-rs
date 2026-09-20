@@ -6,8 +6,7 @@ mod common;
 use asx_rs::as2::receive_with_mdn_with_reliability;
 use asx_rs::as2::{As2MdnMode, As2ReceiveMdnRequest, As2ReceivePolicy};
 use asx_rs::as4::{
-    As4PushPolicyBuilder, As4ReceivePushRequest, As4ReceivePushSyncRequest,
-    receive_push_with_dedup_sync,
+    As4PushPolicyBuilder, As4ReceivePushRequest, As4ReceivePushSync, receive_push_sync,
 };
 use asx_rs::core::{ErrorCode, InteropMode, SessionContext};
 use asx_rs::interop::{InteropExceptionCode, InteropExceptionPolicy};
@@ -21,8 +20,8 @@ fn session(id: &str, profile: &str) -> SessionContext {
     SessionContext::new(id, "partner-guard", profile).expect("session")
 }
 
-fn dedup_backend() -> InMemoryDedupBackend {
-    InMemoryDedupBackend::default()
+fn dedup_backend() -> std::sync::Arc<dyn asx_rs::storage::DedupStorage> {
+    std::sync::Arc::new(InMemoryDedupBackend::default())
 }
 
 #[cfg(feature = "interop-relaxed")]
@@ -58,7 +57,7 @@ async fn guardrail_outcomes_include_allowed_and_denied_for_as2() {
             original_message_id: None,
         },
         &hook,
-        &dedup,
+        dedup.clone(),
         &verifier,
     )
     .expect("allowed path");
@@ -84,7 +83,7 @@ async fn guardrail_outcomes_include_allowed_and_denied_for_as2() {
             original_message_id: None,
         },
         &hook,
-        &dedup,
+        dedup.clone(),
         &verifier,
     )
     .expect_err("denied path");
@@ -147,10 +146,10 @@ async fn security_blocked_exceptions_are_non_overridable() {
         .expect("policy");
 
     let dedup = dedup_backend();
-    let err = receive_push_with_dedup_sync(
+    let err = receive_push_sync(
         &session("g-as4-blocked", "partner-quirks"),
         &bus,
-        As4ReceivePushSyncRequest {
+        As4ReceivePushSync {
             request: As4ReceivePushRequest {
                 http_content_type: "application/soap+xml".into(),
                 payload: payload.to_vec().into(),
@@ -158,7 +157,8 @@ async fn security_blocked_exceptions_are_non_overridable() {
                 policy: strict_policy,
                 authenticated_sender_scope: None,
             },
-            dedup_backend: &dedup,
+            dedup: dedup.clone(),
+            signer_pins: None,
         },
     )
     .expect_err("security-blocked exception must not be overridable");

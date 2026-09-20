@@ -14,7 +14,7 @@ AS4 (OASIS ebMS3 + eDelivery) EDI transport protocols. The crate is published as
 | Feature | Enables | Required by |
 |---|---|---|
 | `as2` | AS2 send/receive free functions (`as2::send_sync`, `as2::receive_sync`) and async wrappers (`as2::send_async`, `as2::receive_async`) | anything using AS2 |
-| `as4` | AS4 send/receive free functions (`as4::send_sync`, `as4::receive_push_with_dedup_sync`), receipt verification (`as4::verify_sync_response`), `As4PullStore`, and protocol configuration (`pmode`, `types`) | anything using AS4 |
+| `as4` | AS4 send/receive free functions (`as4::send_sync`, `as4::receive_push_sync`), receipt verification (`as4::verify_sync_response`), `As4PullStore`, and protocol configuration (`pmode`, `types`) | anything using AS4 |
 | `compression` | Zlib/GZIP payload compression via `flate2` | AS2/AS4 `policy.compress = true` (default) |
 | `async-ocsp` | Async OCSP responder fetching via `reqwest` | production OCSP validation |
 | `interop-strict` | **(default)** Strict interop mode as the default. Governs header/ambiguity handling only — **not** the security policy; see [`InteropMode`](core::InteropMode) | All profiles |
@@ -36,19 +36,19 @@ AS4 (OASIS ebMS3 + eDelivery) EDI transport protocols. The crate is published as
 
 ```toml
 # AS2 only (sign, encrypt, OCSP; compression is enabled by default):
-asx-rs = { version = "0.14", features = ["as2", "async-ocsp"] }
+asx-rs = { version = "0.15", features = ["as2", "async-ocsp"] }
 
 # AS4 only (sign, encrypt; compression is enabled by default):
-asx-rs = { version = "0.14", features = ["as4", "async-ocsp"] }
+asx-rs = { version = "0.15", features = ["as4", "async-ocsp"] }
 
 # Both protocols with compression:
-asx-rs = { version = "0.14", features = ["as2", "as4", "compression", "async-ocsp"] }
+asx-rs = { version = "0.15", features = ["as2", "as4", "compression", "async-ocsp"] }
 
 # AS4 with Peppol/CEF dynamic discovery:
-asx-rs = { version = "0.14", features = ["as4", "client", "dns"] }
+asx-rs = { version = "0.15", features = ["as4", "client", "dns"] }
 
 # Both protocols, relaxed interop for legacy partners:
-asx-rs = { version = "0.14", features = ["as2", "as4", "interop-relaxed", "async-ocsp"] }
+asx-rs = { version = "0.15", features = ["as2", "as4", "interop-relaxed", "async-ocsp"] }
 
 ```
 
@@ -125,6 +125,10 @@ pub mod as4;
 #[cfg(feature = "client")]
 #[cfg(feature = "as4")]
 pub mod smp;
+
+/// Peppol network rules that sit above a single protocol.
+#[cfg(feature = "as4")]
+pub mod peppol;
 
 pub use core::{AsxError, CryptoAdmissionControl, ErrorCode, ErrorContext, Result};
 #[cfg(any(feature = "as2", feature = "as4"))]

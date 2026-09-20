@@ -56,17 +56,13 @@ pub use receipt_verify::{
 #[cfg(feature = "testing")]
 pub use receive::private as verifier_seal;
 pub use receive::{
-    As4Ordered, As4ReceivePushAsyncFragmentAwareRequest, As4ReceivePushOrderedFragmentAwareRequest,
-    As4ReceivePushOrderedRequest, As4ReceivePushSyncFragmentAwareRequest,
-    As4ReceivePushSyncRequest, As4Verifier, As4WsSecVerifier, receive_push_ordered,
-    receive_push_ordered_fragment_aware, receive_push_with_dedup_async,
-    receive_push_with_dedup_async_fragment_aware, receive_push_with_dedup_sync,
-    receive_push_with_dedup_sync_fragment_aware,
+    As4Ordered, As4ReceivePush, As4ReceivePushSync, As4Verifier, As4WsSecVerifier, receive_push,
+    receive_push_fragment_aware, receive_push_sync, receive_push_sync_fragment_aware,
 };
 #[cfg(feature = "testing")]
 pub use receive::{
-    InsecureBypassAs4Verifier, receive_push_with_dedup_async_with_custom_verifier,
-    receive_push_with_dedup_sync_with_custom_verifier,
+    InsecureBypassAs4Verifier, receive_push_sync_with_custom_verifier,
+    receive_push_with_custom_verifier,
 };
 pub use send::{
     As4AdditionalPayload, As4SendPreparedRequest, As4SendRequest, send_async, send_async_prepared,
@@ -78,6 +74,7 @@ pub use signals::{
     generate_receipt_with_nri, generate_signed_receipt_for_output,
     generate_signed_receipt_with_nri,
 };
+pub use signer_pins::{As4SignerPinMap, As4SignerPins};
 
 mod parser;
 
@@ -87,6 +84,7 @@ pub use mime_packaging::{
 };
 
 pub mod pmode;
+pub mod signer_pins;
 /// The ebMS3 Test Service (Core §5.2.2).
 ///
 /// **Not** test scaffolding: §5.2.2 makes the Test Service mandatory for a

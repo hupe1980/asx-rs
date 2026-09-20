@@ -27,10 +27,13 @@ fn session() -> SessionContext {
     SessionContext::new("sess-rx-1", "partner-a", "strict").expect("session")
 }
 
-fn reliability() -> (InMemoryReconciliationHook, InMemoryDedupBackend) {
+fn reliability() -> (
+    InMemoryReconciliationHook,
+    std::sync::Arc<dyn asx_rs::storage::DedupStorage>,
+) {
     (
         InMemoryReconciliationHook::default(),
-        InMemoryDedupBackend::default(),
+        std::sync::Arc::new(InMemoryDedupBackend::default()),
     )
 }
 
@@ -58,7 +61,7 @@ async fn sync_mdn_with_matching_mic_is_success_confirmed() {
             original_message_id: None,
         },
         &hook,
-        &dedup,
+        dedup.clone(),
         &InsecureBypassTrustVerifier::new(TrustEvidence::verified_and_decryptable()),
     )
     .expect("receive");
@@ -83,7 +86,7 @@ async fn async_warning_mdn_without_mic_is_pending_verification() {
             original_message_id: None,
         },
         &hook,
-        &dedup,
+        dedup.clone(),
         &InsecureBypassTrustVerifier::new(TrustEvidence::verified_and_decryptable()),
     )
     .expect("receive");
@@ -114,7 +117,7 @@ async fn malformed_boundary_is_rejected_in_strict_mode() {
             original_message_id: None,
         },
         &hook,
-        &dedup,
+        dedup.clone(),
         &InsecureBypassTrustVerifier::new(TrustEvidence::verified_and_decryptable()),
     )
     .expect_err("strict parse failure");
@@ -147,7 +150,7 @@ Human-readable only
             original_message_id: None,
         },
         &hook,
-        &dedup,
+        dedup.clone(),
         &InsecureBypassTrustVerifier::new(TrustEvidence::verified_and_decryptable()),
     )
     .expect_err("strict multipart/report without notification body must fail");
@@ -194,7 +197,7 @@ Content-Type: message/rfc822
             original_message_id: None,
         },
         &hook,
-        &dedup,
+        dedup.clone(),
         &InsecureBypassTrustVerifier::new(TrustEvidence::verified_and_decryptable()),
     )
     .expect("structured multipart/report should parse");
@@ -247,7 +250,7 @@ Disposition: automatic-action/MDN-sent-automatically; processed
             original_message_id: None,
         },
         &hook,
-        &dedup,
+        dedup.clone(),
         &InsecureBypassTrustVerifier::new(TrustEvidence::verified_and_decryptable()),
     )
     .expect_err("duplicate disposition fields must fail closed");
@@ -290,7 +293,7 @@ Received-Content-MIC: KUPgyYBxFU9pqBBAxdTOeAw3hlDAepf6m2Pfoy8VI0g=, sha-256
             original_message_id: None,
         },
         &hook,
-        &dedup,
+        dedup.clone(),
         &InsecureBypassTrustVerifier::new(TrustEvidence::verified_and_decryptable()),
     )
     .expect_err("duplicate mic fields must fail closed");
@@ -321,7 +324,7 @@ async fn mdn_notification_with_non_utf8_octets_is_rejected() {
             original_message_id: None,
         },
         &hook,
-        &dedup,
+        dedup.clone(),
         &InsecureBypassTrustVerifier::new(TrustEvidence::verified_and_decryptable()),
     )
     .expect_err("MDN body with non-UTF-8 octets must be rejected (fail-closed)");
@@ -358,7 +361,7 @@ async fn mdn_with_quoted_received_content_mic_matches_expected() {
             original_message_id: None,
         },
         &hook,
-        &dedup,
+        dedup.clone(),
         &InsecureBypassTrustVerifier::new(TrustEvidence::verified_and_decryptable()),
     )
     .expect("quoted MIC must match expected digest");
@@ -393,7 +396,7 @@ async fn partner_quirk_parses_in_relaxed_mode() {
             original_message_id: None,
         },
         &hook,
-        &dedup,
+        dedup.clone(),
         &InsecureBypassTrustVerifier::new(TrustEvidence::verified_and_decryptable()),
     )
     .expect("relaxed parse");
@@ -426,7 +429,7 @@ async fn relaxed_partner_quirk_without_exception_is_rejected() {
             original_message_id: None,
         },
         &hook,
-        &dedup,
+        dedup.clone(),
         &InsecureBypassTrustVerifier::new(TrustEvidence::verified_and_decryptable()),
     )
     .expect_err("relaxed without configured exception must fail");
@@ -453,7 +456,7 @@ async fn retry_side_effects_are_not_duplicated_for_same_message() {
             original_message_id: None,
         },
         &hook,
-        &dedup,
+        dedup.clone(),
         &InsecureBypassTrustVerifier::new(TrustEvidence::verified_and_decryptable()),
     )
     .expect("first receive");
@@ -471,7 +474,7 @@ async fn retry_side_effects_are_not_duplicated_for_same_message() {
             original_message_id: None,
         },
         &hook,
-        &dedup,
+        dedup.clone(),
         &InsecureBypassTrustVerifier::new(TrustEvidence::verified_and_decryptable()),
     )
     .expect("second receive");
@@ -490,9 +493,10 @@ async fn duplicate_mdn_ingress_emits_duplicate_detected_event() {
     let bus = EventBus::new(32).expect("bus");
     let mut events = bus.subscribe_scoped_events();
     let hook = InMemoryReconciliationHook::default();
-    let dedup = InMemoryDedupBackend::default();
+    let dedup: std::sync::Arc<dyn asx_rs::storage::DedupStorage> =
+        std::sync::Arc::new(InMemoryDedupBackend::default());
 
-    for _ in 0..2 {
+    let receive = |dedup: std::sync::Arc<dyn asx_rs::storage::DedupStorage>| {
         receive_with_mdn_with_reliability(
             &session(),
             &bus,
@@ -506,11 +510,25 @@ async fn duplicate_mdn_ingress_emits_duplicate_detected_event() {
                 original_message_id: None,
             },
             &hook,
-            &dedup,
+            dedup,
             &InsecureBypassTrustVerifier::new(TrustEvidence::verified_and_decryptable()),
         )
-        .expect("receive with dedup");
-    }
+    };
+
+    // A replay is only a replay once the first MDN's outcome has been settled.
+    let first = receive(dedup.clone()).expect("receive with dedup");
+    let claim = first
+        .dedup
+        .into_claim()
+        .expect("a first-seen MDN carries a claim");
+    claim.accept().await.expect("accept claim");
+
+    let replay = receive(dedup.clone()).expect("replay");
+    assert!(
+        matches!(replay.dedup, asx_rs::as2::As2MdnDedup::Duplicate),
+        "an accepted MDN must replay as Duplicate, got {:?}",
+        replay.dedup
+    );
 
     let mut duplicate_seen = false;
     for _ in 0..20 {
@@ -547,7 +565,8 @@ async fn duplicate_async_mdn_does_not_emit_mdn_received_twice() {
     let bus = EventBus::new(32).expect("bus");
     let mut events = bus.subscribe_scoped_events();
     let hook = InMemoryReconciliationHook::default();
-    let dedup = InMemoryDedupBackend::default();
+    let dedup: std::sync::Arc<dyn asx_rs::storage::DedupStorage> =
+        std::sync::Arc::new(InMemoryDedupBackend::default());
 
     for _ in 0..2 {
         receive_with_mdn_with_reliability(
@@ -563,7 +582,7 @@ async fn duplicate_async_mdn_does_not_emit_mdn_received_twice() {
                 original_message_id: None,
             },
             &hook,
-            &dedup,
+            dedup.clone(),
             &InsecureBypassTrustVerifier::new(TrustEvidence::verified_and_decryptable()),
         )
         .expect("receive with dedup");
@@ -582,4 +601,61 @@ async fn duplicate_async_mdn_does_not_emit_mdn_received_twice() {
     }
 
     assert_eq!(mdn_received_count, 1);
+}
+
+/// An MDN whose claim is still unsettled must not be reported as a duplicate.
+///
+/// Before the two-phase protocol the key was consumed the moment the MDN was
+/// classified, so any later failure left the delivery outcome unrecorded and
+/// the partner's retransmission silently ignored (D57).
+#[tokio::test]
+async fn unsettled_mdn_claim_reports_in_flight_not_duplicate() {
+    let mdn = std::fs::read("tests/fixtures/as2_mdn_sync_ok.golden").expect("fixture");
+    let bus = EventBus::new(32).expect("bus");
+    let _events = bus.subscribe_scoped_events();
+    let hook = InMemoryReconciliationHook::default();
+    let dedup: std::sync::Arc<dyn asx_rs::storage::DedupStorage> =
+        std::sync::Arc::new(InMemoryDedupBackend::default());
+
+    let receive = |dedup: std::sync::Arc<dyn asx_rs::storage::DedupStorage>| {
+        receive_with_mdn_with_reliability(
+            &session(),
+            &bus,
+            As2ReceiveMdnRequest {
+                payload: vec![1].into(),
+                mdn_payload: mdn.clone().into(),
+                mdn_mode: As2MdnMode::Synchronous,
+                require_signed_mdn: false,
+                expected_mic: Some(EXPECTED_MIC.to_string()),
+                policy: test_receive_policy(),
+                original_message_id: None,
+            },
+            &hook,
+            dedup,
+            &InsecureBypassTrustVerifier::new(TrustEvidence::verified_and_decryptable()),
+        )
+    };
+
+    // Hold the claim, as an application still recording the outcome would.
+    let first = receive(dedup.clone()).expect("first receive");
+    let claim = first
+        .dedup
+        .into_claim()
+        .expect("a first-seen MDN carries a claim");
+
+    let concurrent = receive(dedup.clone()).expect("concurrent receive");
+    assert!(
+        matches!(concurrent.dedup, asx_rs::as2::As2MdnDedup::InFlight),
+        "an unsettled MDN must report InFlight, got {:?}",
+        concurrent.dedup
+    );
+
+    // Abandoning it lets the partner's retransmission be processed.
+    claim.abandon().await.expect("abandon claim");
+    let retransmission = receive(dedup).expect("retransmission");
+    assert!(
+        retransmission.dedup.is_first_seen(),
+        "a retransmission after an abandoned claim must be processed, got {:?}",
+        retransmission.dedup
+    );
 }

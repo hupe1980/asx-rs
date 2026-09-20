@@ -30,9 +30,7 @@ use crate::as2::{
 #[cfg(feature = "as2")]
 use crate::as2::private::Sealed as TrustVerifierSeal;
 #[cfg(feature = "as4")]
-use crate::as4::{
-    As4PushPolicy, As4ReceivePushRequest, As4ReceivePushSyncRequest, receive_push_with_dedup_sync,
-};
+use crate::as4::{As4PushPolicy, As4ReceivePushRequest, As4ReceivePushSync, receive_push_sync};
 #[cfg(feature = "as4")]
 use crate::crypto::wssec::{WsSecOutboundKeyInfoProfile, generate_xmlsig_signature};
 #[cfg(feature = "as2")]
@@ -392,7 +390,8 @@ fn execute_as2_fixture(
     }
 
     let hook = InMemoryReconciliationHook::default();
-    let dedup = InMemoryDedupBackend::default();
+    let dedup: std::sync::Arc<dyn crate::storage::DedupStorage> =
+        std::sync::Arc::new(InMemoryDedupBackend::default());
     let verifier = DeterministicTrustVerifier::new(TrustEvidence::verified_and_decryptable());
     let result = receive_with_mdn_with_reliability(
         session,
@@ -407,7 +406,7 @@ fn execute_as2_fixture(
             original_message_id: None,
         },
         &hook,
-        &dedup,
+        dedup,
         &verifier,
     );
 
@@ -448,12 +447,13 @@ fn execute_as4_fixture(
     policy.fail_closed_audit_events = false;
 
     let http_content_type = infer_as4_fixture_http_content_type(&payload);
-    let dedup = InMemoryDedupBackend::default();
+    let dedup: std::sync::Arc<dyn crate::storage::DedupStorage> =
+        std::sync::Arc::new(InMemoryDedupBackend::default());
     let configured_session = configure_matrix_as4_trust_anchor(base_dir, session)?;
-    let result = receive_push_with_dedup_sync(
+    let result = receive_push_sync(
         &configured_session,
         &bus,
-        As4ReceivePushSyncRequest {
+        As4ReceivePushSync {
             request: As4ReceivePushRequest {
                 http_content_type,
                 payload: payload.into(),
@@ -461,7 +461,8 @@ fn execute_as4_fixture(
                 policy,
                 authenticated_sender_scope: None,
             },
-            dedup_backend: &dedup,
+            dedup,
+            signer_pins: None,
         },
     );
 

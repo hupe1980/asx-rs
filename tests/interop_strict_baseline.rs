@@ -6,8 +6,8 @@ use asx_rs::as2::receive_with_mdn_with_reliability;
 
 use asx_rs::as2::{As2MdnMode, As2ReceiveMdnRequest, As2ReceivePolicy};
 use asx_rs::as4::{
-    As4PushPolicy, As4PushPolicyBuilder, As4ReceivePushRequest, As4ReceivePushSyncRequest,
-    receive_push_with_dedup_sync,
+    As4PushPolicy, As4PushPolicyBuilder, As4ReceivePushRequest, As4ReceivePushSync,
+    receive_push_sync,
 };
 use asx_rs::core::{ErrorCode, InteropMode, SessionContext};
 use asx_rs::lifecycle::TrustEvidence;
@@ -31,7 +31,8 @@ fn defaults_are_strict_for_as2_and_as4_policies() {
 fn as2_strict_mode_rejects_malformed_boundary_with_stage_context() {
     let mdn = fixture("as2_mdn_malformed_boundary.golden");
     let hook = asx_rs::reliability::InMemoryReconciliationHook::default();
-    let dedup = asx_rs::reliability::InMemoryDedupBackend::default();
+    let dedup: std::sync::Arc<dyn asx_rs::storage::DedupStorage> =
+        std::sync::Arc::new(asx_rs::reliability::InMemoryDedupBackend::default());
     let verifier = InsecureBypassTrustVerifier::new(TrustEvidence::verified_and_decryptable());
 
     let err = receive_with_mdn_with_reliability(
@@ -50,7 +51,7 @@ fn as2_strict_mode_rejects_malformed_boundary_with_stage_context() {
             original_message_id: None,
         },
         &hook,
-        &dedup,
+        dedup.clone(),
         &verifier,
     )
     .expect_err("strict mode should reject malformed boundary");
@@ -73,12 +74,13 @@ fn as4_strict_mode_rejects_missing_security_header_with_stage_context() {
     </S12:Header>
     <S12:Body/>
     </S12:Envelope>"#;
-    let dedup = asx_rs::reliability::InMemoryDedupBackend::default();
+    let dedup: std::sync::Arc<dyn asx_rs::storage::DedupStorage> =
+        std::sync::Arc::new(asx_rs::reliability::InMemoryDedupBackend::default());
 
-    let err = receive_push_with_dedup_sync(
+    let err = receive_push_sync(
         &session("strict"),
         &EventBus::new(32).expect("bus"),
-        As4ReceivePushSyncRequest {
+        As4ReceivePushSync {
             request: As4ReceivePushRequest {
                 http_content_type: "application/soap+xml".into(),
                 payload: payload.to_vec().into(),
@@ -89,7 +91,8 @@ fn as4_strict_mode_rejects_missing_security_header_with_stage_context() {
                     .expect("policy"),
                 authenticated_sender_scope: None,
             },
-            dedup_backend: &dedup,
+            dedup: dedup.clone(),
+            signer_pins: None,
         },
     )
     .expect_err("strict mode should reject missing wsse:Security");

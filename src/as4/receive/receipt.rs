@@ -1,8 +1,7 @@
 use super::super::parser::{parse_as4_receipt, precheck_as4_receipt_structure_bytes};
 use super::super::services::{
     emit_receive_push_receipt_received, emit_receive_push_receipt_taxonomy_outcome,
-    enforce_signal_signature_coverage, expected_fingerprint_from_session,
-    wssec_revocation_policy_from_session,
+    enforce_signal_signature_coverage, session_signer_pins, wssec_revocation_policy_from_session,
 };
 use super::super::types::As4PushPolicy;
 use crate::core::{AsxError, ErrorCode, ErrorContext, Result, SessionContext};
@@ -38,8 +37,8 @@ pub(super) fn parse_and_verify_receipt_if_present(
     )?;
 
     if parsed_receipt.is_signed {
-        let expected_fingerprint = expected_fingerprint_from_session(session);
-        if expected_fingerprint.is_none() {
+        let expected_fingerprints = session_signer_pins(session);
+        if expected_fingerprints.is_empty() {
             emit_receive_push_receipt_taxonomy_outcome(
                 session,
                 event_bus,
@@ -76,7 +75,7 @@ pub(super) fn parse_and_verify_receipt_if_present(
                 &receipt_doc,
                 receipt_xml,
                 WsSecVerifyOptions::new()
-                    .with_expected_fingerprint(expected_fingerprint)
+                    .with_expected_fingerprints(&expected_fingerprints)
                     .with_revocation(revocation_policy),
             ) {
                 Ok(Some(coverage)) => coverage,

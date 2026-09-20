@@ -513,11 +513,13 @@ pub fn generate_pull_request(
 /// #     session: &SessionContext,
 /// #     outcome: As4ReceiveOutcome,
 /// # ) -> asx_rs::Result<()> {
-/// if let As4ReceiveOutcome::FirstSeen(output) = outcome {
+/// if let As4ReceiveOutcome::FirstSeen { output, claim } = outcome {
 ///     // A ping is acknowledged but never delivered (ebMS3 §5.2.2).
 ///     let receipt_id = format!("receipt@{}", uuid::Uuid::new_v4());
 ///     let receipt_bytes = generate_receipt_for_output(session, &receipt_id, &output)?;
 ///     let _ = receipt_bytes;
+///     // Acknowledged, so a replay must not be delivered again.
+///     claim.accept_blocking()?;
 /// }
 /// # Ok(())
 /// # }
@@ -564,12 +566,14 @@ pub fn generate_receipt_for_output(
 /// #     content_type: &str,
 /// #     credentials: &As4ReceiptCredentials,
 /// # ) -> asx_rs::Result<()> {
-/// if let As4ReceiveOutcome::FirstSeen(output) = outcome {
+/// if let As4ReceiveOutcome::FirstSeen { output, claim } = outcome {
 ///     let receipt_id = format!("receipt@{}", uuid::Uuid::new_v4());
 ///     let receipt_bytes = generate_signed_receipt_for_output(
 ///         session, &receipt_id, &output, raw_body, content_type, credentials,
 ///     )?;
 ///     let _ = receipt_bytes;
+///     // The receipt is an NRR commitment: settle before it goes on the wire.
+///     claim.accept_blocking()?;
 /// }
 /// # Ok(())
 /// # }

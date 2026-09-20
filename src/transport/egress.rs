@@ -40,6 +40,7 @@
 
 use std::net::SocketAddr;
 use std::time::Duration;
+use zeroize::Zeroize;
 
 use crate::core::{AsxError, ErrorCode, ErrorContext, Result};
 use crate::http::HttpHeaders;
@@ -104,6 +105,11 @@ fn build_ocsp_http_client(
         .connect_timeout(config.connect_timeout)
         .timeout(config.request_timeout)
         .user_agent(&config.user_agent);
+
+    // Deliberately no `config.client_identity`: an OCSP responder is a third
+    // party, not the AS4 partner. Presenting the market-communication client
+    // certificate to it would disclose our identity to an unrelated service
+    // for no gain — RFC 6960 responses are signed, not client-authenticated.
 
     if let Some((host, addrs)) = pinned_resolution {
         builder = builder.resolve_to_addrs(host, addrs);
@@ -351,6 +357,12 @@ fn build_http_client(
         .pool_max_idle_per_host(config.pool_max_idle_per_host)
         .pool_idle_timeout(Some(config.pool_idle_timeout));
 
+    // Mutual TLS: present the configured client certificate when the partner
+    // asks for one during the handshake.
+    if let Some(identity) = &config.client_identity {
+        builder = builder.identity(identity.as_reqwest());
+    }
+
     if let Some((host, addrs)) = pinned_resolution {
         builder = builder.resolve_to_addrs(host, addrs);
     }
@@ -427,6 +439,94 @@ pub(crate) fn is_private_host(host: &str) -> bool {
 
 // ── Transport configuration ─────────────────────────────────────────────────
 
+/// A client certificate and its private key, presented during the TLS
+/// handshake when the partner requires mutual TLS.
+///
+/// Built from PEM so the API stays independent of the TLS backend, and parsed
+/// **once** at construction: a bad certificate/key pair fails where it is
+/// configured rather than at the first message, and no send pays for a parse.
+///
+/// Several AS4 profiles — BDEW's *Regelungen zum Übertragungsweg* among them —
+/// require client-certificate authentication on the wire in addition to the
+/// WS-Security signature, and the two use different keys. This is the
+/// transport-layer one.
+#[derive(Clone)]
+pub struct ClientIdentity {
+    identity: reqwest::Identity,
+    /// Retained for diagnostics only — the key material is not kept in PEM.
+    cert_chain_len: usize,
+}
+
+impl std::fmt::Debug for ClientIdentity {
+    /// Never prints key material.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClientIdentity")
+            .field(
+                "cert_chain_pem",
+                &format_args!("<{} bytes>", self.cert_chain_len),
+            )
+            .field("key_pem", &"<redacted>")
+            .finish()
+    }
+}
+
+impl ClientIdentity {
+    /// Build an identity from a PEM certificate chain and a PEM private key.
+    ///
+    /// `cert_chain_pem` is the leaf certificate first, followed by any
+    /// intermediates the partner needs to build a path. `key_pem` is the
+    /// leaf's private key (PKCS#8, SEC1 or PKCS#1).
+    ///
+    /// # Errors
+    /// [`ErrorCode::InvalidInput`] if either input is empty, or if the pair is
+    /// not a usable certificate/key.
+    pub fn from_pem(cert_chain_pem: impl AsRef<[u8]>, key_pem: impl AsRef<[u8]>) -> Result<Self> {
+        let cert_chain_pem = cert_chain_pem.as_ref();
+        let key_pem = key_pem.as_ref();
+        if cert_chain_pem.is_empty() {
+            return Err(AsxError::new(
+                ErrorCode::InvalidInput,
+                "client identity certificate chain is empty",
+                ErrorContext::new("transport_client_identity"),
+            ));
+        }
+        if key_pem.is_empty() {
+            return Err(AsxError::new(
+                ErrorCode::InvalidInput,
+                "client identity private key is empty",
+                ErrorContext::new("transport_client_identity"),
+            ));
+        }
+
+        // reqwest wants one PEM buffer holding the key and the chain together.
+        // It is a copy of the private key, so it is wiped before it is dropped.
+        let mut combined = Vec::with_capacity(key_pem.len() + cert_chain_pem.len() + 1);
+        combined.extend_from_slice(key_pem);
+        if !key_pem.ends_with(b"\n") {
+            combined.push(b'\n');
+        }
+        combined.extend_from_slice(cert_chain_pem);
+        let parsed = reqwest::Identity::from_pem(&combined);
+        combined.zeroize();
+
+        Ok(Self {
+            identity: parsed.map_err(|err| {
+                AsxError::new(
+                    ErrorCode::InvalidInput,
+                    format!("invalid TLS client identity (certificate/key pair): {err}"),
+                    ErrorContext::new("transport_client_identity"),
+                )
+            })?,
+            cert_chain_len: cert_chain_pem.len(),
+        })
+    }
+
+    /// The parsed backend identity.
+    fn as_reqwest(&self) -> reqwest::Identity {
+        self.identity.clone()
+    }
+}
+
 /// Configuration for the async HTTP transport client.
 ///
 /// Use [`TransportConfig::default`] for sensible production defaults, or
@@ -444,6 +544,11 @@ pub struct TransportConfig {
     pub pool_max_idle_per_host: usize,
     /// Idle keep-alive timeout. Default: 90 s.
     pub pool_idle_timeout: Duration,
+    /// Client certificate presented when the partner requests one during the
+    /// TLS handshake. Default: none (server-authenticated TLS only).
+    ///
+    /// Set it with [`with_client_identity`](Self::with_client_identity).
+    pub client_identity: Option<ClientIdentity>,
 }
 
 impl Default for TransportConfig {
@@ -454,6 +559,7 @@ impl Default for TransportConfig {
             user_agent: concat!("asx/", env!("CARGO_PKG_VERSION")).to_string(),
             pool_max_idle_per_host: 4,
             pool_idle_timeout: Duration::from_secs(90),
+            client_identity: None,
         }
     }
 }
@@ -474,6 +580,21 @@ impl TransportConfig {
     /// Override the `User-Agent` header value.
     pub fn with_user_agent(mut self, user_agent: impl Into<String>) -> Self {
         self.user_agent = user_agent.into();
+        self
+    }
+
+    /// Present `identity` as the client certificate on every outbound
+    /// connection this transport makes.
+    ///
+    /// # Example
+    /// ```rust,ignore
+    /// let identity = ClientIdentity::from_pem(cert_chain_pem, key_pem)?;
+    /// let transport = As4HttpTransport::new(
+    ///     TransportConfig::default().with_client_identity(identity),
+    /// )?;
+    /// ```
+    pub fn with_client_identity(mut self, identity: ClientIdentity) -> Self {
+        self.client_identity = Some(identity);
         self
     }
 }

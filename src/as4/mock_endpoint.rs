@@ -44,14 +44,14 @@ use axum::{
 use tokio::sync::mpsc;
 
 use crate::as4::{
-    As4PushPolicyBuilder, As4ReceiveOutcome, As4ReceivePushRequest, FragmentScopePolicy,
-    InsecureBypassAs4Verifier, receive_push_with_dedup_async_with_custom_verifier,
+    As4PushPolicyBuilder, As4ReceiveOutcome, As4ReceivePush, As4ReceivePushRequest,
+    FragmentScopePolicy, InsecureBypassAs4Verifier, receive_push_with_custom_verifier,
 };
 use crate::core::{DEFAULT_MAX_BODY_BYTES, SessionContext};
 use crate::http::{HttpHeaders, HttpRequest};
 use crate::observability::EventBus;
 use crate::reliability::InMemoryDedupBackend;
-use crate::storage::{BoxFuture, DedupStorage};
+use crate::storage::{BoxFuture, DedupStorage, DedupVerdict};
 use crate::transport::ingress::as4_ingress_from_http;
 
 // ---------------------------------------------------------------------------
@@ -117,8 +117,16 @@ impl DedupStorage for MockDedup {
     fn is_durable(&self) -> bool {
         true // test-only: claim durability so strict guards pass
     }
-    fn first_seen<'a>(&'a self, key: &'a str) -> BoxFuture<'a, crate::core::Result<bool>> {
-        self.0.first_seen(key)
+    fn claim<'a>(&'a self, key: &'a str) -> BoxFuture<'a, crate::core::Result<DedupVerdict>> {
+        self.0.claim(key)
+    }
+
+    fn accept<'a>(&'a self, key: &'a str) -> BoxFuture<'a, crate::core::Result<()>> {
+        self.0.accept(key)
+    }
+
+    fn abandon<'a>(&'a self, key: &'a str) -> BoxFuture<'a, crate::core::Result<()>> {
+        self.0.abandon(key)
     }
 }
 
@@ -408,17 +416,23 @@ async fn mock_as4_handler(State(state): State<Arc<MockEndpointState>>, req: Requ
 
     let dedup: Arc<dyn DedupStorage> = state.dedup.clone();
 
-    let outcome = receive_push_with_dedup_async_with_custom_verifier(
+    let outcome = receive_push_with_custom_verifier(
         &state.session,
         &state.event_bus,
-        push_req,
-        dedup,
+        As4ReceivePush {
+            request: push_req,
+            dedup,
+            ordering: None,
+            // The bypass verifier checks no signature, so pins are moot here.
+            signer_pins: None,
+        },
         InsecureBypassAs4Verifier,
     )
-    .await;
+    .await
+    .map(crate::as4::As4Ordered::into_inner);
 
     match outcome {
-        Ok(As4ReceiveOutcome::FirstSeen(output)) => {
+        Ok(As4ReceiveOutcome::FirstSeen { output, claim }) => {
             let ref_id = output.user_message.message_id.clone();
             let receipt = build_receipt_bytes(&state, &output, &ingress);
             let msg = MockReceivedMessage {
@@ -441,6 +455,16 @@ async fn mock_as4_handler(State(state): State<Arc<MockEndpointState>>, req: Requ
             );
             let _ = state.tx.send(msg);
             let _ = &ref_id;
+            // The message has been handed to the test's channel and a receipt
+            // is about to go back, so the claim is settled: a replay must be
+            // answered as a duplicate, not delivered a second time.
+            if let Err(err) = claim.accept().await {
+                tracing::warn!(
+                    target: "asx_rs::as4::mock_endpoint",
+                    error = %err,
+                    "MockAs4Endpoint: failed to settle dedup claim"
+                );
+            }
             receipt_response(receipt)
         }
         Ok(As4ReceiveOutcome::Duplicate { ref message_id }) => {
@@ -453,6 +477,21 @@ async fn mock_as4_handler(State(state): State<Arc<MockEndpointState>>, req: Requ
             // A replay is acknowledged with a plain receipt: the original
             // inbound bytes are no longer available to echo NRI digests from.
             receipt_response(generate_plain_receipt(&state.session, message_id))
+        }
+        Ok(As4ReceiveOutcome::InFlight { ref message_id }) => {
+            // A concurrent delivery still holds the claim: acknowledging would
+            // confirm a message nobody has taken responsibility for yet.
+            tracing::debug!(
+                target: "asx_rs::as4::mock_endpoint",
+                message_id = %message_id,
+                "MockAs4Endpoint: delivery in flight, asking the sender to retry"
+            );
+            (
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                [] as [(axum::http::HeaderName, String); 0],
+                Vec::new(),
+            )
+                .into_response()
         }
         Err(e) => {
             use crate::core::ErrorCode;

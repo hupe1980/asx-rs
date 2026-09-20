@@ -1,6 +1,6 @@
 +++
 title = "Conformance"
-description = "What asx-rs implements against the eDelivery AS4 conformance profile, what it does not, and how to read the coverage table honestly."
+description = "What asx-rs implements against the eDelivery AS4 conformance profile, what a deployment must add, and which interop oracles check it."
 +++
 
 Two separate things, often conflated:
@@ -10,7 +10,7 @@ Two separate things, often conflated:
 | Gives you | A signed certificate + a public listing on the EC's conformant-solutions page | Continuous regression evidence in CI |
 | Cost | **Free** (see below) | Free |
 | Runs | On request, against DIGIT-hosted infrastructure | On every PR |
-| Needs | A **publicly reachable** SUT + a SUT Controller + registration | Docker only |
+| Needs | A **publicly reachable** SUT + a SUT Controller + registration | Docker, for most of it |
 | Proves | Point-in-time conformance of a specific version | That today's commit still interoperates |
 
 They are complementary, and the second is a prerequisite for passing the first
@@ -33,13 +33,11 @@ without burning support cycles. Do the self-hosted loop first.
 - Neither the service pages, the Service Offering Description, nor the 46-page
   AS4 User Guide mention a fee, price, or charge anywhere.
 
-The cost is **engineering time, not money** — and the engineering cost is the
-part worth planning for (see [What ASX still needs](#what-asx-still-needs)).
+The cost is **engineering time, not money**; [Coverage](#coverage) has what a
+deployment must add on top of this library.
 
-> Caveat worth stating plainly: "no fee is documented anywhere" is strong
-> evidence but is not the same as a published "this service is free of charge"
-> sentence, which we did not find. Confirm in the registration email; it costs
-> one line.
+> No fee is documented anywhere, which is not the same as a published "free of
+> charge" statement. Confirm it in the registration email.
 
 ---
 
@@ -72,8 +70,7 @@ v1.20, © European Union 2024.
 
 ### The SUT Controller
 
-This is the part people underestimate. It is **not** part of AS4 — it is a
-test-harness protocol carried *over* AS4, using ordinary user messages whose
+Not part of AS4 — a test-harness protocol carried *over* AS4, using ordinary user messages whose
 `eb:CollaborationInfo/Action` names a command and whose parameters travel as
 `eb:MessageProperties`.
 
@@ -112,44 +109,50 @@ Four parts, exercising **multi-payload** messages:
 
 ---
 
-> **Caveat on this table.** Rows marked ✅ reflect *implemented and
-> unit-tested*. For the one-way push + NRR flow there is additionally
-> third-party evidence: the [Holodeck B2B counterparty
-> test](#live-counterparty-shipped) exchanges a signed message for a signed,
-> digest-echoing receipt with an independent WSS4J-based implementation on
-> every run. The caution still applies to everything that exchange does not
-> cover.
+## Coverage
 
-## What ASX still needs
+`asx-rs` is a **library**; the conformance service tests a deployed **access
+point**. What the profile requires of the protocol is implemented; what it
+requires of a deployment is not shipped, because this crate never owns a
+listener or a process.
 
-ASX is a **library**; the conformance service tests an **access point**. The
-gap is deployment scaffolding, not protocol work.
-
-| Requirement | Status |
+| Conformance requirement | In `asx-rs` |
 |---|---|
-| AS4 signing (RSA + ECDSA), XML encryption | ✅ shipped |
-| AS4 compression (gzip + `CompressionType` part property, both directions) | ✅ shipped |
-| One-way push send + receive | ✅ shipped |
-| Verified receipts / NRR | ✅ shipped (`verify_sync_response`) |
-| **Multi-payload messages** (4 payload profiles) | ✅ shipped, both directions — send attaches parts via `As4AdditionalPayload` (pinned Content-IDs supported); receive resolves every signed `eb:PartInfo` reference and verifies each attachment's coverage. Exercised live against Holodeck B2B with two payloads |
-| Retry with bounded interval | ✅ `reliability::RetryScheduler` |
-| Two-way push-and-push | ⬜ expressible as two correlated one-ways via `RefToMessageId`; not modelled as a MEP |
-| ebMS3 `PING` service/action | ⬜ not special-cased |
-| **A runnable access point** (public URL) | ⬜ not shipped — `server` + `client` features provide the pieces; no binary |
-| **SUT Controller** | ⬜ not shipped |
+| AS4 signing (RSA + ECDSA), XML encryption | Yes |
+| AS4 compression (gzip + `CompressionType` part property, both directions) | Yes |
+| One-way push send + receive | Yes |
+| Verified receipts / NRR | Yes — `verify_sync_response` |
+| Multi-payload messages (all four payload profiles) | Yes, both directions. Send attaches parts via `As4AdditionalPayload` with pinned Content-IDs; receive resolves every signed `eb:PartInfo` reference and verifies each attachment's coverage |
+| Retry with bounded interval | Yes — `reliability::RetryScheduler` |
+| `PING` profile (ebMS3 core §5.2.2 Test Service) | Yes — `as4::test_service`; a ping is acknowledged and reported as one, never delivered as a business document |
+| Two-way push-and-push | Expressible as two correlated one-ways via `RefToMessageId`; not modelled as a single MEP |
+| A runnable access point at a public URL | Not shipped. The `server` and `client` features provide the pieces; there is no binary |
+| SUT Controller | Not shipped |
 
-The two ⬜ *deployment* blockers are the access point binary and the SUT
-Controller. Everything else is either done or a small increment.
-
-> ✅ **The protocol blocker found here is fixed.** The oracle initially showed
-> xmlsec1 rejecting ASX signatures (0/3 reference digests). Root cause: the
-> canonicalizer stripped whitespace-only text nodes, which no W3C
-> canonicalization does. Removed, plus the missing per-`ds:Reference`
-> exc-c14n `ds:Transform`. Now 3/3.
+The last two are deployment scaffolding you build around the library, not
+protocol gaps. Rows above them are implemented and unit-tested; the one-way
+push + NRR flow additionally has third-party evidence on every run, below.
 
 ---
 
-## Live counterparty — shipped
+## Interop oracles
+
+Each one checks this crate against an implementation that does not share its
+assumptions — the defect class our own verifier structurally cannot reach.
+
+| Oracle | Counterparty | Needs | Runs |
+|---|---|---|---|
+| `interop_peppol_smp_oracle` | A signature from the live Peppol production network | nothing | every `cargo test` |
+| `interop_openssl_smime_oracle` | `openssl smime` CLI | `openssl` binary | every PR, blocking |
+| `interop_xmlsec_oracle` | xmlsec1, the W3C XMLDSig reference implementation | Docker | every PR, advisory |
+| `interop_redis_storage_conformance` | A real Redis server | Docker | every PR, advisory |
+| `interop_holodeck_counterparty` | Holodeck B2B 6.1.1 (WSS4J) | Docker | every PR, advisory |
+
+The Docker-backed job is `continue-on-error`, so a registry outage cannot block
+a merge — which also means a genuine interop regression there shows up as a red
+job, not a blocked PR. Read it, do not assume it.
+
+### Live AS4 counterparty — Holodeck B2B
 
 `tests/interop_holodeck_counterparty.rs` exchanges a **signed AS4 push with
 Non-Repudiation of Receipt** against **Holodeck B2B 6.1.1** — an independent,
@@ -178,7 +181,19 @@ bare XMLDSig oracle can reach.
 
 ---
 
-## AS2 S/MIME oracle — shipped
+### Peppol SMP signature — live production capture
+
+`tests/interop_peppol_smp_oracle.rs` verifies a `SignedServiceMetadata`
+captured from the **live Peppol production network** against the real Peppol
+PKI (`PEPPOL Root CA - G3` and the issuing SMP CA), plus tamper cases that must
+fail. It needs no container and no network, so it runs in the ordinary test
+suite.
+
+The specimen differs from everything this crate generates in ways that exercise
+real paths: a default `xmlns` rather than a `ds:` prefix, inclusive C14N, and a
+reference with no explicit canonicalization transform.
+
+### AS2 S/MIME — openssl CLI
 
 `tests/interop_openssl_smime_oracle.rs` validates AS2 in both directions
 against the `openssl smime` CLI — no container required:
@@ -194,7 +209,7 @@ carried only in the HTTP header).
 
 ---
 
-## Independent oracle — shipped
+### XMLDSig — xmlsec1
 
 `tests/interop_xmlsec_oracle.rs` verifies ASX-generated WS-Security signatures
 with **xmlsec1**, the W3C XMLDSig reference implementation, in a container:
@@ -210,12 +225,10 @@ nothing would look like a pass.
 Managed with **testcontainers** (`blocking` runner, `WaitFor::Exit`), so the
 container is removed even if an assertion panics.
 
-This is the cheapest possible independent check (no gateway, no PModes, no
-keystores, ~2 s) and it targets the exact defect class this codebase keeps
-producing: canonicalization and digest disagreements that our own verifier
-cannot see because it shares the signer's assumptions. **It found a real defect on
-its first run** — a whitespace-stripping bug that made every ASX signature
-non-interoperable, invisible to 998 other tests.
+The cheapest independent check in the suite (no gateway, no PModes, no
+keystores, ~2 s). It targets the defect class our own verifier structurally
+cannot see, because it shares the signer's assumptions: canonicalization and
+digest disagreements.
 
 Three harness transformations are applied, none changing any digest input: the
 `cid:` reference is retargeted to a local file with identical octets (xmlsec1
@@ -230,95 +243,34 @@ the interoperability question the oracle exists to answer.
 
 ---
 
-## Self-hosted end-to-end testing (do this first)
+## Running the oracles locally
 
-Since ITB is EUPL and Docker-distributed, and Domibus — the very access point
-DIGIT uses as Test Driver — is also freely available, **the whole loop can run
-locally and in CI without registering for anything.**
+All oracle tests are `#[ignore]`d and Docker-backed where a container is
+needed; CI runs them in a dedicated `interop-docker-oracles` job.
 
-### Option A — real counterparty, via testcontainers
-
-Exchange real AS4 traffic with an independent implementation. This is the
-third-party interop evidence the project still lacks, and unlike the official run it executes on
-every commit.
-
-**On testcontainers-rs.** The crate is `testcontainers` (0.27.x as of
-2026-04), the official Rust fork of testcontainers.org. `GenericImage` plus a
-`WaitFor` strategy covers a gateway container:
-
-```rust
-let container = GenericImage::new("holodeck", "7")
-    .with_exposed_port(8080.tcp())
-    .with_wait_for(WaitFor::message_on_stdout("Server startup"))
-    .start()
-    .await?;
-let port = container.get_host_port_ipv4(8080).await?;
+```bash
+cargo test --all-features -- --ignored
 ```
 
-`WaitFor::Exit(ExitWaitStrategy::new())` also covers **run-to-completion**
-containers, which is how the xmlsec1 oracle uses it — no ports, just a
-bind-mount, a command, and the exit code plus captured stdout/stderr. That is
-why the oracle uses testcontainers rather than shelling out to `docker run`:
-the container is torn down when the handle drops, including when an assertion
-panics, and a missing daemon produces a typed error instead of a silently
-skipped test.
+`testcontainers` is a dev-dependency only. The container is torn down when the
+handle drops — including when an assertion panics — and a missing Docker daemon
+surfaces as a typed error rather than a silently skipped test.
 
-`testcontainers` is a **dev-dependency only** (`features = ["blocking"]`), and
-every test that uses it is `#[ignore]`d, so a normal `cargo test` never starts
-a container.
+## Toward official certification
 
-Candidate counterparties, in rough order of value:
+Two things the library deliberately does not provide stand between it and a
+registration, both listed under [Coverage](#coverage): a publicly reachable
+access point binary, and a SUT Controller. Both are deployment code you write
+around `asx-rs` using the `server` and `client` features.
 
-| Counterparty | Why | Notes |
-|---|---|---|
-| **Domibus** | It *is* the conformance Test Driver — passing against it strongly predicts passing officially | Heaviest to start; needs a DB container |
-| **phase4** | Closest analogue (embeddable Java AS4 library), Peppol/CEF profiles built in | Lighter than Domibus |
-| **Holodeck B2B** | Long-standing independent implementation | Good third data point |
-
-Shape of the harness:
-
-```
-#[tokio::test]
-#[ignore = "requires docker"]           // opt-in: `cargo test -- --ignored`
-async fn as4_push_is_accepted_by_domibus() {
-    let gateway = Domibus::default().start().await?;   // testcontainers
-    // ASX sends a signed+encrypted push to the container's AS4 endpoint
-    // and verifies the returned receipt with `verify_sync_response`.
-}
-```
-
-Both directions matter: **ASX → counterparty** proves our send path produces
-conformant wire bytes; **counterparty → ASX** proves our receive path accepts
-what real implementations emit. The second direction is where the defects found
-in this codebase have clustered (attachment coverage, single-quoted `href`,
-`ds:CanonicalizationMethod`) — precisely because in-crate fixtures are written
-by the same hands as the parser.
-
-Gate it behind `#[ignore]` plus a `docker` CI job so the default `cargo test`
-stays hermetic and fast.
-
-### Option B — self-hosted ITB with the real test suite
-
-Stand up GITB from the `ISAITB` Docker images and run the actual eDelivery test
-cases locally. This gets you the *same assertions* the official run uses,
-without registration or a public URL.
-
-The catch: the published messaging adapter, `isaitb/asx-messaging-v4`, drives
-**Domibus** via its Default WebService Plugin. To point the suite at ASX you
-implement the GITB messaging-service API (a small SOAP service: send, check
-acknowledgement, receive by message id) on top of ASX — which is most of the
-SUT Controller work anyway, so it is not wasted effort.
-
-### Recommended order
-
-1. **Option A** with one counterparty, wired into CI. Cheapest, immediate, and
-   catches the class of bug that internal fixtures structurally cannot.
-2. **Option B** once the messaging adapter exists — the official assertions,
-   run locally.
-3. **Official registration** for the certificate, once 1 and 2 are green. By
-   then the SUT Controller exists and the run is a formality.
-
----
+The ITB is EUPL-licensed and Docker-distributed, so the official assertions can
+be run locally before registering for anything: stand up GITB from the `ISAITB`
+images and run the eDelivery AS4 test cases against your access point. The
+published messaging adapter (`isaitb/asx-messaging-v4`) drives **Domibus** via
+its Default WebService Plugin, so pointing the suite at your own SUT means
+implementing the GITB messaging-service API — a small SOAP service (send, check
+acknowledgement, receive by message id). That is most of the SUT Controller
+work, so it is not spent twice.
 
 ## References
 

@@ -8,7 +8,7 @@ mod common;
 // ebMS 3.0 §5, SOAP 1.2, and XML 1.0 processing rules.
 
 use crate::common::{as4_strict_push_policy, as4_unsigned_push_policy};
-use asx_rs::as4::{As4ReceivePushRequest, As4ReceivePushSyncRequest, receive_push_with_dedup_sync};
+use asx_rs::as4::{As4ReceivePushRequest, As4ReceivePushSync, receive_push_sync};
 use asx_rs::core::{ErrorCode, SessionContext};
 use asx_rs::observability::EventBus;
 use asx_rs::reliability::InMemoryDedupBackend;
@@ -17,8 +17,8 @@ fn session() -> SessionContext {
     SessionContext::new("s-adversarial", "p-adversarial", "strict").expect("session")
 }
 
-fn dedup() -> InMemoryDedupBackend {
-    InMemoryDedupBackend::default()
+fn dedup() -> std::sync::Arc<dyn asx_rs::storage::DedupStorage> {
+    std::sync::Arc::new(InMemoryDedupBackend::default())
 }
 
 fn bus() -> EventBus {
@@ -95,10 +95,10 @@ fn push(payload: &[u8]) -> asx_rs::core::Result<asx_rs::as4::As4ReceivePushOutpu
         ensure_required_strict_properties_in_xml(&normalized_payload).into_bytes()
     };
     let http_content_type = content_type_for_payload(&payload_owned);
-    receive_push_with_dedup_sync(
+    receive_push_sync(
         &session(),
         &bus,
-        As4ReceivePushSyncRequest {
+        As4ReceivePushSync {
             request: As4ReceivePushRequest {
                 http_content_type,
                 payload: payload_owned.into(),
@@ -106,10 +106,11 @@ fn push(payload: &[u8]) -> asx_rs::core::Result<asx_rs::as4::As4ReceivePushOutpu
                 policy: as4_unsigned_push_policy(),
                 authenticated_sender_scope: None,
             },
-            dedup_backend: &dedup(),
+            dedup: dedup(),
+            signer_pins: None,
         },
     )
-    .map(|o| o.unwrap_output())
+    .map(|o| o.unwrap_output().0)
 }
 
 fn push_signed_required(payload: &[u8]) -> asx_rs::core::Result<asx_rs::as4::As4ReceivePushOutput> {
@@ -126,10 +127,10 @@ fn push_signed_required(payload: &[u8]) -> asx_rs::core::Result<asx_rs::as4::As4
         ensure_required_strict_properties_in_xml(&normalized_payload).into_bytes()
     };
     let http_content_type = content_type_for_payload(&payload_owned);
-    receive_push_with_dedup_sync(
+    receive_push_sync(
         &session(),
         &bus,
-        As4ReceivePushSyncRequest {
+        As4ReceivePushSync {
             request: As4ReceivePushRequest {
                 http_content_type,
                 payload: payload_owned.into(),
@@ -137,10 +138,11 @@ fn push_signed_required(payload: &[u8]) -> asx_rs::core::Result<asx_rs::as4::As4
                 policy: as4_strict_push_policy(),
                 authenticated_sender_scope: None,
             },
-            dedup_backend: &dedup(),
+            dedup: dedup(),
+            signer_pins: None,
         },
     )
-    .map(|o| o.unwrap_output())
+    .map(|o| o.unwrap_output().0)
 }
 
 fn multipart_payload_with_cid(soap_xml: &[u8], payload_cid: &str, payload: &[u8]) -> Vec<u8> {
@@ -2421,10 +2423,10 @@ fn rejects_receipt_namespace_confusion_with_fake_receipt_element() {
         <S12:Body/>
     </S12:Envelope>"#;
 
-    let err = receive_push_with_dedup_sync(
+    let err = receive_push_sync(
         &session(),
         &bus,
-        As4ReceivePushSyncRequest {
+        As4ReceivePushSync {
             request: As4ReceivePushRequest {
                 http_content_type: content_type_for_payload(&payload),
                 payload: payload.into(),
@@ -2432,7 +2434,8 @@ fn rejects_receipt_namespace_confusion_with_fake_receipt_element() {
                 policy: as4_unsigned_push_policy(),
                 authenticated_sender_scope: None,
             },
-            dedup_backend: &dedup(),
+            dedup: dedup(),
+            signer_pins: None,
         },
     )
     .expect_err("namespace-confused receipt must be rejected");

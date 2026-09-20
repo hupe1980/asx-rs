@@ -120,6 +120,8 @@ jobs:
           cargo test --all-features --test as4_pull_flow
           cargo test --all-features --test wssec_c14n_vectors
           cargo test --all-features --test wssec_strict_matrix
+      - name: AS2 S/MIME oracle against the openssl CLI
+        run: cargo test --all-features --test interop_openssl_smime_oracle -- --ignored --nocapture
 
   property-and-fuzz-smoke:
     runs-on: ubuntu-latest
@@ -167,6 +169,33 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
       - name: Run Session Isolation Integration Suite
         run: cargo test --all-features --test session_isolation_concurrency
+
+  # Docker-backed foreign-implementation oracles.
+  #
+  # These are `#[ignore]`d so a normal `cargo test` stays hermetic and offline;
+  # this job is the only place they run. Each one exists because testing
+  # against ourselves proves agreement with ourselves:
+  #
+  # - Holodeck B2B  — an independent WSS4J-based AS4 stack, for the protocol.
+  # - Redis         — a real network-backed store, for the async half of the
+  #                   storage traits that no in-tree backend exercises (D61).
+  #
+  # `continue-on-error` is deliberate: these depend on third-party images and
+  # a Docker daemon, and an outage there must not block a merge. The result is
+  # still visible on the run.
+  interop-docker-oracles:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: WS-Security signatures against xmlsec1
+        run: cargo test --all-features --test interop_xmlsec_oracle -- --ignored --nocapture
+      - name: Storage conformance against a real Redis
+        run: cargo test --all-features --test interop_redis_storage_conformance -- --ignored --nocapture
+      - name: Signed AS4 exchange against Holodeck B2B
+        run: cargo test --all-features --test interop_holodeck_counterparty -- --ignored --nocapture
 
   coverage-profile-interop:
     runs-on: ubuntu-latest

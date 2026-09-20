@@ -60,7 +60,7 @@ fn anchors() -> OwnedRevocationPolicy {
 
 fn verify(xml: &str) -> asx_rs::core::Result<()> {
     let owned = anchors();
-    verify_enveloped_document_signature(xml, None, &RevocationPolicy::from(&owned)).map(|_| ())
+    verify_enveloped_document_signature(xml, &[], &RevocationPolicy::from(&owned)).map(|_| ())
 }
 
 /// A reference that is not whole-document is rejected by name rather than

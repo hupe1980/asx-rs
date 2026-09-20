@@ -190,7 +190,8 @@ Common event types:
 | `MessageSigned` | Signature applied |
 | `MessageEncrypted` | Encryption applied |
 | `InboundReceived` | Receive path entered |
-| `DuplicateDetected` | Message ID already seen in dedup store |
+| `DuplicateDetected` | Message ID already **accepted** — a genuine replay |
+| `DuplicateInFlight` | A concurrent delivery holds an unsettled dedup claim. A sustained rate means claims are being dropped unsettled, or the claim lease outlasts the sender's retransmission interval |
 | `SignatureVerified` | Cryptographic signature check passed |
 | `SignatureFailed` | Cryptographic signature check failed |
 | `MdnGenerated` | AS2 MDN constructed |

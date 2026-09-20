@@ -11,57 +11,161 @@ The `reliability` and `storage` modules provide the infrastructure for exactly-o
 
 ## Deduplication
 
+Deduplication is **two-phase**. A key is *claimed* before the message is
+processed and *settled* once its fate is known, because a single call that both
+records the key and answers cannot express the state that matters: seen, but not
+yet known to be handled.
+
 ### `DedupStorage` trait
 
 ```rust
+pub enum DedupVerdict {
+    /// First sight. The caller owns an unsettled claim and must settle it.
+    Claimed,
+    /// A previous attempt was accepted — a genuine replay.
+    Duplicate,
+    /// Another attempt holds an unsettled claim (a concurrent delivery).
+    InFlight,
+}
+
 pub trait DedupStorage: Send + Sync {
-    /// Attempt to record the key as seen. Returns Ok(true) if first time seen,
-    /// Ok(false) if duplicate. Implementations must be safe for concurrent use.
-    fn first_seen(&self, key: &str) -> Result<bool>;
+    fn is_durable(&self) -> bool;
+    fn cluster_safe(&self) -> bool { false }
+
+    /// Phase 1: atomically claim the key, or report what already holds it.
+    fn claim(&self, key: &str) -> Result<DedupVerdict>;
+
+    /// Phase 2a: the message is durably handled. Replays are now rejected.
+    fn accept(&self, key: &str) -> Result<()>;
+
+    /// Phase 2b: the message was NOT handled. Release the key so the sender's
+    /// retransmission is processed.
+    fn abandon(&self, key: &str) -> Result<()>;
 }
 ```
 
-Protocol functions accept `Arc<dyn DedupStorage>`. Pass the same instance across all concurrent receive calls for a given session to enforce deduplication correctly.
+Protocol functions accept `Arc<dyn DedupStorage>`. Pass the same instance across
+all concurrent receive calls for a given session.
 
-### In-memory dedup
+`Err` from any method must **fail closed** — a backend that cannot answer must
+never be read as "not seen".
+
+### Settling the claim
+
+A first-seen message arrives with an unsettled `DedupClaim`:
 
 ```rust
-use asx_rs::storage::InMemoryDedupStorage;
+use asx_rs::as4::As4ReceiveOutcome;
 
-let dedup = Arc::new(InMemoryDedupStorage::default());
+match receive_push(&session, &bus, push).await?.into_inner() {
+    As4ReceiveOutcome::FirstSeen { output, claim } => {
+        match persist_and_dispatch(&output).await {
+            // Handled, or durably dead-lettered: it is ours now, and a
+            // retransmission must not deliver it a second time.
+            Ok(()) => claim.accept().await?,
+            // We could not take responsibility for it. Release the key so the
+            // sender's retransmission is processed instead of swallowed.
+            Err(e) => {
+                claim.abandon().await?;
+                return Err(e);
+            }
+        }
+        // ... return an AS4 receipt
+    }
+    As4ReceiveOutcome::Duplicate { .. } => {
+        // Already accepted. Return a receipt without re-dispatching — the
+        // sender may not have received the first one.
+    }
+    As4ReceiveOutcome::InFlight { .. } => {
+        // A concurrent delivery still holds the claim. Do NOT acknowledge:
+        // answer 503 and let ReceptionAwareness retransmit.
+    }
+    _ => {}
+}
 ```
 
-`InMemoryDedupStorage` uses a `Mutex<HashSet<String>>`. It is correct under concurrent access but does **not** persist across process restarts. All previously-seen message IDs are forgotten on restart. For production deployments requiring replay protection across restarts, implement `DedupStorage` against a persistent store (Redis, DynamoDB, PostgreSQL).
+The caller settles because only the caller knows whether the message was
+*handled* — committed with your business transaction, queued, or dead-lettered.
+`asx-rs` knows only that it parsed, verified and decrypted.
 
-### TTL-aware dedup
+> **The claim is `#[must_use]`.** Dropping one without settling it holds the
+> `eb:MessageId` until the backend's claim lease expires, and every
+> retransmission in that window is answered `InFlight`. That is a delay rather
+> than a loss, but it is still a bug.
+
+### Claim leases
+
+An unsettled claim must expire, or a process that dies between `claim` and
+`accept` wedges that message forever. Size the lease **above** the longest
+plausible processing time and **below** the sender's retransmission interval.
+The in-tree backends default to 5 minutes:
 
 ```rust
 use asx_rs::storage::TtlDedupStorage;
 use std::time::Duration;
 
-// Expire entries after 48 hours (RFC 4130 §5.2.1 recommended window):
+let dedup = Arc::new(
+    TtlDedupStorage::new(Duration::from_secs(48 * 3600))
+        .with_claim_lease(Duration::from_secs(120)),
+);
+```
+
+### In-memory backends
+
+```rust
+use asx_rs::storage::TtlDedupStorage;
+use std::time::Duration;
+
+// The TTL *is* the replay window.
 let dedup = Arc::new(TtlDedupStorage::new(Duration::from_secs(48 * 3600)));
 ```
 
-`TtlDedupStorage` wraps `InMemoryDedupStorage` with lazy per-entry expiry based on `first_seen` timestamp. Entries older than the TTL are treated as unseen (first occurrence accepted again). Expiry is lazy — entries are not evicted on a background thread; they are checked on next access.
+`TtlDedupStorage` is the only in-tree backend. Memory is bounded by the replay
+window rather than by a key count, and expiry is lazy — entries are checked on
+access and swept periodically, not on a background thread.
 
-> **Production note:** `TtlDedupStorage` is still in-memory. For replay protection across process restarts, plug in a persistent backend. The minimum recommended window is 48 hours per RFC 4130 §5.2.1.
+It is in-memory, so the window resets on restart. RFC 4130 §5.2.1 recommends
+**48 hours**; for production, implement `DedupStorage` against a persistent
+store.
 
 ### Implementing a custom backend
 
+The whole `claim` decision — inspect, expire, insert — must be **one atomic
+step**. A read followed by a separate write lets two concurrent deliveries of
+the same message both claim it.
+
 ```rust
-use asx_rs::storage::DedupStorage;
+use asx_rs::storage::{DedupStorage, DedupVerdict};
 use asx_rs::Result;
 
 struct RedisDedupStorage { /* ... */ }
 
 impl DedupStorage for RedisDedupStorage {
-    fn first_seen(&self, key: &str) -> Result<bool> {
-        // SET NX + EXPIRE in Redis
+    fn is_durable(&self) -> bool { true }
+    fn cluster_safe(&self) -> bool { true }
+
+    fn claim(&self, key: &str) -> Result<DedupVerdict> {
+        // SET key "inflight" NX EX <lease>  -> Claimed when created.
+        // Otherwise GET decides Duplicate ("accepted") vs InFlight.
+        todo!()
+    }
+
+    fn accept(&self, key: &str) -> Result<()> {
+        // SET key "accepted" EX <ttl>   (overwrites our own claim)
+        todo!()
+    }
+
+    fn abandon(&self, key: &str) -> Result<()> {
+        // DEL key, but only while it is still "inflight" — an accepted key
+        // must survive a late abandon.
         todo!()
     }
 }
 ```
+
+Verify it with `asx_rs::storage::conformance::DedupConformance`, which races
+concurrent claims and checks each settlement rule. See
+[Testing](@/docs/testing.md).
 
 ---
 

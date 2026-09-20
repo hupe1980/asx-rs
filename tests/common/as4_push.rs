@@ -4,8 +4,6 @@ use asx_rs::core::{CertHandle, OcspMode};
 #[cfg(feature = "as4")]
 use asx_rs::crypto::wssec::{WsSecOutboundKeyInfoProfile, generate_xmlsig_signature};
 use asx_rs::reliability::InMemoryDedupBackend;
-#[cfg(feature = "as4")]
-use sha2::{Digest, Sha256};
 
 #[inline]
 #[cfg(feature = "as4")]
@@ -90,17 +88,14 @@ pub(crate) fn session() -> SessionContext {
 }
 
 #[cfg(feature = "as4")]
+/// The pinnable fingerprint of a certificate.
+///
+/// Uses the crate's own public helper rather than reimplementing PEM → DER →
+/// SHA-256, which is the thing integrators previously had to do by hand.
 fn cert_fingerprint_sha256_hex(cert_pem: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let cert = openssl::x509::X509::from_pem(cert_pem).expect("valid certificate PEM");
-    let der = cert.to_der().expect("valid certificate DER");
-    let digest = Sha256::digest(&der);
-    let mut out = String::with_capacity(digest.len() * 2);
-    for &byte in &digest {
-        out.push(HEX[(byte >> 4) as usize] as char);
-        out.push(HEX[(byte & 0x0f) as usize] as char);
-    }
-    out
+    asx_rs::crypto::CertFingerprint::from_cert_pem(cert_pem)
+        .expect("valid certificate PEM")
+        .to_string()
 }
 
 #[cfg(feature = "as4")]
@@ -118,6 +113,6 @@ pub(crate) fn session_with_trust_anchor_and_fingerprint_pin(anchor_pem: &[u8]) -
 }
 
 #[inline]
-pub(crate) fn dedup_backend() -> InMemoryDedupBackend {
-    InMemoryDedupBackend::default()
+pub(crate) fn dedup_backend() -> std::sync::Arc<dyn asx_rs::storage::DedupStorage> {
+    std::sync::Arc::new(InMemoryDedupBackend::default())
 }

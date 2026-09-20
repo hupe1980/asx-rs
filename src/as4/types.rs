@@ -9,6 +9,7 @@ use crate::interop::InteropExceptionPolicy;
 use crate::lifecycle::DomainReady;
 use crate::reliability::{DeliveryOutcome, RetryDecision};
 use crate::sbdh::SbdhHeader;
+use crate::storage::DedupClaim;
 use std::sync::Arc;
 use zeroize::Zeroize;
 
@@ -1221,6 +1222,16 @@ pub struct As4ReceivePushRequest {
     ///
     /// For non-fragment (normal push) messages this field is ignored and may be
     /// `None`.
+    ///
+    /// # Not a sender-authentication mechanism
+    ///
+    /// Supplying it does **not** authenticate the sender, and nothing checks
+    /// it against the message's claimed `eb:From`. It scopes fragment
+    /// reassembly so one sender cannot inject fragments into another's group,
+    /// and that is all. What binds a verified signature to a claimed party is
+    /// [`As4ReceivePush::signer_pins`](crate::as4::As4ReceivePush::signer_pins)
+    /// — or, for a single partner,
+    /// [`SessionContextBuilder::with_fingerprint_sha256`](crate::core::SessionContextBuilder::with_fingerprint_sha256).
     pub authenticated_sender_scope: Option<Arc<str>>,
 }
 
@@ -1477,7 +1488,7 @@ pub struct As4ReceivedPayload {
     pub payload: DomainReady<Arc<[u8]>>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 #[non_exhaustive]
 pub enum As4ReceivePushProgress {
     PendingFragment {
@@ -1485,13 +1496,22 @@ pub enum As4ReceivePushProgress {
         received_fragments: usize,
         expected_fragments: Option<usize>,
     },
-    Complete(Box<As4ReceivePushOutput>),
-    /// The message was already processed — idempotent replay detected by the
-    /// dedup store.  Return an acknowledgement without re-dispatching to
-    /// business logic.
-    Duplicate {
-        message_id: String,
+    /// The message is verified and ready for business processing, and its
+    /// idempotency key is **claimed but unsettled**.
+    ///
+    /// Settle `claim` once the message's fate is durable — see [`DedupClaim`].
+    Complete {
+        output: Box<As4ReceivePushOutput>,
+        claim: DedupClaim,
     },
+    /// The message was already processed — a settled replay. Return an
+    /// acknowledgement without re-dispatching to business logic.
+    Duplicate { message_id: String },
+    /// A concurrent delivery of this message holds an unsettled claim.
+    ///
+    /// Neither accepted nor rejected: do **not** acknowledge it, so the sender
+    /// retransmits under `ReceptionAwareness` once the other attempt settles.
+    InFlight { message_id: String },
 }
 
 /// Outcome of a non-fragment-aware AS4 push receive call.
@@ -1501,31 +1521,73 @@ pub enum As4ReceivePushProgress {
 /// (return an idempotent acknowledgement without re-dispatching) at the call
 /// site — no `EventBus` subscription required.
 ///
+/// # Settling the claim
+///
+/// A first-seen message arrives with an unsettled [`DedupClaim`]. Until it is
+/// settled the key is held but nothing is permanently deduplicated, so the
+/// decision of whether a retransmission may be reprocessed is the caller's —
+/// which is the whole point: only the caller knows whether it took durable
+/// responsibility for the message.
+///
 /// # Example
-/// ```rust,ignore
-/// match receive_push_with_dedup_async(&session, &bus, req, dedup).await? {
-///     As4ReceiveOutcome::FirstSeen(output) => dispatch_to_workflow(output),
-///     As4ReceiveOutcome::Duplicate { message_id } => {
-///         tracing::info!(%message_id, "replay ignored");
-///         // still send an AS4 receipt — the sender may not have received the first one
+/// ```no_run
+/// use asx_rs::as4::{As4ReceiveOutcome, As4ReceivePushOutput};
+///
+/// # async fn example(outcome: As4ReceiveOutcome) -> asx_rs::Result<()> {
+/// # fn dispatch_to_workflow(_: &As4ReceivePushOutput) -> asx_rs::Result<()> { Ok(()) }
+/// match outcome {
+///     As4ReceiveOutcome::FirstSeen { output, claim } => {
+///         match dispatch_to_workflow(&output) {
+///             // Handled, or durably dead-lettered: a replay must not redo it.
+///             Ok(()) => claim.accept().await?,
+///             // We could not take responsibility — let the sender retransmit.
+///             Err(e) => {
+///                 claim.abandon().await?;
+///                 return Err(e);
+///             }
+///         }
 ///     }
+///     As4ReceiveOutcome::Duplicate { message_id } => {
+///         // Still send an AS4 receipt — the sender may not have received the first one.
+///         let _ = message_id;
+///     }
+///     As4ReceiveOutcome::InFlight { message_id } => {
+///         // Do NOT acknowledge: answer 503 and let ReceptionAwareness retry.
+///         let _ = message_id;
+///     }
+///     // The enum is `#[non_exhaustive]`; treat anything new as "do not
+///     // acknowledge" until the variant is handled deliberately.
+///     _ => {}
 /// }
+/// # Ok(())
+/// # }
 /// ```
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 #[non_exhaustive]
 pub enum As4ReceiveOutcome {
     /// First occurrence: message verified and ready for business processing.
-    FirstSeen(Box<As4ReceivePushOutput>),
-    /// Replay: already processed.  Use `message_id` to correlate and return
-    /// an idempotent acknowledgement without re-dispatching.
+    ///
+    /// `claim` is unsettled — call [`DedupClaim::accept`] or
+    /// [`DedupClaim::abandon`].
+    FirstSeen {
+        output: Box<As4ReceivePushOutput>,
+        claim: DedupClaim,
+    },
+    /// Replay of a message that was already accepted.  Use `message_id` to
+    /// correlate and return an idempotent acknowledgement without
+    /// re-dispatching.
     Duplicate { message_id: String },
+    /// A concurrent attempt holds an unsettled claim on this message.
+    ///
+    /// Do not acknowledge; see [`As4ReceivePushProgress::InFlight`].
+    InFlight { message_id: String },
 }
 
 impl As4ReceiveOutcome {
     /// Returns `true` if this is a first-seen message.
     #[inline]
     pub fn is_first_seen(&self) -> bool {
-        matches!(self, Self::FirstSeen(_))
+        matches!(self, Self::FirstSeen { .. })
     }
 
     /// Returns `true` if this is a duplicate replay.
@@ -1534,25 +1596,45 @@ impl As4ReceiveOutcome {
         matches!(self, Self::Duplicate { .. })
     }
 
-    /// Consume the outcome and return the output if first-seen, `None` for duplicates.
+    /// Returns `true` if a concurrent delivery holds the claim.
     #[inline]
-    pub fn into_output(self) -> Option<As4ReceivePushOutput> {
+    pub fn is_in_flight(&self) -> bool {
+        matches!(self, Self::InFlight { .. })
+    }
+
+    /// The `eb:MessageId` this outcome refers to.
+    #[inline]
+    pub fn message_id(&self) -> &str {
         match self {
-            Self::FirstSeen(output) => Some(*output),
-            Self::Duplicate { .. } => None,
+            Self::FirstSeen { output, .. } => &output.user_message.message_id,
+            Self::Duplicate { message_id } | Self::InFlight { message_id } => message_id,
         }
     }
 
-    /// Unwrap the output, panicking on duplicates.  Only use after `is_duplicate()` check.
+    /// Consume the outcome and return the output and its claim if first-seen,
+    /// `None` otherwise.
+    #[inline]
+    pub fn into_output(self) -> Option<(As4ReceivePushOutput, DedupClaim)> {
+        match self {
+            Self::FirstSeen { output, claim } => Some((*output, claim)),
+            Self::Duplicate { .. } | Self::InFlight { .. } => None,
+        }
+    }
+
+    /// Unwrap the output and claim, panicking on anything else.  Only use
+    /// after an `is_first_seen()` check.
     ///
     /// # Panics
-    /// Panics if called on a `Duplicate` variant.
+    /// Panics on a `Duplicate` or `InFlight` variant.
     #[inline]
-    pub fn unwrap_output(self) -> As4ReceivePushOutput {
+    pub fn unwrap_output(self) -> (As4ReceivePushOutput, DedupClaim) {
         match self {
-            Self::FirstSeen(output) => *output,
+            Self::FirstSeen { output, claim } => (*output, claim),
             Self::Duplicate { ref message_id } => {
                 panic!("called unwrap_output on a Duplicate (message_id={message_id})")
+            }
+            Self::InFlight { ref message_id } => {
+                panic!("called unwrap_output on an InFlight claim (message_id={message_id})")
             }
         }
     }
@@ -2084,13 +2166,21 @@ pub struct As4ReceivePullRequest {
     pub authorization_info: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct As4ReceivePullOutput {
     pub pull_message_id: Arc<str>,
     pub correlation_message_id: Option<Arc<str>>,
     pub mpc: Arc<str>,
     pub duplicate_retrieval: bool,
     pub pulled: Option<Arc<As4ReceivePushOutput>>,
+    /// Unsettled dedup claim on the **pulled `UserMessage`**, present exactly
+    /// when `pulled` is a message this call dequeued and delivered for the
+    /// first time.
+    ///
+    /// Settle it once the payload is durably handled — see [`DedupClaim`]. A
+    /// replayed retrieval served from the pull store's cache carries `None`:
+    /// its claim was settled by the call that first delivered it.
+    pub claim: Option<DedupClaim>,
     pub outcome: DeliveryOutcome,
     pub retry: RetryDecision,
 }

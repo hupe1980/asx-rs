@@ -6,8 +6,7 @@ mod common;
 use asx_rs::as2::receive_with_mdn_with_reliability;
 use asx_rs::as2::{As2MdnMode, As2ReceiveMdnRequest, As2ReceivePolicy};
 use asx_rs::as4::{
-    As4PushPolicyBuilder, As4ReceivePushRequest, As4ReceivePushSyncRequest,
-    receive_push_with_dedup_sync,
+    As4PushPolicyBuilder, As4ReceivePushRequest, As4ReceivePushSync, receive_push_sync,
 };
 use asx_rs::core::{ErrorCode, InteropMode, SessionContext};
 use asx_rs::interop::{InteropExceptionCode, InteropExceptionPolicy};
@@ -25,10 +24,13 @@ fn relaxed_session() -> SessionContext {
     SessionContext::new("sess-relaxed", "partner-a", "partner-quirks").expect("session")
 }
 
-fn reliability() -> (InMemoryReconciliationHook, InMemoryDedupBackend) {
+fn reliability() -> (
+    InMemoryReconciliationHook,
+    std::sync::Arc<dyn asx_rs::storage::DedupStorage>,
+) {
     (
         InMemoryReconciliationHook::default(),
-        InMemoryDedupBackend::default(),
+        std::sync::Arc::new(InMemoryDedupBackend::default()),
     )
 }
 
@@ -95,7 +97,7 @@ disposition: automatic-action/MDN-sent-automatically; processed/warning: boundar
                 &bus,
                 strict_req,
                 &strict_hook,
-                &strict_dedup,
+                strict_dedup.clone(),
                 &verifier,
             )
         },
@@ -105,7 +107,7 @@ disposition: automatic-action/MDN-sent-automatically; processed/warning: boundar
                 &bus,
                 relaxed_req,
                 &relaxed_hook,
-                &relaxed_dedup,
+                relaxed_dedup.clone(),
                 &verifier,
             )
         }
@@ -188,14 +190,16 @@ async fn as4_strict_and_relaxed_sessions_run_concurrently_without_event_leakage(
       <S12:Body/>
     </S12:Envelope>"#;
 
-    let strict_dedup = InMemoryDedupBackend::default();
-    let relaxed_dedup = InMemoryDedupBackend::default();
+    let strict_dedup: std::sync::Arc<dyn asx_rs::storage::DedupStorage> =
+        std::sync::Arc::new(InMemoryDedupBackend::default());
+    let relaxed_dedup: std::sync::Arc<dyn asx_rs::storage::DedupStorage> =
+        std::sync::Arc::new(InMemoryDedupBackend::default());
     let (strict_out, relaxed_out) = tokio::join!(
         async {
-            receive_push_with_dedup_sync(
+            receive_push_sync(
                 &strict,
                 &bus,
-                As4ReceivePushSyncRequest {
+                As4ReceivePushSync {
                     request: As4ReceivePushRequest {
                         http_content_type: "application/soap+xml".into(),
                         payload: strict_payload.to_vec().into(),
@@ -206,15 +210,16 @@ async fn as4_strict_and_relaxed_sessions_run_concurrently_without_event_leakage(
                             .expect("policy"),
                         authenticated_sender_scope: None,
                     },
-                    dedup_backend: &strict_dedup,
+                    dedup: strict_dedup.clone(),
+                    signer_pins: None,
                 },
             )
         },
         async {
-            receive_push_with_dedup_sync(
+            receive_push_sync(
                 &relaxed,
                 &bus,
-                As4ReceivePushSyncRequest {
+                As4ReceivePushSync {
                     request: As4ReceivePushRequest {
                         http_content_type: "application/soap+xml".into(),
                         payload: relaxed_payload.to_vec().into(),
@@ -228,7 +233,8 @@ async fn as4_strict_and_relaxed_sessions_run_concurrently_without_event_leakage(
                             .expect("policy"),
                         authenticated_sender_scope: None,
                     },
-                    dedup_backend: &relaxed_dedup,
+                    dedup: relaxed_dedup.clone(),
+                    signer_pins: None,
                 },
             )
         }

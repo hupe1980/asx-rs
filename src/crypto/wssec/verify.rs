@@ -15,9 +15,9 @@ use super::canonicalize::{
     normalize_same_document_uri, try_serialize_node,
 };
 use super::x509::{
-    extract_rsa_keyvalue_from_cert, normalize_fingerprint, pkey_from_rsa_components,
-    sha256_hex_lower, validate_cert_public_key_matches_rsa_keyvalue,
-    validate_pkix_chain_and_revocation, validate_x509_certificate,
+    extract_rsa_keyvalue_from_cert, pkey_from_rsa_components,
+    validate_cert_public_key_matches_rsa_keyvalue, validate_pkix_chain_and_revocation,
+    validate_x509_certificate,
 };
 use super::{
     ECDSA_SHA256_URI, ECDSA_SHA384_URI, ECDSA_SHA512_URI, RSA_SHA256_URI, RSA_SHA384_URI,
@@ -54,6 +54,7 @@ struct ParsedWsSecSignatureMaterialBorrowed<'a> {
     /// itself must render these prefixes; WSS4J-based stacks (phase4, Domibus,
     /// Oxalis) routinely declare their SOAP envelope prefix here, and ignoring
     /// the list makes every such signature fail with a bare value mismatch.
+    signed_info_c14n_kind: WsSecCanonicalizationKind,
     signed_info_inclusive_ns_prefixes: Vec<String>,
     signature_value: Vec<u8>,
     signature_method_algorithm: String,
@@ -520,7 +521,9 @@ pub fn verify_signature_references_strict(
 /// methods before passing to [`verify_enveloped_signature`].
 #[derive(Debug)]
 pub struct WsSecVerifyOptions<'a> {
-    pub(crate) expected_cert_fingerprint_sha256: Option<&'a str>,
+    /// Permitted signer fingerprints. Empty means "no pin configured";
+    /// the AS4 receive path refuses before reaching here in that case.
+    pub(crate) expected_cert_fingerprints: &'a [crate::crypto::CertFingerprint],
     pub(crate) revocation_policy: RevocationPolicy<'a>,
     pub(crate) external_references: &'a [(&'a str, &'a [u8])],
 }
@@ -533,7 +536,7 @@ impl<'a> WsSecVerifyOptions<'a> {
     /// paths.
     pub fn new() -> Self {
         Self {
-            expected_cert_fingerprint_sha256: None,
+            expected_cert_fingerprints: &[],
             revocation_policy: RevocationPolicy {
                 trust_anchor_pems: &[],
                 revocation_crl_pems: &[],
@@ -555,9 +558,15 @@ impl<'a> WsSecVerifyOptions<'a> {
         }
     }
 
-    /// Require the signing certificate to match this SHA-256 fingerprint.
-    pub fn with_expected_fingerprint(mut self, fingerprint: Option<&'a str>) -> Self {
-        self.expected_cert_fingerprint_sha256 = fingerprint;
+    /// Require the signing certificate to match one of these fingerprints.
+    ///
+    /// An empty slice applies no pin. On the AS4 receive path that state is
+    /// refused earlier, by the signer-pin resolver.
+    pub fn with_expected_fingerprints(
+        mut self,
+        fingerprints: &'a [crate::crypto::CertFingerprint],
+    ) -> Self {
+        self.expected_cert_fingerprints = fingerprints;
         self
     }
 
@@ -686,7 +695,7 @@ fn verify_enveloped_signature_with_parsed_signature_borrowed(
     verify_signature_value_with_components(
         parsed.signature_material,
         c14n_profile,
-        opts.expected_cert_fingerprint_sha256,
+        opts.expected_cert_fingerprints,
         &opts.revocation_policy,
     )
 }
@@ -1136,11 +1145,12 @@ fn validate_cid_reference_uri(uri: &str) -> Result<&str> {
 fn verify_signature_value_with_components(
     mat: ParsedWsSecSignatureMaterialBorrowed<'_>,
     profile: WsSecCanonicalizationProfile,
-    expected_cert_fingerprint_sha256: Option<&str>,
+    expected_cert_fingerprints: &[crate::crypto::CertFingerprint],
     revocation_policy: &RevocationPolicy<'_>,
 ) -> Result<()> {
     let ParsedWsSecSignatureMaterialBorrowed {
         signed_info,
+        signed_info_c14n_kind,
         signed_info_inclusive_ns_prefixes,
         signature_value,
         signature_method_algorithm,
@@ -1152,6 +1162,9 @@ fn verify_signature_value_with_components(
     // signer declared on ds:CanonicalizationMethod — the listed prefixes are
     // part of the canonical bytes the signature was computed over.
     let mut profile = profile;
+    // The signer's declared algorithm wins over the caller's default: the
+    // signature was computed over whatever `ds:CanonicalizationMethod` names.
+    profile.kind = signed_info_c14n_kind;
     profile.inclusive_ns_prefixes = signed_info_inclusive_ns_prefixes;
     let profile = profile;
     let is_rsa = signature_method_algorithm == RSA_SHA256_URI
@@ -1194,19 +1207,13 @@ fn verify_signature_value_with_components(
 
     validate_x509_certificate(signer_cert_der)?;
 
-    if let Some(expected) = expected_cert_fingerprint_sha256 {
-        let expected = normalize_fingerprint(expected).ok_or_else(|| {
-            AsxError::new(
-                ErrorCode::ParseFailed,
-                "expected certificate fingerprint is empty or invalid",
-                ErrorContext::new("wssec_verify_signature_value"),
-            )
-        })?;
-        let actual = sha256_hex_lower(signer_cert_der);
-        if actual != expected {
+    if !expected_cert_fingerprints.is_empty() {
+        let actual = crate::crypto::CertFingerprint::from_cert_der(signer_cert_der);
+        if !expected_cert_fingerprints.contains(&actual) {
             return Err(AsxError::new(
                 ErrorCode::SecurityVerificationFailed,
-                "signer certificate fingerprint does not match expected fingerprint",
+                "signer certificate fingerprint does not match any pinned fingerprint \
+                 for the claimed sender",
                 ErrorContext::new("wssec_verify_signature_value"),
             ));
         }
@@ -1332,6 +1339,7 @@ fn parse_signature_material_from_doc(
 
     let ParsedWsSecSignatureMaterialBorrowed {
         signed_info,
+        signed_info_c14n_kind,
         signed_info_inclusive_ns_prefixes,
         signature_value,
         signature_method_algorithm,
@@ -1341,6 +1349,10 @@ fn parse_signature_material_from_doc(
     } = parse_signature_material_components_from_signature(doc, signature)?;
 
     let mut profile = profile;
+    // As in `verify_signature_value_with_components`: the signature was
+    // computed over whatever `ds:CanonicalizationMethod` declares, so that is
+    // what SignedInfo must be serialized with (D68).
+    profile.kind = signed_info_c14n_kind;
     profile.inclusive_ns_prefixes = signed_info_inclusive_ns_prefixes;
     let mut signed_info_xml = String::new();
     try_serialize_node(
@@ -1413,8 +1425,14 @@ const EXC_C14N_WITH_COMMENTS_URI: &str = "http://www.w3.org/2001/10/xml-exc-c14n
 /// mean verifying under a different algorithm than the one declared.
 fn parse_signed_info_canonicalization_method(
     signed_info: roxmltree::Node<'_, '_>,
-) -> Result<Vec<String>> {
+) -> Result<(WsSecCanonicalizationKind, Vec<String>)> {
     const EXC_C14N_NS: &str = "http://www.w3.org/2001/10/xml-exc-c14n#";
+    /// Inclusive Canonical XML 1.0. Mandated for Peppol SMP `ds:Signature`
+    /// (SMP 1.4.0 §5.5.1, which changed it *from* exclusive in that release),
+    /// and the XMLDSig default for a reference that declares no transform (D49).
+    const INCLUSIVE_C14N_URI: &str = "http://www.w3.org/TR/2001/REC-xml-c14n-20010315";
+    const INCLUSIVE_C14N_WITH_COMMENTS_URI: &str =
+        "http://www.w3.org/TR/2001/REC-xml-c14n-20010315#WithComments";
 
     let method = signed_info
         .children()
@@ -1439,22 +1457,36 @@ fn parse_signed_info_canonicalization_method(
             )
         })?;
 
-    if algorithm != EXC_C14N_URI {
-        let detail = if algorithm == EXC_C14N_WITH_COMMENTS_URI {
-            "comment-preserving canonicalization is not supported"
-        } else {
-            "only Exclusive XML Canonicalization 1.0 is supported"
-        };
+    // Which canonicalization the signer declared decides how SignedInfo is
+    // serialized before the signature is checked. Both W3C algorithms are
+    // legitimate here and the networks disagree: AS4 WS-Security profiles
+    // require exclusive, Peppol SMP requires inclusive. Forcing one rejected
+    // every conformant SMP response (D68).
+    let kind = match algorithm {
+        EXC_C14N_URI => WsSecCanonicalizationKind::Exclusive,
+        INCLUSIVE_C14N_URI => WsSecCanonicalizationKind::Inclusive,
+        _ => {
+            let detail = if algorithm == EXC_C14N_WITH_COMMENTS_URI
+                || algorithm == INCLUSIVE_C14N_WITH_COMMENTS_URI
+            {
+                "comment-preserving canonicalization is not supported"
+            } else {
+                "only Canonical XML 1.0 (inclusive) and Exclusive XML Canonicalization 1.0 \
+                 are supported"
+            };
 
-        return Err(AsxError::new(
-            ErrorCode::InteropViolation,
-            format!(
-                "unsupported ds:CanonicalizationMethod Algorithm \"{algorithm}\": {detail} \
-                 (expected \"{EXC_C14N_URI}\", as required by the AS4 profiles)"
-            ),
-            ErrorContext::new("wssec_signature_material").with_message_id(algorithm.to_string()),
-        ));
-    }
+            return Err(AsxError::new(
+                ErrorCode::InteropViolation,
+                format!(
+                    "unsupported ds:CanonicalizationMethod Algorithm \"{algorithm}\": {detail} \
+                     (expected \"{EXC_C14N_URI}\" for AS4 WS-Security, or \
+                     \"{INCLUSIVE_C14N_URI}\" for Peppol SMP)"
+                ),
+                ErrorContext::new("wssec_signature_material")
+                    .with_message_id(algorithm.to_string()),
+            ));
+        }
+    };
 
     let mut inclusive_prefixes = Vec::new();
     for child in method.children().filter(roxmltree::Node::is_element) {
@@ -1478,7 +1510,20 @@ fn parse_signed_info_canonicalization_method(
         }
     }
 
-    Ok(inclusive_prefixes)
+    // `InclusiveNamespaces/@PrefixList` is an exclusive-C14N construct; under
+    // inclusive canonicalization the whole in-scope context is emitted anyway,
+    // so a prefix list would be meaningless rather than merely redundant.
+    if kind == WsSecCanonicalizationKind::Inclusive && !inclusive_prefixes.is_empty() {
+        return Err(AsxError::new(
+            ErrorCode::InteropViolation,
+            "ds:CanonicalizationMethod declares inclusive Canonical XML 1.0 but carries an \
+             exc-c14n InclusiveNamespaces PrefixList, which applies only to exclusive \
+             canonicalization",
+            ErrorContext::new("wssec_signature_material"),
+        ));
+    }
+
+    Ok((kind, inclusive_prefixes))
 }
 
 fn parse_signature_material_components_from_signature_with_signed_info<'a>(
@@ -1486,7 +1531,8 @@ fn parse_signature_material_components_from_signature_with_signed_info<'a>(
     signature: roxmltree::Node<'a, 'a>,
     signed_info: roxmltree::Node<'a, 'a>,
 ) -> Result<ParsedWsSecSignatureMaterialBorrowed<'a>> {
-    let signed_info_inclusive_ns_prefixes = parse_signed_info_canonicalization_method(signed_info)?;
+    let (signed_info_c14n_kind, signed_info_inclusive_ns_prefixes) =
+        parse_signed_info_canonicalization_method(signed_info)?;
 
     let signature_method_algorithm = signed_info
         .children()
@@ -1616,6 +1662,7 @@ fn parse_signature_material_components_from_signature_with_signed_info<'a>(
 
     Ok(ParsedWsSecSignatureMaterialBorrowed {
         signed_info,
+        signed_info_c14n_kind,
         signed_info_inclusive_ns_prefixes,
         signature_value,
         signature_method_algorithm,
@@ -1927,7 +1974,7 @@ pub struct VerifiedEnvelopedSignature {
 ///   implement (non-empty `URI`, missing enveloped-signature transform).
 pub fn verify_enveloped_document_signature(
     xml: &str,
-    expected_cert_fingerprint_sha256: Option<&str>,
+    expected_cert_fingerprints: &[crate::crypto::CertFingerprint],
     revocation_policy: &RevocationPolicy<'_>,
 ) -> Result<VerifiedEnvelopedSignature> {
     let doc = parse_wssec_document(
@@ -2003,7 +2050,7 @@ pub fn verify_enveloped_document_signature(
     verify_signature_value_with_components(
         material,
         WsSecCanonicalizationProfile::default(),
-        expected_cert_fingerprint_sha256,
+        expected_cert_fingerprints,
         revocation_policy,
     )?;
 

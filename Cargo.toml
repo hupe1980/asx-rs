@@ -1,6 +1,6 @@
 [package]
 name = "asx-rs"
-version = "0.14.0"
+version = "0.15.0"
 edition = "2024"
 authors = ["hupe1980"]
 description = "AS2 and AS4 B2B messaging library for Rust — signing, encryption, MDN, and ebMS3/AS4 profile support"
@@ -19,12 +19,12 @@ categories = ["network-programming", "cryptography", "encoding"]
 exclude = [
     "FINDINGS.md",
     "REVIEW.md",
+    "*_FEEDBACK.md",
     "artifacts/",
     "scripts/",
     "benches/",
     "site/",
     "concepts/",
-    "specs/",
 ]
 
 # `as2` and `as4` are not default features, so a docs.rs build with default
@@ -118,9 +118,11 @@ proptest = "1"
 tower = { version = "0.5", features = ["util"] }
 criterion = { version = "0.5", features = ["html_reports"] }
 opentelemetry-sdk = { package = "opentelemetry_sdk", version = "0.32", default-features = false, features = ["metrics"] }
-# Docker-backed interop oracle (`tests/interop_xmlsec_oracle.rs`). Those tests
-# are `#[ignore]`d, so a normal `cargo test` never starts a container.
+# Docker-backed foreign-implementation oracles (`tests/interop_*`). They are
+# `#[ignore]`d, so a normal `cargo test` never starts a container; the
+# `interop-docker-oracles` CI job is where they run.
 testcontainers = { version = "0.27", features = ["blocking"] }
+redis = { version = "1.7", features = ["tokio-comp"] }
 
 [[bench]]
 name = "as4_streaming_vs_buffer"

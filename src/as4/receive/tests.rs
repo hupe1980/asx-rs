@@ -11,7 +11,7 @@ use crate::as4::types::{
 };
 use crate::core::{CertHandle, ErrorCode, OcspFailureMode, OcspMode, SessionContext};
 use crate::reliability::InMemoryDedupBackend;
-use crate::storage::{BoxFuture, DedupStorage};
+use crate::storage::{BoxFuture, DedupStorage, DedupVerdict};
 use openssl::asn1::Asn1Time;
 use openssl::bn::BigNum;
 use openssl::hash::MessageDigest;
@@ -19,7 +19,6 @@ use openssl::nid::Nid;
 use openssl::pkey::PKey;
 use openssl::rsa::Rsa;
 use openssl::x509::{X509, X509NameBuilder};
-use roxmltree::Document;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -35,8 +34,16 @@ impl DedupStorage for DurableTestDedup {
         true
     }
 
-    fn first_seen<'a>(&'a self, idempotency_key: &'a str) -> BoxFuture<'a, Result<bool>> {
-        self.0.first_seen(idempotency_key)
+    fn claim<'a>(&'a self, idempotency_key: &'a str) -> BoxFuture<'a, Result<DedupVerdict>> {
+        self.0.claim(idempotency_key)
+    }
+
+    fn accept<'a>(&'a self, idempotency_key: &'a str) -> BoxFuture<'a, Result<()>> {
+        self.0.accept(idempotency_key)
+    }
+
+    fn abandon<'a>(&'a self, idempotency_key: &'a str) -> BoxFuture<'a, Result<()>> {
+        self.0.abandon(idempotency_key)
     }
 }
 
@@ -125,14 +132,15 @@ fn durable_dedup_receive_push_rejects_non_durable_backend() {
 policy,
         authenticated_sender_scope: None,
     };
-    let dedup = InMemoryDedupBackend::new(Duration::from_secs(60));
+    let dedup: Arc<dyn DedupStorage> = Arc::new(InMemoryDedupBackend::new(Duration::from_secs(60)));
 
-    let err = receive_push_with_dedup_sync(
+    let err = receive_push_sync(
         &session,
         &bus,
-        As4ReceivePushSyncRequest {
+        As4ReceivePushSync {
             request,
-            dedup_backend: &dedup,
+            dedup: dedup.clone(),
+            signer_pins: None,
         },
     )
     .expect_err("non-durable dedup backend must be rejected");
@@ -153,10 +161,19 @@ fn wssec_verifier_unsigned_path_requires_signature_when_missing() {
     };
     let xml =
         "<s:Envelope xmlns:s='http://www.w3.org/2003/05/soap-envelope'><s:Header/></s:Envelope>";
-    let doc = Document::parse(xml).expect("document");
+    let doc = roxmltree::Document::parse(xml).expect("document");
 
     let err = As4WsSecVerifier
-        .verify_security(&session, &policy, xml, &doc, "msg-registered", &[])
+        .verify_security(super::verifier::As4SecurityVerification {
+            session: &session,
+            policy: &policy,
+            soap_xml: xml,
+            soap_doc: &doc,
+            message_id: "msg-registered",
+            external_references: &[],
+            from_party_id: "partner-a",
+            permitted_signers: &[],
+        })
         .expect_err("unsigned strict receive should fail when signature is required");
 
     assert_eq!(err.code, ErrorCode::SecurityVerificationFailed);
@@ -205,14 +222,16 @@ xmlns:xop='http://www.w3.org/2004/08/xop/include'>\
         .build()
         .expect("policy");
 
-    let dedup = DurableTestDedup(InMemoryDedupBackend::new(Duration::from_secs(60)));
+    let dedup: Arc<dyn DedupStorage> = Arc::new(DurableTestDedup(InMemoryDedupBackend::new(
+        Duration::from_secs(60),
+    )));
     let gate = As4ConversationOrderGate::new(64);
-    let dedup_backend: Arc<dyn crate::storage::DedupStorage> = Arc::new(dedup);
+    let dedup_backend = Arc::clone(&dedup);
 
-    let err = receive_push_ordered(
+    let err = receive_push(
         &session,
         &bus,
-        As4ReceivePushOrderedRequest {
+        As4ReceivePush {
             request: As4ReceivePushRequest {
                 http_content_type: format!("multipart/related; boundary={boundary}"),
                 payload: Arc::from(multipart),
@@ -220,8 +239,9 @@ xmlns:xop='http://www.w3.org/2004/08/xop/include'>\
                 policy,
                 authenticated_sender_scope: None,
             },
-            dedup_backend,
-            gate: &gate,
+            dedup: dedup_backend,
+            ordering: Some(&gate),
+            signer_pins: None,
         },
     )
     .await
@@ -252,16 +272,8 @@ impl SlowVerifier {
 impl private::Sealed for SlowVerifier {}
 
 impl As4Verifier for SlowVerifier {
-    fn verify_security(
-        &self,
-        _session: &SessionContext,
-        _policy: &As4PushPolicy,
-        _soap_xml: &str,
-        _soap_doc: &Document<'_>,
-        message_id: &str,
-        _external_references: &[(&str, &[u8])],
-    ) -> Result<()> {
-        if message_id == "msg-1" {
+    fn verify_security(&self, ctx: super::verifier::As4SecurityVerification<'_>) -> Result<()> {
+        if ctx.message_id == "msg-1" {
             std::thread::sleep(Duration::from_millis(120));
         } else {
             std::thread::sleep(Duration::from_millis(20));
@@ -348,11 +360,13 @@ impl crate::storage::ReconciliationStorage for DurableTestReconciliation {
 /// `testing` escape hatch — which would make them pass only in builds that
 /// enable that feature.
 fn ordered_test_session(session_id: &str, bus: &EventBus) -> SessionContext {
-    let dedup = DurableTestDedup(InMemoryDedupBackend::new(Duration::from_secs(60)));
+    let dedup: Arc<dyn DedupStorage> = Arc::new(DurableTestDedup(InMemoryDedupBackend::new(
+        Duration::from_secs(60),
+    )));
     let reconciliation = DurableTestReconciliation;
     let token = crate::presets::StrictRuntimeBootstrap::new("as4_ordered_tests")
         .event_bus(bus)
-        .dedup(&dedup)
+        .dedup(dedup.as_ref())
         .reconciliation(&reconciliation)
         .validate()
         .expect("strict runtime bootstrap");
@@ -413,7 +427,7 @@ async fn ordered_receive_still_holds_the_turn_when_it_returns() {
     let gate = Arc::new(As4ConversationOrderGate::new(64));
     let (payload, content_type) = ordered_test_multipart_payload("msg-hold", None);
 
-    let ordered = ordered_async::receive_push_ordered_with_verifier(
+    let ordered = ordered_async::receive_push_with_verifier(
         &session,
         &bus,
         As4ReceivePushRequest {
@@ -424,8 +438,9 @@ async fn ordered_receive_still_holds_the_turn_when_it_returns() {
             authenticated_sender_scope: None,
         },
         dedup,
-        gate.as_ref(),
+        Some(gate.as_ref()),
         Arc::new(SlowVerifier::new()),
+        None,
     )
     .await
     .expect("receive");
@@ -434,7 +449,7 @@ async fn ordered_receive_still_holds_the_turn_when_it_returns() {
         ordered.holds_turn(),
         "the conversation turn must outlive the receive call, or delivery is unserialized"
     );
-    assert!(matches!(ordered.get(), As4ReceiveOutcome::FirstSeen(_)));
+    assert!(matches!(ordered.get(), As4ReceiveOutcome::FirstSeen { .. }));
 
     // A second arrival in the same conversation cannot proceed while the first
     // turn is held.
@@ -447,7 +462,7 @@ async fn ordered_receive_still_holds_the_turn_when_it_returns() {
     ));
     let policy2 = As4PushPolicyBuilder::new().build().expect("policy");
     let blocked = tokio::spawn(async move {
-        ordered_async::receive_push_ordered_with_verifier(
+        ordered_async::receive_push_with_verifier(
             &session2,
             &bus2,
             As4ReceivePushRequest {
@@ -458,8 +473,9 @@ async fn ordered_receive_still_holds_the_turn_when_it_returns() {
                 authenticated_sender_scope: None,
             },
             dedup2,
-            gate2.as_ref(),
+            Some(gate2.as_ref()),
             Arc::new(SlowVerifier::new()),
+            None,
         )
         .await
         .map(|ordered| ordered.holds_turn())
@@ -505,7 +521,7 @@ async fn ordered_receive_rejects_a_duplicated_conversation_id() {
         "<eb:CollaborationInfo><eb:ConversationId>conv-decoy</eb:ConversationId><eb:Action>",
     );
 
-    let err = ordered_async::receive_push_ordered_with_verifier(
+    let err = ordered_async::receive_push_with_verifier(
         &session,
         &bus,
         As4ReceivePushRequest {
@@ -516,8 +532,9 @@ async fn ordered_receive_rejects_a_duplicated_conversation_id() {
             authenticated_sender_scope: None,
         },
         dedup,
-        gate.as_ref(),
+        Some(gate.as_ref()),
         Arc::new(SlowVerifier::new()),
+        None,
     )
     .await
     .expect_err("a UserMessage with two ConversationIds must be refused");
@@ -566,12 +583,20 @@ async fn ordered_receive_reserves_arrival_order_but_allows_parallel_heavy_verify
     let v1 = verifier.clone();
     let tx1 = tx.clone();
     let t1 = tokio::spawn(async move {
-        ordered_async::receive_push_ordered_with_verifier(&s1, &b1, request_a, d1, g1.as_ref(), v1)
-            .await
-            .expect(
-                "msg-1 must actually be received; a discarded error makes the \
+        ordered_async::receive_push_with_verifier(
+            &s1,
+            &b1,
+            request_a,
+            d1,
+            Some(g1.as_ref()),
+            v1,
+            None,
+        )
+        .await
+        .expect(
+            "msg-1 must actually be received; a discarded error makes the \
                  ordering assertion below meaningless",
-            );
+        );
         tx1.send("msg-1".to_string()).await.expect("send msg-1");
     });
 
@@ -584,12 +609,20 @@ async fn ordered_receive_reserves_arrival_order_but_allows_parallel_heavy_verify
     let v2 = verifier.clone();
     let tx2 = tx.clone();
     let t2 = tokio::spawn(async move {
-        ordered_async::receive_push_ordered_with_verifier(&s2, &b2, request_b, d2, g2.as_ref(), v2)
-            .await
-            .expect(
-                "msg-2 must actually be received; a discarded error makes the \
+        ordered_async::receive_push_with_verifier(
+            &s2,
+            &b2,
+            request_b,
+            d2,
+            Some(g2.as_ref()),
+            v2,
+            None,
+        )
+        .await
+        .expect(
+            "msg-2 must actually be received; a discarded error makes the \
                  ordering assertion below meaningless",
-            );
+        );
         tx2.send("msg-2".to_string()).await.expect("send msg-2");
     });
 
@@ -630,13 +663,14 @@ async fn ordered_receive_rejects_response_before_original_completion() {
         authenticated_sender_scope: None,
     };
 
-    let _err = ordered_async::receive_push_ordered_with_verifier(
+    let _err = ordered_async::receive_push_with_verifier(
         &session,
         &bus,
         early_response,
         Arc::clone(&dedup),
-        &gate,
+        Some(&gate),
         Arc::clone(&verifier),
+        None,
     )
     .await
     .expect_err("response before original must fail");
@@ -650,13 +684,14 @@ async fn ordered_receive_rejects_response_before_original_completion() {
         policy: policy.clone(),
         authenticated_sender_scope: None,
     };
-    ordered_async::receive_push_ordered_with_verifier(
+    ordered_async::receive_push_with_verifier(
         &session,
         &bus,
         original,
         Arc::clone(&dedup),
-        &gate,
+        Some(&gate),
         Arc::clone(&verifier),
+        None,
     )
     .await
     .expect("original should pass");
@@ -670,13 +705,14 @@ async fn ordered_receive_rejects_response_before_original_completion() {
         policy,
         authenticated_sender_scope: None,
     };
-    ordered_async::receive_push_ordered_with_verifier(
+    ordered_async::receive_push_with_verifier(
         &session,
         &bus,
         valid_response,
         dedup,
-        &gate,
+        Some(&gate),
         verifier,
+        None,
     )
     .await
     .expect("response should pass after original completion");
@@ -739,15 +775,16 @@ async fn ordered_fragment_aware_receive_completes_in_conversation_turn_order() {
     let gate = As4ConversationOrderGate::new(32);
     let fragment_joiner = Arc::new(std::sync::Mutex::new(As4FragmentJoiner::new()));
 
-    let progress = receive_push_ordered_fragment_aware(
+    let progress = receive_push_fragment_aware(
         &session,
         &bus,
-        As4ReceivePushOrderedFragmentAwareRequest {
+        As4ReceivePush {
             request,
-            dedup_backend: dedup,
-            gate: &gate,
-            fragment_joiner,
+            dedup,
+            ordering: Some(&gate),
+            signer_pins: None,
         },
+        fragment_joiner,
     )
     .await
     .expect("ordered fragment-aware receive");
@@ -758,8 +795,9 @@ async fn ordered_fragment_aware_receive_completes_in_conversation_turn_order() {
     );
     match progress.get() {
         As4ReceivePushProgress::PendingFragment { .. } => {}
-        As4ReceivePushProgress::Complete(_) => {}
+        As4ReceivePushProgress::Complete { .. } => {}
         As4ReceivePushProgress::Duplicate { .. } => panic!("unexpected duplicate"),
+        As4ReceivePushProgress::InFlight { .. } => panic!("unexpected in-flight claim"),
     }
 }
 
@@ -820,22 +858,26 @@ async fn async_fragment_aware_receive_accepts_typed_request() {
     ));
     let fragment_joiner = Arc::new(std::sync::Mutex::new(As4FragmentJoiner::new()));
 
-    let progress = receive_push_with_dedup_async_fragment_aware(
+    let progress = receive_push_fragment_aware(
         &session,
         &bus,
-        As4ReceivePushAsyncFragmentAwareRequest {
+        As4ReceivePush {
             request,
-            dedup_backend: dedup,
-            fragment_joiner,
+            dedup,
+            ordering: None,
+            signer_pins: None,
         },
+        fragment_joiner,
     )
     .await
-    .expect("async fragment-aware receive");
+    .expect("async fragment-aware receive")
+    .into_inner();
 
     match progress {
         As4ReceivePushProgress::PendingFragment { .. } => {}
-        As4ReceivePushProgress::Complete(_) => {}
+        As4ReceivePushProgress::Complete { .. } => {}
         As4ReceivePushProgress::Duplicate { .. } => panic!("unexpected duplicate"),
+        As4ReceivePushProgress::InFlight { .. } => panic!("unexpected in-flight claim"),
     }
 }
 
@@ -912,14 +954,16 @@ async fn non_fragmented_message_is_accepted_with_require_authenticated_scope_and
     ));
     let fragment_joiner = Arc::new(std::sync::Mutex::new(As4FragmentJoiner::new()));
 
-    let progress = receive_push_with_dedup_async_fragment_aware(
+    let progress = receive_push_fragment_aware(
         &session,
         &bus,
-        As4ReceivePushAsyncFragmentAwareRequest {
+        As4ReceivePush {
             request,
-            dedup_backend: dedup,
-            fragment_joiner,
+            dedup,
+            ordering: None,
+            signer_pins: None,
         },
+        fragment_joiner,
     )
     .await
     .expect(
@@ -927,8 +971,8 @@ async fn non_fragmented_message_is_accepted_with_require_authenticated_scope_and
          RequireAuthenticatedScope and authenticated_sender_scope = None",
     );
 
-    match progress {
-        As4ReceivePushProgress::Complete(output) => {
+    match progress.into_inner() {
+        As4ReceivePushProgress::Complete { output, .. } => {
             assert_eq!(output.user_message.message_id, "mid-non-fragment-scope");
         }
         other => panic!("expected a completed receive, got {other:?}"),
@@ -979,7 +1023,9 @@ fn fragment_aware_receive_reassembles_and_processes_message() {
     #[cfg(feature = "testing")]
     let receive_policy = receive_policy.allow_unsigned_push(true);
     let receive_policy = receive_policy.build().expect("receive policy");
-    let dedup = DurableTestDedup(InMemoryDedupBackend::new(Duration::from_secs(300)));
+    let dedup: Arc<dyn DedupStorage> = Arc::new(DurableTestDedup(InMemoryDedupBackend::new(
+        Duration::from_secs(300),
+    )));
     let mut joiner = As4FragmentJoiner::new();
 
     let mut completed = None;
@@ -992,18 +1038,19 @@ fn fragment_aware_receive_reassembles_and_processes_message() {
             authenticated_sender_scope: Some(Arc::from("partner-a")),
         };
 
-        let progress = receive_push_with_dedup_sync_fragment_aware(
+        let progress = receive_push_sync_fragment_aware(
             &session,
             &bus,
-            As4ReceivePushSyncFragmentAwareRequest {
+            As4ReceivePushSync {
                 request,
-                dedup_backend: &dedup,
-                fragment_joiner: &mut joiner,
+                dedup: dedup.clone(),
+                signer_pins: None,
             },
+            &mut joiner,
         )
         .expect("fragment-aware receive");
 
-        if let As4ReceivePushProgress::Complete(out) = progress {
+        if let As4ReceivePushProgress::Complete { output: out, .. } = progress {
             completed = Some(*out);
         }
     }
@@ -1063,14 +1110,17 @@ fn non_fragment_aware_receive_rejects_message_fragment_payload() {
         },
         authenticated_sender_scope: Some(Arc::from("partner-a")),
     };
-    let dedup = DurableTestDedup(InMemoryDedupBackend::new(Duration::from_secs(60)));
+    let dedup: Arc<dyn DedupStorage> = Arc::new(DurableTestDedup(InMemoryDedupBackend::new(
+        Duration::from_secs(60),
+    )));
 
-    let err = receive_push_with_dedup_sync(
+    let err = receive_push_sync(
         &session,
         &bus,
-        As4ReceivePushSyncRequest {
+        As4ReceivePushSync {
             request,
-            dedup_backend: &dedup,
+            dedup: dedup.clone(),
+            signer_pins: None,
         },
     )
     .expect_err("non-fragment-aware receive should reject MessageFragment payload");

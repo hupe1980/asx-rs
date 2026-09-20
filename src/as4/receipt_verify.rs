@@ -15,37 +15,38 @@
 //!
 //! [`verify_sync_response`] performs, in order:
 //!
-//! 1. **Size and structure bounds** — the response is capped at
-//!    [`As4ReceiptPolicy::max_receipt_bytes`] and must be a SOAP envelope
-//!    carrying an `eb:SignalMessage`.
-//! 2. **Namespace-correct, unambiguous parsing** — prefixes (`eb:`, `eb3:`,
-//!    `ns2:`, default namespace) and CDATA sections are all handled; nothing is
-//!    matched by substring.  At most one `eb:Messaging` and one
-//!    `eb:SignalMessage` are accepted, each `eb:MessageInfo` child at most
-//!    once, and `NonRepudiationInformation` is read only from inside the
-//!    `eb:Receipt` — so no injected element can shadow a real one.
-//! 3. **Signal classification** — an `eb:Error` signal is returned as
+//! 1. **Size bounds** — the response is capped at
+//!    [`As4ReceiptPolicy::max_receipt_bytes`] and must be non-empty.
+//! 2. **Namespace-resolved parse** — prefixes (`eb:`, `eb3:`, `ns2:`, default
+//!    namespace) and CDATA sections are all handled; nothing is matched by
+//!    substring. The body must be a SOAP envelope carrying an
+//!    `eb:SignalMessage`.
+//! 3. **Structural unambiguity** — at most one `eb:Messaging` and one
+//!    `eb:SignalMessage`, each `eb:MessageInfo` child at most once, and
+//!    `NonRepudiationInformation` read only from inside the `eb:Receipt`, so
+//!    no injected element can shadow a real one.
+//! 4. **Signal classification** — an `eb:Error` signal is returned as
 //!    [`As4SyncSignal::Error`] with the ebMS3 error code, severity and
-//!    description intact, instead of being reported as "no receipt".  A signal
+//!    description intact, instead of being reported as "no receipt". A signal
 //!    carrying both a Receipt and an Error is rejected as ambiguous.
-//! 4. **Signature verification (NRR)** — when the receipt carries a
-//!    `ds:Signature` it is verified against the session trust anchors,
-//!    revocation policy and expected signer fingerprint, **and** the
-//!    `eb:SignalMessage` acted on must itself be covered by that signature
-//!    (directly or through a signed ancestor).  Without that binding a
-//!    counterparty could leave a genuinely signed element in place and append
-//!    an unsigned acknowledgement — XML Signature Wrapping.
-//! 5. **Correlation** — `eb:RefToMessageId` must equal the sent
-//!    [`As4SendOutput::message_id`].  An `eb:Error` correlating to a different
+//! 5. **Signature verification** — when the receipt carries a `ds:Signature`
+//!    it is verified against the session trust anchors, revocation policy and
+//!    expected signer fingerprint.
+//! 6. **Signature binding** — the `eb:SignalMessage` acted on must itself be
+//!    covered by that signature, directly or through a signed ancestor.
+//!    Without this a counterparty could leave a genuinely signed element in
+//!    place and append an unsigned acknowledgement — XML Signature Wrapping.
+//! 7. **Correlation** — `eb:RefToMessageId` must equal the sent
+//!    [`As4SendOutput::message_id`]. An `eb:Error` correlating to a different
 //!    message is rejected rather than attributed to this one.
-//! 6. **Non-repudiation (NRR digest check)** — every `ds:Reference` of the
+//! 8. **Non-repudiation (NRR digest check)** — every `ds:Reference` of the
 //!    *sent* message's own signature must be echoed by a
-//!    `MessagePartNRInformation` entry in the receipt, with a matching digest
-//!    algorithm and digest value.  This is the step that makes the receipt
-//!    evidence rather than decoration: it proves the counterparty signed a
-//!    statement about the exact bytes that were sent.
-//! 7. **Freshness** — the receipt `eb:Timestamp` must be inside the configured
-//!    replay window.  A receipt with no timestamp is rejected while a window is
+//!    `MessagePartNRInformation` entry, with a matching digest algorithm and
+//!    digest value. This is the step that makes the receipt evidence rather
+//!    than decoration: it proves the counterparty signed a statement about the
+//!    exact bytes that were sent.
+//! 9. **Freshness** — the receipt `eb:Timestamp` must be inside the configured
+//!    replay window. A receipt with no timestamp is rejected while a window is
 //!    configured, so the guard cannot be bypassed by dropping the element.
 //!
 //! # What is *not* authenticated
@@ -83,8 +84,7 @@
 
 use super::parser::parse_as4_signal_envelope;
 use super::services::{
-    enforce_signal_signature_coverage, expected_fingerprint_from_session,
-    wssec_revocation_policy_from_session,
+    enforce_signal_signature_coverage, session_signer_pins, wssec_revocation_policy_from_session,
 };
 use super::stream::extract_multipart_related_payload_if_present;
 use super::types::{As4ErrorSignal, As4NriReference, As4SendOutput, As4VerifiedReceipt};
@@ -599,12 +599,15 @@ fn verify_receipt_signature(
         return Ok(None);
     }
 
-    let expected_fingerprint = policy
-        .expected_signer_fingerprint_sha256
-        .as_deref()
-        .or_else(|| expected_fingerprint_from_session(session));
+    let expected_fingerprints: Vec<crate::crypto::CertFingerprint> =
+        match policy.expected_signer_fingerprint_sha256.as_deref() {
+            Some(raw) => crate::crypto::CertFingerprint::parse(raw)
+                .map(|f| vec![f])
+                .unwrap_or_default(),
+            None => session_signer_pins(session),
+        };
 
-    if expected_fingerprint.is_none() {
+    if expected_fingerprints.is_empty() {
         return Err(reject(
             session,
             event_bus,
@@ -637,7 +640,7 @@ fn verify_receipt_signature(
         &soap_doc,
         soap_xml,
         WsSecVerifyOptions::new()
-            .with_expected_fingerprint(expected_fingerprint)
+            .with_expected_fingerprints(&expected_fingerprints)
             .with_revocation(revocation_policy),
     ) {
         Ok(Some(coverage)) => coverage,
@@ -685,7 +688,7 @@ fn verify_receipt_signature(
         return Err(err);
     }
 
-    Ok(expected_fingerprint.map(ToOwned::to_owned))
+    Ok(expected_fingerprints.first().map(ToString::to_string))
 }
 
 fn check_receipt_freshness(

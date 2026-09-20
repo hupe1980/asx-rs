@@ -12,7 +12,7 @@ use asx_rs::observability::{BackpressurePolicy, EventBus, EventEmissionMode};
 #[cfg(feature = "as4")]
 use asx_rs::presets::DeploymentTopology;
 use asx_rs::presets::StrictRuntimeBootstrap;
-use asx_rs::storage::{BoxFuture, DedupStorage, ReconciliationStorage};
+use asx_rs::storage::{BoxFuture, DedupStorage, DedupVerdict, ReconciliationStorage};
 
 #[derive(Debug)]
 struct DurableTestAuditSink;
@@ -98,11 +98,19 @@ impl DedupStorage for DurableClusterSafeDedup {
         true
     }
 
-    fn first_seen<'a>(
+    fn claim<'a>(
         &'a self,
         _idempotency_key: &'a str,
-    ) -> BoxFuture<'a, asx_rs::core::Result<bool>> {
-        Box::pin(async move { Ok(true) })
+    ) -> BoxFuture<'a, asx_rs::core::Result<DedupVerdict>> {
+        Box::pin(async move { Ok(DedupVerdict::Claimed) })
+    }
+
+    fn accept<'a>(&'a self, _idempotency_key: &'a str) -> BoxFuture<'a, asx_rs::core::Result<()>> {
+        Box::pin(async move { Ok(()) })
+    }
+
+    fn abandon<'a>(&'a self, _idempotency_key: &'a str) -> BoxFuture<'a, asx_rs::core::Result<()>> {
+        Box::pin(async move { Ok(()) })
     }
 }
 
@@ -140,11 +148,19 @@ impl DedupStorage for NonClusterSafeDedup {
         true
     }
 
-    fn first_seen<'a>(
+    fn claim<'a>(
         &'a self,
         _idempotency_key: &'a str,
-    ) -> BoxFuture<'a, asx_rs::core::Result<bool>> {
-        Box::pin(async move { Ok(true) })
+    ) -> BoxFuture<'a, asx_rs::core::Result<DedupVerdict>> {
+        Box::pin(async move { Ok(DedupVerdict::Claimed) })
+    }
+
+    fn accept<'a>(&'a self, _idempotency_key: &'a str) -> BoxFuture<'a, asx_rs::core::Result<()>> {
+        Box::pin(async move { Ok(()) })
+    }
+
+    fn abandon<'a>(&'a self, _idempotency_key: &'a str) -> BoxFuture<'a, asx_rs::core::Result<()>> {
+        Box::pin(async move { Ok(()) })
     }
 }
 

@@ -60,7 +60,7 @@ description = "How asx-rs is layered: the transport boundary, wire format, proto
 | `lifecycle` | Type-state progression: `UntrustedBytes` → `StructurallyParsed` → `CryptographicallyVerified` → `ContentDecrypted` → `DomainReady` |
 | `as2` | AS2 MIME packaging, MIC computation, MDN generation/parsing, S/MIME crypto (behind `as2` feature) |
 | `as4` | AS4 SOAP envelope, ebMS3 headers, WS-Security signing/verification, pull store, P-Mode registry, Test Service, SBDH (behind `as4` feature) |
-| `sbdh` | Standard Business Document Header (SBDH) wrap/unwrap; Peppol-compatible |
+| `sbdh` | Standard Business Document Header wrap/unwrap, including `BusinessScope` — the Peppol Business Message Envelope — and the non-XML payload wrappers |
 | `send_pipeline` | Shared send validation and event emission helpers (internal) |
 
 ## Design Decisions
@@ -109,7 +109,7 @@ This means protocol logic never depends on a specific HTTP framework.
 
 ## Envelope Lifecycle
 
-The type-state pattern in `lifecycle.rs` is the only lifecycle mechanism. Protocol functions (`asx_rs::as2::receive_sync`, `asx_rs::as4::receive_push_with_dedup_sync`) use it exclusively.
+The type-state pattern in `lifecycle.rs` is the only lifecycle mechanism. Protocol functions (`asx_rs::as2::receive_sync`, `asx_rs::as4::receive_push_sync`) use it exclusively.
 
 Allowed progression (forward-only):
 

@@ -29,7 +29,8 @@
 //! |---|---|
 //! | `As2HttpTransport` | Send AS2 messages with RFC 4130 §6 headers |
 //! | `As4HttpTransport` | Send AS4 SOAP envelopes with eDelivery HTTP headers |
-//! | `TransportConfig` | Configure timeouts, user-agent, connection pool |
+//! | `TransportConfig` | Configure timeouts, user-agent, connection pool, client TLS identity |
+//! | `ClientIdentity` | Client certificate + key for mutual TLS on egress |
 //! | `HttpSendOutcome` | HTTP response wrapping status, headers, body |
 
 pub mod ingress;
@@ -44,7 +45,7 @@ pub mod server;
 pub use ingress::{As2HttpIngress, As4HttpIngress, as2_ingress_from_http, as4_ingress_from_http};
 
 #[cfg(any(feature = "client", feature = "async-ocsp"))]
-pub use egress::{HttpSendOutcome, TransportConfig};
+pub use egress::{ClientIdentity, HttpSendOutcome, TransportConfig};
 
 #[cfg(all(feature = "client", feature = "as2"))]
 pub use egress::As2HttpTransport;

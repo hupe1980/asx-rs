@@ -1,8 +1,6 @@
 use roxmltree::Document;
 
-use super::super::services::{
-    expected_fingerprint_from_session, wssec_revocation_policy_from_session,
-};
+use super::super::services::wssec_revocation_policy_from_session;
 use super::super::types::As4PushPolicy;
 use crate::core::{AsxError, ErrorCode, ErrorContext, Result, SessionContext};
 use crate::crypto::wssec::WsSecVerifyOptions;
@@ -26,23 +24,47 @@ pub mod private {
     pub trait Sealed {}
 }
 
+/// Everything a [`As4Verifier`] is given about one inbound message.
+///
+/// A struct rather than eight parameters, so adding a fact the verifier needs
+/// does not reorder an argument list that is easy to get silently wrong — two
+/// of these fields are `&str` and two are slices.
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct As4SecurityVerification<'a> {
+    pub session: &'a SessionContext,
+    pub policy: &'a As4PushPolicy,
+    /// The SOAP envelope as text, for canonicalization.
+    pub soap_xml: &'a str,
+    /// The same envelope, parsed.
+    pub soap_doc: &'a Document<'a>,
+    pub message_id: &'a str,
+    /// Every payload attachment as `(content_id, bytes)`, for `cid:`
+    /// reference resolution. Empty when the message has no attachments.
+    pub external_references: &'a [(&'a str, &'a [u8])],
+    /// The primary `<eb:From>/<eb:PartyId>` the message *claims* to be from.
+    ///
+    /// Unauthenticated at this point. `permitted_signers` is what a successful
+    /// verification binds it to.
+    pub from_party_id: &'a str,
+    /// The fingerprints that claimed sender is allowed to sign with, already
+    /// resolved by the caller.
+    ///
+    /// Empty means the sender is unpinned: a **signed** message must then be
+    /// refused, because a signature that verifies against the network's
+    /// anchors proves membership of the network and not the identity of the
+    /// sender. An unsigned message has no signer to attribute and is
+    /// unaffected.
+    pub permitted_signers: &'a [crate::crypto::CertFingerprint],
+}
+
 /// Security-verification hook for the AS4 push receive pipeline.
 ///
 /// This trait is sealed — external crates cannot implement it unless the
 /// testing feature is enabled. This mirrors the sealing approach used on
 /// AS2 trust-verifier surfaces and prevents silent trust bypasses on AS4.
 pub trait As4Verifier: private::Sealed {
-    fn verify_security(
-        &self,
-        session: &SessionContext,
-        policy: &As4PushPolicy,
-        soap_xml: &str,
-        soap_doc: &Document<'_>,
-        message_id: &str,
-        // Every payload attachment as `(content_id, bytes)`, for `cid:`
-        // reference resolution. Empty when the message has no attachments.
-        external_references: &[(&str, &[u8])],
-    ) -> Result<()>;
+    fn verify_security(&self, ctx: As4SecurityVerification<'_>) -> Result<()>;
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -51,19 +73,20 @@ pub struct As4WsSecVerifier;
 impl private::Sealed for As4WsSecVerifier {}
 
 impl As4Verifier for As4WsSecVerifier {
-    fn verify_security(
-        &self,
-        session: &SessionContext,
-        policy: &As4PushPolicy,
-        soap_xml: &str,
-        soap_doc: &Document<'_>,
-        message_id: &str,
-        external_references: &[(&str, &[u8])],
-    ) -> Result<()> {
-        let expected_fingerprint = expected_fingerprint_from_session(session);
+    fn verify_security(&self, ctx: As4SecurityVerification<'_>) -> Result<()> {
+        let As4SecurityVerification {
+            session,
+            policy,
+            soap_xml,
+            soap_doc,
+            message_id,
+            external_references,
+            from_party_id,
+            permitted_signers,
+        } = ctx;
         let revocation_policy = wssec_revocation_policy_from_session(session)?;
         let opts = WsSecVerifyOptions::new()
-            .with_expected_fingerprint(expected_fingerprint)
+            .with_expected_fingerprints(permitted_signers)
             .with_revocation(revocation_policy);
 
         let coverage = crate::crypto::wssec::verify::verify_enveloped_signature_optional_with_doc(
@@ -82,11 +105,16 @@ impl As4Verifier for As4WsSecVerifier {
             ));
         }
 
-        if signature_present && expected_fingerprint.is_none() {
-            return Err(AsxError::new(
-                ErrorCode::PolicyViolation,
-                "AS4 receive requires cert_handle.fingerprint_sha256 when verifying signed messages",
-                ErrorContext::for_session_with_message("as4_receive_push", session, message_id),
+        // A signature that verifies against the network's anchors proves
+        // membership of the network, not the identity of the sender — every
+        // access point shares those anchors. Without a pin for the claimed
+        // party there is nothing to attribute the signature to, so refuse
+        // rather than accept an unattributable one.
+        if signature_present && permitted_signers.is_empty() {
+            return Err(super::super::signer_pins::unpinned_sender_error(
+                "as4_receive_push",
+                session,
+                from_party_id,
             ));
         }
 
@@ -242,15 +270,8 @@ impl private::Sealed for InsecureBypassAs4Verifier {}
 
 #[cfg(feature = "testing")]
 impl As4Verifier for InsecureBypassAs4Verifier {
-    fn verify_security(
-        &self,
-        session: &SessionContext,
-        _policy: &As4PushPolicy,
-        _soap_xml: &str,
-        _soap_doc: &Document<'_>,
-        message_id: &str,
-        _external_references: &[(&str, &[u8])],
-    ) -> Result<()> {
+    fn verify_security(&self, ctx: As4SecurityVerification<'_>) -> Result<()> {
+        let (session, message_id) = (ctx.session, ctx.message_id);
         // Intentional no-op — bypasses ALL WS-Security checks.
         // Emit a tracing event so test logs are auditable and production
         // log-scraping can detect accidental non-test usage.

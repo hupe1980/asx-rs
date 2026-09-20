@@ -202,6 +202,14 @@ fuzz-gate iterations=fuzz_iterations budget_ms=fuzz_budget_ms out=fuzz_artifacts
 interop-matrix:
     bash scripts/run_interop_matrix.sh
 
+# Cross-implementation oracles (needs `openssl`; all but the first need Docker).
+[group('gate')]
+oracles:
+    cargo test --all-features --test interop_openssl_smime_oracle -- --ignored --nocapture
+    cargo test --all-features --test interop_xmlsec_oracle -- --ignored --nocapture
+    cargo test --all-features --test interop_redis_storage_conformance -- --ignored --nocapture
+    cargo test --all-features --test interop_holodeck_counterparty -- --ignored --nocapture
+
 # WS-Security canonicalization / signature vector gate (release gate 7).
 [group('gate')]
 wssec-vectors:
@@ -330,14 +338,15 @@ site-social-card:
 # ---------------------------------------------------------------------------
 
 # Download the RFCs, OASIS/W3C standards, network profiles and national
-# regulations this crate is written against into specs/ (gitignored;
-# specs/README.md is the index and says what each document governs).
+# regulations this crate is written against into concepts/references/
+# (gitignored; concepts/references/README.md is the index and says what each
+# document governs).
 #
 # Existing files are kept, so a re-run only fills gaps. Anything the publisher
 # refuses to a non-browser client is listed at the end for a manual download —
 # keep the file name the index uses.
 [group('specs')]
-[doc('Fetch the primary sources into specs/ (gitignored; see specs/README.md)')]
+[doc('Fetch the primary sources into concepts/references/ (gitignored; see its README.md)')]
 specs:
     #!/usr/bin/env bash
     set -uo pipefail
@@ -345,13 +354,13 @@ specs:
     missing=""
     # fetch DIR FILE URL
     fetch() {
-        mkdir -p "specs/$1"
-        if [ -s "specs/$1/$2" ]; then echo "kept     $1/$2"; return 0; fi
+        mkdir -p "concepts/references/$1"
+        if [ -s "concepts/references/$1/$2" ]; then echo "kept     $1/$2"; return 0; fi
         if curl -fsSL -A "$ua" --retry 3 --retry-delay 5 --max-time 900 \
-                -o "specs/$1/$2.part" "$3" && [ -s "specs/$1/$2.part" ]; then
-            mv "specs/$1/$2.part" "specs/$1/$2"; echo "fetched  $1/$2"; return 0
+                -o "concepts/references/$1/$2.part" "$3" && [ -s "concepts/references/$1/$2.part" ]; then
+            mv "concepts/references/$1/$2.part" "concepts/references/$1/$2"; echo "fetched  $1/$2"; return 0
         fi
-        rm -f "specs/$1/$2.part"
+        rm -f "concepts/references/$1/$2.part"
         echo "MISSING  $1/$2  <- $3" >&2
         missing="$missing  $1/$2  <- $3"$'\n'
     }
