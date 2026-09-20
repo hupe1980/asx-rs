@@ -146,9 +146,12 @@ assumptions — the defect class our own verifier structurally cannot reach.
 | `interop_openssl_smime_oracle` | `openssl smime` CLI | `openssl` binary | every PR, blocking |
 | `interop_xmlsec_oracle` | xmlsec1, the W3C XMLDSig reference implementation | Docker | every PR, advisory |
 | `interop_redis_storage_conformance` | A real Redis server | Docker | every PR, advisory |
-| `interop_holodeck_counterparty` | Holodeck B2B 6.1.1 (WSS4J) | Docker | every PR, advisory |
+| `interop_holodeck_counterparty` | Holodeck B2B 6.1.1 (WSS4J) | Docker on **arm64** | every PR, advisory |
 
-The Docker-backed job is `continue-on-error`, so a registry outage cannot block
+`cosmo83/holodeckb2b` publishes a `linux/arm64` image only, so that oracle runs
+on an arm64 runner; on amd64 the container fails with `exec format error`.
+
+The Docker-backed jobs are `continue-on-error`, so a registry outage cannot block
 a merge — which also means a genuine interop regression there shows up as a red
 job, not a blocked PR. Read it, do not assume it.
 

@@ -102,9 +102,9 @@ fmt-check:
 clippy:
     cargo clippy --workspace --all-targets --all-features -- -D warnings
 
-# fmt-check + clippy — the CI `lint` job.
+# fmt-check + clippy + rustdoc links — the CI `lint` job.
 [group('lint')]
-lint: fmt-check clippy
+lint: fmt-check clippy doc-links
 
 # Hygiene scan: no TODO/FIXME/HACK markers, no code-level deprecations.
 #
@@ -244,6 +244,12 @@ powerset:
         --at-least-one-of as2,as4 \
         --exclude-features prometheus,opentelemetry \
         --lib --tests
+    # `--at-least-one-of` above never builds without a protocol feature, and
+    # both protocols pull `crypto`. lib.rs documents the protocol-less build
+    # and `xtask` depends on the crate that way, so check it separately.
+    cargo hack check --feature-powerset --depth 2 \
+        --exclude-features as2,as4,server,client,dns,prometheus,opentelemetry \
+        --lib
 
 # Ratchet on uncompiled doctests.
 #

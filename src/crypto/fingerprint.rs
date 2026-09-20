@@ -50,6 +50,12 @@ impl CertFingerprint {
     /// certificate. A PEM **bundle** is not accepted: the fingerprint of "the
     /// first certificate in a file" is a guess, and pinning the wrong one of a
     /// chain is the mistake this type exists to prevent — pass the leaf.
+    ///
+    /// Requires the `crypto` feature, which supplies the X.509 parser. Without
+    /// it, [`from_cert_der`](Self::from_cert_der) and [`parse`](Self::parse)
+    /// are still available, since neither needs one.
+    #[cfg(feature = "crypto")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "crypto")))]
     pub fn from_cert_pem(cert_pem: &[u8]) -> Result<Self> {
         let cert = openssl::x509::X509::from_pem(cert_pem).map_err(|err| {
             AsxError::new(

@@ -27,7 +27,7 @@ pub struct As4ReceivePush<'a> {
     /// reserves the conversation's place from the raw bytes on arrival and
     /// holds it until the guard is dropped.
     ///
-    /// Pass `&gate` for the in-process [`super::As4ConversationOrderGate`], or
+    /// Pass `&gate` for the in-process [`crate::as4::As4ConversationOrderGate`], or
     /// a distributed implementation for a multi-replica deployment.
     pub ordering: Option<&'a dyn ConversationOrderGate>,
     /// Which signing certificate each **claimed** `eb:From` party may use.

@@ -61,6 +61,15 @@ use asx_rs::transport::As4HttpTransport;
 const HOLODECK_IMAGE: &str = "cosmo83/holodeckb2b";
 const HOLODECK_TAG: &str = "latest";
 
+/// The only published `cosmo83/holodeckb2b` manifest is `linux/arm64`, so on an
+/// amd64 host Docker either refuses the image or runs it under emulation, where
+/// the first `sh` fails with `exec format error` and the JVM never starts
+/// within this test's timeouts. Say that plainly rather than leaving the next
+/// reader to decode an exec failure from a Java gateway.
+const ARCH_NOTE: &str = "the Holodeck image is linux/arm64 only; on amd64 this \
+                         fails as `exec format error`. Run it on an arm64 host \
+                         (CI uses an arm64 runner for this oracle).";
+
 /// Party identifiers and collaboration values — these must agree byte-for-byte
 /// between the P-Mode installed into Holodeck and the asx send policy.
 const FROM_PARTY: &str = "org:asx:test:company:A";
@@ -213,7 +222,11 @@ fn build_jks_keystores(work_dir: &Path) {
         .stderr_to_vec()
         .map(|bytes: Vec<u8>| String::from_utf8_lossy(&bytes).into_owned())
         .unwrap_or_default();
-    assert_eq!(exit, Some(0), "keytool keystore assembly failed:\n{stderr}");
+    assert_eq!(
+        exit,
+        Some(0),
+        "keytool keystore assembly failed ({ARCH_NOTE}):\n{stderr}"
+    );
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -264,7 +277,7 @@ fn signed_push_with_nrr_roundtrips_against_holodeck_b2b() {
         ))
         .with_startup_timeout(Duration::from_secs(180))
         .start()
-        .expect("start Holodeck B2B container");
+        .unwrap_or_else(|e| panic!("start Holodeck B2B container ({ARCH_NOTE}): {e}"));
     let port = holodeck
         .get_host_port_ipv4(8080)
         .expect("mapped Holodeck port");

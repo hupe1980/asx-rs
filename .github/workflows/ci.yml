@@ -58,6 +58,16 @@ jobs:
             --at-least-one-of as2,as4 \
             --exclude-features prometheus,opentelemetry \
             --lib --tests
+      # `--at-least-one-of` above means no powerset member ever builds without a
+      # protocol feature, and both protocols pull `crypto`. But lib.rs documents
+      # the protocol-less build, and `xtask` depends on the crate that way, so
+      # it is a supported configuration and needs its own check. An ungated use
+      # of `openssl` reached main because nothing compiled this.
+      - name: Check the protocol-less build
+        run: |
+          cargo hack check --feature-powerset --depth 2 \
+            --exclude-features as2,as4,server,client,dns,prometheus,opentelemetry \
+            --lib
 
   lint:
     runs-on: ubuntu-latest
@@ -183,6 +193,7 @@ jobs:
   # `continue-on-error` is deliberate: these depend on third-party images and
   # a Docker daemon, and an outage there must not block a merge. The result is
   # still visible on the run.
+  # `alpine` and `redis` are multi-arch, so these run on the default runner.
   interop-docker-oracles:
     runs-on: ubuntu-latest
     continue-on-error: true
@@ -194,6 +205,17 @@ jobs:
         run: cargo test --all-features --test interop_xmlsec_oracle -- --ignored --nocapture
       - name: Storage conformance against a real Redis
         run: cargo test --all-features --test interop_redis_storage_conformance -- --ignored --nocapture
+
+  # `cosmo83/holodeckb2b` publishes a linux/arm64 image only, so this needs an
+  # arm64 runner. Under QEMU on amd64 the JVM gateway does not start inside the
+  # test's timeouts, and the container fails with `exec format error`.
+  interop-holodeck-oracle:
+    runs-on: ubuntu-24.04-arm
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
       - name: Signed AS4 exchange against Holodeck B2B
         run: cargo test --all-features --test interop_holodeck_counterparty -- --ignored --nocapture
 

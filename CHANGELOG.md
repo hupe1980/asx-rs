@@ -94,7 +94,8 @@ message was lost.
   `cfg(test)` helper, so every integrator reimplemented it. `parse` requires
   exactly **64 hex digits**, so a truncated or SHA-1 value is rejected where it
   is configured rather than surfacing later as "signature does not match" and
-  reading as the counterparty's fault (D65).
+  reading as the counterparty's fault (D65). `from_cert_pem` needs the `crypto`
+  feature for the X.509 parser; `from_cert_der` and `parse` do not.
 
 - **Mutual TLS on egress** (`ClientIdentity`, `TransportConfig::with_client_identity`).
   Several AS4 profiles require client-certificate authentication on the wire in
