@@ -287,6 +287,13 @@ impl As4Inbound {
                         "the receiving application refused the message",
                         None,
                     ),
+                    Fault::Permanent => (
+                        "EBMS:0004",
+                        "Other",
+                        "Content",
+                        "the receiving application refused the message permanently",
+                        None,
+                    ),
                     Fault::NotServiced => (
                         "EBMS:0004",
                         "Other",

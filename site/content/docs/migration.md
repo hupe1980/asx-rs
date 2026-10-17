@@ -27,12 +27,12 @@ instance in a trading relationship together.
 | **Message ids** | AS2 sent `Message-ID: <id@asx>` | AS2 `<id>` with your RFC 2822 `id-left@id-right`; AS4 ids are RFC 2822 msg-ids too | build ids as `"{id}@{your-domain}"` |
 | **Unsigned AS4 message** | answered `EBMS:0101` | answered `EBMS:0103` PolicyNoncompliance | |
 | **BDEW unconfigured senders** | refused unless pinned | accepted when the verified SM-PKI certificate carries the claimed MP-ID as subject **OU** (BDEW 1.2 §2.3.2, §2.3.4.4; RzÜ AS4 2.6 §5.2) | MP-ID only in the CN is refused, also at `build()` |
-| **`eb:Timestamp` window** | 300 s both ways | 300 s ahead, 24 h behind (the dedup retention) | a retry within a day is a duplicate, not a replay |
+| **`eb:Timestamp` window** | 300 s both ways | 300 s ahead, 7 days behind (the dedup retention) | a retry within 7 days (BDEW: 72 h) is a duplicate, not a replay |
 | **BDEW header** | caller-set action, roles, conversation id, agreement | always gzip; fixed Action, roles and `AgreementRef` ([profiles](@/docs/profiles.md#what-each-preset-fixes)); empty `ConversationId`; no `eb:MessageProperties`; PKIPath token | setting a conversation id is refused |
 | **Content-IDs** | random | `part<N>.<hash>@asx` from message id and part index; deterministic gzip | identical resends |
 | **Duplicates** | returned to the embedder | AS4: fresh signed receipt; AS2: `processed/warning: duplicate-document` | |
 | **In flight** | embedder-chosen status | HTTP 503 | |
-| **Handler refusal** | embedder-chosen | AS4 `EBMS:0202` DeliveryFailure; AS2 `processed/error: unexpected-processing-error` | |
+| **Handler refusal** | embedder-chosen | AS4 `EBMS:0202` DeliveryFailure (retried), or `EBMS:0004` (not retried) for `Reject::permanent`; AS2 `processed/error: unexpected-processing-error` | dead-lettered messages: return `Reject::permanent` |
 | **Test service** | delivered like a business message | receipted, never delivered | |
 | **AS2 inbound** | unsigned or unencrypted accepted, verifier-dependent | refused: `insufficient-message-security`; RFC 5402-compressed content that is not a MIME entity: `decompression-failed` | |
 | **AS2 MDN request** | configurable | always a signed MDN with `sha-256`, synchronous unless `send_async_mdn` | |

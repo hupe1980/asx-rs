@@ -50,7 +50,7 @@ Inbound AS4, in order; a failing step stops the pipeline:
    `tests/as4_swa_encryption_inbound.rs::messaging_digest_failure_is_pre_key`);
 4. `eb:To` is the local party (`message_for_another_party_is_refused`);
 5. revocation (below);
-6. `eb:Timestamp`: at most 300 s in the future, at most 24 h in the past;
+6. `eb:Timestamp`: at most 300 s in the future, at most 7 days in the past;
 7. the ebMS3 test service is receipted here and never delivered
    (`ping_is_receipted_without_a_claim`);
 8. the payload set equals the signed `eb:PartInfo` set (a part property

@@ -1,6 +1,6 @@
 [package]
 name = "asx-rs"
-version = "0.16.1"
+version = "0.16.2"
 edition = "2024"
 authors = ["hupe1980"]
 description = "AS2 and AS4 (ebMS3) B2B messaging: BDEW, Peppol, eDelivery and ENTSOG profiles, signed receipts and MDNs, one tower Service to receive"
@@ -14,14 +14,14 @@ rust-version = "1.88"
 keywords = ["as2", "as4", "ebms3", "edi", "peppol"]
 categories = ["network-programming", "cryptography", "encoding"]
 # Not published: the website, scripts, benches, local notes.
+# Anchored with `/`: an unanchored pattern matches at any depth.
 exclude = [
-    "*_FEEDBACK.md",
-    "artifacts/",
-    "scripts/",
-    "benches/",
-    "site/",
-    "concepts/",
-    "testkit/",
+    "/*_FEEDBACK.md",
+    "/artifacts/",
+    "/scripts/",
+    "/benches/",
+    "/site/",
+    "/concepts/",
 ]
 
 [package.metadata.docs.rs]

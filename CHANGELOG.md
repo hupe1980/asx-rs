@@ -17,6 +17,28 @@ Versioning follows the [SemVer policy](#semver-policy) below.
 
 ## [Unreleased]
 
+## [0.16.2] — 2026-10-18
+
+### Fixed
+
+- The published package was missing `asx::testkit`: an unanchored `exclude`
+  pattern also dropped `src/testkit/`, so `features = ["test-util"]` did not
+  compile from crates.io. Releases now build the packaged crate with every
+  feature before publishing.
+
+### Wire / crypto
+
+- An inbound AS4 `eb:Timestamp` is accepted up to 7 days in the past (was
+  24 h), so a sender that retries with the original timestamp — BDEW for
+  72 h — is answered as a duplicate instead of refused. A `DedupStore` must
+  now remember accepted keys for at least 7 days; `MemoryDedup` does.
+
+### API
+
+- `Reject::permanent` refuses a message for good: AS4 answers `EBMS:0004`,
+  which the sender does not retry (use it after dead-lettering).
+  `Reject::new` still answers the retryable `EBMS:0202`.
+
 ## [0.16.1] — 2026-10-18
 
 ### Wire / crypto

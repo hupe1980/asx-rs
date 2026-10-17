@@ -99,15 +99,16 @@ fn judged(
     parsed.check_timestamp_freshness(window, clock.now())
 }
 
-/// Retry vs freshness: a retry reuses `Message::timestamp`, so a message stamped
-/// an hour ago (retried after a transport failure) is accepted — the past
-/// bound is the dedup retention (24 h), within which a replay is a duplicate.
+/// Retry vs freshness: a retry reuses `Message::timestamp`, so a message
+/// stamped hours ago is accepted — including a BDEW sender's retries over
+/// 72 h. The past bound is the dedup retention (7 days), within which a
+/// replay is a duplicate.
 #[test]
 fn timestamp_in_the_past_is_accepted_within_the_dedup_retention() {
     let sent = crate::clock::system().now();
     let parsed = stamped(sent);
     let clock = crate::clock::ManualClock::at(sent);
-    for after in [0, 299, 301, 3_600, 23 * 3_600, 24 * 3_600] {
+    for after in [0, 299, 301, 3_600, 24 * 3_600, 72 * 3_600, 7 * 24 * 3_600] {
         clock.set(sent + std::time::Duration::from_secs(after));
         judged(&parsed, &clock).unwrap_or_else(|e| panic!("{after} s later: {e}"));
     }
@@ -120,8 +121,8 @@ fn timestamp_older_than_the_dedup_retention_is_refused() {
     let sent = crate::clock::system().now();
     let parsed = stamped(sent);
     let clock = crate::clock::ManualClock::at(sent);
-    clock.advance(std::time::Duration::from_secs(24 * 3_600 + 1));
-    let err = judged(&parsed, &clock).expect_err("older than 24 h");
+    clock.advance(std::time::Duration::from_secs(7 * 24 * 3_600 + 1));
+    let err = judged(&parsed, &clock).expect_err("older than 7 days");
     assert_eq!(err.code, ErrorCode::SecurityVerificationFailed);
 }
 

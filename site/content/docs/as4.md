@@ -146,7 +146,8 @@ fn endpoint(as4: &As4, store: impl DedupStore) -> Inbound {
 | In flight (`Claim::InFlight`) | HTTP 503 | no | unchanged |
 | `claim` failed | HTTP 500 + `EBMS:0004` | no | — |
 | Handler `Ok`, audit record and `accept` succeed | HTTP 200 + signed NRR receipt | yes | accepted |
-| Handler `Err`, or a panic | HTTP 200 + `EBMS:0202` DeliveryFailure | yes | abandoned |
+| Handler `Err(Reject::new(..))`, or a panic | HTTP 200 + `EBMS:0202` DeliveryFailure (the sender may retry) | yes | abandoned |
+| Handler `Err(Reject::permanent(..))` | HTTP 200 + `EBMS:0004` Other (the sender does not retry) | yes | abandoned |
 | Handler returns `peppol::not_serviced()` | HTTP 200 + `EBMS:0004` with `PEPPOL:NOT_SERVICED` | yes | abandoned |
 | Handler `Ok`, then the audit record or `accept` fails | HTTP 500, no receipt | yes | abandoned |
 

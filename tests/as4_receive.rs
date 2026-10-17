@@ -136,6 +136,30 @@ async fn handler_err_answer_is_an_ebms_0202_signal() {
     assert!(body.contains("EBMS:0202"), "W9: {body}");
 }
 
+/// A permanent refusal answers EBMS:0004, which the sender does not retry,
+/// so a message the receiver will never accept is not retransmitted.
+#[tokio::test(flavor = "current_thread")]
+async fn a_permanent_refusal_is_an_ebms_0004_the_sender_does_not_retry() {
+    let p = pair(Preset::Bdew);
+    p.mode.store(peers::HANDLER_PERMANENT, Ordering::SeqCst);
+    let err = p
+        .sender
+        .send(Preset::Bdew.message(&p.to_b, b"x"))
+        .await
+        .expect_err("refused");
+    assert_eq!(err.ebms_code(), Some("EBMS:0004"));
+    assert!(!err.is_retryable(), "{err}");
+    // A plain refusal stays retryable.
+    p.mode.store(HANDLER_ERR, Ordering::SeqCst);
+    let err = p
+        .sender
+        .send(Preset::Bdew.message(&p.to_b, b"y"))
+        .await
+        .expect_err("refused");
+    assert_eq!(err.ebms_code(), Some("EBMS:0202"));
+    assert!(err.is_retryable(), "{err}");
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn handler_panic_is_treated_as_err() {
     let p = pair(Preset::Bdew);

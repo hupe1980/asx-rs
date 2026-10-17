@@ -42,8 +42,13 @@ pub struct Reject {
 /// What the peer is told about a refusal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Fault {
-    /// EBMS:0202 DeliveryFailure / `unexpected-processing-error`.
+    /// EBMS:0202 DeliveryFailure / `unexpected-processing-error`: the sender
+    /// may retry.
     DeliveryFailure,
+    /// EBMS:0004 Other (AS4): the message will never be accepted, so the
+    /// sender does not retry. AS2 has no such disposition and answers
+    /// `unexpected-processing-error`.
+    Permanent,
     /// Peppol "not serviced": EBMS:0004 with `PEPPOL:NOT_SERVICED` (Peppol
     /// AS4 §4.4).
     #[cfg_attr(not(feature = "peppol"), allow(dead_code))]
@@ -51,10 +56,21 @@ pub(crate) enum Fault {
 }
 
 impl Reject {
-    /// Refuse the message because of `source`.
+    /// Refuse the message because of `source`; the sender may retry
+    /// (AS4: EBMS:0202 DeliveryFailure).
     pub fn new(source: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> Reject {
         Reject {
             fault: Fault::DeliveryFailure,
+            source: Some(source.into()),
+        }
+    }
+
+    /// Refuse the message for good, e.g. after dead-lettering it: the
+    /// sender does not retry (AS4: EBMS:0004 Other). The claim is released,
+    /// not accepted, so a retransmission is never answered with a receipt.
+    pub fn permanent(source: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> Reject {
+        Reject {
+            fault: Fault::Permanent,
             source: Some(source.into()),
         }
     }

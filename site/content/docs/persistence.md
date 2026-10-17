@@ -34,7 +34,7 @@ The contract, as the testkit checks it:
 | an unsettled claim expires (a lease), then the key can be claimed again | a crashed handler must not block the message forever |
 | `accept` and `abandon` succeed only if the token is the key's current lease (compare-and-set), else `Err` | a slow handler whose lease was re-claimed must not settle |
 | `abandon` never reopens an accepted key | a late refusal must not admit a replay |
-| an accepted key is remembered for at least 24 hours | inbound `eb:Timestamp` is accepted up to 24 hours back |
+| an accepted key is remembered for at least 7 days | inbound `eb:Timestamp` is accepted up to 7 days back |
 | infrastructure failure returns `Err` | fail closed: HTTP 500, no receipt, the sender retries |
 
 Keys are opaque 64-character lowercase hex digests of
@@ -44,7 +44,7 @@ across releases.
 ### `MemoryDedup` is not durable
 
 `MemoryDedup::default()` keeps claims in process memory (lease 5 minutes,
-retention 24 hours). After a restart, or behind a load balancer, a
+retention 7 days). After a restart, or behind a load balancer, a
 retransmission is delivered again. Use it for tests, examples and
 single-process deployments with idempotent handlers.
 
@@ -67,7 +67,7 @@ claim:   INSERT … ON CONFLICT (key) DO UPDATE SET token = :new, lease_until = 
 accept:  UPDATE asx_dedup SET state = 'accepted', token = NULL, accepted_at = now()
            WHERE key = :key AND state = 'claimed' AND token = :token   -- 0 rows → Err
 abandon: DELETE FROM asx_dedup WHERE key = :key AND state = 'claimed' AND token = :token  -- 0 rows → Err
-expire:  DELETE FROM asx_dedup WHERE state = 'accepted' AND accepted_at < now() - interval '24 hours'
+expire:  DELETE FROM asx_dedup WHERE state = 'accepted' AND accepted_at < now() - interval '7 days'
 ```
 
 The same logic over a `Mutex<HashMap>`, compiled so the trait shape is exact

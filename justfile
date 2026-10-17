@@ -34,6 +34,11 @@ features:
 msrv:
     cargo +1.88 check --locked --workspace --all-features
 
+# Build the crate as crates.io ships it (the .crate file, outside the
+# workspace) with every feature: catches files left out of the package.
+package:
+    bash scripts/package-check.sh
+
 # Dependency policy, deny.toml (needs cargo-deny).
 deny:
     cargo deny --workspace --all-features check advisories licenses bans sources

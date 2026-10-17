@@ -15,7 +15,7 @@ use tokio::time::Instant;
 /// (handler `Ok`, audit written) or `abandon` (handler `Err`, panic, audit
 /// failure) with the token the claim returned.
 ///
-/// An accepted key must be remembered for at least 24 hours: an inbound AS4
+/// An accepted key must be remembered for at least 7 days: an inbound AS4
 /// message is refused by its `eb:Timestamp` only beyond that, so a replay
 /// within it must be answered as [`Claim::Duplicate`].
 pub trait DedupStore: Send + Sync + std::fmt::Debug + 'static {
@@ -78,7 +78,7 @@ impl ClaimToken {
 }
 
 /// In-process, **non-durable**: forgets everything on restart and is not
-/// shared between processes. Lease 5 min, retention 24 h.
+/// shared between processes. Lease 5 min, retention 7 days.
 ///
 /// Use it for tests, examples and single-process deployments that accept
 /// redelivery after a restart; implement [`DedupStore`] over your database
@@ -99,8 +99,10 @@ const RETENTION: Duration = MIN_RETENTION;
 
 /// How long a [`DedupStore`] must remember an accepted key: the inbound AS4
 /// `eb:Timestamp` window reaches this far back (a replay within it is a
-/// duplicate; one beyond it is refused by its timestamp).
-pub(crate) const MIN_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
+/// duplicate; one beyond it is refused by its timestamp). Senders retry with
+/// the original timestamp; 7 days covers BDEW's 72 h and is the AS4 profile's
+/// own example (`checkwindow=7D`, AS4 §3.2).
+pub(crate) const MIN_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 impl MemoryDedup {
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, Entry>> {

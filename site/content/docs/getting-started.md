@@ -119,8 +119,10 @@ fn router(as4: &As4) -> axum::Router {
 ```
 
 The endpoint verifies the message, claims it in the `DedupStore`, calls your
-handler and answers: `Ok` gets a signed receipt, `Err` an `EBMS:0202` delivery
-failure, a duplicate a fresh receipt without calling the handler. The full
+handler and answers: `Ok` gets a signed receipt, `Err(Reject::new(..))` an
+`EBMS:0202` delivery failure the sender may retry, `Err(Reject::permanent(..))`
+an `EBMS:0004` it does not retry (use it after dead-lettering), a duplicate a
+fresh receipt without calling the handler. The full
 table is on the [AS4 page](@/docs/as4.md#what-the-sender-is-told); the complete
 program is `examples/as4_receive_axum.rs`.
 
@@ -186,7 +188,8 @@ async fn attempt(as4: &As4, partner: &Partner, id: &str, first_attempt: SystemTi
 }
 ```
 
-An asx receiver accepts an `eb:Timestamp` up to 300 s ahead and 24 h behind,
-so a retry within a day is answered as a duplicate with a fresh receipt.
+An asx receiver accepts an `eb:Timestamp` up to 300 s ahead and 7 days behind,
+so a retry within that time (BDEW: 72 h) is answered as a duplicate with a fresh
+receipt.
 Message ids must be RFC 2822 `id-left@id-right` (`"{outbox_id}@{your-domain}"`);
 `send` refuses anything else with `Config`.

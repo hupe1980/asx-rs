@@ -185,6 +185,7 @@ pub struct asx::Receipt
 pub struct asx::Reject
 impl asx::Reject
 pub fn asx::Reject::new(impl core::convert::Into<alloc::boxed::Box<(dyn core::error::Error + core::marker::Send + core::marker::Sync)>>) -> asx::Reject
+pub fn asx::Reject::permanent(impl core::convert::Into<alloc::boxed::Box<(dyn core::error::Error + core::marker::Send + core::marker::Sync)>>) -> asx::Reject
 impl<E: core::error::Error + core::marker::Send + core::marker::Sync + 'static> core::convert::From<E> for asx::Reject
 pub fn asx::Reject::from(E) -> asx::Reject
 pub struct asx::Verified<T>

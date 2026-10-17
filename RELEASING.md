@@ -36,7 +36,8 @@ Docker and `openssl` for `just interop`, `zola` for `just site`.
    [SemVer policy](CHANGELOG.md#semver-policy); rename `## [Unreleased]` in
    `CHANGELOG.md` to `## [X.Y.Z] — YYYY-MM-DD` and open a new empty
    `## [Unreleased]`.
-2. Run `just ci`, `just interop` and, if the API changed, `just public-api`.
+2. Run `just ci`, `just interop`, `just package` and, if the API changed,
+   `just public-api`.
 3. Merge to `main` and wait for CI.
 4. Tag and push:
 

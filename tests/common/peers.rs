@@ -83,6 +83,7 @@ pub const HANDLER_PANIC: u8 = 2;
 pub const HANDLER_SLOW: u8 = 3;
 /// The first call waits for `Pair::gate`; later calls succeed.
 pub const HANDLER_GATED: u8 = 4;
+pub const HANDLER_PERMANENT: u8 = 5;
 
 pub struct Pair {
     pub preset: Preset,
@@ -161,6 +162,9 @@ pub fn pair_with(
                         "refused by the application",
                     ))),
                     HANDLER_PANIC => panic!("handler panicked on purpose"),
+                    HANDLER_PERMANENT => Err(Reject::permanent(std::io::Error::other(
+                        "refused permanently by the application",
+                    ))),
                     HANDLER_SLOW => {
                         tokio::time::sleep(std::time::Duration::from_secs(6 * 60)).await;
                         Ok(())
