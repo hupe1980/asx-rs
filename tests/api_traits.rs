@@ -2,12 +2,12 @@
 //! Auto traits and object safety of the public API.
 
 use asx::as4::{As4, UserMessage};
+use asx::testkit::loopback::Loopback;
+use asx::testkit::pki::TestCa;
 use asx::{
     AuditDurability, AuditRecord, AuditSink, Decrypter, DedupStore, Handler, HttpClient,
     MemoryDedup, Profile, Reject, Signer, Verified,
 };
-use asx_testkit::loopback::Loopback;
-use asx_testkit::pki::TestCa;
 use std::sync::Arc;
 
 fn assert_send_sync<T: Send + Sync>() {}
@@ -135,12 +135,12 @@ async fn inbound_is_a_tower_service_and_enforces_the_size_limit() {
 fn inbound_mounts_on_a_stateful_axum_router() {
     #[derive(Clone)]
     struct AppState;
-    let ca = asx_testkit::pki::TestCa::sm_pki();
+    let ca = asx::testkit::pki::TestCa::sm_pki();
     let me = ca.bdew_party("9900000000001");
     let as4 = asx::as4::As4::builder(asx::Profile::bdew())
         .local(me.local())
         .trust_anchor(ca.anchor())
-        .http_client(asx_testkit::loopback::Loopback::new())
+        .http_client(asx::testkit::loopback::Loopback::new())
         .build()
         .unwrap();
     let inbound = as4.inbound(

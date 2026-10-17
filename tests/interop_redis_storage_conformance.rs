@@ -35,8 +35,8 @@ mod ported;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use asx::testkit::dedup::{self, DedupHarness, conformance};
 use asx::{BoxFuture, Claim, ClaimToken, DedupStore};
-use asx_testkit::dedup::{self, DedupHarness, conformance};
 use testcontainers::core::{IntoContainerPort, WaitFor};
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{ContainerAsync, GenericImage};

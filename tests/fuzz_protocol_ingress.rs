@@ -12,9 +12,9 @@ mod inbound_harness;
 mod peers;
 
 use asx::as2::{As2, Received};
+use asx::testkit::loopback::Loopback;
+use asx::testkit::pki::{KeyAlg, TestCa, TestParty};
 use asx::{MemoryDedup, Payload, Profile, Reject, Verified};
-use asx_testkit::loopback::Loopback;
-use asx_testkit::pki::{KeyAlg, TestCa, TestParty};
 use inbound_harness::{Answer, Genuine, Receiver, genuine, request};
 use peers::{Preset, pair_with};
 use proptest::prelude::*;

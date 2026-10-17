@@ -117,7 +117,7 @@ Expect one `sign` per outbound message, receipt or MDN, and one `decrypt` per
 inbound encrypted message, only after the sender authenticated and the key
 reference selected this key. A failing decrypter gives the same uniform
 decryption failure as a wrong key. For tests,
-`asx_testkit::keys::CountingKeys` counts operations.
+`asx::testkit::keys::CountingKeys` counts operations.
 
 ## Key rollover
 

@@ -54,8 +54,8 @@ use crate::error::BoxFuture;
 /// store a second copy) and must not call back into the library. There is no
 /// read, replay or acknowledge method: querying the store is the embedder's.
 ///
-/// Check an implementation with the conformance suite in `asx-rs-testkit`
-/// (`asx_testkit::audit::conformance`) before relying on it.
+/// Check an implementation with the conformance suite in `asx::testkit`
+/// (`asx::testkit::audit::conformance`) before relying on it.
 pub trait AuditSink: Send + Sync + fmt::Debug {
     /// `Durable`: a record whose `record` returned `Ok` survives process and
     /// host failure, and an `Err` fails the exchange. `BestEffort`: errors are

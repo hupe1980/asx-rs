@@ -128,12 +128,12 @@ async fn unsigned_receipt_is_indeterminate() {
 #[tokio::test]
 async fn receipt_from_an_unpinned_signer_is_indeterminate() {
     // The sender pins a certificate the partner does not sign with.
-    let other = asx_testkit::pki::TestCa::sm_pki().bdew_party("9900000000002");
+    let other = asx::testkit::pki::TestCa::sm_pki().bdew_party("9900000000002");
     let p = pair_with(
         Preset::Bdew,
         |b| {
             asx::Partner::new(&b.id)
-                .party_type(asx_testkit::pki::BDEW_PARTY_TYPE)
+                .party_type(asx::testkit::pki::BDEW_PARTY_TYPE)
                 .endpoint(peers::B_URL)
                 .signing_cert(other.signing.certificate())
                 .encryption_cert(b.encryption.certificate())

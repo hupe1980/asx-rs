@@ -175,7 +175,7 @@ impl asx::HttpClient for PeerHttp {
     ) -> BoxFuture<'_, Result<http::Response<Bytes>, BoxError>> {
         // A test CA's CRL: the crate checks the phase4 signer's
         // path against its distribution point.
-        if let Some(crl) = asx_testkit::pki::published_crl(&request.uri().to_string()) {
+        if let Some(crl) = asx::testkit::pki::published_crl(&request.uri().to_string()) {
             return Box::pin(async move {
                 Ok(http::Response::builder()
                     .status(200)

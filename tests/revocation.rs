@@ -11,10 +11,10 @@
 mod net;
 
 use asx::as4::{As4, UserMessage};
+use asx::testkit::loopback::Loopback;
+use asx::testkit::pki::{Cdp, IssueOptions, KeyAlg, TestCa};
+use asx::testkit::revocation::RevocationHttp;
 use asx::{ErrorKind, MemoryDedup, Profile, Verified};
-use asx_testkit::loopback::Loopback;
-use asx_testkit::pki::{Cdp, IssueOptions, KeyAlg, TestCa};
-use asx_testkit::revocation::RevocationHttp;
 use net::peers::{B_URL, Preset};
 use net::*;
 use std::sync::Arc;
@@ -62,7 +62,7 @@ async fn bdew_refuses_a_sub_ca_listed_in_the_indirect_root_crl() {
     );
     let (a, b) = (bdew(&sub, A, A, Cdp::Issuer), bdew(&sub, B, B, Cdp::Issuer));
     let indirect = |revoked: bool| {
-        let builder = signer.crl_builder().idp(asx_testkit::pki::Idp {
+        let builder = signer.crl_builder().idp(asx::testkit::pki::Idp {
             uris: vec![url.into()],
             indirect: true,
             ..Default::default()

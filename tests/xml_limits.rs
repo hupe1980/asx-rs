@@ -13,7 +13,7 @@
 mod peers;
 
 use asx::__fuzz::{AsxError, ErrorCode};
-use asx_testkit::pki::KeyAlg;
+use asx::testkit::pki::KeyAlg;
 use peers::{HANDLER_ERR, Preset};
 use std::sync::atomic::Ordering;
 use tower::ServiceExt;
@@ -370,7 +370,7 @@ fn sbdh_document_limits() {
 /// the hardened parser with the envelope limits.
 #[test]
 fn encrypted_payload_limits() {
-    let pair = asx_testkit::pki::KeyPair::self_signed("limits-xmlenc", KeyAlg::Rsa2048);
+    let pair = asx::testkit::pki::KeyPair::self_signed("limits-xmlenc", KeyAlg::Rsa2048);
     let (xml, bodies) = asx::__fuzz::wssec::encrypt_swa(
         &[("limits@asx.test", "application/gzip", b"limits")],
         &pair.cert_pem,

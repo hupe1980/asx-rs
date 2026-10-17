@@ -7,8 +7,8 @@
 #[path = "common/revocation_net.rs"]
 mod net;
 
-use asx_testkit::pki::{Cdp, IssueOptions, KeyAlg, TestCa};
-use asx_testkit::trace::TraceCapture;
+use asx::testkit::pki::{Cdp, IssueOptions, KeyAlg, TestCa};
+use asx::testkit::trace::TraceCapture;
 use net::peers::Preset;
 use net::*;
 
@@ -47,7 +47,7 @@ fn revocation_spans_carry_method_source_outcome_and_reason() {
             });
     }
     let spans = capture.spans_named("asx.revocation");
-    let field = |s: &asx_testkit::trace::CapturedSpan, f: &str| s.fields.get(f).cloned();
+    let field = |s: &asx::testkit::trace::CapturedSpan, f: &str| s.fields.get(f).cloned();
     let revoked = spans
         .iter()
         .find(|s| field(s, "outcome").as_deref() == Some("revoked"))

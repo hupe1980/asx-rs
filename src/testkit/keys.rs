@@ -19,7 +19,7 @@ pub struct CountingKeys {
 
 impl CountingKeys {
     /// Wrap `pair` (its PEM stays inside).
-    pub fn new(pair: &crate::pki::KeyPair) -> CountingKeys {
+    pub fn new(pair: &super::pki::KeyPair) -> CountingKeys {
         CountingKeys {
             inner: pair.key_pair(),
             chain: vec![pair.certificate()],

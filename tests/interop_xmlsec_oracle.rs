@@ -35,7 +35,7 @@ use testcontainers::{GenericImage, ImageExt};
 /// A self-signed RSA-2048 certificate and key from the test PKI.
 fn self_signed_rsa(subject_cn: &str) -> (Vec<u8>, Vec<u8>) {
     let pair =
-        asx_testkit::pki::KeyPair::self_signed(subject_cn, asx_testkit::pki::KeyAlg::Rsa2048);
+        asx::testkit::pki::KeyPair::self_signed(subject_cn, asx::testkit::pki::KeyAlg::Rsa2048);
     (pair.cert_pem, pair.key_pem)
 }
 
@@ -356,8 +356,8 @@ fn ecdsa_dir(tag: &str) -> std::path::PathBuf {
     dir
 }
 
-fn ecdsa_key(alg: asx_testkit::pki::KeyAlg) -> asx_testkit::pki::KeyPair {
-    asx_testkit::pki::KeyPair::self_signed("asx-xmlsec-ecdsa", alg)
+fn ecdsa_key(alg: asx::testkit::pki::KeyAlg) -> asx::testkit::pki::KeyPair {
+    asx::testkit::pki::KeyPair::self_signed("asx-xmlsec-ecdsa", alg)
 }
 
 fn xmlsec_verify_script(file: &str) -> String {
@@ -368,7 +368,7 @@ fn xmlsec_verify_script(file: &str) -> String {
     )
 }
 
-fn asx_ecdsa_signed(pair: &asx_testkit::pki::KeyPair) -> String {
+fn asx_ecdsa_signed(pair: &asx::testkit::pki::KeyPair) -> String {
     let signature = asx::__fuzz::wssec::generate_xmlsig_signature(
         ECDSA_ENVELOPE,
         &["#body"],
@@ -384,7 +384,7 @@ fn asx_ecdsa_signed(pair: &asx_testkit::pki::KeyPair) -> String {
     )
 }
 
-fn assert_asx_ecdsa_verifies_under_xmlsec1(alg: asx_testkit::pki::KeyAlg, width: usize) {
+fn assert_asx_ecdsa_verifies_under_xmlsec1(alg: asx::testkit::pki::KeyAlg, width: usize) {
     let pair = ecdsa_key(alg);
     let signed = asx_ecdsa_signed(&pair);
     let value = signature_value_octets(&signed);
@@ -413,28 +413,28 @@ fn signature_value_octets(xml: &str) -> Vec<u8> {
 #[test]
 #[ignore = "requires a Docker daemon; run with --ignored"]
 fn asx_ecdsa_verifies_under_xmlsec1_p256() {
-    assert_asx_ecdsa_verifies_under_xmlsec1(asx_testkit::pki::KeyAlg::EcP256, 64);
+    assert_asx_ecdsa_verifies_under_xmlsec1(asx::testkit::pki::KeyAlg::EcP256, 64);
 }
 
 #[test]
 #[ignore = "requires a Docker daemon; run with --ignored"]
 fn asx_ecdsa_verifies_under_xmlsec1_bp256() {
-    assert_asx_ecdsa_verifies_under_xmlsec1(asx_testkit::pki::KeyAlg::EcBrainpoolP256r1, 64);
+    assert_asx_ecdsa_verifies_under_xmlsec1(asx::testkit::pki::KeyAlg::EcBrainpoolP256r1, 64);
 }
 
 #[test]
 #[ignore = "requires a Docker daemon; run with --ignored"]
 fn asx_ecdsa_verifies_under_xmlsec1_p384() {
-    assert_asx_ecdsa_verifies_under_xmlsec1(asx_testkit::pki::KeyAlg::EcP384, 96);
+    assert_asx_ecdsa_verifies_under_xmlsec1(asx::testkit::pki::KeyAlg::EcP384, 96);
 }
 
 #[test]
 #[ignore = "requires a Docker daemon; run with --ignored"]
 fn asx_ecdsa_verifies_under_xmlsec1_p521() {
-    assert_asx_ecdsa_verifies_under_xmlsec1(asx_testkit::pki::KeyAlg::EcP521, 132);
+    assert_asx_ecdsa_verifies_under_xmlsec1(asx::testkit::pki::KeyAlg::EcP521, 132);
 }
 
-fn assert_xmlsec1_ecdsa_verifies_here(alg: asx_testkit::pki::KeyAlg, width: usize) {
+fn assert_xmlsec1_ecdsa_verifies_here(alg: asx::testkit::pki::KeyAlg, width: usize) {
     let pair = ecdsa_key(alg);
     let dir = ecdsa_dir(&format!("sign-{alg:?}"));
     std::fs::write(dir.join("template.xml"), ECDSA_TEMPLATE).expect("template");
@@ -466,25 +466,25 @@ fn assert_xmlsec1_ecdsa_verifies_here(alg: asx_testkit::pki::KeyAlg, width: usiz
 #[test]
 #[ignore = "requires a Docker daemon; run with --ignored"]
 fn xmlsec1_ecdsa_verifies_here_p256() {
-    assert_xmlsec1_ecdsa_verifies_here(asx_testkit::pki::KeyAlg::EcP256, 64);
+    assert_xmlsec1_ecdsa_verifies_here(asx::testkit::pki::KeyAlg::EcP256, 64);
 }
 
 #[test]
 #[ignore = "requires a Docker daemon; run with --ignored"]
 fn xmlsec1_ecdsa_verifies_here_bp256() {
-    assert_xmlsec1_ecdsa_verifies_here(asx_testkit::pki::KeyAlg::EcBrainpoolP256r1, 64);
+    assert_xmlsec1_ecdsa_verifies_here(asx::testkit::pki::KeyAlg::EcBrainpoolP256r1, 64);
 }
 
 #[test]
 #[ignore = "requires a Docker daemon; run with --ignored"]
 fn xmlsec1_ecdsa_verifies_here_p384() {
-    assert_xmlsec1_ecdsa_verifies_here(asx_testkit::pki::KeyAlg::EcP384, 96);
+    assert_xmlsec1_ecdsa_verifies_here(asx::testkit::pki::KeyAlg::EcP384, 96);
 }
 
 #[test]
 #[ignore = "requires a Docker daemon; run with --ignored"]
 fn xmlsec1_ecdsa_verifies_here_p521() {
-    assert_xmlsec1_ecdsa_verifies_here(asx_testkit::pki::KeyAlg::EcP521, 132);
+    assert_xmlsec1_ecdsa_verifies_here(asx::testkit::pki::KeyAlg::EcP521, 132);
 }
 
 /// The negative: xmlsec1 refuses the DER `ECDSA-Sig-Value` of a valid
@@ -493,7 +493,7 @@ fn xmlsec1_ecdsa_verifies_here_p521() {
 #[ignore = "requires a Docker daemon; run with --ignored"]
 fn xmlsec1_rejects_der_ecdsa_value() {
     use base64::Engine;
-    let pair = ecdsa_key(asx_testkit::pki::KeyAlg::EcBrainpoolP256r1);
+    let pair = ecdsa_key(asx::testkit::pki::KeyAlg::EcBrainpoolP256r1);
     let signed = asx_ecdsa_signed(&pair);
     let wire = signature_value_octets(&signed);
     let (r, s) = wire.split_at(32);

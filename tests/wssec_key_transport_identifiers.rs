@@ -9,7 +9,7 @@
 
 use asx::__fuzz::wssec::{XmlEncPayloadAlgorithm, decrypt_swa, encrypt_swa};
 use asx::__fuzz::{AsxError, ErrorCode};
-use asx_testkit::pki::{KeyAlg, KeyPair};
+use asx::testkit::pki::{KeyAlg, KeyPair};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
 use std::collections::HashMap;

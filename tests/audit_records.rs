@@ -13,9 +13,9 @@ mod ported;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
+use asx::testkit::audit::MemoryAuditSink;
+use asx::testkit::loopback::Loopback;
 use asx::{AuditDurability, AuditRecord, ErrorKind};
-use asx_testkit::audit::MemoryAuditSink;
-use asx_testkit::loopback::Loopback;
 use base64::Engine as _;
 use peers::{HANDLER_ERR, Preset, pair};
 use ported::{FailingSink, Log, LoggingDedup, LoggingSink};

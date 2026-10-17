@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# The blocking public-API gate (spec 042 T077, FR-003, FR-031, research R15).
+# The public-API gate.
 #
-#   1. The snapshot `cargo +nightly public-api -sss --all-features` equals
+#   1. The snapshot `cargo +nightly public-api -sss --features as2,as4,http-client,peppol,metrics` equals
 #      tests/public-api.txt (regenerate with `just public-api-update` and
 #      review the diff in the same change).
 #   2. The declared item count is at most 160: lines starting with `pub `,
 #      excluding members of `impl Trait for Type` blocks (fixed by the trait).
 #   3. No name in scripts/deleted-names.txt is a segment of an `asx::` path.
-#   4. FR-003: no declared item name selects signing, encryption, compression,
+#   4. No declared item name selects signing, encryption, compression,
 #      an algorithm, a token reference, or a receipt/MDN/MIC requirement —
 #      outside the contract's allowlisted items (the `Profile`/`Quirk` data,
 #      the key-custody seam and trust material).
@@ -21,7 +21,7 @@ BUDGET=160
 committed=tests/public-api.txt
 failed=0
 
-current=$(cargo +nightly public-api -sss --all-features -p asx-rs 2>/dev/null)
+current=$(cargo +nightly public-api -sss --features as2,as4,http-client,peppol,metrics -p asx-rs 2>/dev/null)
 if [ "${1:-}" = "--update" ]; then
     printf '%s\n' "$current" >"$committed"
 fi
@@ -75,9 +75,9 @@ while IFS= read -r name; do
     fi
 done <scripts/deleted-names.txt
 
-# 4. FR-003 word check over declared item paths.
+# 4. Word check over declared item paths.
 # `Builder::crl_signer` is trust material (the indirect-CRL signer, like a
-# trust anchor), not a setting (spec 026 research R10).
+# trust anchor), not a setting.
 allow='^asx::(Profile|Quirk|SignatureAlgorithm|Signer|Receipt|KeyOp|ClaimToken)(::|<|$)|^asx::KeyPair::sign$|^asx::LocalParty::signer$|^asx::Partner::(signing_cert|encryption_cert)$|^asx::Builder<C>::crl_signer$|^asx::Verified<T>::signer$|^asx::AuditRecord::signal$|^asx::Claim::Claimed$'
 words=$(printf '%s\n' "$current" | awk '
     {
@@ -92,7 +92,7 @@ words=$(printf '%s\n' "$current" | awk '
         print line
     }' | grep -iE 'sign|encrypt|compress|algorithm|token|receipt|mic' | grep -vE "$allow" || true)
 if [ -n "$words" ]; then
-    echo "public-api: item names that select a security or wire setting (FR-003):" >&2
+    echo "public-api: item names that select a security or wire setting:" >&2
     echo "$words" >&2
     failed=1
 fi
@@ -100,4 +100,4 @@ fi
 if [ "$failed" -ne 0 ]; then
     exit 1
 fi
-echo "public-api: snapshot equal, $count ≤ $BUDGET items, no deleted name, FR-003 clean"
+echo "public-api: snapshot equal, $count ≤ $BUDGET items, no deleted name, no setting names"

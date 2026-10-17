@@ -1,7 +1,5 @@
-//! Crate-private helpers for the in-crate unit tests.
-//!
-//! In-crate tests are compiled into a different `asx-rs` instance than the one
-//! `asx-rs-testkit` links, so they cannot use the testkit.
+//! Crate-private helpers for the in-crate unit tests (the test PKI and the
+//! loopback partner are in `crate::testkit`).
 //!
 //! The internal policy views are built only by the profile: the
 //! helpers in [`views`] resolve a profile and a partner exactly as `build()`

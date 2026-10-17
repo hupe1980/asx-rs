@@ -62,7 +62,7 @@ impl TrustResult {
 ///
 /// This trait is **sealed**: it cannot be implemented outside this crate. The
 /// only implementation is [`CmsSmimeTrustVerifier`]; tests run it against
-/// generated test PKI (`asx-rs-testkit`), never against a bypass.
+/// generated test PKI (`asx::testkit`), never against a bypass.
 pub(crate) trait As2TrustVerifier: private::Sealed + std::fmt::Debug {
     fn verify_and_decrypt(&self, session: &SessionContext, body: &Arc<[u8]>)
     -> Result<TrustResult>;

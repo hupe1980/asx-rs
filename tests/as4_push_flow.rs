@@ -106,8 +106,9 @@ async fn forged_receipt_signature_is_indeterminate() {
 async fn receipt_signed_by_an_untrusted_certificate_is_indeterminate() {
     use base64::Engine;
     let p = pair(Preset::Edelivery);
-    let foreign = asx_testkit::pki::TestCa::new("foreign root", asx_testkit::pki::KeyAlg::Rsa2048)
-        .rsa_party("party-b");
+    let foreign =
+        asx::testkit::pki::TestCa::new("foreign root", asx::testkit::pki::KeyAlg::Rsa2048)
+            .rsa_party("party-b");
     let token =
         base64::engine::general_purpose::STANDARD.encode(foreign.signing.certificate().der());
     let signer = foreign.signing.clone();

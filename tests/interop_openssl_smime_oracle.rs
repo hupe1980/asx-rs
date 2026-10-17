@@ -29,7 +29,7 @@ use std::process::Command;
 /// A self-signed RSA-2048 certificate and key from the test PKI.
 fn self_signed_rsa(subject_cn: &str) -> (Vec<u8>, Vec<u8>) {
     let pair =
-        asx_testkit::pki::KeyPair::self_signed(subject_cn, asx_testkit::pki::KeyAlg::Rsa2048);
+        asx::testkit::pki::KeyPair::self_signed(subject_cn, asx::testkit::pki::KeyAlg::Rsa2048);
     (pair.cert_pem, pair.key_pem)
 }
 
@@ -238,7 +238,7 @@ mod as2_peers;
 /// files.
 struct OracleInbound {
     dir: PathBuf,
-    loopback: asx_testkit::loopback::Loopback,
+    loopback: asx::testkit::loopback::Loopback,
     delivered: as2_peers::Delivered,
 }
 
@@ -246,7 +246,7 @@ const ORACLE_ID: &str = "OPENSSL";
 
 fn oracle_inbound(test: &str) -> OracleInbound {
     use std::sync::Arc;
-    let ca = asx_testkit::pki::TestCa::new("asx-oracle root", asx_testkit::pki::KeyAlg::Rsa2048);
+    let ca = asx::testkit::pki::TestCa::new("asx-oracle root", asx::testkit::pki::KeyAlg::Rsa2048);
     let (partner, receiver) = (ca.as2_party(ORACLE_ID), ca.as2_party(as2_peers::B_ID));
     let dir = std::env::temp_dir().join(format!("asx-smime-{test}-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("dir");
@@ -254,7 +254,7 @@ fn oracle_inbound(test: &str) -> OracleInbound {
     std::fs::write(dir.join("key.pem"), &partner.signing.key_pem).expect("key");
     std::fs::write(dir.join("receiver.pem"), &receiver.encryption.cert_pem).expect("receiver");
     std::fs::write(dir.join("ca.pem"), ca.cert_pem()).expect("ca");
-    let loopback = asx_testkit::loopback::Loopback::new();
+    let loopback = asx::testkit::loopback::Loopback::new();
     let client = asx::as2::As2::builder(asx::Profile::as2())
         .local(receiver.local())
         .trust_anchor(ca.anchor())
@@ -419,13 +419,13 @@ async fn inbound_refuses_an_openssl_signed_but_unencrypted_message() {
 #[tokio::test]
 #[ignore = "requires an openssl binary; run with --ignored"]
 async fn openssl_verifies_a_client_message_signed_by_an_external_ec_signer() {
-    use asx_testkit::keys::CountingKeys;
-    use asx_testkit::pki::{KeyAlg, TestCa};
+    use asx::testkit::keys::CountingKeys;
+    use asx::testkit::pki::{KeyAlg, TestCa};
     let ca = TestCa::new("asx-oracle ext root", KeyAlg::Rsa2048);
     let (a, b) = (ca.as2_party(as2_peers::A_ID), ca.as2_party(as2_peers::B_ID));
     let ec = ca.issue("asx-oracle ec signer", KeyAlg::EcP256);
     let signer = CountingKeys::new(&ec);
-    let loopback = asx_testkit::loopback::Loopback::new();
+    let loopback = asx::testkit::loopback::Loopback::new();
     let to_b = b.partner(as2_peers::B_URL);
     let sender = asx::as2::As2::builder(asx::Profile::as2())
         .local(

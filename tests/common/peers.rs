@@ -3,10 +3,10 @@
 #![allow(dead_code, unreachable_pub, clippy::type_complexity)]
 
 use asx::as4::{As4, Message, UserMessage};
+use asx::testkit::audit::MemoryAuditSink;
+use asx::testkit::loopback::Loopback;
+use asx::testkit::pki::{TestCa, TestParty};
 use asx::{MemoryDedup, Partner, Payload, Profile, Reject, Verified};
-use asx_testkit::audit::MemoryAuditSink;
-use asx_testkit::loopback::Loopback;
-use asx_testkit::pki::{TestCa, TestParty};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
@@ -55,7 +55,7 @@ impl Preset {
     pub fn ca(self) -> TestCa {
         match self {
             Preset::Bdew => TestCa::sm_pki(),
-            _ => TestCa::new("asx-test root", asx_testkit::pki::KeyAlg::Rsa2048),
+            _ => TestCa::new("asx-test root", asx::testkit::pki::KeyAlg::Rsa2048),
         }
     }
 

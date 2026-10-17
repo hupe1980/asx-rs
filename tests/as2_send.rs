@@ -101,7 +101,7 @@ async fn requests_a_signed_sha256_mdn_and_encrypts() {
 
 #[tokio::test]
 async fn partner_decryption_failure_is_a_partner_error() {
-    let other = asx_testkit::pki::TestCa::new("other", asx_testkit::pki::KeyAlg::Rsa2048)
+    let other = asx::testkit::pki::TestCa::new("other", asx::testkit::pki::KeyAlg::Rsa2048)
         .as2_party("OTHER");
     let p = pair_with(
         |b| {
@@ -293,9 +293,9 @@ async fn signed_mdn_under_the_quirk_records_no_quirk() {
 
 #[tokio::test]
 async fn audit_failure_after_a_verified_mdn_is_delivered_but_unrecorded() {
-    let ca = asx_testkit::pki::TestCa::new("root", asx_testkit::pki::KeyAlg::Rsa2048);
+    let ca = asx::testkit::pki::TestCa::new("root", asx::testkit::pki::KeyAlg::Rsa2048);
     let (a, b) = (ca.as2_party("A"), ca.as2_party("B"));
-    let loopback = asx_testkit::loopback::Loopback::new();
+    let loopback = asx::testkit::loopback::Loopback::new();
     let to_b = b.partner(B_URL);
     let sender = As2::builder(Profile::as2())
         .local(a.local())
@@ -344,7 +344,7 @@ async fn invalid_messages_are_refused_before_sending() {
     }
     let mut big = Profile::as2();
     big = big.max_message_bytes(4);
-    let ca = asx_testkit::pki::TestCa::new("root", asx_testkit::pki::KeyAlg::Rsa2048);
+    let ca = asx::testkit::pki::TestCa::new("root", asx::testkit::pki::KeyAlg::Rsa2048);
     let (a, b) = (ca.as2_party("A"), ca.as2_party("B"));
     let small = As2::builder(big)
         .local(a.local())
@@ -545,7 +545,7 @@ impl asx::Signer for External {
 #[tokio::test]
 async fn an_external_signer_builds_an_as2_client() {
     use asx::Signer as _;
-    let ca = asx_testkit::pki::TestCa::new("root", asx_testkit::pki::KeyAlg::Rsa2048);
+    let ca = asx::testkit::pki::TestCa::new("root", asx::testkit::pki::KeyAlg::Rsa2048);
     let a = ca.as2_party("A");
     let key = a.signing.key_pair();
     let chain = key.certificate_chain().to_vec();
@@ -553,10 +553,10 @@ async fn an_external_signer_builds_an_as2_client() {
         .local(
             asx::LocalParty::new("A")
                 .signer(External(key.clone(), chain))
-                .decrypter(asx_testkit::keys::CountingKeys::new(&a.encryption)),
+                .decrypter(asx::testkit::keys::CountingKeys::new(&a.encryption)),
         )
         .trust_anchor(ca.anchor())
-        .http_client(asx_testkit::loopback::Loopback::new())
+        .http_client(asx::testkit::loopback::Loopback::new())
         .build()
         .expect("an external signer and decrypter are accepted");
 }

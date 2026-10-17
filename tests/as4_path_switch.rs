@@ -13,8 +13,8 @@ mod inbound_harness;
 mod peers;
 
 use asx::as4::{As4, Message, PathSwitch, UserMessage};
+use asx::testkit::keys::CountingKeys;
 use asx::{ErrorKind, LocalParty, MemoryDedup, Partner, Payload, Reject, Verified};
-use asx_testkit::keys::CountingKeys;
 use bytes::Bytes;
 use inbound_harness::{Answer, genuine_with, post, request, resign};
 use peers::{A_URL, B_URL, Pair, Preset, pair, pair_with};

@@ -37,7 +37,7 @@
 //! # Using it
 //!
 //! ```no_run
-//! use asx_testkit::dedup::{conformance, DedupHarness};
+//! use asx::testkit::dedup::{conformance, DedupHarness};
 //! use std::time::Duration;
 //!
 //! #[derive(Debug)]

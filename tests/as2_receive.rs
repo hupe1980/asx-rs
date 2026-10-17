@@ -31,8 +31,8 @@ fn mdn_disposition(resp: &http::Response<bytes::Bytes>) -> String {
 /// A raw AS2 message: optionally signed by `signer`, optionally encrypted to
 /// `recipient` (`asx::__fuzz::as2_raw_message`; the client always does both).
 fn raw_message(
-    signer: Option<&asx_testkit::pki::KeyPair>,
-    recipient: Option<&asx_testkit::pki::KeyPair>,
+    signer: Option<&asx::testkit::pki::KeyPair>,
+    recipient: Option<&asx::testkit::pki::KeyPair>,
 ) -> (String, Vec<u8>) {
     asx::__fuzz::as2_raw_message(
         PAYLOAD,
@@ -74,7 +74,7 @@ async fn post(
 }
 
 /// Every MDN this side sends is signed by the local signer.
-fn assert_signed_by(resp: &http::Response<bytes::Bytes>, party: &asx_testkit::pki::TestParty) {
+fn assert_signed_by(resp: &http::Response<bytes::Bytes>, party: &asx::testkit::pki::TestParty) {
     let content_type = resp.headers()["content-type"].to_str().unwrap();
     assert!(content_type.contains("multipart/signed"), "{content_type}");
     let text = String::from_utf8_lossy(resp.body());
@@ -223,7 +223,7 @@ async fn bad_signature_is_authentication_failed() {
     );
     // A signer from another CA entirely.
     let stranger =
-        asx_testkit::pki::KeyPair::self_signed("stranger", asx_testkit::pki::KeyAlg::Rsa2048);
+        asx::testkit::pki::KeyPair::self_signed("stranger", asx::testkit::pki::KeyAlg::Rsa2048);
     let (content_type, body) = raw_message(Some(&stranger), Some(&p.b.encryption));
     let resp = post(
         &p,
@@ -241,7 +241,7 @@ async fn bad_signature_is_authentication_failed() {
 async fn every_decryption_failure_is_the_same_decryption_failed() {
     let p = pair();
     let elsewhere =
-        asx_testkit::pki::KeyPair::self_signed("elsewhere", asx_testkit::pki::KeyAlg::Rsa2048);
+        asx::testkit::pki::KeyPair::self_signed("elsewhere", asx::testkit::pki::KeyAlg::Rsa2048);
     let (wrong_ct, wrong_key) = raw_message(Some(&p.a.signing), Some(&elsewhere));
     let (good_ct, good) = raw_message(Some(&p.a.signing), Some(&p.b.encryption));
     let mut corrupted = good.clone();
@@ -285,7 +285,7 @@ async fn unknown_sender_is_refused_before_any_private_key_operation() {
     // Encrypted to a key the receiver does not hold. Were it decrypted
     // first, the answer would be decryption-failed; it is refused on AS2-From.
     let elsewhere =
-        asx_testkit::pki::KeyPair::self_signed("elsewhere", asx_testkit::pki::KeyAlg::Rsa2048);
+        asx::testkit::pki::KeyPair::self_signed("elsewhere", asx::testkit::pki::KeyAlg::Rsa2048);
     let (content_type, body) = raw_message(Some(&p.a.signing), Some(&elsewhere));
     let resp = post(
         &p,
@@ -477,18 +477,18 @@ async fn dedup_failure_is_500_without_an_mdn() {
 
 #[tokio::test]
 async fn audit_failure_is_500_without_an_mdn_and_releases_the_claim() {
-    let ca = asx_testkit::pki::TestCa::new("root", asx_testkit::pki::KeyAlg::Rsa2048);
+    let ca = asx::testkit::pki::TestCa::new("root", asx::testkit::pki::KeyAlg::Rsa2048);
     let (a, b) = (ca.as2_party(A_ID), ca.as2_party(B_ID));
     let receiver = asx::as2::As2::builder(asx::Profile::as2())
         .local(b.local())
         .trust_anchor(ca.anchor())
         .partner(a.partner(as2_peers::A_URL))
-        .http_client(asx_testkit::loopback::Loopback::new())
+        .http_client(asx::testkit::loopback::Loopback::new())
         .audit(as2_peers::FailingSink)
         .build()
         .unwrap();
     let dedup = Arc::new(asx::MemoryDedup::default());
-    let loopback = asx_testkit::loopback::Loopback::new();
+    let loopback = asx::testkit::loopback::Loopback::new();
     loopback.mount(
         B_URL,
         receiver.inbound(
@@ -547,16 +547,16 @@ async fn an_async_mdn_request_is_answered_synchronously() {
 
 #[tokio::test]
 async fn oversized_body_is_413() {
-    let ca = asx_testkit::pki::TestCa::new("root", asx_testkit::pki::KeyAlg::Rsa2048);
+    let ca = asx::testkit::pki::TestCa::new("root", asx::testkit::pki::KeyAlg::Rsa2048);
     let (a, b) = (ca.as2_party(A_ID), ca.as2_party(B_ID));
     let receiver = asx::as2::As2::builder(asx::Profile::as2().max_message_bytes(64))
         .local(b.local())
         .trust_anchor(ca.anchor())
         .partner(a.partner(as2_peers::A_URL))
-        .http_client(asx_testkit::loopback::Loopback::new())
+        .http_client(asx::testkit::loopback::Loopback::new())
         .build()
         .unwrap();
-    let loopback = asx_testkit::loopback::Loopback::new();
+    let loopback = asx::testkit::loopback::Loopback::new();
     loopback.mount(
         B_URL,
         receiver.inbound(
@@ -572,32 +572,20 @@ async fn oversized_body_is_413() {
     assert_eq!(resp.status(), http::StatusCode::PAYLOAD_TOO_LARGE);
 }
 
-/// Counts the private-key operations (`asx.decrypt` spans) of one future.
-struct DecryptCounter(Arc<std::sync::atomic::AtomicUsize>);
-
-impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for DecryptCounter {
-    fn on_new_span(
-        &self,
-        attrs: &tracing::span::Attributes<'_>,
-        _id: &tracing::span::Id,
-        _ctx: tracing_subscriber::layer::Context<'_, S>,
-    ) {
-        if attrs.metadata().name() == "asx.decrypt" {
-            self.0.fetch_add(1, Ordering::SeqCst);
-        }
-    }
-}
-
+/// Counts the private-key operations (`asx.decrypt` spans) of one request.
 async fn decrypt_calls(
     p: &as2_peers::Pair,
     request: http::Request<bytes::Bytes>,
 ) -> (usize, String) {
-    use tracing::instrument::WithSubscriber as _;
-    use tracing_subscriber::layer::SubscriberExt as _;
-    let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let subscriber = tracing_subscriber::registry().with(DecryptCounter(count.clone()));
-    let resp = post(p, request).with_subscriber(subscriber).await;
-    (count.load(Ordering::SeqCst), mdn_disposition(&resp))
+    let capture = asx::testkit::trace::TraceCapture::new();
+    let resp = {
+        let _guard = capture.set_default();
+        post(p, request).await
+    };
+    (
+        capture.spans_named("asx.decrypt").len(),
+        mdn_disposition(&resp),
+    )
 }
 
 #[tokio::test]

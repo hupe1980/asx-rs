@@ -4,7 +4,7 @@ description = "Implementing a durable DedupStore and AuditSink, and checking the
 +++
 
 The library keeps no state between requests. Two stores are yours, each a
-trait with a conformance suite in `asx-rs-testkit`:
+trait with a conformance suite in `asx::testkit`:
 
 - **[`DedupStore`](https://docs.rs/asx-rs/latest/asx/trait.DedupStore.html)**
   decides whether an inbound message is new;
@@ -140,13 +140,13 @@ impl DedupStore for TableDedup {
 
 ### Check your store before production
 
-`asx_testkit::dedup::conformance` drives a store through every rule above,
+`asx::testkit::dedup::conformance` drives a store through every rule above,
 including the concurrent claim race and stale-holder fencing, and returns the
 failed checks. Each check is itself tested against a deliberately broken store
-in `asx_testkit::dedup::broken`.
+in `asx::testkit::dedup::broken`.
 
 ```rust,no_run
-use asx_testkit::dedup::{conformance, DedupHarness};
+use asx::testkit::dedup::{conformance, DedupHarness};
 use std::time::Duration;
 
 struct Harness;
@@ -217,5 +217,5 @@ fn with_audit(builder: asx::Builder<asx::as4::As4>) -> asx::Builder<asx::as4::As
   message was delivered: do not resend it).
 - `BestEffort`: an `ERROR` event and a counted metric; the exchange proceeds.
 
-`asx_testkit::audit::conformance` checks the durability claim; see
+`asx::testkit::audit::conformance` checks the durability claim; see
 [check your sink](@/docs/observability.md#check-your-sink-before-production).

@@ -198,7 +198,7 @@ pub(crate) fn check_freshness(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use asx_testkit::pki::{IssueOptions, KeyAlg, TestCa};
+    use asx::testkit::pki::{IssueOptions, KeyAlg, TestCa};
     use openssl::asn1::Asn1GeneralizedTime;
 
     const NOW: u64 = 1_780_000_000;

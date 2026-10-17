@@ -53,7 +53,7 @@ instance in a trading relationship together.
 | feature `server` (and the `axum` dependency) | removed: `Inbound` is a tower `Service`; mount it with `Router::route_service` |
 | feature `dns` | part of `peppol` |
 | feature `trace`, `prometheus`, `opentelemetry` | spans are always on; `metrics` for counters, an exporter in your application |
-| feature `testing` | removed: `asx-rs-testkit` as a dev-dependency |
+| feature `testing` | removed: the additive `test-util` feature (`asx::testkit`) in dev-dependencies |
 | feature `interop-strict`, `interop-relaxed` | removed: strict only; per-partner `Quirk`s |
 
 ## Configure
@@ -142,11 +142,11 @@ See [persistence](@/docs/persistence.md).
 
 | 0.15 | 0.16 |
 |---|---|
-| `features = ["testing"]` | `asx-rs-testkit` dev-dependency ([testing](@/docs/testing.md)) |
-| `fixtures::generate_self_signed_*` | `asx_testkit::pki::TestCa` (`sm_pki().bdew_party(mp_id)` puts the MP-ID in the OU) |
-| `as4::mock_endpoint::MockAs4Endpoint`, `As4HttpTransport::new_for_localhost_testing` | `asx_testkit::loopback::Loopback` mounting a real partner client's `Inbound` |
-| `storage::conformance`, `DurableInMemoryDedupBackend` | `asx_testkit::dedup::conformance`, `asx_testkit::audit::conformance` |
-| `EventBus::new_for_testing` | `asx_testkit::trace::TraceCapture`, `asx_testkit::audit::MemoryAuditSink` |
+| `features = ["testing"]` | `features = ["test-util"]` in dev-dependencies ([testing](@/docs/testing.md)) |
+| `fixtures::generate_self_signed_*` | `asx::testkit::pki::TestCa` (`sm_pki().bdew_party(mp_id)` puts the MP-ID in the OU) |
+| `as4::mock_endpoint::MockAs4Endpoint`, `As4HttpTransport::new_for_localhost_testing` | `asx::testkit::loopback::Loopback` mounting a real partner client's `Inbound` |
+| `storage::conformance`, `DurableInMemoryDedupBackend` | `asx::testkit::dedup::conformance`, `asx::testkit::audit::conformance` |
+| `EventBus::new_for_testing` | `asx::testkit::trace::TraceCapture`, `asx::testkit::audit::MemoryAuditSink` |
 
 ## Internal helpers that became private
 

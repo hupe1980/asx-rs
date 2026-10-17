@@ -1,6 +1,6 @@
 [package]
 name = "asx-rs"
-version = "0.16.0"
+version = "0.16.1"
 edition = "2024"
 authors = ["hupe1980"]
 description = "AS2 and AS4 (ebMS3) B2B messaging: BDEW, Peppol, eDelivery and ENTSOG profiles, signed receipts and MDNs, one tower Service to receive"
@@ -13,7 +13,7 @@ documentation = "https://docs.rs/asx-rs"
 rust-version = "1.88"
 keywords = ["as2", "as4", "ebms3", "edi", "peppol"]
 categories = ["network-programming", "cryptography", "encoding"]
-# Not published: the website, scripts, benches, the testkit, local notes.
+# Not published: the website, scripts, benches, local notes.
 exclude = [
     "*_FEEDBACK.md",
     "artifacts/",
@@ -32,7 +32,7 @@ rustdoc-args = ["--cfg", "docsrs"]
 name = "asx"
 
 [workspace]
-members = ["xtask", "testkit"]
+members = ["xtask"]
 default-members = ["."]
 
 [features]
@@ -47,6 +47,8 @@ http-client = ["dep:reqwest"]
 peppol = ["as4", "dep:hickory-resolver"]
 ## Counters and histograms through the `metrics` facade.
 metrics = ["dep:metrics"]
+## Test support (`asx::testkit`). Dev-dependencies only; adds helpers, changes nothing.
+test-util = ["as2", "as4", "dep:uuid", "dep:serde_json", "dep:tracing-subscriber", "tokio/rt-multi-thread", "tokio/macros"]
 
 [lints.rust]
 # `unsafe_code` is forbidden in `src/lib.rs`, not here: a test target
@@ -93,12 +95,15 @@ der = { version = "0.7", optional = true }
 roxmltree = { version = "0.21", optional = true }
 hickory-resolver = { version = "0.26", default-features = false, features = ["system-config", "tokio"], optional = true }
 metrics = { version = "0.24", optional = true }
+uuid = { version = "1", features = ["v4"], optional = true }
+serde_json = { version = "1", optional = true }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["registry", "std"], optional = true }
 
 [dev-dependencies]
 # Doc examples only (`as4/signals.rs`, `as4/types.rs`).
 uuid = { version = "1", features = ["v4"] }
-# Path only: `cargo publish` strips it (test PKI, loopback partner, suites).
-asx-rs-testkit = { path = "testkit" }
+# The tests use the test helpers (`asx::testkit`).
+asx-rs = { path = ".", features = ["test-util"] }
 proptest = "1"
 tower = { version = "0.5", features = ["util"] }
 # Paused-time lease tests (`MemoryDedup`, the dedup conformance suite).

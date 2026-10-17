@@ -68,7 +68,7 @@ async fn captured_smp_document_gives_a_partner() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn smp_signature_not_chaining_to_the_anchor_is_rejected() {
-    let foreign = asx_testkit::pki::TestCa::new("not peppol", asx_testkit::pki::KeyAlg::Rsa2048);
+    let foreign = asx::testkit::pki::TestCa::new("not peppol", asx::testkit::pki::KeyAlg::Rsa2048);
     let smp =
         Smp::production(CapturedSmp, foreign.anchor()).__with_static_smp("https://smp.example");
     let err = smp
@@ -113,7 +113,7 @@ async fn access_point_whose_cn_is_not_its_party_id_is_refused() {
     let p = pair(Preset::Peppol);
     p.loopback.mount(B_URL, stranger(&p));
     // The sender claims POP000009 but signs with the POP000001 certificate.
-    let liar = asx_testkit::pki::TestParty {
+    let liar = asx::testkit::pki::TestParty {
         id: "POP000009".into(),
         ..p.a.clone()
     };

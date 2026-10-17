@@ -9,7 +9,7 @@ use asx::__fuzz::wssec::{
     ChainPolicy, WsSecOutboundKeyInfoProfile, WsSecVerifyOptions, generate_xmlsig_signature,
     verify_enveloped_signature,
 };
-use asx_testkit::pki::{KeyAlg, TestCa};
+use asx::testkit::pki::{KeyAlg, TestCa};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
 

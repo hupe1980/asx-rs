@@ -7,8 +7,8 @@
 //! .validateInitiatorIdentity`), as SM-PKI market-communication certificates
 //! carry it; both sides' certificates follow that form.
 
+use asx::testkit::pki::{KeyAlg, TestCa};
 use asx::{Certificate, KeyPair, LocalParty, Partner};
-use asx_testkit::pki::{KeyAlg, TestCa};
 use openssl::nid::Nid;
 use openssl::x509::X509;
 use serde_json::{Value, json};
@@ -70,7 +70,7 @@ impl std::fmt::Debug for PemPair {
 }
 
 impl PemPair {
-    fn from_testkit(pair: asx_testkit::pki::KeyPair) -> PemPair {
+    fn from_testkit(pair: asx::testkit::pki::KeyPair) -> PemPair {
         PemPair {
             cert_pem: pair.cert_pem,
             key_pem: pair.key_pem,

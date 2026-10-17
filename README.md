@@ -39,9 +39,10 @@ none changes security behaviour:
 | `http-client` | The built-in HTTPS client (reqwest, HTTPS only, address pinning, mTLS identity) | ✅ |
 | `peppol` | SMP lookup through BDXL (`asx::peppol::Smp`); implies `as4` | ❌ |
 | `metrics` | Counters and histograms through the `metrics` facade (spans via `tracing` are always on) | ❌ |
+| `test-util` | `asx::testkit`: test PKI, loopback partner, store suites; `[dev-dependencies]` only | ❌ |
 
-Test helpers (test PKI, in-process loopback partner, conformance suites) live
-in the `asx-rs-testkit` dev-dependency.
+Test helpers (test PKI, in-process loopback partner, conformance suites) are
+in `asx::testkit`, behind the `test-util` feature for `[dev-dependencies]`.
 
 ## Golden paths
 
@@ -174,7 +175,7 @@ carries its audit record (`evidence()`).
 - **Keys can live in an HSM or KMS.** `Signer` and `Decrypter` are async traits
   for the private-key operation; `KeyPair` is the in-memory implementation.
 - **Integration points are traits.** `DedupStore`, `AuditSink` and
-  `HttpClient` are yours to implement; `asx-rs-testkit` has the conformance
+  `HttpClient` are yours to implement; `asx::testkit` has the conformance
   suites. No retry scheduler, storage backend or listener is built in.
 
 See the **[security model](https://hupe1980.github.io/asx-rs/docs/security/)**

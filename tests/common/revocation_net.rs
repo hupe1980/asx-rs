@@ -7,10 +7,10 @@ pub mod peers;
 
 use asx::as2::{self, As2, Received};
 use asx::as4::{As4, UserMessage};
+use asx::testkit::loopback::Loopback;
+use asx::testkit::pki::{Cdp, IssueOptions, KeyAlg, KeyPair, Nid, TestCa};
+use asx::testkit::revocation::RevocationHttp;
 use asx::{Certificate, ErrorKind, LocalParty, MemoryDedup, Partner, Payload, Profile, Verified};
-use asx_testkit::loopback::Loopback;
-use asx_testkit::pki::{Cdp, IssueOptions, KeyAlg, KeyPair, Nid, TestCa};
-use asx_testkit::revocation::RevocationHttp;
 use peers::{A_URL, B_URL, Preset};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -18,7 +18,7 @@ use std::time::Duration;
 
 pub const A: &str = "9900000000001";
 pub const B: &str = "9900000000002";
-pub const BDEW_TYPE: &str = asx_testkit::pki::BDEW_PARTY_TYPE;
+pub const BDEW_TYPE: &str = asx::testkit::pki::BDEW_PARTY_TYPE;
 pub const HOUR: Duration = Duration::from_secs(3600);
 
 /// One party's key material, issued by `ca`, whose local signer presents
@@ -88,7 +88,7 @@ pub fn rsa(ca: &TestCa, id: &str, preset: Preset, options: IssueOptions) -> Part
         id: id.to_string(),
         party_type: match preset {
             Preset::Peppol => None,
-            _ => Some(asx_testkit::pki::UNREGISTERED_PARTY_TYPE.to_string()),
+            _ => Some(asx::testkit::pki::UNREGISTERED_PARTY_TYPE.to_string()),
         },
         ca: ca.clone(),
         encryption: if preset == Preset::Peppol {

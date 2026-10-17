@@ -7,11 +7,11 @@
 //! profile section.
 
 use asx::as4::As4;
+use asx::testkit::loopback::Loopback;
+use asx::testkit::pki::{BDEW_PARTY_TYPE, KeyAlg, Nid, TestCa, TestParty};
 use asx::{
     Certificate, ErrorKind, LocalParty, Partner, Profile, Quirk, SignatureAlgorithm, Signer,
 };
-use asx_testkit::loopback::Loopback;
-use asx_testkit::pki::{BDEW_PARTY_TYPE, KeyAlg, Nid, TestCa, TestParty};
 
 const A: &str = "9900000000001";
 const B: &str = "9900000000002";

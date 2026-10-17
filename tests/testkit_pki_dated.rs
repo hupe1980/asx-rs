@@ -3,7 +3,7 @@
 //! `thisUpdate`/`nextUpdate`. The dates are checked with the `openssl` CLI,
 //! a foreign parser; a missing tool fails the test, it never skips it.
 
-use asx_testkit::pki::{KeyAlg, KeyPair, TestCa, Validity};
+use asx::testkit::pki::{KeyAlg, KeyPair, TestCa, Validity};
 use openssl::asn1::Asn1Time;
 use openssl::x509::X509;
 use std::path::PathBuf;
@@ -165,7 +165,7 @@ async fn an_expired_partner_certificate_is_refused_at_send_as_config() {
         .unwrap();
     let stale: KeyPair = ca.issue_with("receiver enc", KeyAlg::Rsa2048, expired());
     let partner = asx::Partner::new("receiver")
-        .party_type(asx_testkit::pki::UNREGISTERED_PARTY_TYPE)
+        .party_type(asx::testkit::pki::UNREGISTERED_PARTY_TYPE)
         .endpoint("https://as4.example.org/msh")
         .encryption_cert(stale.certificate());
     let message = asx::as4::Message::to(&partner)

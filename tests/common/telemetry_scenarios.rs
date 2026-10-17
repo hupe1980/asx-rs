@@ -10,7 +10,7 @@
 use std::sync::atomic::Ordering;
 
 use asx::AuditDurability;
-use asx_testkit::loopback::Loopback;
+use asx::testkit::loopback::Loopback;
 
 #[path = "peers.rs"]
 mod peers;
@@ -151,7 +151,7 @@ pub(crate) async fn run_scenarios() {
 
     // A revocation check: the leaf is on its CA's CRL.
     {
-        use asx_testkit::pki::{KeyAlg, TestCa};
+        use asx::testkit::pki::{KeyAlg, TestCa};
         let ca = TestCa::new("contract revocation root", KeyAlg::EcP256);
         let leaf = ca.issue("contract revoked leaf", KeyAlg::EcP256);
         let der = |pem: &[u8]| {
@@ -178,12 +178,12 @@ pub(crate) async fn run_scenarios() {
 #[cfg(feature = "as2")]
 async fn as2_round_trip() {
     use asx::as2::{As2, Received};
-    use asx_testkit::pki::{KeyAlg, TestCa};
+    use asx::testkit::pki::{KeyAlg, TestCa};
     const B_URL: &str = "https://b.example/as2";
     let ca = TestCa::new("asx-test AS2 root", KeyAlg::Rsa2048);
     let (a, b) = (ca.as2_party("CONTRACT-A"), ca.as2_party("CONTRACT-B"));
     let loopback = Loopback::new();
-    let build = |local: &asx_testkit::pki::TestParty, partner: asx::Partner| {
+    let build = |local: &asx::testkit::pki::TestParty, partner: asx::Partner| {
         As2::builder(asx::Profile::as2())
             .local(local.local())
             .trust_anchor(ca.anchor())

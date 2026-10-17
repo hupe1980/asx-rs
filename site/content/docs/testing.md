@@ -1,23 +1,21 @@
 +++
 title = "Testing"
-description = "Testing an asx integration with asx-rs-testkit: test PKI, loopback partner, counting keys, store suites and trace capture."
+description = "Testing an asx integration with the test-util feature: test PKI, loopback partner, counting keys, store suites and trace capture."
 +++
 
-`asx-rs-testkit` is built only on the public `asx` API and weakens no check:
-tests run the production security policy with throw-away keys. There is no
-test-only feature in `asx`.
+The `test-util` feature adds `asx::testkit`. It only adds helpers, built on
+the public API, and changes nothing else: tests run the production security
+policy with throw-away keys.
 
 ```toml
 [dev-dependencies]
-asx-rs-testkit = "0.16"
+asx-rs = { version = "0.16", features = ["test-util"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "test-util"] }
 ```
 
-Import it as `asx_testkit`.
-
 ## A test PKI per profile
 
-`asx_testkit::pki::TestCa` is a throw-away CA whose party constructors issue
+`asx::testkit::pki::TestCa` is a throw-away CA whose party constructors issue
 exactly what each profile's `build()` accepts:
 
 | Constructor | Issues |
@@ -34,13 +32,13 @@ identity), `partner(endpoint)` (`Partner` with pinned certificates) and
 
 ## A loopback partner
 
-`asx_testkit::loopback::Loopback` is an `HttpClient` that hands a request for a
+`asx::testkit::loopback::Loopback` is an `HttpClient` that hands a request for a
 mounted URL to that URL's `Inbound`, without socket or TLS. Clones share their
 routes:
 
 ```rust
 use asx::{as4::{As4, Message, UserMessage}, MemoryDedup, Payload, Profile, Reject, Verified};
-use asx_testkit::{loopback::Loopback, pki::TestCa};
+use asx::testkit::{loopback::Loopback, pki::TestCa};
 
 async fn deliver(msg: Verified<UserMessage>) -> Result<(), Reject> {
     assert_eq!(msg.payloads()[0].bytes().as_ref(), b"UNA:+.? '");
@@ -94,27 +92,27 @@ entity when compressed).
 
 ## External keys
 
-`asx_testkit::keys::CountingKeys` wraps a test key pair behind `Signer` and
+`asx::testkit::keys::CountingKeys` wraps a test key pair behind `Signer` and
 `Decrypter`, counts private-key operations (`signs()`, `decrypts()`) and can
 simulate an outage (`fail()`).
 
 ## Conformance suites for your stores
 
-- `asx_testkit::dedup::conformance` checks a `DedupStore`
+- `asx::testkit::dedup::conformance` checks a `DedupStore`
   ([persistence](@/docs/persistence.md#check-your-store-before-production)).
-- `asx_testkit::audit::conformance` checks an `AuditSink`
+- `asx::testkit::audit::conformance` checks an `AuditSink`
   ([observability](@/docs/observability.md#check-your-sink-before-production)).
-- `asx_testkit::audit::MemoryAuditSink` is a durable in-memory sink whose clones
+- `asx::testkit::audit::MemoryAuditSink` is a durable in-memory sink whose clones
   share one store; `records()` returns what was written.
 
 ## Asserting on telemetry
 
-`asx_testkit::trace::TraceCapture` collects spans and events while it is the
+`asx::testkit::trace::TraceCapture` collects spans and events while it is the
 default subscriber; names and fields are on the
 [observability page](@/docs/observability.md#spans):
 
 ```rust
-use asx_testkit::trace::TraceCapture;
+use asx::testkit::trace::TraceCapture;
 
 fn capture_spans() {
     let capture = TraceCapture::new();

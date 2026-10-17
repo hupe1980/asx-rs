@@ -10,7 +10,8 @@
 //! - No removed revocation knob (`OcspMode`, `revocation_crl_pems`,
 //!   `ocsp_client`), one CRL parser (`src/revocation/crl.rs`) and one OCSP
 //!   verifier (`src/revocation/ocsp.rs`).
-//! - No `testing` feature branch and no `InteropMode`.
+//! - No `testing` feature branch and no `InteropMode`; `test-util` gates only
+//!   the `testkit` module, and no library code uses it.
 //! - Wall-clock time only through `crate::clock`; golden examples ≤ 25 lines;
 //!   no ```` ```ignore ```` doctest.
 
@@ -249,11 +250,61 @@ fn no_testing_feature_and_no_interop_mode() {
 /// `SystemTime::now()` outside `src/clock.rs`, and durations on Tokio's clock
 /// (which tests pause), never `std::time::Instant`.
 #[test]
+fn test_util_gates_only_the_testkit_module() {
+    let gated: Vec<_> = src_lines()
+        .into_iter()
+        .filter(|(_, _, line)| line.contains("feature = \"test-util\""))
+        .collect();
+    // `mod testkit`, `extern crate self as asx`, and the docs-compile
+    // doctest module's feature list.
+    let allowed = |file: &str, line: &str| {
+        file == "src/lib.rs"
+            && matches!(
+                line.trim(),
+                "#[cfg(feature = \"test-util\")]" | "feature = \"test-util\""
+            )
+    };
+    for (file, n, line) in &gated {
+        assert!(
+            allowed(file, line),
+            "{file}:{n}: test-util may gate only the testkit module: {line}"
+        );
+    }
+    assert_eq!(
+        gated.len(),
+        3,
+        "exactly `mod testkit`, `extern crate self` and the docs module: {gated:?}"
+    );
+    // Unit tests (after a file's `#[cfg(test)]`, or a `tests.rs` file) may
+    // use the testkit; library code may not.
+    let mut in_tests: Option<(String, bool)> = None;
+    for (file, n, line) in src_lines() {
+        let tests = match &mut in_tests {
+            Some((f, t)) if *f == file => t,
+            _ => {
+                &mut in_tests
+                    .insert((file.clone(), file.ends_with("tests.rs")))
+                    .1
+            }
+        };
+        if line.contains("#[cfg(test)]") {
+            *tests = true;
+        }
+        if !*tests && !file.starts_with("src/testkit") && line.contains("testkit::") {
+            panic!("{file}:{n}: library code must not use the testkit: {line}");
+        }
+    }
+}
+
+#[test]
 fn wall_clock_only_through_crate_clock() {
     let offenders: Vec<String> = src_lines()
         .into_iter()
         .filter(|(f, _, l)| {
-            (l.contains("SystemTime::now()") && f != "src/clock.rs")
+            (l.contains("SystemTime::now()")
+                && f != "src/clock.rs"
+                // Test certificates are dated relative to real time.
+                && !f.starts_with("src/testkit"))
                 || l.contains("std::time::Instant")
                 || (l.contains("use std::time::{")
                     && l.split(['{', '}', ',']).any(|s| s.trim() == "Instant"))

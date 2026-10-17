@@ -11,9 +11,9 @@
 //! either.
 
 use asx::as4::{As4, UserMessage};
+use asx::testkit::keys::CountingKeys;
+use asx::testkit::pki::{KeyAlg, TestCa};
 use asx::{KeyPair, Profile, Reject, Verified};
-use asx_testkit::keys::CountingKeys;
-use asx_testkit::pki::{KeyAlg, TestCa};
 
 const SENTINEL: &str = "S3NT1NEL";
 
@@ -59,7 +59,7 @@ fn assert_redacted(name: &str, value: &dyn std::fmt::Debug, secrets: &[String]) 
 #[test]
 fn key_pair_debug_prints_the_certificate_only() {
     for alg in [KeyAlg::Rsa2048, KeyAlg::EcP256] {
-        let pair = asx_testkit::pki::KeyPair::self_signed("debug", alg);
+        let pair = asx::testkit::pki::KeyPair::self_signed("debug", alg);
         let secrets = key_renderings(&pair.key_pem);
         let key_pair = KeyPair::from_pem(&pair.cert_pem, &pair.key_pem).expect("key pair");
         assert_redacted("KeyPair", &key_pair, &secrets);
@@ -107,8 +107,8 @@ fn parties_builders_clients_and_inbounds_redact_their_keys() {
 
 #[test]
 fn key_errors_never_echo_the_key() {
-    let pair = asx_testkit::pki::KeyPair::self_signed("debug", KeyAlg::Rsa2048);
-    let other = asx_testkit::pki::KeyPair::self_signed("other", KeyAlg::Rsa2048);
+    let pair = asx::testkit::pki::KeyPair::self_signed("debug", KeyAlg::Rsa2048);
+    let other = asx::testkit::pki::KeyPair::self_signed("other", KeyAlg::Rsa2048);
 
     // A key that does not match the leaf.
     let mut secrets = key_renderings(&other.key_pem);

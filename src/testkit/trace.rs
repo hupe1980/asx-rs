@@ -2,7 +2,7 @@
 //! contract (span names, targets, levels, field values).
 //!
 //! ```
-//! use asx_testkit::trace::TraceCapture;
+//! use asx::testkit::trace::TraceCapture;
 //!
 //! let capture = TraceCapture::new();
 //! {

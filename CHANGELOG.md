@@ -17,6 +17,22 @@ Versioning follows the [SemVer policy](#semver-policy) below.
 
 ## [Unreleased]
 
+## [0.16.1] — 2026-10-18
+
+### Wire / crypto
+
+- A CRL entry with a `CertificateIssuer` extension is refused unless the CRL's
+  `IssuingDistributionPoint` sets `indirectCRL` (RFC 5280 §5.3.3), on every
+  OpenSSL version. Before, only OpenSSL 4 enforced it.
+
+### API
+
+- Test support is the additive `test-util` feature: `asx::testkit` replaces
+  the `asx-rs-testkit` crate, which is not published. Use
+  `asx-rs = { version = "0.16", features = ["test-util"] }` under
+  `[dev-dependencies]` and import `asx::testkit::…` instead of `asx_testkit::…`.
+  The feature only adds the module and changes no library behaviour.
+
 ## [0.16.0] — 2026-10-17
 
 0.16.0 is a hard cut: one small async API replaces the 0.15 API, with no

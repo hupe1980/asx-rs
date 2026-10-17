@@ -3,8 +3,8 @@
 
 use std::sync::{Arc, Mutex};
 
+use asx::testkit::audit::{self, AuditSinkHarness, MemoryAuditSink, conformance};
 use asx::{AuditDurability, AuditRecord, AuditSink, BoxFuture};
-use asx_testkit::audit::{self, AuditSinkHarness, MemoryAuditSink, conformance};
 use base64::Engine as _;
 use serde_json::Value;
 

@@ -19,10 +19,10 @@ struct State {
 ///
 /// A URL answers, in order: an error when [`fail`](Self::fail)ed; the bytes
 /// given to [`serve`](Self::serve); the current CRL a
-/// [`TestCa`](crate::pki::TestCa) publishes there
-/// ([`published_crl`](crate::pki::published_crl)); the
+/// [`TestCa`](super::pki::TestCa) publishes there
+/// ([`published_crl`](super::pki::published_crl)); the
 /// [`with_fallback`](Self::with_fallback) client (e.g. a
-/// [`Loopback`](crate::loopback::Loopback) carrying the messages); else HTTP
+/// [`Loopback`](super::loopback::Loopback) carrying the messages); else HTTP
 /// 404. Every request except those handed to the fallback is recorded.
 /// Clones share their state.
 #[derive(Clone, Default)]
@@ -109,7 +109,7 @@ impl RevocationHttp {
         };
         let local = match local {
             Some(answer) => Some(answer),
-            None => crate::pki::published_crl(&url).map(Ok),
+            None => super::pki::published_crl(&url).map(Ok),
         };
         match local {
             Some(answer) => {

@@ -10,7 +10,7 @@
 
 use asx::__fuzz::revocation::decide;
 use asx::Profile;
-use asx_testkit::pki::{Cdp, Idp, IssueOptions, KeyAlg, KeyPair, TestCa};
+use asx::testkit::pki::{Cdp, Idp, IssueOptions, KeyAlg, KeyPair, TestCa};
 use openssl::x509::{X509, X509Crl};
 use std::path::{Path, PathBuf};
 use std::process::Command;

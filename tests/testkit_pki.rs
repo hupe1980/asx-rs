@@ -2,7 +2,7 @@
 //! (That the production verifiers accept its parties is exercised by every
 //! client suite under `tests/`.)
 
-use asx_testkit::pki::{KeyAlg, TestCa};
+use asx::testkit::pki::{KeyAlg, TestCa};
 use openssl::stack::Stack;
 use openssl::x509::store::X509StoreBuilder;
 use openssl::x509::{X509, X509StoreContext};
@@ -43,7 +43,7 @@ fn key_pair_debug_never_prints_the_private_key() {
 
 #[test]
 fn ec_p521_key_pairs_are_on_secp521r1() {
-    use asx_testkit::pki::KeyPair;
+    use asx::testkit::pki::KeyPair;
     use openssl::nid::Nid;
 
     let pair = KeyPair::self_signed("asx-testkit-p521", KeyAlg::EcP521);

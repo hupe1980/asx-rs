@@ -259,9 +259,10 @@ pub async fn conformance<H: AuditSinkHarness>(harness: &H) -> Vec<ConformanceFai
 /// parties, empty and absent collections, and a 1 MiB non-UTF-8 signal.
 /// Every record has a distinct `message_id`.
 pub fn sample_records() -> Vec<AuditRecord> {
-    let mut values: Vec<Value> =
-        serde_json::from_str(include_str!("../fixtures/audit/sample-records.json"))
-            .expect("sample-records.json is valid JSON");
+    let mut values: Vec<Value> = serde_json::from_str(include_str!(
+        "../../tests/fixtures/testkit/audit/sample-records.json"
+    ))
+    .expect("sample-records.json is valid JSON");
     let big: Vec<u8> = (0..1024 * 1024u32)
         .map(|i| [0xff, 0xfe, 0x80, 0x00, 0xc3][(i % 5) as usize])
         .collect();

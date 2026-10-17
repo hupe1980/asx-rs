@@ -21,10 +21,11 @@ changes what is checked:
 | `http-client` | built-in HTTPS client (HTTPS only, resolved addresses pinned, mTLS identity from `LocalParty::tls_identity`) | yes |
 | `peppol` | `asx::peppol::Smp`: SMP lookup through BDXL; implies `as4` | no |
 | `metrics` | counters and histograms through the [`metrics`](https://docs.rs/metrics) facade | no |
+| `test-util` | `asx::testkit` (see [Testing](@/docs/testing.md)); `[dev-dependencies]` only | no |
 
 Without `http-client`, pass your own [`HttpClient`](https://docs.rs/asx-rs/latest/asx/trait.HttpClient.html)
-to `Builder::http_client`. For tests, add `asx-rs-testkit = "0.16"` as a
-dev-dependency (see [Testing](@/docs/testing.md)).
+to `Builder::http_client`. For tests, enable `test-util` in
+`[dev-dependencies]` (see [Testing](@/docs/testing.md)).
 
 ## Runtime
 

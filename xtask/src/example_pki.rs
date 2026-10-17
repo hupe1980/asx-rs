@@ -2,7 +2,7 @@
 //! the testkit: a BDEW pair under an SM-PKI-like root for the AS4 examples
 //! and an AS2 pair for the AS2 example.
 
-use asx_testkit::pki::TestCa;
+use asx::testkit::pki::TestCa;
 use std::path::Path;
 
 pub(crate) fn run(args: &[String]) -> Result<(), String> {
@@ -25,7 +25,7 @@ pub(crate) fn run(args: &[String]) -> Result<(), String> {
         "UTILMD.edi",
         b"UNA:+.? 'UNB+UNOC:3+9900000000001:500+9900000000002:500+261016:1200+1'",
     )?;
-    let as2_ca = TestCa::new("asx example AS2 root", asx_testkit::pki::KeyAlg::Rsa2048);
+    let as2_ca = TestCa::new("asx example AS2 root", asx::testkit::pki::KeyAlg::Rsa2048);
     let ours = as2_ca.as2_party("OURAS2ID");
     let theirs = as2_ca.as2_party("THEIRAS2ID");
     write("ca.crt", as2_ca.cert_pem())?;

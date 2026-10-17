@@ -30,7 +30,7 @@ repo = "https://github.com/hupe1980/asx-rs"
 crate = "https://crates.io/crates/asx-rs"
 api_docs = "https://docs.rs/asx-rs"
 # Shown in the page footer and the JSON-LD `softwareVersion`.
-version = "0.16.0"
+version = "0.16.1"
 # Fallback social-card text when a page sets no description.
 default_description = "Async-native AS2 and AS4 (ebMS3) B2B messaging for Rust."
 

@@ -3,10 +3,10 @@
 #![allow(dead_code, unreachable_pub)]
 
 use asx::as2::{As2, Message, Received};
+use asx::testkit::audit::MemoryAuditSink;
+use asx::testkit::loopback::Loopback;
+use asx::testkit::pki::{TestCa, TestParty};
 use asx::{MemoryDedup, Partner, Payload, Profile, Reject, Verified};
-use asx_testkit::audit::MemoryAuditSink;
-use asx_testkit::loopback::Loopback;
-use asx_testkit::pki::{TestCa, TestParty};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
@@ -49,7 +49,7 @@ pub fn pair_with(
     sender_partner: impl FnOnce(&TestParty) -> Partner,
     receiver_partner: impl FnOnce(&TestParty) -> Partner,
 ) -> Pair {
-    let ca = TestCa::new("asx-test AS2 root", asx_testkit::pki::KeyAlg::Rsa2048);
+    let ca = TestCa::new("asx-test AS2 root", asx::testkit::pki::KeyAlg::Rsa2048);
     let (a, b) = (ca.as2_party(A_ID), ca.as2_party(B_ID));
     let loopback = Loopback::new();
     let to_b = sender_partner(&b);
@@ -145,7 +145,7 @@ impl Pair {
 
 /// An MDN signed by `pair` with the doc-hidden generator.
 pub fn sign_mdn(
-    pair: &asx_testkit::pki::KeyPair,
+    pair: &asx::testkit::pki::KeyPair,
     original_id: &str,
     disposition: &str,
     mic: Option<&str>,
@@ -171,7 +171,7 @@ pub fn unsigned_mdn(original_id: &str, disposition: &str, mic: Option<&str>) -> 
 }
 
 /// Sign arbitrary MIME `entity` (an MDN shape of the test's choosing) as `pair`.
-pub fn sign_entity(pair: &asx_testkit::pki::KeyPair, entity: &[u8]) -> Vec<u8> {
+pub fn sign_entity(pair: &asx::testkit::pki::KeyPair, entity: &[u8]) -> Vec<u8> {
     asx::__fuzz::sign_smime_message(entity, &pair.key_pem, &pair.cert_pem).expect("signed")
 }
 

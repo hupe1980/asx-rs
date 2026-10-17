@@ -61,7 +61,7 @@ async fn crate_inbound(peer: &Phase4Peer, pki: &RunPki, v: &ProfileVariant) -> C
         pki,
         v,
         peer.http_client(),
-        asx_testkit::audit::MemoryAuditSink::new(),
+        asx::testkit::audit::MemoryAuditSink::new(),
     )
     .unwrap_or_else(|e| panic!("{e}"));
     CrateInbound::start(&as4)

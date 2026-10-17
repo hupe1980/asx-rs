@@ -9,8 +9,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
+use asx::testkit::dedup::{DedupHarness, conformance};
 use asx::{BoxFuture, Claim, ClaimToken, DedupStore, MemoryDedup};
-use asx_testkit::dedup::{DedupHarness, conformance};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 

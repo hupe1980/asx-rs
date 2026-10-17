@@ -5,4 +5,4 @@ edition = "2024"
 publish = false
 
 [dependencies]
-asx-rs-testkit = { path = "../testkit" }
+asx-rs = { path = "..", features = ["test-util"] }

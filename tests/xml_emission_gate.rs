@@ -27,7 +27,7 @@ const ALLOWED: &[(&str, &str, &str)] = &[
 ];
 
 /// `Debug` placeholders that look like tags but are not XML.
-const NOT_XML: &[&str] = &["<redacted>", "<none>", "<absent>"];
+const NOT_XML: &[&str] = &["<redacted>", "<none>", "<absent>", "<unparseable>"];
 
 /// Files that may write (writer, C14N serializer) or tokenize (the parser's
 /// pre-scan delimiters) markup.

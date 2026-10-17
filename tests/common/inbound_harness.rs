@@ -367,7 +367,7 @@ impl Genuine {
 pub fn resign(
     soap: &str,
     attachments: &[(String, Vec<u8>)],
-    signer: &asx_testkit::pki::KeyPair,
+    signer: &asx::testkit::pki::KeyPair,
 ) -> String {
     const PLACEHOLDER: &str = "<!--asx-resign-->";
     let start = soap.find("<ds:Signature").expect("ds:Signature");

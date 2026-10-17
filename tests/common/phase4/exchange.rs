@@ -4,8 +4,8 @@
 use std::time::Duration;
 
 use asx::as4::{As4, Message};
+use asx::testkit::audit::MemoryAuditSink;
 use asx::{ErrorKind, Payload};
-use asx_testkit::audit::MemoryAuditSink;
 use serde_json::Value;
 
 use super::http::{PeerHttp, Tamper, apply_tamper};

@@ -5,7 +5,7 @@
 use super::*;
 use crate::clock::ManualClock;
 use crate::error::{BoxError, BoxFuture};
-use asx_testkit::pki::{Cdp, Idp, IssueOptions, KeyAlg, KeyPair, TestCa};
+use asx::testkit::pki::{Cdp, Idp, IssueOptions, KeyAlg, KeyPair, TestCa};
 use std::sync::atomic::AtomicUsize;
 
 const HOUR: Duration = Duration::from_secs(3600);
@@ -917,8 +917,8 @@ async fn the_trust_anchor_is_never_checked() {
 async fn warn_events(
     message: &str,
     body: impl std::future::Future<Output = ()>,
-) -> Vec<asx_testkit::trace::CapturedEvent> {
-    let capture = asx_testkit::trace::TraceCapture::new();
+) -> Vec<asx::testkit::trace::CapturedEvent> {
+    let capture = asx::testkit::trace::TraceCapture::new();
     {
         let _guard = capture.set_default();
         // Callsites first hit by a parallel test may have cached "never".

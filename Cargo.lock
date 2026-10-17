@@ -153,11 +153,11 @@ dependencies = [
 
 [[package]]
 name = "asx-rs"
-version = "0.16.0"
+version = "0.16.1"
 dependencies = [
  "aes-gcm",
  "aes-kw",
- "asx-rs-testkit",
+ "asx-rs",
  "axum",
  "base64 0.22.1",
  "bytes",
@@ -193,26 +193,6 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "x509-parser",
- "zeroize",
-]
-
-[[package]]
-name = "asx-rs-testkit"
-version = "0.16.0"
-dependencies = [
- "asx-rs",
- "base64 0.22.1",
- "bytes",
- "http",
- "http-body-util",
- "openssl",
- "serde_json",
- "sha2",
- "tokio",
- "tower-service",
- "tracing",
- "tracing-subscriber",
- "uuid",
  "zeroize",
 ]
 
@@ -1778,9 +1758,9 @@ dependencies = [
 
 [[package]]
 name = "inout"
-version = "0.2.3"
+version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d8c0d789294fb457b791f7797a04478704788f30b407e5d0b01deaa846572d9f"
+checksum = "3ce983bb6fb399067d101fbfc9e74174e07e9f29a2bc679efefeb8c645819c3f"
 dependencies = [
  "hybrid-array",
 ]
@@ -4301,7 +4281,7 @@ dependencies = [
 name = "xtask"
 version = "0.4.0"
 dependencies = [
- "asx-rs-testkit",
+ "asx-rs",
 ]
 
 [[package]]

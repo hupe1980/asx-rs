@@ -26,10 +26,9 @@ In scope, for example:
 - secret material (keys, passwords, session secrets) exposed through `Debug`,
   logs, errors or metrics.
 
-Not a vulnerability: behaviour of the `testing` feature, which disables
-WS-Security enforcement on purpose and refuses to compile in a release build;
-and a profile or `interop-relaxed` exception that an embedder enables
-explicitly, as long as it does what its documentation says.
+Not a vulnerability: a partner `Quirk` that an embedder enables explicitly,
+as long as it does what its documentation says (a quirk accepts an absent
+element, never a wrong one).
 
 ## Supported versions
 

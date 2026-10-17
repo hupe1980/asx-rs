@@ -173,11 +173,11 @@ A record is written **before** an inbound dedup claim is accepted and before a v
 
 ### Check your sink before production
 
-`asx_testkit::audit::conformance` checks the `durability()` claim through fresh handles to the same store.
+`asx::testkit::audit::conformance` checks the `durability()` claim through fresh handles to the same store.
 
 ```rust,no_run
 use asx::{AuditRecord, BoxFuture};
-use asx_testkit::audit::{conformance, AuditSinkHarness, MemoryAuditSink};
+use asx::testkit::audit::{conformance, AuditSinkHarness, MemoryAuditSink};
 
 /// Opens handles to the store under test. `MemoryAuditSink` stands in for
 /// yours: its clones share one store, as connections to a database do.

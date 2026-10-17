@@ -2195,7 +2195,7 @@ async fn security_header_targeted_at_another_role_is_refused() {
 async fn messaging_resigned_by_another_key_is_refused() {
     let (g, r) = edelivery().await;
     let attacker =
-        asx_testkit::pki::TestCa::new("attacker root", asx_testkit::pki::KeyAlg::Rsa2048)
+        asx::testkit::pki::TestCa::new("attacker root", asx::testkit::pki::KeyAlg::Rsa2048)
             .rsa_party("party-a");
     let attachments: Vec<(String, Vec<u8>)> = g.parts()[1..]
         .iter()

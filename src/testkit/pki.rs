@@ -19,7 +19,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::der;
+use super::der;
 
 /// Validity window of an issued certificate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -179,7 +179,7 @@ impl KeyPair {
 /// ([`TestCa::crl_url`], `http://crl.testkit.example/<random>.crl`), and
 /// every certificate it issues names that point (RFC 5280 §4.2.1.13), so a
 /// client checking revocation finds a current CRL through
-/// [`crate::loopback::Loopback`] or [`crate::revocation::RevocationHttp`]
+/// [`super::loopback::Loopback`] or [`super::revocation::RevocationHttp`]
 /// without configuration. [`TestCa::revoke`] lists a certificate in it.
 /// Clones share the CA.
 #[derive(Clone)]

@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 
 use asx::Verified;
 use asx::as4::UserMessage;
-use asx_testkit::loopback::Loopback;
+use asx::testkit::loopback::Loopback;
 use peers::Preset;
 use tracing_subscriber::layer::SubscriberExt;
 
@@ -134,13 +134,13 @@ struct ObservedAs2 {
 #[cfg(feature = "as2")]
 async fn as2_exchange() -> ObservedAs2 {
     use asx::as2::{As2, Received};
-    use asx_testkit::pki::{KeyAlg, TestCa};
+    use asx::testkit::pki::{KeyAlg, TestCa};
     const B_URL: &str = "https://b.example/as2";
     // Two clients with no audit sink, through the in-process loopback.
     let ca = TestCa::new("asx-test AS2 root", KeyAlg::Rsa2048);
     let (a, b) = (ca.as2_party("QUIET-A"), ca.as2_party("QUIET-B"));
     let loopback = Loopback::new();
-    let build = |local: &asx_testkit::pki::TestParty, partner: asx::Partner| {
+    let build = |local: &asx::testkit::pki::TestParty, partner: asx::Partner| {
         As2::builder(asx::Profile::as2())
             .local(local.local())
             .trust_anchor(ca.anchor())

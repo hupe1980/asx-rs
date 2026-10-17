@@ -5,7 +5,7 @@ use std::collections::BTreeSet;
 use std::marker::PhantomData;
 use std::time::Duration;
 
-use asx_testkit::dedup::{self, DedupHarness, broken, conformance};
+use asx::testkit::dedup::{self, DedupHarness, broken, conformance};
 
 #[derive(Debug)]
 struct Fresh<S>(PhantomData<fn() -> S>);

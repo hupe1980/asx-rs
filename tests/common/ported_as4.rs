@@ -7,9 +7,9 @@
 use std::sync::{Arc, Mutex};
 
 use asx::as4::{As4, UserMessage};
+use asx::testkit::loopback::Loopback;
+use asx::testkit::pki::{TestCa, TestParty};
 use asx::{AuditDurability, AuditRecord, AuditSink, BoxFuture, Builder, Reject, Verified};
-use asx_testkit::loopback::Loopback;
-use asx_testkit::pki::{TestCa, TestParty};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -114,7 +114,7 @@ impl asx::DedupStore for LoggingDedup {
 
 /// A durable in-memory sink that logs every write.
 #[derive(Debug, Clone)]
-pub struct LoggingSink(pub asx_testkit::audit::MemoryAuditSink, pub Log);
+pub struct LoggingSink(pub asx::testkit::audit::MemoryAuditSink, pub Log);
 
 impl AuditSink for LoggingSink {
     fn durability(&self) -> AuditDurability {

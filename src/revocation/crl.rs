@@ -395,7 +395,7 @@ impl ParsedCrl {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use asx_testkit::pki::{Cdp, Idp as TkIdp, IssueOptions, KeyAlg, TestCa};
+    use asx::testkit::pki::{Cdp, Idp as TkIdp, IssueOptions, KeyAlg, TestCa};
     use openssl::x509::X509;
 
     fn x509(pem: &[u8]) -> X509 {

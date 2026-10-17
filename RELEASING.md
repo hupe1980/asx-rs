@@ -46,7 +46,7 @@ Docker and `openssl` for `just interop`, `zola` for `just site`.
 
 `release.yml` then runs CI for the tagged commit, checks that the tag equals
 `v` + the `Cargo.toml` version and that `CHANGELOG.md` has a `## [X.Y.Z]`
-section, publishes with `cargo publish --locked` through crates.io Trusted
+section, publishes `asx-rs` through crates.io Trusted
 Publishing (`rust-lang/crates-io-auth-action`; no stored token), and creates the
 GitHub release with that CHANGELOG section as its notes.
 

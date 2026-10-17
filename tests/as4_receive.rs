@@ -238,13 +238,13 @@ async fn message_for_another_party_is_refused() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn unpinned_signer_of_a_configured_partner_is_refused() {
-    let other = asx_testkit::pki::TestCa::sm_pki().bdew_party("9900000000001");
+    let other = asx::testkit::pki::TestCa::sm_pki().bdew_party("9900000000001");
     let p = pair_with(
         Preset::Bdew,
         |b| b.partner(B_URL),
         |a| {
             asx::Partner::new(&a.id)
-                .party_type(asx_testkit::pki::BDEW_PARTY_TYPE)
+                .party_type(asx::testkit::pki::BDEW_PARTY_TYPE)
                 .endpoint(A_URL)
                 .signing_cert(other.signing.certificate())
                 .encryption_cert(a.encryption.certificate())
@@ -263,7 +263,7 @@ async fn unpinned_signer_of_a_configured_partner_is_refused() {
 fn stranger_receiver(
     p: &peers::Pair,
     profile: Profile,
-    d: &asx_testkit::pki::TestParty,
+    d: &asx::testkit::pki::TestParty,
 ) -> asx::Inbound {
     let receiver = As4::builder(profile)
         .local(p.b.local())
@@ -343,7 +343,7 @@ async fn tampered_payload_is_refused_without_a_claim() {
 /// neither accepted unregistered nor configurable as a partner.
 #[tokio::test(flavor = "current_thread")]
 async fn bdew_mp_id_must_be_in_the_ou() {
-    use asx_testkit::pki::{KeyAlg, Nid, TestParty};
+    use asx::testkit::pki::{KeyAlg, Nid, TestParty};
     let p = pair(Preset::Bdew);
     let cn_only = |role: &str| {
         p.ca.issue_named(
@@ -353,7 +353,7 @@ async fn bdew_mp_id_must_be_in_the_ou() {
     };
     let e = TestParty {
         id: "9900000000005".into(),
-        party_type: Some(asx_testkit::pki::BDEW_PARTY_TYPE.into()),
+        party_type: Some(asx::testkit::pki::BDEW_PARTY_TYPE.into()),
         signing: cn_only("sig"),
         encryption: cn_only("enc"),
         tls: cn_only("tls"),

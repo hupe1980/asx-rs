@@ -6,7 +6,7 @@
 use asx::__fuzz::revocation::{decide, ocsp_status};
 use asx::__fuzz::wssec::{ChainPolicy, validate_certificate_chain};
 use asx::Profile;
-use asx_testkit::pki::{Cdp, IssueOptions, KeyAlg, KeyPair, TestCa};
+use asx::testkit::pki::{Cdp, IssueOptions, KeyAlg, KeyPair, TestCa};
 use openssl::x509::X509;
 use std::time::{Duration, SystemTime};
 

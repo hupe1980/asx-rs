@@ -62,8 +62,8 @@ use testcontainers::runners::SyncRunner;
 use testcontainers::{GenericImage, ImageExt};
 
 use asx::as4::{As4, Message};
+use asx::testkit::pki::{KeyAlg, TestCa, TestParty};
 use asx::{Payload, Profile};
-use asx_testkit::pki::{KeyAlg, TestCa, TestParty};
 
 const HOLODECK_IMAGE: &str = "cosmo83/holodeckb2b";
 const HOLODECK_TAG: &str = "latest";

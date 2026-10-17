@@ -14,8 +14,8 @@ mod inbound_harness;
 mod peers;
 
 use asx::as4::{As4, UserMessage};
+use asx::testkit::keys::CountingKeys;
 use asx::{LocalParty, MemoryDedup, Payload, Reject, Verified};
-use asx_testkit::keys::CountingKeys;
 use inbound_harness::{Answer, Genuine, Part, post};
 use peers::{A_URL, Preset};
 use std::sync::Arc;
@@ -47,7 +47,7 @@ impl Counted {
 }
 
 /// `b` with `decrypters` (each wrapping a key pair) instead of its key pair.
-fn counted_with(g: &Genuine, decrypters: &[&asx_testkit::pki::KeyPair]) -> Counted {
+fn counted_with(g: &Genuine, decrypters: &[&asx::testkit::pki::KeyPair]) -> Counted {
     let b = &g.pair.b;
     let keys: Vec<CountingKeys> = decrypters.iter().map(|k| CountingKeys::new(k)).collect();
     let mut local = LocalParty::new(&b.id)

@@ -20,6 +20,7 @@
 //! | `http-client` (default) | the built-in HTTPS [`HttpClient`] |
 //! | `peppol` | [`peppol`]: SMP lookup through BDXL with the bundled DNS resolver; implies `as4` |
 //! | `metrics` | counters and histograms through the [`metrics`](https://docs.rs/metrics) facade |
+//! | `test-util` | [`testkit`]: test PKI, loopback partner, store suites; for `[dev-dependencies]` only |
 //!
 //! Without `http-client`, pass an [`HttpClient`] to [`Builder::http_client`].
 //!
@@ -70,7 +71,8 @@ pub(crate) mod test_support;
     feature = "as4",
     feature = "http-client",
     feature = "peppol",
-    feature = "metrics"
+    feature = "metrics",
+    feature = "test-util"
 ))]
 mod docs;
 #[allow(unreachable_pub)]
@@ -95,6 +97,15 @@ pub(crate) mod smp;
 /// Peppol network rules that sit above a single protocol.
 #[cfg(feature = "peppol")]
 pub mod peppol;
+
+/// Test support (`test-util` feature). This is the only item the feature
+/// gates: it adds helpers and never changes library behaviour (checked by
+/// `tests/source_gates.rs`).
+#[cfg(feature = "test-util")]
+pub mod testkit;
+// The test helpers name the library `asx`, as an embedder does.
+#[cfg(feature = "test-util")]
+extern crate self as asx;
 
 // ── The client API ────────────────────────────────────────────────────────────
 #[cfg(any(feature = "as2", feature = "as4"))]

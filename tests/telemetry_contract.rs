@@ -10,7 +10,7 @@ mod scenarios;
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use asx_testkit::trace::{CapturedEvent, CapturedSpan, TraceCapture};
+use asx::testkit::trace::{CapturedEvent, CapturedSpan, TraceCapture};
 use scenarios::{AUTH_CANARY, DN_CANARY, PARTNER, PAYLOAD_CANARY, run_scenarios};
 
 const CONTRACT: &str = include_str!("../site/content/docs/observability.md");

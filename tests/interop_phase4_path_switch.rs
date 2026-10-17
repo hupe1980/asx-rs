@@ -27,8 +27,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use asx::as4::{As4, Message, PathSwitch, UserMessage};
+use asx::testkit::audit::MemoryAuditSink;
 use asx::{MemoryDedup, Reject, Verified};
-use asx_testkit::audit::MemoryAuditSink;
 use phase4::exchange::{Expectation, crate_client, expect};
 use phase4::peer::{PeerConfig, Phase4Peer};
 use phase4::pki::RunPki;

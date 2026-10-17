@@ -9,7 +9,7 @@ type Hook = Arc<dyn Fn(&mut http::Response<bytes::Bytes>) + Send + Sync>;
 /// An in-process [`asx::HttpClient`]: a request to a mounted URL is handed to
 /// that URL's [`asx::Inbound`] — a real partner client's receive endpoint —
 /// with no socket and no TLS. An unmounted URL where a
-/// [`TestCa`](crate::pki::TestCa) publishes its CRL answers that CRL; other
+/// [`TestCa`](super::pki::TestCa) publishes its CRL answers that CRL; other
 /// unmounted URLs fail like an unreachable host.
 ///
 /// Clones share their routes, so the sender's client and the test can hold
@@ -100,7 +100,7 @@ impl Loopback {
         let Some(mut inbound) = inbound else {
             // The CRL a test CA publishes at its distribution point:
             // revocation checks find it without configuration.
-            if let Some(crl) = crate::pki::published_crl(&url) {
+            if let Some(crl) = super::pki::published_crl(&url) {
                 return Ok(http::Response::builder()
                     .status(200)
                     .body(bytes::Bytes::from(crl))

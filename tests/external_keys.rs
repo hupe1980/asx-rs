@@ -14,14 +14,14 @@ mod as2_peers;
 mod as4 {
     use super::peers::{A_URL, B_URL, MP, Preset};
     use asx::as4::{As4, UserMessage};
+    use asx::testkit::keys::CountingKeys;
+    use asx::testkit::loopback::Loopback;
+    use asx::testkit::pki::{TestCa, TestParty};
     use asx::{ErrorKind, LocalParty, MemoryDedup, Profile, Reject, Verified};
-    use asx_testkit::keys::CountingKeys;
-    use asx_testkit::loopback::Loopback;
-    use asx_testkit::pki::{TestCa, TestParty};
 
     fn local(party: &TestParty, signer: &CountingKeys, decrypters: &[CountingKeys]) -> LocalParty {
         let mut local = LocalParty::new(&party.id)
-            .party_type(asx_testkit::pki::BDEW_PARTY_TYPE)
+            .party_type(asx::testkit::pki::BDEW_PARTY_TYPE)
             .signer(signer.clone());
         for d in decrypters {
             local = local.decrypter(d.clone());
@@ -47,13 +47,13 @@ mod as4 {
         for i in 0..extra {
             b_keys.push(ca.issue_named(
                 &[
-                    (asx_testkit::pki::Nid::COMMONNAME, &format!("b enc {i}")),
+                    (asx::testkit::pki::Nid::COMMONNAME, &format!("b enc {i}")),
                     (
-                        asx_testkit::pki::Nid::ORGANIZATIONALUNITNAME,
+                        asx::testkit::pki::Nid::ORGANIZATIONALUNITNAME,
                         "9900000000002",
                     ),
                 ],
-                asx_testkit::pki::KeyAlg::EcBrainpoolP256r1,
+                asx::testkit::pki::KeyAlg::EcBrainpoolP256r1,
             ));
         }
         let a_sign = CountingKeys::new(&a.signing);
@@ -66,7 +66,7 @@ mod as4 {
             &b_keys[0]
         };
         let to_b = asx::Partner::new(&b.id)
-            .party_type(asx_testkit::pki::BDEW_PARTY_TYPE)
+            .party_type(asx::testkit::pki::BDEW_PARTY_TYPE)
             .endpoint(B_URL)
             .signing_cert(b.signing.certificate())
             .encryption_cert(target.certificate());
@@ -163,10 +163,10 @@ mod as4 {
 mod as2 {
     use super::as2_peers::{A_ID, A_URL, B_ID, B_URL, Delivered, EDI, handler};
     use asx::as2::{As2, Message};
+    use asx::testkit::keys::CountingKeys;
+    use asx::testkit::loopback::Loopback;
+    use asx::testkit::pki::{KeyAlg, TestCa};
     use asx::{ErrorKind, LocalParty, MemoryDedup, Partner, Payload, Profile};
-    use asx_testkit::keys::CountingKeys;
-    use asx_testkit::loopback::Loopback;
-    use asx_testkit::pki::{KeyAlg, TestCa};
 
     struct Setup {
         sender: As2,

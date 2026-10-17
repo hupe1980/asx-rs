@@ -13,8 +13,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use asx::Verified;
 use asx::as4::UserMessage;
-use asx_testkit::audit::MemoryAuditSink;
-use asx_testkit::loopback::Loopback;
+use asx::testkit::audit::MemoryAuditSink;
+use asx::testkit::loopback::Loopback;
 
 const UNSIGNED: &str = r#"<S12:Envelope xmlns:S12="http://www.w3.org/2003/05/soap-envelope" xmlns:eb="http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/">
 <S12:Header>
