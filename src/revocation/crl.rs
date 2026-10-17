@@ -266,6 +266,13 @@ pub(crate) fn parse_and_verify(
         for ext in entry.extensions() {
             let oid = ext.oid.to_id_string();
             if oid == CERTIFICATE_ISSUER {
+                // RFC 5280 §5.3.3. OpenSSL enforces this only from some
+                // versions on, so the rule is checked here.
+                if !idp.as_ref().is_some_and(|idp| idp.indirect) {
+                    return Err("a CertificateIssuer entry extension in a CRL without \
+                         IssuingDistributionPoint.indirectCRL"
+                        .into());
+                }
                 entry_issuer = certificate_issuer(ext.value)
                     .ok_or("an unreadable CertificateIssuer entry extension")?;
             } else if ext.critical && !KNOWN_ENTRY_EXTENSIONS.contains(&oid.as_str()) {
@@ -502,7 +509,11 @@ mod tests {
             .crl_builder()
             .revoke_ca_issued_by(&sub, &root)
             .build();
-        assert!(parse_and_verify(&plain, &ca_x509(&signer), true).is_err());
+        let err = parse_and_verify(&plain, &ca_x509(&signer), true).unwrap_err();
+        assert!(
+            err.contains("indirectCRL") || err.contains("Indirect CRL"),
+            "{err}"
+        );
     }
 
     #[test]
