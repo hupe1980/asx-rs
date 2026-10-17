@@ -1,108 +1,78 @@
-#![cfg(all(feature = "as2", feature = "as4", feature = "testing"))]
-#[path = "common/as2_verifier_fixture.rs"]
-mod common;
+#![cfg(feature = "as4")]
+//! The strict baseline: an inbound AS4 message without `wsse:Security` is
+//! refused under every profile; there is no relaxed mode to fall back to.
 
-use asx_rs::as2::receive_with_mdn_with_reliability;
+#[path = "common/peers.rs"]
+mod peers;
+#[allow(unreachable_pub)]
+#[path = "common/ported_as4.rs"]
+mod ported;
 
-use asx_rs::as2::{As2MdnMode, As2ReceiveMdnRequest, As2ReceivePolicy};
-use asx_rs::as4::{
-    As4PushPolicy, As4PushPolicyBuilder, As4ReceivePushRequest, As4ReceivePushSync,
-    receive_push_sync,
-};
-use asx_rs::core::{ErrorCode, InteropMode, SessionContext};
-use asx_rs::lifecycle::TrustEvidence;
-use asx_rs::observability::EventBus;
-use common::{DeterministicTrustVerifier as InsecureBypassTrustVerifier, fixture};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
-fn session(profile: &str) -> SessionContext {
-    SessionContext::new("strict-baseline-s1", "partner-strict", profile).expect("session")
-}
+use asx::Verified;
+use asx::as4::UserMessage;
+use asx_testkit::audit::MemoryAuditSink;
+use asx_testkit::loopback::Loopback;
 
-#[test]
-fn defaults_are_strict_for_as2_and_as4_policies() {
-    assert_eq!(
-        As2ReceivePolicy::default().interop_mode,
-        InteropMode::Strict
-    );
-    assert_eq!(As4PushPolicy::default().interop, InteropMode::Strict);
-}
+const UNSIGNED: &str = r#"<S12:Envelope xmlns:S12="http://www.w3.org/2003/05/soap-envelope" xmlns:eb="http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/">
+<S12:Header>
+<eb:Messaging S12:mustUnderstand="true">
+<eb:UserMessage>
+<eb:MessageInfo><eb:Timestamp>2026-01-01T00:00:00Z</eb:Timestamp><eb:MessageId>msg-no-security@asx.test</eb:MessageId></eb:MessageInfo>
+<eb:PartyInfo><eb:From><eb:PartyId>sender-a</eb:PartyId><eb:Role>http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/initiator</eb:Role></eb:From><eb:To><eb:PartyId>receiver-b</eb:PartyId><eb:Role>http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/responder</eb:Role></eb:To></eb:PartyInfo>
+<eb:CollaborationInfo><eb:Service>urn:example:service</eb:Service><eb:Action>SubmitOrder</eb:Action><eb:ConversationId>c-1</eb:ConversationId></eb:CollaborationInfo>
+</eb:UserMessage>
+</eb:Messaging>
+</S12:Header>
+<S12:Body/>
+</S12:Envelope>"#;
 
-#[test]
-fn as2_strict_mode_rejects_malformed_boundary_with_stage_context() {
-    let mdn = fixture("as2_mdn_malformed_boundary.golden");
-    let hook = asx_rs::reliability::InMemoryReconciliationHook::default();
-    let dedup: std::sync::Arc<dyn asx_rs::storage::DedupStorage> =
-        std::sync::Arc::new(asx_rs::reliability::InMemoryDedupBackend::default());
-    let verifier = InsecureBypassTrustVerifier::new(TrustEvidence::verified_and_decryptable());
-
-    let err = receive_with_mdn_with_reliability(
-        &session("strict"),
-        &EventBus::new(32).expect("bus"),
-        As2ReceiveMdnRequest {
-            payload: vec![1].into(),
-            mdn_payload: mdn.into(),
-            mdn_mode: As2MdnMode::Synchronous,
-            require_signed_mdn: false,
-            expected_mic: None,
-            policy: As2ReceivePolicy {
-                fail_closed_audit_events: false,
-                ..As2ReceivePolicy::default()
+#[tokio::test]
+async fn every_profile_refuses_a_message_without_wsse_security() {
+    for preset in peers::AS4_PRESETS {
+        let ca = preset.ca();
+        let (a, b) = preset.parties(&ca);
+        let sink = MemoryAuditSink::new();
+        let receiver = ported::client(
+            preset.profile(),
+            &ca,
+            &b,
+            a.partner(peers::A_URL),
+            &Loopback::new(),
+            |builder| builder.audit(sink.clone()),
+        );
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counted = calls.clone();
+        let inbound = receiver.inbound(
+            asx::MemoryDedup::default(),
+            move |_m: Verified<UserMessage>| {
+                counted.fetch_add(1, Ordering::SeqCst);
+                async { Ok::<(), asx::Reject>(()) }
             },
-            original_message_id: None,
-        },
-        &hook,
-        dedup.clone(),
-        &verifier,
-    )
-    .expect_err("strict mode should reject malformed boundary");
-
-    assert_eq!(err.code, ErrorCode::InteropViolation);
-    assert_eq!(err.context.stage, "as2_receive_mdn_boundary");
-}
-
-#[test]
-fn as4_strict_mode_rejects_missing_security_header_with_stage_context() {
-    let payload = br#"<S12:Envelope xmlns:S12="http://www.w3.org/2003/05/soap-envelope" xmlns:eb="http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/">
-    <S12:Header>
-    <eb:Messaging S12:mustUnderstand="true">
-    <eb:UserMessage>
-    <eb:MessageInfo><eb:MessageId>msg-no-security</eb:MessageId></eb:MessageInfo>
-    <eb:PartyInfo><eb:From><eb:PartyId>sender-a</eb:PartyId></eb:From><eb:To><eb:PartyId>receiver-b</eb:PartyId></eb:To></eb:PartyInfo>
-    <eb:CollaborationInfo><eb:Action>SubmitOrder</eb:Action></eb:CollaborationInfo>
-    </eb:UserMessage>
-    </eb:Messaging>
-    </S12:Header>
-    <S12:Body/>
-    </S12:Envelope>"#;
-    let dedup: std::sync::Arc<dyn asx_rs::storage::DedupStorage> =
-        std::sync::Arc::new(asx_rs::reliability::InMemoryDedupBackend::default());
-
-    let err = receive_push_sync(
-        &session("strict"),
-        &EventBus::new(32).expect("bus"),
-        As4ReceivePushSync {
-            request: As4ReceivePushRequest {
-                http_content_type: "application/soap+xml".into(),
-                payload: payload.to_vec().into(),
-                receipt_payload: None,
-                policy: As4PushPolicyBuilder::new()
-                    .fail_closed_audit_events(false)
-                    .build()
-                    .expect("policy"),
-                authenticated_sender_scope: None,
-            },
-            dedup: dedup.clone(),
-            signer_pins: None,
-        },
-    )
-    .expect_err("strict mode should reject missing wsse:Security");
-
-    assert!(matches!(
-        err.code,
-        ErrorCode::InteropViolation
-            | ErrorCode::PolicyViolation
-            | ErrorCode::SecurityVerificationFailed
-            | ErrorCode::ParseFailed
-    ));
-    assert_eq!(err.context.stage, "as4_parse_user_message");
+        );
+        let request = http::Request::post(peers::B_URL)
+            .header(http::header::CONTENT_TYPE, "application/soap+xml")
+            .body(bytes::Bytes::from_static(UNSIGNED.as_bytes()))
+            .unwrap();
+        let (status, body) = ported::post(&inbound, request).await;
+        let body = String::from_utf8_lossy(&body);
+        assert_eq!(status, http::StatusCode::BAD_REQUEST, "{preset:?}: {body}");
+        assert!(
+            body.contains("eb:Error") || body.contains(":Error "),
+            "{preset:?}: {body}"
+        );
+        assert!(body.contains("errorCode=\"EBMS:0"), "{preset:?}: {body}");
+        assert!(!body.contains("Receipt"), "{preset:?}: never receipted");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "{preset:?}: never delivered"
+        );
+        assert!(
+            sink.records().is_empty(),
+            "{preset:?}: unauthenticated, never recorded"
+        );
+    }
 }

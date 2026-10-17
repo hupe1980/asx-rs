@@ -1,0 +1,35 @@
+{
+  "action": null,
+  "conversation_id": null,
+  "direction": "outbound",
+  "disposition": "automatic-action/MDN-sent-automatically; processed",
+  "ebms_code": null,
+  "error_kind": null,
+  "local_party": "audit-golden-as2",
+  "message_id": "<msg-42@example>",
+  "message_timestamp": null,
+  "mic": {
+    "algorithm": "sha-256",
+    "value": "<volatile>"
+  },
+  "outcome": "delivered",
+  "partner": "partner-a",
+  "profile": "strict",
+  "protocol": "as2",
+  "quirks": [],
+  "record_id": "<volatile>",
+  "recorded_at": "<volatile>",
+  "ref_to_message_id": null,
+  "references": [],
+  "service": null,
+  "signal": {
+    "bytes": "<volatile>",
+    "message_id": null,
+    "nrr": [],
+    "ref_to_message_id": "<msg-42@example>",
+    "sha256": "<volatile>",
+    "signed": false,
+    "timestamp": null
+  },
+  "signer": null
+}

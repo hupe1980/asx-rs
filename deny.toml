@@ -1,0 +1,51 @@
+# Dependency policy for asx-rs, checked by `just deny` and the CI `deny` job.
+#
+# Change rule: adding a licence to `allow` names the crate that needs it in the
+# pull request; adding an advisory `ignore` carries a reason and the condition
+# (roadmap item or upstream release) that removes it.
+
+[graph]
+targets = []            # all targets
+all-features = true
+
+[advisories]
+version = 2
+# Vulnerabilities, unsound and yanked crates are denied (version 2 default);
+# an unmaintained notice only fails for a direct workspace dependency.
+unmaintained = "workspace"
+ignore = []             # entries: { id = "RUSTSEC-…", reason = "… (ROADMAP Xn / upstream issue)" }
+
+[licenses]
+version = 2
+# The minimal set the current graph needs (derived from `cargo metadata
+# --all-features --locked`): ISC (rustls-webpki, untrusted, ring, aws-lc-rs),
+# BSD-3-Clause (subtle, encoding_rs, matchit, aws-lc-sys, …), 0BSD (mailparse,
+# quoted_printable), Zlib (foldhash, zlib-rs), BSL-1.0 (xxhash-rust),
+# Unicode-3.0 (icu_*, unicode-ident), CDLA-Permissive-2.0 (webpki-root-certs).
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-3-Clause",
+    "ISC",
+    "0BSD",
+    "Zlib",
+    "BSL-1.0",
+    "Unicode-3.0",
+    "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.8
+
+[licenses.private]
+ignore = true           # xtask: publish = false, no license field
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+highlight = "all"
+deny = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

@@ -1,27 +1,14 @@
 use roxmltree::Document;
 
-use super::super::services::wssec_revocation_policy_from_session;
+use super::super::services::wssec_chain_policy_from_session;
 use super::super::types::As4PushPolicy;
 use crate::core::{AsxError, ErrorCode, ErrorContext, Result, SessionContext};
 use crate::crypto::wssec::WsSecVerifyOptions;
 
 /// Sealing module — prevents external crates from implementing
-/// As4Verifier without going through the testing escape hatch.
-#[cfg(not(feature = "testing"))]
+/// [`As4Verifier`]; the only implementation is [`As4WsSecVerifier`].
 pub(crate) mod private {
-    pub trait Sealed {}
-}
-
-/// Under the `testing` feature, the sealing module is made public so that
-/// downstream crates can implement [`As4Verifier`] for their own custom verifier
-/// types (e.g., a recording verifier that also captures the parsed envelope).
-/// This is intentionally restricted to `testing` builds so the sealed trait
-/// cannot be bypassed in production code.
-///
-/// Re-exported from `asx_rs::as4` as [`as4::verifier_seal`](crate::as4::verifier_seal).
-#[cfg(feature = "testing")]
-pub mod private {
-    pub trait Sealed {}
+    pub(crate) trait Sealed {}
 }
 
 /// Everything a [`As4Verifier`] is given about one inbound message.
@@ -29,9 +16,8 @@ pub mod private {
 /// A struct rather than eight parameters, so adding a fact the verifier needs
 /// does not reorder an argument list that is easy to get silently wrong — two
 /// of these fields are `&str` and two are slices.
-#[derive(Debug)]
 #[non_exhaustive]
-pub struct As4SecurityVerification<'a> {
+pub(crate) struct As4SecurityVerification<'a> {
     pub session: &'a SessionContext,
     pub policy: &'a As4PushPolicy,
     /// The SOAP envelope as text, for canonicalization.
@@ -39,8 +25,9 @@ pub struct As4SecurityVerification<'a> {
     /// The same envelope, parsed.
     pub soap_doc: &'a Document<'a>,
     pub message_id: &'a str,
-    /// Every payload attachment as `(content_id, bytes)`, for `cid:`
-    /// reference resolution. Empty when the message has no attachments.
+    /// Every declared payload part as `(content_id, _)`: each must be
+    /// covered by a signed `cid:` reference (its digest is checked after
+    /// decryption).
     pub external_references: &'a [(&'a str, &'a [u8])],
     /// The primary `<eb:From>/<eb:PartyId>` the message *claims* to be from.
     ///
@@ -56,6 +43,24 @@ pub struct As4SecurityVerification<'a> {
     /// sender. An unsigned message has no signer to attribute and is
     /// unaffected.
     pub permitted_signers: &'a [crate::crypto::CertFingerprint],
+    /// The profile's sender rule, checked with the pins.
+    /// When present, an empty pin list is not a refusal: the rule decides.
+    pub(crate) signer_check: Option<&'a crate::crypto::wssec::verify::SignerCheck>,
+    /// Where a successful verification leaves the signer and the verified
+    /// references, for the audit record.
+    pub(crate) evidence:
+        &'a std::sync::OnceLock<crate::crypto::wssec::verify::VerifiedSignatureCoverage>,
+}
+
+impl std::fmt::Debug for As4SecurityVerification<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("As4SecurityVerification")
+            .field("message_id", &self.message_id)
+            .field("from_party_id", &self.from_party_id)
+            .field("permitted_signers", &self.permitted_signers)
+            .field("signer_check", &self.signer_check.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 /// Security-verification hook for the AS4 push receive pipeline.
@@ -63,12 +68,12 @@ pub struct As4SecurityVerification<'a> {
 /// This trait is sealed — external crates cannot implement it unless the
 /// testing feature is enabled. This mirrors the sealing approach used on
 /// AS2 trust-verifier surfaces and prevents silent trust bypasses on AS4.
-pub trait As4Verifier: private::Sealed {
+pub(crate) trait As4Verifier: private::Sealed {
     fn verify_security(&self, ctx: As4SecurityVerification<'_>) -> Result<()>;
 }
 
 #[derive(Debug, Default, Clone, Copy)]
-pub struct As4WsSecVerifier;
+pub(crate) struct As4WsSecVerifier;
 
 impl private::Sealed for As4WsSecVerifier {}
 
@@ -83,16 +88,24 @@ impl As4Verifier for As4WsSecVerifier {
             external_references,
             from_party_id,
             permitted_signers,
+            signer_check,
+            evidence,
         } = ctx;
-        let revocation_policy = wssec_revocation_policy_from_session(session)?;
+        let chain_policy = wssec_chain_policy_from_session(session)?;
         let opts = WsSecVerifyOptions::new()
             .with_expected_fingerprints(permitted_signers)
-            .with_revocation(revocation_policy);
+            .with_signer_check(signer_check)
+            .with_chain_policy(chain_policy)
+            .at(session.clock().now())
+            // `cid:` digests over the decrypted parts are the caller's; so is
+            // revocation, after the sender rule.
+            .deferring_attachments();
 
         let coverage = crate::crypto::wssec::verify::verify_enveloped_signature_optional_with_doc(
             soap_doc,
             soap_xml,
-            opts.with_external_references(external_references),
+            crate::crypto::wssec::verify::SignedDocClass::UserMessage,
+            opts,
         )?;
 
         let signature_present = coverage.is_some();
@@ -110,11 +123,15 @@ impl As4Verifier for As4WsSecVerifier {
         // access point shares those anchors. Without a pin for the claimed
         // party there is nothing to attribute the signature to, so refuse
         // rather than accept an unattributable one.
-        if signature_present && permitted_signers.is_empty() {
-            return Err(super::super::signer_pins::unpinned_sender_error(
-                "as4_receive_push",
-                session,
-                from_party_id,
+        if signature_present && permitted_signers.is_empty() && signer_check.is_none() {
+            return Err(AsxError::new(
+                ErrorCode::PolicyViolation,
+                format!(
+                    "no signing certificate is pinned for the claimed sender '{from_party_id}', \
+                     so a valid signature could not be attributed to it; pin the partner's \
+                     signing certificate (Partner::signing_cert)"
+                ),
+                ErrorContext::for_session("as4_receive_push", session),
             ));
         }
 
@@ -131,6 +148,7 @@ impl As4Verifier for As4WsSecVerifier {
                 external_references,
                 &coverage,
             )?;
+            let _ = evidence.set(coverage);
         }
 
         Ok(())
@@ -145,7 +163,7 @@ impl As4Verifier for As4WsSecVerifier {
 /// check, a signature covering only the header and body verifies happily while
 /// an intermediary swaps the attachment, and the receive pipeline hands the
 /// substituted bytes to the application as `DomainReady`.
-fn enforce_attachment_signature_coverage(
+pub(super) fn enforce_attachment_signature_coverage(
     session: &SessionContext,
     message_id: &str,
     attachments: &[(&str, &[u8])],
@@ -245,46 +263,6 @@ fn enforce_messaging_signature_coverage(
     Ok(())
 }
 
-/// Test-only bypass verifier — skips all WS-Security checks.
-///
-/// Available only under the `testing` feature.  **Never use in production.**
-///
-/// Useful for:
-/// - Integration tests that exercise the full AS4 receive pipeline without
-///   setting up a real X.509 PKI (no trust anchors, no certificate pinning).
-/// - [`MockAs4Endpoint`] — the in-process mock AS4 server.
-/// - Testing BDEW/PEPPOL message routing without WIRK/production certificates.
-///
-/// ```toml
-/// [dev-dependencies]
-/// asx-rs = { version = "0.14", features = ["as4", "testing"] }
-/// ```
-///
-/// [`MockAs4Endpoint`]: crate::as4::mock_endpoint::MockAs4Endpoint
-#[cfg(feature = "testing")]
-#[derive(Debug, Default, Clone, Copy)]
-pub struct InsecureBypassAs4Verifier;
-
-#[cfg(feature = "testing")]
-impl private::Sealed for InsecureBypassAs4Verifier {}
-
-#[cfg(feature = "testing")]
-impl As4Verifier for InsecureBypassAs4Verifier {
-    fn verify_security(&self, ctx: As4SecurityVerification<'_>) -> Result<()> {
-        let (session, message_id) = (ctx.session, ctx.message_id);
-        // Intentional no-op — bypasses ALL WS-Security checks.
-        // Emit a tracing event so test logs are auditable and production
-        // log-scraping can detect accidental non-test usage.
-        tracing::warn!(
-            target: "asx_rs::as4::testing",
-            session_id = %session.session_id(),
-            message_id = %message_id,
-            "InsecureBypassAs4Verifier: ALL SIGNATURE / TRUST CHECKS BYPASSED (testing only)"
-        );
-        Ok(())
-    }
-}
-
 #[cfg(test)]
 mod xsw_coverage_tests {
     use super::{
@@ -303,6 +281,10 @@ mod xsw_coverage_tests {
         VerifiedSignatureCoverage {
             signed_same_document_ids: ids.iter().map(|s| s.to_string()).collect(),
             signed_cid_references: Vec::new(),
+            signer_certificate_der: None,
+            references: Vec::new(),
+            deferred: None,
+            signer_path: Vec::new(),
         }
     }
 
@@ -310,6 +292,10 @@ mod xsw_coverage_tests {
         VerifiedSignatureCoverage {
             signed_same_document_ids: Vec::new(),
             signed_cid_references: cids.iter().map(|s| s.to_string()).collect(),
+            signer_certificate_der: None,
+            references: Vec::new(),
+            deferred: None,
+            signer_path: Vec::new(),
         }
     }
 

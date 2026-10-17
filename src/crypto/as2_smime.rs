@@ -1,25 +1,23 @@
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
-use openssl::asn1::Asn1Time;
 use openssl::hash::MessageDigest;
 use openssl::nid::Nid;
-use openssl::ocsp::{OcspCertId, OcspCertStatus, OcspFlag, OcspResponse, OcspResponseStatus};
 use openssl::pkcs7::{Pkcs7, Pkcs7Flags};
 use openssl::pkey::PKey;
 use openssl::stack::Stack;
 use openssl::x509::store::X509StoreBuilder;
-use openssl::x509::{X509, X509Crl, X509Ref};
+use openssl::x509::{X509, X509Ref, X509StoreContext};
 use std::borrow::Cow;
-use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::core::{AsxError, ErrorCode, ErrorContext, OcspFailureMode, OcspMode, Result};
-use crate::crypto::ocsp_client;
+use crate::core::{AsxError, ErrorCode, ErrorContext, Result};
 use crate::crypto::wssec;
 
 #[derive(Debug, Clone)]
 pub struct As2SmimeVerificationOptions<'a> {
     pub expected_signer_fingerprint_sha256: Option<&'a str>,
-    pub revocation_policy: wssec::RevocationPolicy<'a>,
+    /// The anchors the signer must chain to (offline; revocation is the
+    /// caller's, on [`VerifiedSmimeEntity`]'s path).
+    pub chain_policy: wssec::ChainPolicy<'a>,
     /// Optional intermediate CA certificates (PEM) to supplement chain building.
     /// Use when the partner's CMS SignedData does not embed the full intermediate
     /// chain and the intermediate is not present in `trust_anchor_pems`.
@@ -31,7 +29,7 @@ pub struct As2SmimeVerificationOptions<'a> {
 /// This function is **synchronous** and not cancel-safe.  When invoked from a
 /// `tokio::task::spawn_blocking` closure, cancelling the outer Tokio task does
 /// **not** interrupt the blocking thread — OpenSSL operations run to completion
-/// and all temporary allocations (parsed certificates, CRL/OCSP responses, etc.)
+/// and all temporary allocations (parsed certificates, etc.)
 /// are released only when the thread finishes naturally.
 ///
 /// Do not call this function directly from an async context; always dispatch via
@@ -40,7 +38,17 @@ pub fn verify_smime_signed_payload(
     payload: &[u8],
     options: As2SmimeVerificationOptions<'_>,
 ) -> Result<VerifiedSmimeEntity> {
-    if options.revocation_policy.trust_anchor_pems.is_empty() {
+    let span = crate::telemetry::verify_span("cms-signed-data", None);
+    let result = span.in_scope(|| verify_smime_signed_payload_inner(payload, options));
+    crate::telemetry::child_outcome(&span, &result);
+    result
+}
+
+fn verify_smime_signed_payload_inner(
+    payload: &[u8],
+    options: As2SmimeVerificationOptions<'_>,
+) -> Result<VerifiedSmimeEntity> {
+    if options.chain_policy.trust_anchor_pems.is_empty() {
         return Err(AsxError::new(
             ErrorCode::SecurityVerificationFailed,
             "AS2 CMS verification requires at least one trust anchor",
@@ -48,7 +56,7 @@ pub fn verify_smime_signed_payload(
         ));
     }
 
-    let (pkcs7, detached_content) = Pkcs7::from_smime(payload).map_err(|err| {
+    let (pkcs7, detached_content) = pkcs7_from_smime(payload).map_err(|err| {
         // Produce a richer error for RFC 5652 CMS types that some legacy AS2
         // partners send but that the AS2 receive path does not support.
         // Header-based detection is cheap and runs before the OpenSSL parse.
@@ -79,15 +87,14 @@ pub fn verify_smime_signed_payload(
         )
     })?;
 
-    // Parse trust-anchor PEMs once; reuse parsed certs for both the X509Store
-    // and the CRL/OCSP issuer pool.  Use pre-parsed anchors from the cache
+    // Parse trust-anchor PEMs once. Use pre-parsed anchors from the cache
     // when available (zero PEM parse overhead on hot path).
     let mut trust_anchor_certs: Vec<X509>;
-    if let Some(ref pre) = options.revocation_policy.pre_parsed_trust_anchors {
+    if let Some(ref pre) = options.chain_policy.pre_parsed_trust_anchors {
         trust_anchor_certs = pre.clone(); // O(n) refcount bumps — O(1) per cert
     } else {
         trust_anchor_certs = Vec::new();
-        for pem in options.revocation_policy.trust_anchor_pems {
+        for pem in options.chain_policy.trust_anchor_pems {
             let certs = X509::stack_from_pem(pem.as_bytes()).map_err(|err| {
                 AsxError::new(
                     ErrorCode::SecurityVerificationFailed,
@@ -104,7 +111,7 @@ pub fn verify_smime_signed_payload(
     // every inbound message — the most common hot-path for AS2 receive.
     let fresh_store: Option<openssl::x509::store::X509Store>;
     let store: &openssl::x509::store::X509StoreRef =
-        if let Some(ref pre) = options.revocation_policy.pre_built_x509_store {
+        if let Some(ref pre) = options.chain_policy.pre_built_x509_store {
             pre
         } else {
             let mut builder = X509StoreBuilder::new().map_err(|err| {
@@ -126,18 +133,6 @@ pub fn verify_smime_signed_payload(
             fresh_store = Some(builder.build());
             fresh_store.as_ref().unwrap()
         };
-
-    let mut crls = Vec::new();
-    for pem in options.revocation_policy.revocation_crl_pems {
-        let crl = X509Crl::from_pem(pem.as_bytes()).map_err(|err| {
-            AsxError::new(
-                ErrorCode::SecurityVerificationFailed,
-                format!("invalid revocation CRL PEM: {err}"),
-                ErrorContext::new("as2_smime_verify"),
-            )
-        })?;
-        crls.push(crl);
-    }
 
     // Build the intermediate-certificate stack.  OpenSSL's PKCS7_verify already
     // searches certificates embedded in the CMS SignedData structure, but it
@@ -174,8 +169,8 @@ pub fn verify_smime_signed_payload(
     // PKCS7_NOINTERN: prevent certificates embedded in the inbound CMS structure
     // from being used during chain building.  OpenSSL will only use the explicitly
     // supplied `certs` stack and the configured `store` to construct the path.
-    // This closes the embedded-certificate-chain influence attack described in
-    // the project changelog §5 (MEDIUM).  The explicit `certs` stack (built from
+    // This keeps a sender from influencing chain building with embedded
+    // certificates.  The explicit `certs` stack (built from
     // `intermediate_ca_pems`) must include any intermediate CAs required to
     // complete the path to a configured trust anchor.
     let verify_flags = Pkcs7Flags::NOINTERN;
@@ -216,11 +211,34 @@ pub fn verify_smime_signed_payload(
             ErrorContext::new("as2_smime_verify"),
         )
     })?;
+    if let Ok(der) = signer.to_der() {
+        tracing::Span::current().record(
+            "signer.fingerprint",
+            crate::telemetry::fingerprint(&der).as_str(),
+        );
+    }
 
-    if let Some(expected_fingerprint) =
-        normalize_fingerprint(options.expected_signer_fingerprint_sha256)
-            .filter(|value| !value.is_empty())
+    // A non-empty pin that does not parse fails closed; it never means
+    // "verify unpinned".
+    let expected_fingerprint = match options
+        .expected_signer_fingerprint_sha256
+        .filter(|value| !value.trim().is_empty())
     {
+        Some(raw) => Some(
+            crate::crypto::CertFingerprint::parse(raw)
+                .map_err(|err| {
+                    AsxError::new(
+                        ErrorCode::InvalidInput,
+                        format!("malformed signer pin: {}", err.message),
+                        ErrorContext::new("as2_smime_verify"),
+                    )
+                })?
+                .as_str()
+                .to_string(),
+        ),
+        None => None,
+    };
+    if let Some(expected_fingerprint) = expected_fingerprint {
         let digest = signer.digest(MessageDigest::sha256()).map_err(|err| {
             AsxError::new(
                 ErrorCode::SecurityVerificationFailed,
@@ -239,27 +257,10 @@ pub fn verify_smime_signed_payload(
         }
     }
 
-    if !crls.is_empty() {
-        validate_crls(&crls, &trust_anchor_certs)?;
-
-        if is_revoked(signer, &crls)? {
-            return Err(AsxError::new(
-                ErrorCode::SecurityVerificationFailed,
-                "CMS signer certificate is revoked by configured CRL",
-                ErrorContext::new("as2_smime_verify"),
-            ));
-        }
-    }
-
-    validate_ocsp_status(
-        signer,
-        &trust_anchor_certs,
-        options.revocation_policy.ocsp_mode,
-        options.revocation_policy.ocsp_failure_mode,
-        options.revocation_policy.stapled_ocsp_responses_der,
-        options.revocation_policy.responder_ocsp_responses_der,
-        options.revocation_policy.ocsp_cache_namespace,
-    )?;
+    let signer_der = signer.to_der().ok();
+    // The path PKCS7_verify validated, for the caller's revocation check
+    // (every non-anchor certificate, not only the signer).
+    let signer_path = signer_path(store, signer, &certs)?;
 
     // For a detached (`multipart/signed`) signature OpenSSL hands back the exact
     // octets that were signed; for opaque `signed-data` it writes the
@@ -267,7 +268,43 @@ pub fn verify_smime_signed_payload(
     // entity RFC 4130 §7.3.1 requires the MIC to be computed over — return it
     // instead of discarding it.
     let entity = detached_content.unwrap_or(verified_payload);
-    Ok(VerifiedSmimeEntity::from_entity_bytes(entity))
+    let mut verified = VerifiedSmimeEntity::from_entity_bytes(entity);
+    verified.signer_der = signer_der;
+    verified.signer_path = signer_path;
+    Ok(verified)
+}
+
+/// The certification path of `signer` through `untrusted` to an anchor in
+/// `store`, signer first, anchor last.
+fn signer_path(
+    store: &openssl::x509::store::X509StoreRef,
+    signer: &openssl::x509::X509Ref,
+    untrusted: &Stack<X509>,
+) -> Result<Vec<X509>> {
+    let failed = |detail: String| {
+        AsxError::new(
+            ErrorCode::SecurityVerificationFailed,
+            detail,
+            ErrorContext::new("as2_smime_verify"),
+        )
+    };
+    let mut context = X509StoreContext::new().map_err(|e| failed(format!("PKIX context: {e}")))?;
+    let (valid, path) = context
+        .init(store, signer, untrusted, |ctx| {
+            let valid = ctx.verify_cert()?;
+            let path = ctx
+                .chain()
+                .map(|chain| chain.iter().map(|c| c.to_owned()).collect::<Vec<_>>())
+                .unwrap_or_default();
+            Ok((valid, path))
+        })
+        .map_err(|e| failed(format!("PKIX certificate validation failed: {e}")))?;
+    if !valid || path.is_empty() {
+        return Err(failed(
+            "the CMS signer does not chain to a configured trust anchor".into(),
+        ));
+    }
+    Ok(path)
 }
 
 /// The MIME entity a CMS `SignedData` actually covered.
@@ -284,6 +321,11 @@ pub fn verify_smime_signed_payload(
 pub struct VerifiedSmimeEntity {
     entity: Vec<u8>,
     content_start: usize,
+    /// The certificate (DER) whose signature verified, when this entity
+    /// came out of signature verification.
+    signer_der: Option<Vec<u8>>,
+    /// The signer's validated path, signer first, anchor last.
+    signer_path: Vec<X509>,
 }
 
 impl VerifiedSmimeEntity {
@@ -297,7 +339,22 @@ impl VerifiedSmimeEntity {
         Self {
             entity,
             content_start,
+            signer_der: None,
+            signer_path: Vec::new(),
         }
+    }
+
+    /// The certificate (DER) that made the verified signature, if any.
+    #[cfg_attr(not(feature = "as2"), allow(dead_code))]
+    pub(crate) fn signer_der(&self) -> Option<&[u8]> {
+        self.signer_der.as_deref()
+    }
+
+    /// The signer's validated certification path (signer first, anchor last)
+    /// for the revocation check.
+    #[cfg_attr(not(feature = "as2"), allow(dead_code))]
+    pub(crate) fn signer_path(&self) -> &[X509] {
+        &self.signer_path
     }
 
     /// Exact signed octets (headers + content) — the RFC 4130 §7.3.1 MIC input.
@@ -356,11 +413,6 @@ impl VerifiedSmimeEntity {
     pub fn content_type(&self) -> Option<String> {
         header_value(self.headers(), "content-type")
     }
-
-    /// Consume the entity, returning the signed octets and the content offset.
-    pub fn into_parts(self) -> (Vec<u8>, usize) {
-        (self.entity, self.content_start)
-    }
 }
 
 /// Byte offset just past the `CRLF CRLF` (or `LF LF`) that ends a MIME header
@@ -406,347 +458,6 @@ fn header_value(headers: &[u8], wanted_lower: &str) -> Option<String> {
     })
 }
 
-fn is_revoked(cert: &X509Ref, crls: &[X509Crl]) -> Result<bool> {
-    let cert_issuer = cert.issuer_name().to_der().map_err(|err| {
-        AsxError::new(
-            ErrorCode::SecurityVerificationFailed,
-            format!("failed to read signer certificate issuer: {err}"),
-            ErrorContext::new("as2_smime_verify"),
-        )
-    })?;
-    let cert_serial = cert.serial_number().to_bn().map_err(|err| {
-        AsxError::new(
-            ErrorCode::SecurityVerificationFailed,
-            format!("failed to read signer certificate serial number: {err}"),
-            ErrorContext::new("as2_smime_verify"),
-        )
-    })?;
-    let cert_serial_bytes = cert_serial.to_vec();
-
-    for crl in crls {
-        let crl_issuer = crl.issuer_name().to_der().map_err(|err| {
-            AsxError::new(
-                ErrorCode::SecurityVerificationFailed,
-                format!("failed to read CRL issuer: {err}"),
-                ErrorContext::new("as2_smime_verify"),
-            )
-        })?;
-        if crl_issuer != cert_issuer {
-            continue;
-        }
-
-        if let Some(revoked) = crl.get_revoked() {
-            for entry in revoked {
-                let serial = entry.serial_number().to_bn().map_err(|err| {
-                    AsxError::new(
-                        ErrorCode::SecurityVerificationFailed,
-                        format!("failed to read revoked serial number from CRL: {err}"),
-                        ErrorContext::new("as2_smime_verify"),
-                    )
-                })?;
-                if serial.to_vec() == cert_serial_bytes {
-                    return Ok(true);
-                }
-            }
-        }
-    }
-
-    Ok(false)
-}
-
-fn validate_crls(crls: &[X509Crl], issuer_pool: &[X509]) -> Result<()> {
-    let now = Asn1Time::from_unix(
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|err| {
-                AsxError::new(
-                    ErrorCode::SecurityVerificationFailed,
-                    format!("failed to resolve current system time: {err}"),
-                    ErrorContext::new("as2_smime_verify"),
-                )
-            })?
-            .as_secs() as i64,
-    )
-    .map_err(|err| {
-        AsxError::new(
-            ErrorCode::SecurityVerificationFailed,
-            format!("failed to convert system time for CRL validation: {err}"),
-            ErrorContext::new("as2_smime_verify"),
-        )
-    })?;
-
-    for crl in crls {
-        if crl
-            .last_update()
-            .compare(now.as_ref())
-            .map_err(|err| {
-                AsxError::new(
-                    ErrorCode::SecurityVerificationFailed,
-                    format!("failed to compare CRL lastUpdate: {err}"),
-                    ErrorContext::new("as2_smime_verify"),
-                )
-            })?
-            .is_gt()
-        {
-            return Err(AsxError::new(
-                ErrorCode::SecurityVerificationFailed,
-                "CRL lastUpdate is in the future",
-                ErrorContext::new("as2_smime_verify"),
-            ));
-        }
-
-        if let Some(next_update) = crl.next_update()
-            && next_update
-                .compare(now.as_ref())
-                .map_err(|err| {
-                    AsxError::new(
-                        ErrorCode::SecurityVerificationFailed,
-                        format!("failed to compare CRL nextUpdate: {err}"),
-                        ErrorContext::new("as2_smime_verify"),
-                    )
-                })?
-                .is_lt()
-        {
-            return Err(AsxError::new(
-                ErrorCode::SecurityVerificationFailed,
-                "CRL nextUpdate is in the past",
-                ErrorContext::new("as2_smime_verify"),
-            ));
-        }
-
-        let crl_issuer = crl.issuer_name().to_der().map_err(|err| {
-            AsxError::new(
-                ErrorCode::SecurityVerificationFailed,
-                format!("failed to read CRL issuer: {err}"),
-                ErrorContext::new("as2_smime_verify"),
-            )
-        })?;
-
-        let issuer_cert = issuer_pool
-            .iter()
-            .find(|cert| {
-                cert.subject_name()
-                    .to_der()
-                    .map(|der| der == crl_issuer)
-                    .unwrap_or(false)
-            })
-            .ok_or_else(|| {
-                AsxError::new(
-                    ErrorCode::SecurityVerificationFailed,
-                    "CRL issuer does not match configured trust anchors",
-                    ErrorContext::new("as2_smime_verify"),
-                )
-            })?;
-
-        let valid_signature = crl
-            .verify(
-                issuer_cert
-                    .public_key()
-                    .map_err(|err| {
-                        AsxError::new(
-                            ErrorCode::SecurityVerificationFailed,
-                            format!("failed to extract CRL issuer public key: {err}"),
-                            ErrorContext::new("as2_smime_verify"),
-                        )
-                    })?
-                    .as_ref(),
-            )
-            .map_err(|err| {
-                AsxError::new(
-                    ErrorCode::SecurityVerificationFailed,
-                    format!("failed to verify CRL signature: {err}"),
-                    ErrorContext::new("as2_smime_verify"),
-                )
-            })?;
-        if !valid_signature {
-            return Err(AsxError::new(
-                ErrorCode::SecurityVerificationFailed,
-                "CRL signature verification failed",
-                ErrorContext::new("as2_smime_verify"),
-            ));
-        }
-    }
-
-    Ok(())
-}
-
-fn validate_ocsp_status(
-    cert: &X509Ref,
-    issuer_pool: &[X509],
-    mode: OcspMode,
-    failure_mode: OcspFailureMode,
-    stapled_responses_der: &[Vec<u8>],
-    responder_responses_der: &[Vec<u8>],
-    ocsp_cache_namespace: &str,
-) -> Result<()> {
-    let disabled_with_supplied_responses = mode == OcspMode::Disabled
-        && (!stapled_responses_der.is_empty() || !responder_responses_der.is_empty());
-
-    if mode == OcspMode::Disabled && !disabled_with_supplied_responses {
-        return Ok(());
-    }
-
-    let issuer = issuer_pool.iter().find(|candidate| {
-        match (
-            candidate.subject_name().to_der(),
-            cert.issuer_name().to_der(),
-        ) {
-            (Ok(subject), Ok(issuer_name)) => subject == issuer_name,
-            _ => false,
-        }
-    });
-
-    let Some(issuer) = issuer else {
-        return match failure_mode {
-            OcspFailureMode::HardFail => Err(AsxError::new(
-                ErrorCode::SecurityVerificationFailed,
-                "OCSP verification could not resolve certificate issuer",
-                ErrorContext::new("as2_smime_verify"),
-            )),
-            OcspFailureMode::SoftFail => Ok(()),
-        };
-    };
-
-    let needs_responder = matches!(
-        mode,
-        OcspMode::ResponderOnly | OcspMode::StapledThenResponder
-    );
-    let responder_responses = if needs_responder {
-        effective_responder_ocsp_responses(
-            cert,
-            issuer.as_ref(),
-            responder_responses_der,
-            ocsp_cache_namespace,
-        )?
-    } else {
-        responder_responses_der.to_vec()
-    };
-
-    let responses = match mode {
-        OcspMode::StapledOnly => vec![stapled_responses_der],
-        OcspMode::ResponderOnly => vec![responder_responses.as_slice()],
-        OcspMode::StapledThenResponder => {
-            vec![stapled_responses_der, responder_responses.as_slice()]
-        }
-        OcspMode::Disabled => vec![stapled_responses_der, responder_responses.as_slice()],
-    };
-
-    let mut saw_usable = false;
-    let mut cert_stack = Stack::new().map_err(|err| {
-        AsxError::new(
-            ErrorCode::SecurityVerificationFailed,
-            format!("failed to initialize OCSP certificate stack: {err}"),
-            ErrorContext::new("as2_smime_verify"),
-        )
-    })?;
-    for candidate in issuer_pool {
-        cert_stack.push(candidate.clone()).map_err(|err| {
-            AsxError::new(
-                ErrorCode::SecurityVerificationFailed,
-                format!("failed to build OCSP verification stack: {err}"),
-                ErrorContext::new("as2_smime_verify"),
-            )
-        })?;
-    }
-
-    let mut store_builder = X509StoreBuilder::new().map_err(|err| {
-        AsxError::new(
-            ErrorCode::SecurityVerificationFailed,
-            format!("failed to initialize OCSP trust store: {err}"),
-            ErrorContext::new("as2_smime_verify"),
-        )
-    })?;
-    for candidate in issuer_pool {
-        store_builder.add_cert(candidate.clone()).map_err(|err| {
-            AsxError::new(
-                ErrorCode::SecurityVerificationFailed,
-                format!("failed to add OCSP trust anchor: {err}"),
-                ErrorContext::new("as2_smime_verify"),
-            )
-        })?;
-    }
-    let store = store_builder.build();
-
-    for source in responses {
-        for der in source {
-            let response = match OcspResponse::from_der(der) {
-                Ok(value) => value,
-                Err(_) => continue,
-            };
-            if response.status() != OcspResponseStatus::SUCCESSFUL {
-                continue;
-            }
-            let basic = match response.basic() {
-                Ok(value) => value,
-                Err(_) => continue,
-            };
-            if basic
-                .verify(&cert_stack, &store, OcspFlag::empty())
-                .is_err()
-            {
-                continue;
-            }
-
-            let cert_id = match OcspCertId::from_cert(MessageDigest::sha1(), cert, issuer.as_ref())
-            {
-                Ok(value) => value,
-                Err(_) => continue,
-            };
-
-            let status = match basic.find_status(&cert_id) {
-                Some(value) => value,
-                None => continue,
-            };
-
-            saw_usable = true;
-            status.check_validity(300, Some(86400)).map_err(|err| {
-                AsxError::new(
-                    ErrorCode::SecurityVerificationFailed,
-                    format!("OCSP response failed freshness validation: {err}"),
-                    ErrorContext::new("as2_smime_verify"),
-                )
-            })?;
-
-            if status.status == OcspCertStatus::REVOKED {
-                return Err(AsxError::new(
-                    ErrorCode::SecurityVerificationFailed,
-                    "OCSP response reports signer certificate revoked",
-                    ErrorContext::new("as2_smime_verify"),
-                ));
-            }
-            if status.status == OcspCertStatus::GOOD {
-                return Ok(());
-            }
-        }
-    }
-
-    match failure_mode {
-        OcspFailureMode::HardFail => Err(AsxError::new(
-            ErrorCode::SecurityVerificationFailed,
-            if saw_usable {
-                "OCSP status was not good"
-            } else {
-                "OCSP verification required but no usable response was found"
-            },
-            ErrorContext::new("as2_smime_verify"),
-        )),
-        OcspFailureMode::SoftFail => Ok(()),
-    }
-}
-
-fn effective_responder_ocsp_responses(
-    cert: &X509Ref,
-    issuer: &X509Ref,
-    configured: &[Vec<u8>],
-    ocsp_cache_namespace: &str,
-) -> Result<Vec<Vec<u8>>> {
-    if !configured.is_empty() {
-        return Ok(configured.to_vec());
-    }
-
-    ocsp_client::fetch_ocsp_responses_with_cache_scoped(cert, issuer, ocsp_cache_namespace)
-}
-
 fn hex_lower(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len() * 2);
@@ -757,20 +468,12 @@ fn hex_lower(bytes: &[u8]) -> String {
     out
 }
 
-fn normalize_fingerprint(value: Option<&str>) -> Option<String> {
-    value.and_then(|candidate| {
-        let normalized: String = candidate
-            .chars()
-            .filter(|ch| ch.is_ascii_hexdigit())
-            .map(|ch| ch.to_ascii_lowercase())
-            .collect();
-
-        if normalized.len() == 64 {
-            Some(normalized)
-        } else {
-            None
-        }
-    })
+/// `Pkcs7::from_smime` that cannot panic: the `openssl` crate unwraps the
+/// UTF-8 decoding of OpenSSL's error data, and the MIME parser puts octets
+/// of hostile input there. Such input is unparseable, not a crash.
+fn pkcs7_from_smime(payload: &[u8]) -> std::result::Result<(Pkcs7, Option<Vec<u8>>), String> {
+    std::panic::catch_unwind(|| Pkcs7::from_smime(payload).map_err(|err| err.to_string()))
+        .unwrap_or_else(|_| Err("the S/MIME structure is not parseable".to_string()))
 }
 
 /// Sign a prepared AS2 MIME entity with S/MIME (CMS).
@@ -803,6 +506,20 @@ pub fn sign_smime_message(
 }
 
 pub fn sign_smime_message_preparsed(
+    payload: &[u8],
+    signing_key: &openssl::pkey::PKeyRef<openssl::pkey::Private>,
+    signing_cert: &X509Ref,
+) -> Result<Vec<u8>> {
+    tracing::debug_span!(
+        target: "asx",
+        "asx.sign",
+        algorithm = "cms-signed-data",
+        reference_count = 1usize,
+    )
+    .in_scope(|| sign_smime_message_inner(payload, signing_key, signing_cert))
+}
+
+fn sign_smime_message_inner(
     payload: &[u8],
     signing_key: &openssl::pkey::PKeyRef<openssl::pkey::Private>,
     signing_cert: &X509Ref,
@@ -926,31 +643,12 @@ pub fn detect_smime_format(payload: &[u8]) -> SmimeFormat {
 }
 
 fn detect_smime_format_from_pkcs7(payload: &[u8]) -> Option<SmimeFormat> {
-    let (pkcs7, _) = Pkcs7::from_smime(payload).ok()?;
+    let (pkcs7, _) = pkcs7_from_smime(payload).ok()?;
     match pkcs7.type_()?.nid() {
         Nid::PKCS7_ENVELOPED => Some(SmimeFormat::Enveloped),
         Nid::PKCS7_SIGNED => Some(SmimeFormat::OpaqueSignedData),
         _ => None,
     }
-}
-
-/// Returns `true` when the MIME payload's Content-Type indicates an S/MIME
-/// `EnvelopedData` (encrypted) structure.
-///
-/// Inspects only the first 512 bytes (header region) to avoid scanning large
-/// payloads.  This is deliberately a fast heuristic; the authoritative check
-/// is performed by OpenSSL during the actual decrypt call.
-pub fn is_smime_enveloped(payload: &[u8]) -> bool {
-    matches!(detect_smime_format(payload), SmimeFormat::Enveloped)
-}
-
-/// Returns `true` when the MIME payload appears to be S/MIME signed content
-/// (`multipart/signed` or `smime-type=signed-data`).
-pub fn is_smime_signed(payload: &[u8]) -> bool {
-    matches!(
-        detect_smime_format(payload),
-        SmimeFormat::OpaqueSignedData | SmimeFormat::MultipartSigned
-    )
 }
 
 /// Decrypt an AS2 S/MIME `EnvelopedData` payload (RFC 5751 §3.3).
@@ -971,9 +669,26 @@ pub fn decrypt_smime_enveloped_payload(
     recipient_cert_pem: &[u8],
     recipient_key_pem: &[u8],
 ) -> Result<Vec<u8>> {
+    let span = tracing::debug_span!(
+        target: "asx",
+        "asx.decrypt",
+        algorithm = "cms-enveloped-data",
+        outcome = tracing::field::Empty,
+    );
+    let result = span
+        .in_scope(|| decrypt_smime_enveloped_inner(payload, recipient_cert_pem, recipient_key_pem));
+    crate::telemetry::child_outcome(&span, &result);
+    result
+}
+
+fn decrypt_smime_enveloped_inner(
+    payload: &[u8],
+    recipient_cert_pem: &[u8],
+    recipient_key_pem: &[u8],
+) -> Result<Vec<u8>> {
     use openssl::pkey::PKey;
 
-    let (pkcs7, _) = Pkcs7::from_smime(payload).map_err(|err| {
+    let (pkcs7, _) = pkcs7_from_smime(payload).map_err(|err| {
         AsxError::new(
             ErrorCode::DecryptionFailed,
             format!("failed to parse S/MIME EnvelopedData structure: {err}"),
@@ -1014,41 +729,12 @@ pub fn decrypt_smime_enveloped_payload(
 ///
 /// The cipher is negotiated per partner via [`crate::as2::As2SendPolicy::encryption_cipher`].
 /// `Aes256Cbc` is the default and is required in strict interop mode.
-///
-/// **Security guidance:**
-/// - Prefer `Aes256Cbc` (default) or `Aes192Cbc` for all new deployments.
-/// - `Aes128Cbc` is acceptable but offers reduced key material.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub enum SmimeCipher {
-    /// AES-128-CBC. Acceptable for interoperability but weaker key material.
-    Aes128Cbc,
-    /// AES-192-CBC.
-    Aes192Cbc,
     /// AES-256-CBC (default). Required in strict mode.
     #[default]
     Aes256Cbc,
-}
-
-/// Encrypt an AS2 payload with S/MIME (CMS) using the recipient certificate.
-///
-/// The `cipher` parameter controls which symmetric algorithm is used to wrap
-/// the content-encryption key.  Pass [`SmimeCipher::default()`] (`Aes256Cbc`)
-/// for all new deployments.
-pub fn encrypt_smime_message(
-    payload: &[u8],
-    recipient_cert_pem: &[u8],
-    cipher: SmimeCipher,
-) -> Result<Vec<u8>> {
-    let recipient_cert = X509::from_pem(recipient_cert_pem).map_err(|err| {
-        AsxError::new(
-            ErrorCode::SecurityVerificationFailed,
-            format!("failed to parse recipient certificate PEM: {err}"),
-            ErrorContext::new("as2_smime_encrypt"),
-        )
-    })?;
-
-    encrypt_smime_message_preparsed(payload, &recipient_cert, cipher)
 }
 
 pub fn encrypt_smime_message_preparsed(
@@ -1056,11 +742,21 @@ pub fn encrypt_smime_message_preparsed(
     recipient_cert: &X509Ref,
     cipher: SmimeCipher,
 ) -> Result<Vec<u8>> {
+    let algorithm = match cipher {
+        SmimeCipher::Aes256Cbc => "aes256-cbc",
+    };
+    tracing::debug_span!(target: "asx", "asx.encrypt", algorithm, key_transport = "rsa")
+        .in_scope(|| encrypt_smime_message_inner(payload, recipient_cert, cipher))
+}
+
+fn encrypt_smime_message_inner(
+    payload: &[u8],
+    recipient_cert: &X509Ref,
+    cipher: SmimeCipher,
+) -> Result<Vec<u8>> {
     use openssl::symm::Cipher;
 
     let openssl_cipher = match cipher {
-        SmimeCipher::Aes128Cbc => Cipher::aes_128_cbc(),
-        SmimeCipher::Aes192Cbc => Cipher::aes_192_cbc(),
         SmimeCipher::Aes256Cbc => Cipher::aes_256_cbc(),
     };
 
@@ -1107,16 +803,12 @@ mod tests {
     fn detect_smime_format_enveloped() {
         let payload = b"Content-Type: application/pkcs7-mime; smime-type=enveloped-data\r\n\r\n";
         assert_eq!(detect_smime_format(payload), SmimeFormat::Enveloped);
-        assert!(is_smime_enveloped(payload));
-        assert!(!is_smime_signed(payload));
     }
 
     #[test]
     fn detect_smime_format_opaque_signed() {
         let payload = b"Content-Type: application/pkcs7-mime; smime-type=signed-data\r\n\r\n";
         assert_eq!(detect_smime_format(payload), SmimeFormat::OpaqueSignedData);
-        assert!(!is_smime_enveloped(payload));
-        assert!(is_smime_signed(payload));
     }
 
     #[test]
@@ -1124,8 +816,6 @@ mod tests {
         let payload =
             b"Content-Type: multipart/signed; protocol=\"application/pkcs7-signature\"\r\n\r\n";
         assert_eq!(detect_smime_format(payload), SmimeFormat::MultipartSigned);
-        assert!(!is_smime_enveloped(payload));
-        assert!(is_smime_signed(payload));
     }
 
     #[test]
@@ -1189,12 +879,93 @@ mod tests {
         let payload = b"content";
         let cert_pem = include_bytes!("../../tests/fixtures/pki/receipt_signing.cert.pem");
 
-        let mut enveloped = encrypt_smime_message(payload, cert_pem, SmimeCipher::Aes256Cbc)
+        let cert = X509::from_pem(cert_pem).expect("cert");
+        let mut enveloped = encrypt_smime_message_preparsed(payload, &cert, SmimeCipher::Aes256Cbc)
             .expect("enveloped smime");
         let text = String::from_utf8(enveloped.clone()).expect("smime utf8 envelope");
         let rewritten = text.replace("; smime-type=enveloped-data", "");
         enveloped = rewritten.into_bytes();
 
         assert_eq!(detect_smime_format(&enveloped), SmimeFormat::Enveloped);
+    }
+
+    // ── a malformed pin fails closed ────────────────────────────────────────
+
+    /// Self-signed RSA-2048 certificate and PKCS#8 key (PEM), generated
+    /// inline so the test also runs without the `testing` feature.
+    fn self_signed_rsa_pair(common_name: &str) -> (Vec<u8>, Vec<u8>) {
+        use openssl::asn1::Asn1Time;
+        use openssl::bn::BigNum;
+        use openssl::rsa::Rsa;
+        use openssl::x509::X509NameBuilder;
+        use openssl::x509::extension::{BasicConstraints, KeyUsage};
+
+        let pkey = PKey::from_rsa(Rsa::generate(2048).expect("rsa")).expect("pkey");
+        let mut name = X509NameBuilder::new().expect("name");
+        name.append_entry_by_text("CN", common_name).expect("cn");
+        let name = name.build();
+        let mut builder = X509::builder().expect("builder");
+        builder.set_version(2).expect("version");
+        builder
+            .set_serial_number(
+                &BigNum::from_u32(1)
+                    .expect("bn")
+                    .to_asn1_integer()
+                    .expect("serial"),
+            )
+            .expect("serial");
+        builder.set_subject_name(&name).expect("subject");
+        builder.set_issuer_name(&name).expect("issuer");
+        builder
+            .set_not_before(&Asn1Time::days_from_now(0).expect("nb"))
+            .expect("not before");
+        builder
+            .set_not_after(&Asn1Time::days_from_now(1).expect("na"))
+            .expect("not after");
+        builder.set_pubkey(&pkey).expect("pubkey");
+        builder
+            .append_extension(
+                KeyUsage::new()
+                    .critical()
+                    .digital_signature()
+                    .build()
+                    .expect("ku"),
+            )
+            .expect("ku ext");
+        builder
+            .append_extension(BasicConstraints::new().critical().build().expect("bc"))
+            .expect("bc ext");
+        builder.sign(&pkey, MessageDigest::sha256()).expect("sign");
+        let cert = builder.build();
+        (
+            cert.to_pem().expect("cert pem"),
+            pkey.private_key_to_pem_pkcs8().expect("key pem"),
+        )
+    }
+
+    #[test]
+    fn as2_verify_with_malformed_pin_fails() {
+        let (cert_pem, key_pem) = self_signed_rsa_pair("as2-pin");
+        let entity = b"Content-Type: text/plain\r\n\r\nhello";
+        let signed = sign_smime_message(entity, &key_pem, &cert_pem).expect("sign");
+        // PKCS7_NOINTERN: the signer certificate is supplied explicitly.
+        let anchors = vec![String::from_utf8(cert_pem).expect("utf8")];
+        let options = |pin: Option<&'static str>| As2SmimeVerificationOptions {
+            expected_signer_fingerprint_sha256: pin,
+            chain_policy: wssec::ChainPolicy {
+                trust_anchor_pems: &anchors,
+                require_chain_validation: true,
+                pre_parsed_trust_anchors: None,
+                pre_built_x509_store: None,
+            },
+            intermediate_ca_pems: &anchors,
+        };
+
+        // Control: the signature verifies unpinned.
+        verify_smime_signed_payload(&signed, options(None)).expect("unpinned verify");
+
+        let err = verify_smime_signed_payload(&signed, options(Some("zz-not-a-pin")))
+            .expect_err("a malformed pin must fail, not verify unpinned");
+        assert!(err.message.contains("malformed"), "{}", err.message);
     }
 }

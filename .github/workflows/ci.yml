@@ -4,257 +4,93 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_call: # release.yml runs this for the tagged commit
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+# `just ci` runs check + features + msrv + deny locally; `just interop` runs interop.
 jobs:
-  check-test:
+  check:
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        features:
-          - "as2,client"
-          - "as4,server"
-          - "as2,as4,client,server,trace"
-          # `testing` without `interop-relaxed`: this combination is reachable
-          # by any downstream integration-test build and was silently broken
-          # because every prior job enabled both together.
-          - "as2,as4,testing"
-          - "as2,as4,testing,interop-relaxed"
-          - "as2,as4,compression"
-          # Participant discovery pulls a DNS client; it is off by default, so
-          # nothing else in this matrix compiles it.
-          - "as4,client,dns"
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-      - name: Install stable toolchain
-        uses: dtolnay/rust-toolchain@stable
-      # `-D warnings` here and not only at `--all-features`: dead code behind a
-      # feature gate is invisible to a build that enables every feature, which
-      # is exactly where a `#[cfg]` drifts out of step with its callers.
-      - name: Cargo check
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: rustup toolchain install stable --profile minimal --component rustfmt,clippy --no-self-update && rustup default stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --locked --workspace --all-features --all-targets -- -D warnings
+      - run: cargo doc --locked --all-features --no-deps
         env:
-          RUSTFLAGS: "-D warnings"
-        run: cargo check --no-default-features --features "${{ matrix.features }}"
-      - name: Cargo test
-        run: cargo test --no-default-features --features "${{ matrix.features }}"
+          RUSTDOCFLAGS: -D warnings
+      - name: Docs rules (README and site; the compile half is the src/docs.rs doctests)
+        run: bash scripts/check-docs.sh && bash scripts/concepts-check.sh
+      - run: cargo test --locked --workspace --all-features
 
-  # A hand-written matrix only covers combinations someone thought of. This
-  # walks the powerset so a `#[cfg]` branch that no listed combination compiles
-  # cannot reach main unnoticed.
-  feature-powerset:
+  features:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-      - name: Install stable toolchain
-        uses: dtolnay/rust-toolchain@stable
-      - name: Install cargo-hack
-        uses: taiki-e/install-action@cargo-hack
-      # `--at-least-one-of as2,as4` encodes the crate's own invariant: without a
-      # protocol feature there is nothing to build but shared infrastructure,
-      # and `server` deliberately `compile_error!`s in that state.
-      - name: Check feature powerset
-        run: |
-          cargo hack check --feature-powerset --depth 2 \
-            --at-least-one-of as2,as4 \
-            --exclude-features prometheus,opentelemetry \
-            --lib --tests
-      # `--at-least-one-of` above means no powerset member ever builds without a
-      # protocol feature, and both protocols pull `crypto`. But lib.rs documents
-      # the protocol-less build, and `xtask` depends on the crate that way, so
-      # it is a supported configuration and needs its own check. An ungated use
-      # of `openssl` reached main because nothing compiled this.
-      - name: Check the protocol-less build
-        run: |
-          cargo hack check --feature-powerset --depth 2 \
-            --exclude-features as2,as4,server,client,dns,prometheus,opentelemetry \
-            --lib
-
-  lint:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install stable toolchain
-        uses: dtolnay/rust-toolchain@stable
-      - name: Cargo fmt
-        run: cargo fmt --all -- --check
-      - name: Cargo clippy
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
-      # A broken intra-doc link ships to docs.rs as a dead reference. Four of
-      # them were live, one pointing at a bypass verifier that is not exported.
-      - name: Rustdoc links
-        env:
-          RUSTDOCFLAGS: "-D warnings"
-        run: cargo doc --all-features --no-deps
-
-  perf-gate:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install stable toolchain
-        uses: dtolnay/rust-toolchain@stable
-      - name: Run Performance Gate
-        run: |
-          cargo run --release -p xtask --no-default-features --features "as2,as4,client,server,trace,compression,async-ocsp,interop-strict" -- perf-gate \
-            --iterations 2000 \
-            --check-baseline benches/perf-baseline.txt \
-            --max-regression 0.25
-
-  perf-matrix-smoke:
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        features:
-          - "as2,client"
-          - "as4,server"
-          - "as2,as4,client,server"
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install stable toolchain
-        uses: dtolnay/rust-toolchain@stable
-      - name: Benchmark Harness Smoke
-        run: |
-          cargo run --release -p xtask --no-default-features --features "${{ matrix.features }}" -- perf-gate --iterations 500
-
-  interop-fixtures-required:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install stable toolchain
-        uses: dtolnay/rust-toolchain@stable
-      - name: Run Required Interop Fixtures
-        run: |
-          cargo test --all-features --test as2_send_golden
-          cargo test --all-features --test as2_receive_mdn
-          cargo test --all-features --test as4_push_flow
-          cargo test --all-features --test as4_pull_flow
-          cargo test --all-features --test wssec_c14n_vectors
-          cargo test --all-features --test wssec_strict_matrix
-      - name: AS2 S/MIME oracle against the openssl CLI
-        run: cargo test --all-features --test interop_openssl_smime_oracle -- --ignored --nocapture
-
-  property-and-fuzz-smoke:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install stable toolchain
-        uses: dtolnay/rust-toolchain@stable
-      - name: Run Property Test Suite
-        run: cargo test --all-features --test property_protocol_invariants
-      - name: Run Profile Property Invariants
-        run: cargo test --all-features --test profile_property_invariants
-      - name: Run Fuzz Smoke Suite
-        run: cargo test --all-features --test fuzz_protocol_ingress
-
-  interop-matrix-and-vector-required:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install stable toolchain
-        uses: dtolnay/rust-toolchain@stable
-      - name: Run Interop Matrix Gate
-        run: bash scripts/run_interop_matrix.sh
-      - name: Run WS-Security Vector Gate
-        run: bash scripts/run_wssec_vector_gate.sh
-
-  fuzz-adversarial-required:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install stable toolchain
-        uses: dtolnay/rust-toolchain@stable
-      - name: Run Adversarial Fuzz Gate
-        run: bash scripts/run_fuzz_gate.sh 4000 2500 artifacts/fuzz
-      - name: Upload Fuzz Artifacts
-        uses: actions/upload-artifact@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: rustup toolchain install stable --profile minimal --no-self-update && rustup default stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
         with:
-          name: fuzz-artifacts
-          path: artifacts/fuzz
+          tool: cargo-hack@0.6
+      # No default features, each feature alone, and all features.
+      - run: cargo hack check --locked -p asx-rs --each-feature --lib --tests
+        env:
+          RUSTFLAGS: -D warnings
 
-  session-isolation-required:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install stable toolchain
-        uses: dtolnay/rust-toolchain@stable
-      - name: Run Session Isolation Integration Suite
-        run: cargo test --all-features --test session_isolation_concurrency
-
-  # Docker-backed foreign-implementation oracles.
-  #
-  # These are `#[ignore]`d so a normal `cargo test` stays hermetic and offline;
-  # this job is the only place they run. Each one exists because testing
-  # against ourselves proves agreement with ourselves:
-  #
-  # - Holodeck B2B  — an independent WSS4J-based AS4 stack, for the protocol.
-  # - Redis         — a real network-backed store, for the async half of the
-  #                   storage traits that no in-tree backend exercises (D61).
-  #
-  # `continue-on-error` is deliberate: these depend on third-party images and
-  # a Docker daemon, and an outage there must not block a merge. The result is
-  # still visible on the run.
-  # `alpine` and `redis` are multi-arch, so these run on the default runner.
-  interop-docker-oracles:
-    runs-on: ubuntu-latest
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install stable toolchain
-        uses: dtolnay/rust-toolchain@stable
-      - name: WS-Security signatures against xmlsec1
-        run: cargo test --all-features --test interop_xmlsec_oracle -- --ignored --nocapture
-      - name: Storage conformance against a real Redis
-        run: cargo test --all-features --test interop_redis_storage_conformance -- --ignored --nocapture
-
-  # `cosmo83/holodeckb2b` publishes a linux/arm64 image only, so this needs an
-  # arm64 runner. Under QEMU on amd64 the JVM gateway does not start inside the
-  # test's timeouts, and the container fails with `exec format error`.
-  interop-holodeck-oracle:
-    runs-on: ubuntu-24.04-arm
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install stable toolchain
-        uses: dtolnay/rust-toolchain@stable
-      - name: Signed AS4 exchange against Holodeck B2B
-        run: cargo test --all-features --test interop_holodeck_counterparty -- --ignored --nocapture
-
-  coverage-profile-interop:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install stable toolchain
-        uses: dtolnay/rust-toolchain@stable
-      - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@cargo-llvm-cov
-      - name: Enforce Profile/Interop Coverage Threshold
-        run: bash scripts/check_profile_coverage.sh 85 src/interop.rs
-
-  # `rust-version` in Cargo.toml is a promise to embedders pinned to an older
-  # toolchain. It was declared and unchecked; a build on the exact floor is what
-  # makes it a fact rather than a claim.
   msrv:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
-      - name: Read declared MSRV
-        id: msrv
-        run: |
-          echo "version=$(grep -m1 '^rust-version' Cargo.toml | cut -d'"' -f2)" >> "$GITHUB_OUTPUT"
-      - name: Install the declared toolchain
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: ${{ steps.msrv.outputs.version }}
-      - name: Build on the MSRV floor
-        run: cargo check --all-features --all-targets
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: rustup toolchain install 1.88 --profile minimal --no-self-update
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - run: cargo +1.88 check --locked --workspace --all-features
 
-  # An example that does not compile is worse than none: it looks checked.
-  # The budget only ever goes down.
-  doctest-ratchet:
+  deny:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-      - name: Install stable toolchain
-        uses: dtolnay/rust-toolchain@stable
-      - name: Ratchet uncompiled doctests
-        run: bash scripts/check_doctest_ratchet.sh 39
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
+        with:
+          tool: cargo-deny@0.20.2
+      - run: cargo deny --workspace --all-features check advisories licenses bans sources
+
+  # Foreign implementations as oracles (the `#[ignore]`d interop tests):
+  # openssl CLI (AS2 S/MIME), xmlsec1 (XML-DSig), Redis (async storage) and
+  # phase4 4.8.1 as the BDEW counterparty, built here from tests/fixtures/phase4.
+  interop:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: rustup toolchain install stable --profile minimal --no-self-update && rustup default stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: docker/setup-buildx-action@v3
+      - name: Build the phase4 peer
+        id: peer
+        uses: docker/build-push-action@v6
+        with:
+          context: tests/fixtures/phase4
+          load: true
+          tags: asx-phase4-peer:ci
+          cache-from: type=gha,scope=phase4-peer
+          cache-to: type=gha,scope=phase4-peer,mode=max
+      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
+        with:
+          tool: just
+      - run: just interop
+        env:
+          ASX_PHASE4_IMAGE: ${{ steps.peer.outputs.imageid }}

@@ -1,4 +1,4 @@
-#![cfg(all(feature = "as2", feature = "testing"))]
+#![cfg(feature = "as2")]
 //! AS2 S/MIME oracle: validate asx's AS2 wire output with the `openssl smime`
 //! CLI — the most widely deployed S/MIME implementation — and asx's AS2
 //! receive path with messages **produced by** that CLI.
@@ -11,7 +11,7 @@
 //!   verified/decrypted by `openssl smime`, and the recovered entity must
 //!   round-trip the payload byte-for-byte.
 //! - **openssl → asx**: `openssl smime -sign`/`-encrypt` produce inbound
-//!   messages that asx must verify, decrypt and deliver. openssl output
+//!   messages that an `As2::inbound` must verify, decrypt and deliver. openssl output
 //!   differs from asx output in ways that matter — a MIME preamble line
 //!   before the first boundary and the legacy
 //!   `application/x-pkcs7-signature` protocol parameter — so this direction
@@ -26,13 +26,12 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use asx_rs::as2::{
-    As2IngressReceiveRequest, As2MicAlgorithm, As2SendPolicy, As2SendRequest,
-    CmsSmimeTrustVerifier, SmimeCipher, receive_from_ingress, send_sync,
-};
-use asx_rs::core::{InteropMode, OcspMode, SessionContextBuilder};
-use asx_rs::fixtures::generate_self_signed_rsa_keypair;
-use asx_rs::observability::EventBus;
+/// A self-signed RSA-2048 certificate and key from the test PKI.
+fn self_signed_rsa(subject_cn: &str) -> (Vec<u8>, Vec<u8>) {
+    let pair =
+        asx_testkit::pki::KeyPair::self_signed(subject_cn, asx_testkit::pki::KeyAlg::Rsa2048);
+    (pair.cert_pem, pair.key_pem)
+}
 
 const PAYLOAD: &[u8] = b"ISA*00*          *00*          *ZZ*ORACLE~";
 const CONTENT_TYPE: &str = "application/edi-x12";
@@ -40,74 +39,33 @@ const CONTENT_TYPE: &str = "application/edi-x12";
 struct Identity {
     cert_pem: String,
     key_pem: Vec<u8>,
-    fingerprint: String,
     dir: PathBuf,
 }
 
 fn identity(test: &str) -> Identity {
-    let (cert, key) = generate_self_signed_rsa_keypair("asx-smime-oracle", 2048);
+    let (cert, key) = self_signed_rsa("asx-smime-oracle");
     let cert_pem = String::from_utf8(cert).expect("utf8 cert");
-
-    let x509 = openssl::x509::X509::from_pem(cert_pem.as_bytes()).expect("x509");
-    let fingerprint = x509
-        .digest(openssl::hash::MessageDigest::sha256())
-        .expect("fingerprint")
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect::<String>();
-
     let dir = std::env::temp_dir().join(format!("asx-smime-{test}-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("dir");
     std::fs::write(dir.join("cert.pem"), &cert_pem).expect("cert");
     std::fs::write(dir.join("key.pem"), &key).expect("key");
-
     Identity {
         cert_pem,
         key_pem: key,
-        fingerprint,
         dir,
     }
 }
 
-fn session(id: &Identity) -> asx_rs::core::SessionContext {
-    SessionContextBuilder::new("smime-oracle", "partner-oracle")
-        .with_trust_anchor_pem(id.cert_pem.clone())
-        // AS2 verification runs with PKCS7_NOINTERN: the signer leaf must be
-        // supplied out-of-band.
-        .with_intermediate_ca_pem(id.cert_pem.clone())
-        .with_fingerprint_sha256(id.fingerprint.clone())
-        .with_ocsp_mode(OcspMode::Disabled)
-        .build()
-        .expect("session")
-        .test_only_mark_strict_runtime_bootstrap_validated()
-}
-
-fn send(id: &Identity, sign: bool, encrypt: bool) -> asx_rs::as2::As2SendOutput {
-    let bus = EventBus::new(16).expect("bus");
-    let creds = asx_rs::as2::As2SendCredentials {
-        signing_cert_pem: Some(id.cert_pem.clone().into_bytes().into()),
-        signing_key_pem: Some(id.key_pem.clone()),
-        recipient_cert_pem: Some(id.cert_pem.clone().into_bytes().into()),
-    };
-    send_sync(
-        &session(id),
-        &bus,
-        As2SendRequest {
-            message_id: "smime-oracle-msg".to_string(),
-            payload: PAYLOAD.to_vec(),
-            policy: As2SendPolicy {
-                interop_mode: InteropMode::Strict,
-                fail_closed_audit_events: false,
-                sign,
-                encrypt,
-                compress: false,
-                payload_content_type: Some(CONTENT_TYPE),
-                as2_from_id: "oracle-sender".to_string(),
-                mic_algorithm: As2MicAlgorithm::Sha256,
-                encryption_cipher: SmimeCipher::Aes256Cbc,
-            },
-            credentials: Some(creds),
-        },
+/// An AS2 entity as asx emits it: signed by `id`, and encrypted to `id` when
+/// `encrypt` (the client's packaging, through `asx::__fuzz::as2_raw_message`).
+/// Returns `(Content-Type, body)`.
+fn send(id: &Identity, encrypt: bool) -> (String, Vec<u8>) {
+    asx::__fuzz::as2_raw_message(
+        PAYLOAD,
+        CONTENT_TYPE,
+        "oracle-sender",
+        Some((id.cert_pem.as_bytes(), &id.key_pem)),
+        encrypt.then_some(id.cert_pem.as_bytes()),
     )
     .expect("as2 send")
 }
@@ -181,39 +139,14 @@ fn split_eml(raw: &[u8]) -> (String, Vec<u8>) {
     (content_type, raw[idx + sep..].to_vec())
 }
 
-fn receive(id: &Identity, content_type: &str, body: &[u8]) -> asx_rs::as2::As2InboundResult {
-    let sess = session(id);
-    let verifier = CmsSmimeTrustVerifier::with_decryption_credentials(
-        id.key_pem.clone(),
-        id.cert_pem.clone().into_bytes(),
-    );
-    receive_from_ingress(As2IngressReceiveRequest {
-        session: &sess,
-        payload: body,
-        content_type,
-        original_message_id: Some("smime-oracle-msg"),
-        as2_from_header: "partner-oracle",
-        disposition_notification_to: Some("http://oracle.test/mdn"),
-        disposition_notification_options: Some("signed-receipt-micalg=required,sha-256"),
-        mdn_signing_credentials: None,
-        verifier: &verifier,
-    })
-    .expect("as2 receive")
-}
-
 // ── asx → openssl ───────────────────────────────────────────────────────────
 
 #[test]
 #[ignore = "requires an openssl binary; run with --ignored"]
 fn openssl_verifies_asx_signed_message_and_recovers_the_payload() {
     let id = identity("out-signed");
-    let out = send(&id, true, false);
-    let eml = write_eml(
-        &id.dir,
-        "asx-signed.eml",
-        &out.mime.content_type,
-        &out.mime.body,
-    );
+    let (content_type, body) = send(&id, false);
+    let eml = write_eml(&id.dir, "asx-signed.eml", &content_type, &body);
 
     // `-purpose any`: the fixture certificate carries no S/MIME EKU, and the
     // oracle question is signature/entity correctness, not certificate policy.
@@ -252,13 +185,8 @@ fn openssl_verifies_asx_signed_message_and_recovers_the_payload() {
 #[ignore = "requires an openssl binary; run with --ignored"]
 fn openssl_decrypts_and_verifies_asx_encrypted_signed_message() {
     let id = identity("out-enc");
-    let out = send(&id, true, true);
-    let eml = write_eml(
-        &id.dir,
-        "asx-enc.eml",
-        &out.mime.content_type,
-        &out.mime.body,
-    );
+    let (content_type, body) = send(&id, true);
+    let eml = write_eml(&id.dir, "asx-enc.eml", &content_type, &body);
 
     let decrypted = openssl(
         &id.dir,
@@ -299,88 +227,320 @@ fn openssl_decrypts_and_verifies_asx_encrypted_signed_message() {
     let _ = std::fs::remove_dir_all(&id.dir);
 }
 
-// ── openssl → asx ───────────────────────────────────────────────────────────
+// ── openssl → asx `Inbound` → openssl ───────────────────────────────────────
 
-/// Sign an RFC 4130 entity with openssl. `-binary` keeps the entity octets
-/// verbatim as the first part of the resulting `multipart/signed`.
-fn openssl_signed_message(id: &Identity) -> (String, Vec<u8>) {
-    let entity = format!(
-        "Content-Type: {CONTENT_TYPE}\r\n\r\n{}",
-        String::from_utf8_lossy(PAYLOAD)
+#[path = "common/as2_peers.rs"]
+mod as2_peers;
+
+/// An openssl-driven partner `OPENSSL` sending to the `Inbound` of
+/// `as2_peers::B_ID`. Both are issued by one test CA; openssl gets the
+/// partner's key and certificate, the receiver's certificate and the CA as
+/// files.
+struct OracleInbound {
+    dir: PathBuf,
+    loopback: asx_testkit::loopback::Loopback,
+    delivered: as2_peers::Delivered,
+}
+
+const ORACLE_ID: &str = "OPENSSL";
+
+fn oracle_inbound(test: &str) -> OracleInbound {
+    use std::sync::Arc;
+    let ca = asx_testkit::pki::TestCa::new("asx-oracle root", asx_testkit::pki::KeyAlg::Rsa2048);
+    let (partner, receiver) = (ca.as2_party(ORACLE_ID), ca.as2_party(as2_peers::B_ID));
+    let dir = std::env::temp_dir().join(format!("asx-smime-{test}-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("dir");
+    std::fs::write(dir.join("cert.pem"), &partner.signing.cert_pem).expect("cert");
+    std::fs::write(dir.join("key.pem"), &partner.signing.key_pem).expect("key");
+    std::fs::write(dir.join("receiver.pem"), &receiver.encryption.cert_pem).expect("receiver");
+    std::fs::write(dir.join("ca.pem"), ca.cert_pem()).expect("ca");
+    let loopback = asx_testkit::loopback::Loopback::new();
+    let client = asx::as2::As2::builder(asx::Profile::as2())
+        .local(receiver.local())
+        .trust_anchor(ca.anchor())
+        .partner(partner.partner("https://oracle.example/as2"))
+        .http_client(loopback.clone())
+        .build()
+        .expect("receiver builds");
+    let delivered: as2_peers::Delivered = Arc::default();
+    let handler = as2_peers::handler(Arc::default(), Arc::default(), delivered.clone());
+    loopback.mount(
+        as2_peers::B_URL,
+        client.inbound(asx::MemoryDedup::default(), handler),
     );
-    std::fs::write(id.dir.join("entity.bin"), entity.as_bytes()).expect("entity");
+    OracleInbound {
+        dir,
+        loopback,
+        delivered,
+    }
+}
 
-    let signed = openssl(
-        &id.dir,
+impl OracleInbound {
+    /// The RFC 4130 entity, signed by openssl as the partner.
+    fn signed(&self) -> (Vec<u8>, String, Vec<u8>) {
+        let entity = format!(
+            "Content-Type: {CONTENT_TYPE}\r\n\r\n{}",
+            String::from_utf8_lossy(PAYLOAD)
+        );
+        std::fs::write(self.dir.join("entity.bin"), entity.as_bytes()).expect("entity");
+        let signed = openssl(
+            &self.dir,
+            &[
+                "smime",
+                "-sign",
+                "-binary",
+                "-in",
+                "entity.bin",
+                "-signer",
+                "cert.pem",
+                "-inkey",
+                "key.pem",
+            ],
+        );
+        let (content_type, body) = split_eml(&signed);
+        (entity.into_bytes(), content_type, body)
+    }
+
+    /// Signed, then encrypted to the receiver (AS2 sign-then-encrypt).
+    fn signed_and_encrypted(&self) -> (Vec<u8>, String, Vec<u8>) {
+        let (entity, signed_ct, signed_body) = self.signed();
+        write_eml(&self.dir, "signed-full.eml", &signed_ct, &signed_body);
+        let encrypted = openssl(
+            &self.dir,
+            &[
+                "smime",
+                "-encrypt",
+                "-binary",
+                "-aes256",
+                "-in",
+                "signed-full.eml",
+                "receiver.pem",
+            ],
+        );
+        let (content_type, body) = split_eml(&encrypted);
+        (entity, content_type, body)
+    }
+
+    async fn post(
+        &self,
+        message_id: &str,
+        content_type: &str,
+        body: Vec<u8>,
+    ) -> http::Response<bytes::Bytes> {
+        let request = http::Request::post(as2_peers::B_URL)
+            .header("AS2-Version", "1.2")
+            .header("AS2-From", ORACLE_ID)
+            .header("AS2-To", as2_peers::B_ID)
+            .header("Message-ID", format!("<{message_id}>"))
+            .header("Content-Type", content_type)
+            .header("Disposition-Notification-To", ORACLE_ID)
+            .header(
+                "Disposition-Notification-Options",
+                "signed-receipt-protocol=optional, pkcs7-signature; signed-receipt-micalg=optional, sha-256",
+            )
+            .body(bytes::Bytes::from(body))
+            .unwrap();
+        self.loopback.exchange(request).await.expect("mounted")
+    }
+
+    /// openssl verifies the MDN's signature against the CA and returns the
+    /// signed report.
+    fn openssl_verifies_mdn(&self, mdn: &http::Response<bytes::Bytes>) -> String {
+        let content_type = mdn.headers()["content-type"].to_str().unwrap().to_string();
+        write_eml(&self.dir, "mdn.eml", &content_type, mdn.body());
+        let report = openssl(
+            &self.dir,
+            &[
+                "smime", "-verify", "-in", "mdn.eml", "-CAfile", "ca.pem", "-purpose", "any",
+            ],
+        );
+        String::from_utf8_lossy(&report).into_owned()
+    }
+}
+
+fn report_field(report: &str, name: &str) -> Option<String> {
+    report.lines().find_map(|line| {
+        let (n, v) = line.split_once(':')?;
+        n.trim()
+            .eq_ignore_ascii_case(name)
+            .then(|| v.trim().to_string())
+    })
+}
+
+#[tokio::test]
+#[ignore = "requires an openssl binary; run with --ignored"]
+async fn inbound_accepts_openssl_signed_and_encrypted_and_openssl_verifies_the_mdn_and_mic() {
+    use base64::Engine as _;
+    use sha2::Digest as _;
+    let oracle = oracle_inbound("inbound-0-16");
+    let (entity, content_type, body) = oracle.signed_and_encrypted();
+    let resp = oracle.post("oracle-1@test", &content_type, body).await;
+    assert_eq!(resp.status(), http::StatusCode::OK);
+    let report = oracle.openssl_verifies_mdn(&resp);
+    let disposition = report_field(&report, "Disposition").expect("Disposition");
+    assert!(disposition.ends_with("; processed"), "{disposition}");
+    assert_eq!(
+        report_field(&report, "Original-Message-ID").as_deref(),
+        Some("<oracle-1@test>")
+    );
+    // The MIC is over the entity openssl signed, octet for octet.
+    let expected = base64::engine::general_purpose::STANDARD.encode(sha2::Sha256::digest(&entity));
+    assert_eq!(
+        report_field(&report, "Received-Content-MIC").as_deref(),
+        Some(format!("{expected}, sha-256").as_str())
+    );
+    let delivered = oracle.delivered.lock().unwrap();
+    assert_eq!(delivered[0].2, PAYLOAD);
+    assert_eq!(delivered[0].1, ORACLE_ID);
+    let _ = std::fs::remove_dir_all(&oracle.dir);
+}
+
+#[tokio::test]
+#[ignore = "requires an openssl binary; run with --ignored"]
+async fn inbound_refuses_an_openssl_signed_but_unencrypted_message() {
+    let oracle = oracle_inbound("inbound-0-16-unenc");
+    let (_, content_type, body) = oracle.signed();
+    let resp = oracle.post("oracle-2@test", &content_type, body).await;
+    let report = oracle.openssl_verifies_mdn(&resp);
+    let disposition = report_field(&report, "Disposition").expect("Disposition");
+    assert!(
+        disposition.ends_with("processed/error: insufficient-message-security"),
+        "{disposition}"
+    );
+    assert!(oracle.delivered.lock().unwrap().is_empty());
+    let _ = std::fs::remove_dir_all(&oracle.dir);
+}
+
+// ── External keys ───────────────────────────────────────────────────────────
+
+/// openssl decrypts and verifies what `As2::send` produced with an external
+/// ECDSA signer (the CMS `SignedData` assembled around one `Signer::sign`),
+/// and the receiving `Inbound` accepted it.
+#[tokio::test]
+#[ignore = "requires an openssl binary; run with --ignored"]
+async fn openssl_verifies_a_client_message_signed_by_an_external_ec_signer() {
+    use asx_testkit::keys::CountingKeys;
+    use asx_testkit::pki::{KeyAlg, TestCa};
+    let ca = TestCa::new("asx-oracle ext root", KeyAlg::Rsa2048);
+    let (a, b) = (ca.as2_party(as2_peers::A_ID), ca.as2_party(as2_peers::B_ID));
+    let ec = ca.issue("asx-oracle ec signer", KeyAlg::EcP256);
+    let signer = CountingKeys::new(&ec);
+    let loopback = asx_testkit::loopback::Loopback::new();
+    let to_b = b.partner(as2_peers::B_URL);
+    let sender = asx::as2::As2::builder(asx::Profile::as2())
+        .local(
+            asx::LocalParty::new(as2_peers::A_ID)
+                .signer(signer.clone())
+                .decrypter(CountingKeys::new(&a.encryption)),
+        )
+        .trust_anchor(ca.anchor())
+        .partner(to_b.clone())
+        .http_client(loopback.clone())
+        .build()
+        .expect("sender builds");
+    let receiver = asx::as2::As2::builder(asx::Profile::as2())
+        .local(b.local())
+        .trust_anchor(ca.anchor())
+        .partner(
+            asx::Partner::new(as2_peers::A_ID)
+                .endpoint(as2_peers::A_URL)
+                .signing_cert(ec.certificate())
+                .encryption_cert(a.encryption.certificate()),
+        )
+        .http_client(loopback.clone())
+        .build()
+        .expect("receiver builds");
+    let delivered: as2_peers::Delivered = std::sync::Arc::default();
+    loopback.mount(
+        as2_peers::B_URL,
+        receiver.inbound(
+            asx::MemoryDedup::default(),
+            as2_peers::handler(Default::default(), Default::default(), delivered.clone()),
+        ),
+    );
+    sender
+        .send(asx::as2::Message::to(
+            &to_b,
+            asx::Payload::new(PAYLOAD.to_vec(), CONTENT_TYPE),
+        ))
+        .await
+        .expect("delivered with an external EC signer");
+    assert_eq!(signer.signs(), 1, "one signature per message");
+    assert_eq!(delivered.lock().unwrap()[0].2, PAYLOAD);
+
+    let dir = std::env::temp_dir().join(format!("asx-smime-ext-ec-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("dir");
+    std::fs::write(dir.join("b.pem"), &b.encryption.cert_pem).expect("cert");
+    std::fs::write(dir.join("b.key"), &b.encryption.key_pem).expect("key");
+    std::fs::write(dir.join("ca.pem"), ca.cert_pem()).expect("ca");
+    let request = loopback.last_request().expect("the message was posted");
+    let content_type = request.headers()["content-type"]
+        .to_str()
+        .unwrap()
+        .to_string();
+    let eml = write_eml(&dir, "sent.eml", &content_type, request.body());
+    let decrypted = openssl(
+        &dir,
         &[
             "smime",
-            "-sign",
-            "-binary",
+            "-decrypt",
             "-in",
-            "entity.bin",
-            "-signer",
-            "cert.pem",
+            eml.to_str().unwrap(),
+            "-recip",
+            "b.pem",
             "-inkey",
-            "key.pem",
+            "b.key",
         ],
     );
-    split_eml(&signed)
-}
-
-#[test]
-#[ignore = "requires an openssl binary; run with --ignored"]
-fn asx_receives_an_openssl_signed_message() {
-    let id = identity("in-signed");
-    // openssl output differs from asx output on purpose: it carries a MIME
-    // preamble ("This is an S/MIME signed message") and declares the legacy
-    // protocol="application/x-pkcs7-signature".
-    let (content_type, body) = openssl_signed_message(&id);
-
-    let inbound = receive(&id, &content_type, &body);
-    assert!(
-        inbound.received_content_mic.is_some(),
-        "a MIC must be computed for the MDN"
-    );
-    let content = inbound.content.into_inner();
-    assert_eq!(
-        &content[..],
-        PAYLOAD,
-        "asx must deliver the payload from an openssl-signed message"
-    );
-
-    let _ = std::fs::remove_dir_all(&id.dir);
-}
-
-#[test]
-#[ignore = "requires an openssl binary; run with --ignored"]
-fn asx_receives_an_openssl_signed_and_encrypted_message() {
-    let id = identity("in-enc");
-    let (signed_ct, signed_body) = openssl_signed_message(&id);
-
-    // Re-assemble the full signed MIME message and encrypt it, as AS2
-    // sign-then-encrypt requires.
-    write_eml(&id.dir, "signed-full.eml", &signed_ct, &signed_body);
-    let encrypted = openssl(
-        &id.dir,
+    std::fs::write(dir.join("signed.eml"), &decrypted).expect("write");
+    let verified = openssl(
+        &dir,
         &[
             "smime",
+            "-verify",
+            "-in",
+            "signed.eml",
+            "-CAfile",
+            "ca.pem",
+            "-purpose",
+            "any",
+        ],
+    );
+    assert!(
+        verified
+            .windows(PAYLOAD.len())
+            .any(|window| window == PAYLOAD),
+        "openssl recovers the payload from the externally signed entity"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// openssl `cms -encrypt -keyid` (an SKI `RecipientIdentifier`) with
+/// AES-128-CBC: the `Inbound` selects the decrypter by SKI and opens it.
+#[tokio::test]
+#[ignore = "requires an openssl binary; run with --ignored"]
+async fn inbound_opens_an_openssl_cms_aes128_message_addressed_by_ski() {
+    let oracle = oracle_inbound("inbound-ski-aes128");
+    let (_, signed_ct, signed_body) = oracle.signed();
+    write_eml(&oracle.dir, "signed-full.eml", &signed_ct, &signed_body);
+    let encrypted = openssl(
+        &oracle.dir,
+        &[
+            "cms",
             "-encrypt",
             "-binary",
-            "-aes256",
+            "-keyid",
+            "-aes128",
             "-in",
             "signed-full.eml",
-            "cert.pem",
+            "receiver.pem",
         ],
     );
     let (content_type, body) = split_eml(&encrypted);
-
-    let inbound = receive(&id, &content_type, &body);
-    let content = inbound.content.into_inner();
-    assert_eq!(
-        &content[..],
-        PAYLOAD,
-        "asx must decrypt, verify and deliver the payload"
-    );
-
-    let _ = std::fs::remove_dir_all(&id.dir);
+    let resp = oracle.post("oracle-ski@test", &content_type, body).await;
+    let report = oracle.openssl_verifies_mdn(&resp);
+    let disposition = report_field(&report, "Disposition").expect("Disposition");
+    assert!(disposition.ends_with("; processed"), "{disposition}");
+    assert_eq!(oracle.delivered.lock().unwrap()[0].2, PAYLOAD);
+    let _ = std::fs::remove_dir_all(&oracle.dir);
 }

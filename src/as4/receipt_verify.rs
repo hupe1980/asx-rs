@@ -9,11 +9,11 @@
 //!
 //! This module turns that raw HTTP response body into a verified, typed
 //! outcome.  It is the send-side counterpart of the receive-side receipt
-//! generators in [`crate::as4::generate_signed_receipt_with_nri`].
+//! generators in [`crate::as4::signals`].
 //!
 //! # What is actually verified
 //!
-//! [`verify_sync_response`] performs, in order:
+//! [`verify_signal`] performs, in order:
 //!
 //! 1. **Size bounds** — the response is capped at
 //!    [`As4ReceiptPolicy::max_receipt_bytes`] and must be non-empty.
@@ -30,8 +30,9 @@
 //!    description intact, instead of being reported as "no receipt". A signal
 //!    carrying both a Receipt and an Error is rejected as ambiguous.
 //! 5. **Signature verification** — when the receipt carries a `ds:Signature`
-//!    it is verified against the session trust anchors, revocation policy and
-//!    expected signer fingerprint.
+//!    it is verified against the session trust anchors and the pinned signer
+//!    fingerprints. The caller (`As4::send`) checks the signer's revocation
+//!    afterwards.
 //! 6. **Signature binding** — the `eb:SignalMessage` acted on must itself be
 //!    covered by that signature, directly or through a signed ancestor.
 //!    Without this a counterparty could leave a genuinely signed element in
@@ -55,42 +56,17 @@
 //! are typically unsigned, so [`As4SyncSignal::Error`] establishes only that
 //! *something* on the connection reported a rejection — treat it as a routing
 //! hint (retry vs dead-letter), never as evidence about the message's fate.
-//! Only [`As4VerifiedReceipt::is_non_repudiation_evidence`] asserts a
-//! cryptographically proven outcome.
-//!
-//! # Example
-//!
-//! ```rust,ignore
-//! let sent = asx_rs::as4::send_async(&session, &bus, request).await?;
-//! let outcome = transport.send(&url, &sent).await?;
-//!
-//! let receipt = asx_rs::as4::verify_sync_response(
-//!     &session,
-//!     &bus,
-//!     &sent,
-//!     &outcome.body,
-//!     outcome.header("Content-Type").unwrap_or("application/soap+xml"),
-//!     &asx_rs::as4::As4ReceiptPolicy::regulated(),
-//! )?
-//! .into_receipt()?;
-//!
-//! assert!(receipt.non_repudiation.is_verified());
-//! ```
-//!
-//! [`As4HttpTransport::send_and_verify`] wraps steps 1–7 together with the
-//! HTTP send itself.
-//!
-//! [`As4HttpTransport::send_and_verify`]: crate::transport::As4HttpTransport::send_and_verify
+//! Only a receipt whose `non_repudiation` is [`As4NonRepudiation::Verified`]
+//! asserts a cryptographically proven outcome.
 
 use super::parser::parse_as4_signal_envelope;
 use super::services::{
-    enforce_signal_signature_coverage, session_signer_pins, wssec_revocation_policy_from_session,
+    enforce_signal_signature_coverage, session_signer_pins, wssec_chain_policy_from_session,
 };
 use super::stream::extract_multipart_related_payload_if_present;
 use super::types::{As4ErrorSignal, As4NriReference, As4SendOutput, As4VerifiedReceipt};
 use crate::core::{AsxError, ErrorCode, ErrorContext, Result, SessionContext};
 use crate::crypto::wssec::{WsSecVerifyOptions, parse_signature_references};
-use crate::observability::{AsxEvent, EventBus, emit_protocol_event};
 use crate::wire::enforce_payload_limit;
 use std::sync::Arc;
 
@@ -101,7 +77,7 @@ const STAGE: &str = "as4_verify_sync_response";
 ///
 /// Matches the inbound receipt cap used by the receive path: a SignalMessage
 /// carries no business payload, so anything larger is malformed or hostile.
-pub const DEFAULT_MAX_RECEIPT_BYTES: usize = 256 * 1024;
+pub(crate) const DEFAULT_MAX_RECEIPT_BYTES: usize = 256 * 1024;
 
 // ---------------------------------------------------------------------------
 // Policy
@@ -110,19 +86,17 @@ pub const DEFAULT_MAX_RECEIPT_BYTES: usize = 256 * 1024;
 /// Policy controlling how strictly a counterparty's synchronous AS4 signal is
 /// verified.
 ///
-/// Construct with [`regulated`](Self::regulated) (fail-closed, the right choice
-/// for BDEW / PEPPOL / CEF deployments), [`strict`](Self::strict), or
-/// [`relaxed`](Self::relaxed).
+/// Built only by the profile's receipt view (`PartnerPolicy::receipt_view`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
-pub struct As4ReceiptPolicy {
+pub(crate) struct As4ReceiptPolicy {
     /// Reject a receipt that echoes a `MessagePartNRInformation` entry for a
     /// URI the sent message never signed.
     ///
     /// eDelivery AS4 v1.15 §5.1.8 defines the receipt as echoing the original
     /// `ds:Reference` set, so an extra entry is non-conformant.  When `false`
-    /// the entry is logged and reported through the event bus instead of
-    /// failing the verification — the digests that *do* correspond to sent
+    /// the entry is logged as a `tracing` event instead of failing the
+    /// verification — the digests that *do* correspond to sent
     /// references are still fully checked either way.
     pub reject_unexpected_references: bool,
     /// Require the receipt to carry a WS-Security XML Signature that verifies
@@ -152,69 +126,9 @@ pub struct As4ReceiptPolicy {
     /// `None` disables the check.  Defaults to 5 minutes per eDelivery AS4
     /// v1.15 §5.1.3.
     pub timestamp_freshness_window: Option<std::time::Duration>,
-    /// When `true`, failure to emit an audit event fails the verification
-    /// (fail-closed audit semantics).
-    pub fail_closed_audit_events: bool,
     /// Maximum accepted response body size.  Defaults to
     /// [`DEFAULT_MAX_RECEIPT_BYTES`].
     pub max_receipt_bytes: usize,
-}
-
-impl Default for As4ReceiptPolicy {
-    fn default() -> Self {
-        Self::regulated()
-    }
-}
-
-impl As4ReceiptPolicy {
-    /// Fail-closed preset for regulated deployments (BDEW, PEPPOL, CEF).
-    ///
-    /// Signed receipt required, non-repudiation digests required,
-    /// non-conformant extra references rejected, fail-closed audit emission,
-    /// 5-minute freshness window.
-    pub fn regulated() -> Self {
-        Self {
-            reject_unexpected_references: true,
-            require_signed_receipt: true,
-            require_non_repudiation: true,
-            expected_signer_fingerprint_sha256: None,
-            timestamp_freshness_window: Some(std::time::Duration::from_secs(300)),
-            fail_closed_audit_events: true,
-            max_receipt_bytes: DEFAULT_MAX_RECEIPT_BYTES,
-        }
-    }
-
-    /// Alias for [`regulated`](Self::regulated), matching
-    /// [`crate::as4::As4PushPolicy::strict`] on the receive side.
-    pub fn strict() -> Self {
-        Self::regulated()
-    }
-
-    /// Relaxed preset for interop bring-up and integration tests.
-    ///
-    /// Accepts unsigned receipts and receipts without non-repudiation digests.
-    /// Digests and signatures that *are* present are still verified, and a
-    /// mismatch is still an error.
-    ///
-    /// **Never use this against a production counterparty**: without NRR a
-    /// receipt is not evidence of delivery.
-    pub fn relaxed() -> Self {
-        Self {
-            reject_unexpected_references: false,
-            require_signed_receipt: false,
-            require_non_repudiation: false,
-            expected_signer_fingerprint_sha256: None,
-            timestamp_freshness_window: None,
-            fail_closed_audit_events: false,
-            max_receipt_bytes: DEFAULT_MAX_RECEIPT_BYTES,
-        }
-    }
-
-    /// Pin the receipt signer certificate to an explicit SHA-256 fingerprint.
-    pub fn with_expected_signer_fingerprint(mut self, fingerprint: impl Into<String>) -> Self {
-        self.expected_signer_fingerprint_sha256 = Some(fingerprint.into());
-        self
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -224,54 +138,11 @@ impl As4ReceiptPolicy {
 /// The counterparty's synchronous answer to a pushed `eb:UserMessage`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
-pub enum As4SyncSignal {
+pub(crate) enum As4SyncSignal {
     /// An `eb:Receipt` that passed every check demanded by the policy.
     Receipt(Box<As4VerifiedReceipt>),
     /// An `eb:Error` — the counterparty rejected the message.
     Error(Box<As4ErrorSignal>),
-}
-
-impl As4SyncSignal {
-    /// The verified receipt, or an [`ErrorCode::InteropViolation`] carrying the
-    /// counterparty's ebMS3 diagnostics when the signal was an `eb:Error`.
-    ///
-    /// Use this when delivery is binary: `verify_sync_response(..)?.into_receipt()?`.
-    /// Match on the enum directly when the ebMS3 error code should drive
-    /// retry-vs-dead-letter routing.
-    pub fn into_receipt(self) -> Result<As4VerifiedReceipt> {
-        match self {
-            Self::Receipt(receipt) => Ok(*receipt),
-            Self::Error(signal) => Err(AsxError::new(
-                ErrorCode::InteropViolation,
-                format!(
-                    "counterparty rejected the AS4 message with an eb:Error signal: {}",
-                    signal.summary()
-                ),
-                match &signal.ref_to_message_id {
-                    Some(message_id) => {
-                        ErrorContext::new(STAGE).with_message_id(message_id.clone())
-                    }
-                    None => ErrorContext::new(STAGE),
-                },
-            )),
-        }
-    }
-
-    /// The verified receipt, if this signal is one.
-    pub fn receipt(&self) -> Option<&As4VerifiedReceipt> {
-        match self {
-            Self::Receipt(receipt) => Some(receipt),
-            Self::Error(_) => None,
-        }
-    }
-
-    /// The error signal, if the counterparty rejected the message.
-    pub fn error(&self) -> Option<&As4ErrorSignal> {
-        match self {
-            Self::Receipt(_) => None,
-            Self::Error(signal) => Some(signal),
-        }
-    }
 }
 
 /// Result of checking a receipt's `NonRepudiationInformation` against the sent
@@ -283,7 +154,7 @@ impl As4SyncSignal {
 /// could ignore.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
-pub enum As4NonRepudiation {
+pub(crate) enum As4NonRepudiation {
     /// Every `ds:Reference` of the sent message was echoed with a matching
     /// digest algorithm and digest value.
     Verified {
@@ -299,12 +170,12 @@ pub enum As4NonRepudiation {
 
 impl As4NonRepudiation {
     /// Whether the sent message's digests were echoed and matched.
-    pub fn is_verified(&self) -> bool {
+    pub(crate) fn is_verified(&self) -> bool {
         matches!(self, Self::Verified { .. })
     }
 
     /// The verified references, or an empty slice.
-    pub fn references(&self) -> &[As4NriReference] {
+    pub(crate) fn references(&self) -> &[As4NriReference] {
         match self {
             Self::Verified { references } => references,
             Self::NotProvided => &[],
@@ -316,53 +187,105 @@ impl As4NonRepudiation {
 // Verification
 // ---------------------------------------------------------------------------
 
-/// Parse and verify a counterparty's synchronous AS4 response.
-///
-/// `response_body` and `response_content_type` are the raw HTTP response body
-/// and `Content-Type` returned by the counterparty — bare
-/// `application/soap+xml` or `multipart/related` are both accepted.
-///
-/// See the `as4::receipt_verify` module documentation for the full list of checks. Returns
-/// [`As4SyncSignal::Error`] — not `Err` — when the counterparty replied with a
-/// well-formed `eb:Error`; call [`As4SyncSignal::into_receipt`] to collapse
-/// that into an error when the distinction does not matter.
-///
-/// # Errors
-///
-/// * [`ErrorCode::PayloadTooLarge`] — body exceeds
-///   [`As4ReceiptPolicy::max_receipt_bytes`].
-/// * [`ErrorCode::ParseFailed`] — body is empty, not UTF-8, or not a SOAP
-///   envelope carrying an `eb:SignalMessage`.
-/// * [`ErrorCode::SecurityVerificationFailed`] — the receipt signature failed
-///   to verify, a required signature was absent, a non-repudiation digest did
-///   not match, or the timestamp fell outside the replay window.
-/// * [`ErrorCode::InteropViolation`] — `RefToMessageId` did not match the sent
-///   message, or the receipt was structurally non-conformant in strict mode.
-#[cfg_attr(
-    feature = "trace",
-    tracing::instrument(
-        skip_all,
-        fields(message_id = %sent.message_id, partner_id = %session.partner_id())
-    )
-)]
-pub fn verify_sync_response(
+/// Verify the response and build the audit record of this send leg: the
+/// verified receipt (`delivered`), an `eb:Error` (`partner_error`), or a
+/// response that verified as neither (`indeterminate`). The caller writes the
+/// record before it returns the signal.
+#[cfg(test)]
+pub(crate) fn verify_with_evidence(
     session: &SessionContext,
-    event_bus: &EventBus,
     sent: &As4SendOutput,
     response_body: &[u8],
     response_content_type: &str,
     policy: &As4ReceiptPolicy,
+) -> (Result<As4SyncSignal>, Option<crate::audit::AuditRecord>) {
+    let (result, signer) =
+        verify_signal(session, sent, response_body, response_content_type, policy);
+    let record = outbound_record(session, sent, response_body, policy, &result, signer.der);
+    (result, record)
+}
+
+/// The verified signer of a receipt: its certificate and validated path
+/// (signer first, anchor last), for the revocation check and the record.
+#[derive(Debug, Default)]
+pub(crate) struct VerifiedSigner {
+    pub(crate) der: Option<Vec<u8>>,
+    pub(crate) path: Vec<openssl::x509::X509>,
+}
+
+/// The verification half of [`verify_with_evidence`]: the signal and its
+/// verified signer, without the record. `As4::send` checks the signer's
+/// revocation in between, then builds the record with
+/// [`outbound_record`].
+pub(crate) fn verify_signal(
+    session: &SessionContext,
+    sent: &As4SendOutput,
+    response_body: &[u8],
+    response_content_type: &str,
+    policy: &As4ReceiptPolicy,
+) -> (Result<As4SyncSignal>, VerifiedSigner) {
+    let mut signer = VerifiedSigner::default();
+    let span = tracing::debug_span!(
+        target: "asx",
+        "asx.receipt",
+        message_id = %sent.message_id,
+        signed = tracing::field::Empty,
+        nrr = tracing::field::Empty,
+        outcome = tracing::field::Empty,
+    );
+    let result = span.in_scope(|| {
+        verify_sync_response_inner(
+            session,
+            sent,
+            response_body,
+            response_content_type,
+            policy,
+            &mut signer,
+        )
+    });
+    let nrr = match &result {
+        Ok(As4SyncSignal::Receipt(receipt)) => {
+            span.record("signed", receipt.signed);
+            if receipt.non_repudiation.is_verified() {
+                "verified"
+            } else {
+                "absent"
+            }
+        }
+        _ => "n/a",
+    };
+    span.record("nrr", nrr);
+    crate::telemetry::child_outcome(&span, &result);
+    crate::telemetry::receipt_verified("as4", result.is_ok(), nrr);
+    (result, signer)
+}
+
+fn verify_sync_response_inner(
+    session: &SessionContext,
+    sent: &As4SendOutput,
+    response_body: &[u8],
+    response_content_type: &str,
+    policy: &As4ReceiptPolicy,
+    signer: &mut VerifiedSigner,
 ) -> Result<As4SyncSignal> {
     let message_id = Arc::<str>::from(sent.message_id.as_str());
 
     let soap_xml = extract_signal_soap(session, response_body, response_content_type, policy)?;
-    let parsed = parse_as4_signal_envelope(soap_xml, session, STAGE)?;
+    // One DOM, under the envelope limits: the signal is consumed from the
+    // document the signature verifier checks.
+    let soap_doc =
+        crate::xml::parse(soap_xml, crate::xml::XmlLimits::ENVELOPE, STAGE).map_err(|err| {
+            AsxError::new(
+                ErrorCode::ParseFailed,
+                format!("failed to parse AS4 signal message: {}", err.message),
+                ErrorContext::for_session(STAGE, session),
+            )
+        })?;
+    let parsed = parse_as4_signal_envelope(&soap_doc, session, STAGE)?;
 
     if !parsed.has_signal_message {
         return Err(reject(
             session,
-            event_bus,
-            policy,
             &message_id,
             "semantic_interop_failure",
             "sync_response_missing_signal_message",
@@ -377,8 +300,6 @@ pub fn verify_sync_response(
     if parsed.has_receipt && !parsed.errors.is_empty() {
         return Err(reject(
             session,
-            event_bus,
-            policy,
             &message_id,
             "semantic_interop_failure",
             "sync_response_receipt_and_error",
@@ -420,8 +341,6 @@ pub fn verify_sync_response(
         {
             return Err(reject(
                 session,
-                event_bus,
-                policy,
                 &message_id,
                 "semantic_interop_failure",
                 "error_signal_ref_to_message_id_mismatch",
@@ -441,8 +360,6 @@ pub fn verify_sync_response(
 
         emit_receipt_taxonomy(
             session,
-            event_bus,
-            policy,
             &message_id,
             "semantic_interop_failure",
             if correlations.is_empty() {
@@ -450,15 +367,13 @@ pub fn verify_sync_response(
             } else {
                 "sync_response_error_signal"
             },
-        )?;
+        );
         return Ok(As4SyncSignal::Error(Box::new(signal)));
     }
 
     if !parsed.has_receipt {
         return Err(reject(
             session,
-            event_bus,
-            policy,
             &message_id,
             "semantic_interop_failure",
             "sync_response_missing_receipt",
@@ -470,8 +385,6 @@ pub fn verify_sync_response(
     let ref_to_message_id = parsed.ref_to_message_id.clone().ok_or_else(|| {
         reject(
             session,
-            event_bus,
-            policy,
             &message_id,
             "semantic_interop_failure",
             "receipt_missing_ref_to_message_id",
@@ -484,8 +397,6 @@ pub fn verify_sync_response(
     if ref_to_message_id != sent.message_id {
         return Err(reject(
             session,
-            event_bus,
-            policy,
             &message_id,
             "semantic_interop_failure",
             "receipt_ref_to_message_id_mismatch",
@@ -498,36 +409,15 @@ pub fn verify_sync_response(
         ));
     }
 
-    let signer_fingerprint_sha256 =
-        verify_receipt_signature(session, event_bus, policy, &message_id, soap_xml, &parsed)?;
+    let (signer_fingerprint_sha256, verified_signer_der, signer_path) =
+        verify_receipt_signature(session, policy, &message_id, &soap_doc, &parsed)?;
+    signer.der = verified_signer_der;
+    signer.path = signer_path;
 
-    check_receipt_freshness(
-        session,
-        event_bus,
-        policy,
-        &message_id,
-        parsed.timestamp.as_deref(),
-    )?;
+    check_receipt_freshness(session, policy, &message_id, parsed.timestamp.as_deref())?;
 
-    let non_repudiation = verify_non_repudiation(
-        session,
-        event_bus,
-        policy,
-        &message_id,
-        sent,
-        &parsed.nri_references,
-    )?;
-
-    emit_protocol_event(
-        event_bus,
-        session,
-        AsxEvent::ReceiptReceived {
-            message_id: Arc::clone(&message_id),
-            signal: "as4",
-        },
-        policy.fail_closed_audit_events,
-        STAGE,
-    )?;
+    let non_repudiation =
+        verify_non_repudiation(session, policy, &message_id, sent, &parsed.nri_references)?;
 
     Ok(As4SyncSignal::Receipt(Box::new(As4VerifiedReceipt {
         message_id: parsed.message_id,
@@ -571,22 +461,24 @@ fn extract_signal_soap<'a>(
     crate::core::bytes_to_utf8_str(soap_bytes, STAGE, session)
 }
 
+/// The pinned fingerprint (when one was enforced), the verified signer
+/// certificate and its validated path.
+type VerifiedReceiptSigner = (Option<String>, Option<Vec<u8>>, Vec<openssl::x509::X509>);
+
 /// Verify the receipt's WS-Security signature, returning the pinned signer
-/// fingerprint when one was enforced.
+/// fingerprint when one was enforced, the verified signer certificate and
+/// its validated path (for the caller's revocation check).
 fn verify_receipt_signature(
     session: &SessionContext,
-    event_bus: &EventBus,
     policy: &As4ReceiptPolicy,
     message_id: &Arc<str>,
-    soap_xml: &str,
+    soap_doc: &roxmltree::Document<'_>,
     parsed: &super::parser::ParsedAs4SignalEnvelope,
-) -> Result<Option<String>> {
+) -> Result<VerifiedReceiptSigner> {
     if !parsed.has_signature {
         if policy.require_signed_receipt {
             return Err(reject(
                 session,
-                event_bus,
-                policy,
                 message_id,
                 "security_verification_failed",
                 "receipt_signature_required_but_missing",
@@ -596,22 +488,37 @@ fn verify_receipt_signature(
                  to false only for counterparties that do not sign receipts",
             ));
         }
-        return Ok(None);
+        return Ok((None, None, Vec::new()));
     }
 
+    // A malformed pin fails closed with an error that says so; it is never
+    // reported as "no pin".
     let expected_fingerprints: Vec<crate::crypto::CertFingerprint> =
         match policy.expected_signer_fingerprint_sha256.as_deref() {
-            Some(raw) => crate::crypto::CertFingerprint::parse(raw)
-                .map(|f| vec![f])
-                .unwrap_or_default(),
-            None => session_signer_pins(session),
+            Some(raw) if raw.trim().is_empty() => Vec::new(),
+            Some(raw) => match crate::crypto::CertFingerprint::parse(raw) {
+                Ok(fingerprint) => vec![fingerprint],
+                Err(err) => {
+                    return Err(reject(
+                        session,
+                        message_id,
+                        "security_verification_failed",
+                        "receipt_signer_fingerprint_malformed",
+                        ErrorCode::InvalidInput,
+                        format!(
+                            "As4ReceiptPolicy::expected_signer_fingerprint_sha256 is a \
+                             malformed signer pin: {}",
+                            err.message
+                        ),
+                    ));
+                }
+            },
+            None => session_signer_pins(session)?,
         };
 
     if expected_fingerprints.is_empty() {
         return Err(reject(
             session,
-            event_bus,
-            policy,
             message_id,
             "security_verification_failed",
             "receipt_signer_fingerprint_missing",
@@ -622,26 +529,15 @@ fn verify_receipt_signature(
         ));
     }
 
-    let revocation_policy = wssec_revocation_policy_from_session(session)?;
-    let soap_doc = roxmltree::Document::parse(soap_xml).map_err(|err| {
-        reject(
-            session,
-            event_bus,
-            policy,
-            message_id,
-            "security_verification_failed",
-            "receipt_signature_document_unparseable",
-            ErrorCode::ParseFailed,
-            format!("failed to parse AS4 receipt for signature verification: {err}"),
-        )
-    })?;
-
+    let chain_policy = wssec_chain_policy_from_session(session)?;
     let coverage = match crate::crypto::wssec::verify::verify_enveloped_signature_optional_with_doc(
-        &soap_doc,
-        soap_xml,
+        soap_doc,
+        soap_doc.input_text(),
+        crate::crypto::wssec::verify::SignedDocClass::Signal,
         WsSecVerifyOptions::new()
             .with_expected_fingerprints(&expected_fingerprints)
-            .with_revocation(revocation_policy),
+            .with_chain_policy(chain_policy)
+            .at(session.clock().now()),
     ) {
         Ok(Some(coverage)) => coverage,
         // The streaming parser saw a ds:Signature but the WS-Security layer
@@ -650,8 +546,6 @@ fn verify_receipt_signature(
         Ok(None) => {
             return Err(reject(
                 session,
-                event_bus,
-                policy,
                 message_id,
                 "security_verification_failed",
                 "receipt_signature_not_verifiable",
@@ -663,8 +557,6 @@ fn verify_receipt_signature(
         Err(err) => {
             return Err(reject(
                 session,
-                event_bus,
-                policy,
                 message_id,
                 "security_verification_failed",
                 "receipt_signature_verification_failed",
@@ -675,25 +567,162 @@ fn verify_receipt_signature(
     };
 
     if let Err(err) =
-        enforce_signal_signature_coverage(session, &soap_doc, STAGE, message_id.as_ref(), &coverage)
+        enforce_signal_signature_coverage(session, soap_doc, STAGE, message_id.as_ref(), &coverage)
     {
         emit_receipt_taxonomy(
             session,
-            event_bus,
-            policy,
             message_id,
             "security_verification_failed",
             "receipt_signal_not_signed",
-        )?;
+        );
         return Err(err);
     }
 
-    Ok(expected_fingerprints.first().map(ToString::to_string))
+    Ok((
+        expected_fingerprints.first().map(ToString::to_string),
+        coverage.signer_certificate_der,
+        coverage.signer_path,
+    ))
+}
+
+/// The audit record of one send leg. `None` only if the record cannot be
+/// built, which is logged: the verification result stands either way.
+pub(crate) fn outbound_record(
+    session: &SessionContext,
+    sent: &As4SendOutput,
+    response_body: &[u8],
+    policy: &As4ReceiptPolicy,
+    result: &Result<As4SyncSignal>,
+    signer_der: Option<Vec<u8>>,
+) -> Option<crate::audit::AuditRecord> {
+    use crate::audit::{AuditOutcome, Direction, Protocol, RecordBuilder, Signal};
+
+    let facts = sent_message_facts(session, sent);
+    let parsed = facts.as_ref().map(|(p, _)| p);
+    let local_party = parsed
+        .map(|p| p.sender_party_id().to_owned())
+        .unwrap_or_else(|| session.session_id().to_owned());
+    let builder = RecordBuilder::new(
+        session.clock(),
+        Protocol::As4,
+        Direction::Outbound,
+        sent.message_id.as_str(),
+        local_party,
+        session.partner_id(),
+    )
+    .ref_to_message_id(sent.ref_to_message_id.as_deref())
+    .conversation_id(parsed.and_then(|p| p.conversation_id.as_deref()))
+    .profile(Some(session.profile_name()))
+    .service_action(
+        parsed.and_then(|p| p.service.as_deref()),
+        parsed.map(|p| p.action.as_str()),
+    )
+    .message_timestamp(parsed.and_then(|p| p.timestamp.as_deref()))
+    .references(facts.iter().flat_map(|(_, refs)| {
+        refs.iter().map(|r| {
+            (
+                r.uri.as_str(),
+                r.digest_method.algorithm_uri(),
+                r.digest_value_base64.as_str(),
+            )
+        })
+    }));
+
+    let finished = match result {
+        Ok(As4SyncSignal::Receipt(receipt)) => {
+            let nrr: Vec<(&str, &str, &str)> = receipt
+                .non_repudiation
+                .references()
+                .iter()
+                .map(|r| {
+                    (
+                        r.uri.as_str(),
+                        r.digest_method_uri.as_str(),
+                        r.digest_value_b64.as_str(),
+                    )
+                })
+                .collect();
+            builder
+                .signer_der(signer_der)
+                .signal(Signal {
+                    bytes: response_body,
+                    message_id: receipt.message_id.as_deref(),
+                    ref_to_message_id: Some(&receipt.ref_to_message_id),
+                    timestamp: receipt.timestamp.as_deref(),
+                    signed: receipt.signed,
+                    nrr: &nrr,
+                })
+                .disposition(Some("receipt"))
+                .finish(AuditOutcome::Delivered, None)
+        }
+        Ok(As4SyncSignal::Error(signal)) => builder
+            .signal(Signal {
+                bytes: response_body,
+                message_id: signal.message_id.as_deref(),
+                ref_to_message_id: signal
+                    .ref_to_message_id
+                    .as_deref()
+                    .filter(|id| *id == sent.message_id),
+                timestamp: signal.timestamp.as_deref(),
+                signed: false,
+                nrr: &[],
+            })
+            .disposition(Some("error"))
+            .ebms_code(signal.errors.first().map(|e| e.error_code.as_str()))
+            .finish(AuditOutcome::PartnerError, Some("partner_error")),
+        Err(_) => {
+            let builder =
+                if !response_body.is_empty() && response_body.len() <= policy.max_receipt_bytes {
+                    builder.signal(Signal {
+                        bytes: response_body,
+                        message_id: None,
+                        ref_to_message_id: None,
+                        timestamp: None,
+                        signed: false,
+                        nrr: &[],
+                    })
+                } else {
+                    builder
+                };
+            builder.finish(AuditOutcome::Indeterminate, Some("indeterminate"))
+        }
+    };
+    finished
+        .inspect_err(|err| {
+            tracing::error!(target: "asx", message_id = %sent.message_id, error = %err, "audit record not built");
+        })
+        .ok()
+}
+
+/// What the sent envelope says about itself: its ebMS header and the
+/// `ds:Reference`s its signature commits to.
+fn sent_message_facts(
+    session: &SessionContext,
+    sent: &As4SendOutput,
+) -> Option<(
+    super::ParsedAs4UserMessage,
+    Vec<crate::crypto::wssec::WsSecSignatureReference>,
+)> {
+    let soap_bytes = match extract_multipart_related_payload_if_present(
+        &sent.soap_envelope.body,
+        &sent.http_content_type,
+        session,
+        STAGE,
+    )
+    .ok()?
+    {
+        Some(multipart) => multipart.soap_xml,
+        None => &sent.soap_envelope.body,
+    };
+    let soap = std::str::from_utf8(soap_bytes).ok()?;
+    let doc = super::parser::parse_as4_user_message_document(soap, session).ok()?;
+    let parsed = super::parser::parse_as4_user_message_from_doc(session, &doc).ok()?;
+    let references = parse_signature_references(soap).unwrap_or_default();
+    Some((parsed, references))
 }
 
 fn check_receipt_freshness(
     session: &SessionContext,
-    event_bus: &EventBus,
     policy: &As4ReceiptPolicy,
     message_id: &Arc<str>,
     timestamp: Option<&str>,
@@ -709,8 +738,6 @@ fn check_receipt_freshness(
     let Some(timestamp) = timestamp else {
         return Err(reject(
             session,
-            event_bus,
-            policy,
             message_id,
             "security_verification_failed",
             "receipt_timestamp_missing",
@@ -724,8 +751,6 @@ fn check_receipt_freshness(
     let Some(ts_secs) = crate::time_utils::parse_rfc3339_to_unix_secs(timestamp) else {
         return Err(reject(
             session,
-            event_bus,
-            policy,
             message_id,
             "semantic_interop_failure",
             "receipt_timestamp_unparseable",
@@ -734,17 +759,12 @@ fn check_receipt_freshness(
         ));
     };
 
-    let now_secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or(std::time::Duration::ZERO)
-        .as_secs() as i64;
+    let now_secs = crate::time_utils::unix_secs(session.clock().now());
     let delta_secs = (now_secs - ts_secs).unsigned_abs();
 
     if delta_secs > window.as_secs() {
         return Err(reject(
             session,
-            event_bus,
-            policy,
             message_id,
             "security_verification_failed",
             "receipt_timestamp_outside_freshness_window",
@@ -765,7 +785,6 @@ fn check_receipt_freshness(
 /// the sent message's own signature committed to.
 fn verify_non_repudiation(
     session: &SessionContext,
-    event_bus: &EventBus,
     policy: &As4ReceiptPolicy,
     message_id: &Arc<str>,
     sent: &As4SendOutput,
@@ -775,8 +794,6 @@ fn verify_non_repudiation(
         if policy.require_non_repudiation {
             return Err(reject(
                 session,
-                event_bus,
-                policy,
                 message_id,
                 "security_verification_failed",
                 "receipt_non_repudiation_information_missing",
@@ -789,16 +806,14 @@ fn verify_non_repudiation(
         }
         emit_receipt_taxonomy(
             session,
-            event_bus,
-            policy,
             message_id,
             "semantic_interop_failure",
             "receipt_non_repudiation_information_missing",
-        )?;
+        );
         return Ok(As4NonRepudiation::NotProvided);
     }
 
-    let sent_refs = sent_signature_references(session, event_bus, policy, message_id, sent)?;
+    let sent_refs = sent_signature_references(session, message_id, sent)?;
 
     // Reject duplicate URIs before matching: a receipt that lists the same URI
     // twice with different digests would otherwise let a hostile MSH satisfy
@@ -810,8 +825,6 @@ fn verify_non_repudiation(
         {
             return Err(reject(
                 session,
-                event_bus,
-                policy,
                 message_id,
                 "security_verification_failed",
                 "receipt_non_repudiation_duplicate_reference",
@@ -832,8 +845,6 @@ fn verify_non_repudiation(
         else {
             return Err(reject(
                 session,
-                event_bus,
-                policy,
                 message_id,
                 "security_verification_failed",
                 "receipt_non_repudiation_reference_missing",
@@ -849,8 +860,6 @@ fn verify_non_repudiation(
         if echoed.digest_method_uri != sent_ref.digest_method_uri {
             return Err(reject(
                 session,
-                event_bus,
-                policy,
                 message_id,
                 "security_verification_failed",
                 "receipt_non_repudiation_digest_method_mismatch",
@@ -881,8 +890,6 @@ fn verify_non_repudiation(
         if !crate::core::constant_time_eq(&echoed_digest, &sent_digest) {
             return Err(reject(
                 session,
-                event_bus,
-                policy,
                 message_id,
                 "security_verification_failed",
                 "receipt_non_repudiation_digest_mismatch",
@@ -911,8 +918,6 @@ fn verify_non_repudiation(
         if policy.reject_unexpected_references {
             return Err(reject(
                 session,
-                event_bus,
-                policy,
                 message_id,
                 "semantic_interop_failure",
                 "receipt_non_repudiation_unexpected_reference",
@@ -921,19 +926,17 @@ fn verify_non_repudiation(
             ));
         }
         tracing::warn!(
-            target: "asx_rs::as4::receipt_verify",
+            target: "asx",
             message_id = %message_id,
             uri = %unexpected.uri,
             "{detail}"
         );
         emit_receipt_taxonomy(
             session,
-            event_bus,
-            policy,
             message_id,
             "semantic_interop_failure",
             "receipt_non_repudiation_unexpected_reference",
-        )?;
+        );
     }
 
     Ok(As4NonRepudiation::Verified {
@@ -944,8 +947,6 @@ fn verify_non_repudiation(
 /// Extract the `ds:Reference` set the sent message's own signature commits to.
 fn sent_signature_references(
     session: &SessionContext,
-    event_bus: &EventBus,
-    policy: &As4ReceiptPolicy,
     message_id: &Arc<str>,
     sent: &As4SendOutput,
 ) -> Result<Vec<As4NriReference>> {
@@ -980,8 +981,6 @@ fn sent_signature_references(
     if sig_refs.is_empty() {
         return Err(reject(
             session,
-            event_bus,
-            policy,
             message_id,
             "security_verification_failed",
             "sent_message_signature_has_no_references",
@@ -998,48 +997,34 @@ fn sent_signature_references(
 // Audit helpers
 // ---------------------------------------------------------------------------
 
+/// One DEBUG event classifying a receipt that is refused or is an error
+/// signal.
 fn emit_receipt_taxonomy(
     session: &SessionContext,
-    event_bus: &EventBus,
-    policy: &As4ReceiptPolicy,
     message_id: &Arc<str>,
     outcome: &'static str,
     detail: &'static str,
-) -> Result<()> {
-    emit_protocol_event(
-        event_bus,
-        session,
-        AsxEvent::ReceiptTaxonomyOutcome {
-            message_id: Arc::clone(message_id),
-            signal: "as4",
-            outcome,
-            detail,
-        },
-        policy.fail_closed_audit_events,
-        STAGE,
-    )
+) {
+    tracing::debug!(
+        target: "asx",
+        partner = %session.partner_id(),
+        message_id = %message_id,
+        taxonomy = outcome,
+        detail,
+        "receipt classified"
+    );
 }
 
-/// Emit the taxonomy event for a rejection and build the error to return.
-///
-/// When the audit emission itself fails under fail-closed policy that failure
-/// is returned instead — the verification still fails, and it fails loudly.
-#[allow(clippy::too_many_arguments)]
+/// Classify a rejection and build the error to return.
 fn reject(
     session: &SessionContext,
-    event_bus: &EventBus,
-    policy: &As4ReceiptPolicy,
     message_id: &Arc<str>,
     outcome: &'static str,
     detail: &'static str,
     code: ErrorCode,
     message: impl Into<String>,
 ) -> AsxError {
-    if let Err(emit_err) =
-        emit_receipt_taxonomy(session, event_bus, policy, message_id, outcome, detail)
-    {
-        return emit_err;
-    }
+    emit_receipt_taxonomy(session, message_id, outcome, detail);
     AsxError::new(
         code,
         message,
@@ -1054,13 +1039,57 @@ fn reject(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::as4::{
-        As4ErrorCode, As4ErrorSeverity, As4ReceiptCredentials, As4ReceivedError, SoapEnvelope,
-        generate_receipt_with_nri, generate_signed_receipt_with_nri,
-    };
-    use crate::core::{CertHandle, OcspFailureMode, OcspMode, SessionContextBuilder};
+    use crate::as4::signals::{generate_receipt_with_nri, generate_signed_receipt_with_nri};
+    use crate::as4::{As4ErrorCode, As4ErrorSeverity, As4ReceiptCredentials, SoapEnvelope};
+    use crate::test_support::views;
+
+    /// A test entry point over [`verify_with_evidence`].
+    fn verify_sync_response(
+        session: &SessionContext,
+        _audit: Option<()>,
+        sent: &As4SendOutput,
+        response_body: &[u8],
+        response_content_type: &str,
+        policy: &As4ReceiptPolicy,
+    ) -> Result<As4SyncSignal> {
+        verify_with_evidence(session, sent, response_body, response_content_type, policy).0
+    }
+
+    /// The profile's receipt view with signature and NRR made optional, for
+    /// the cases that check what is verified when present.
+    fn relaxed() -> As4ReceiptPolicy {
+        let mut policy = views::as4_receipt();
+        policy.reject_unexpected_references = false;
+        policy.require_signed_receipt = false;
+        policy.require_non_repudiation = false;
+        policy
+    }
+
+    trait SignalExt {
+        fn into_receipt(self) -> Result<As4VerifiedReceipt>;
+        fn error(&self) -> Option<&crate::as4::As4ErrorSignal>;
+    }
+
+    impl SignalExt for As4SyncSignal {
+        fn into_receipt(self) -> Result<As4VerifiedReceipt> {
+            match self {
+                Self::Receipt(receipt) => Ok(*receipt),
+                Self::Error(_) => Err(AsxError::new(
+                    ErrorCode::InteropViolation,
+                    "eb:Error",
+                    ErrorContext::new(STAGE),
+                )),
+            }
+        }
+        fn error(&self) -> Option<&crate::as4::As4ErrorSignal> {
+            match self {
+                Self::Receipt(_) => None,
+                Self::Error(signal) => Some(signal),
+            }
+        }
+    }
+    use crate::core::{CertHandle, SessionContextBuilder};
     use crate::crypto::wssec::{WsSecOutboundKeyInfoProfile, generate_xmlsig_signature};
-    use crate::observability::{BackpressurePolicy, EventEmissionMode};
     use sha2::{Digest as _, Sha256};
 
     const SENT_MESSAGING_ID: &str = "sent-messaging";
@@ -1113,18 +1142,6 @@ mod tests {
         )
     }
 
-    /// Best-effort bus so these tests never fail on audit emission — available
-    /// without the `testing` feature, unlike `EventBus::new_for_testing`.
-    fn test_bus() -> EventBus {
-        EventBus::new_with_config_and_mode(
-            64,
-            None,
-            BackpressurePolicy::default(),
-            EventEmissionMode::BestEffort,
-        )
-        .expect("best-effort bus is infallible")
-    }
-
     fn fingerprint_hex(cert_pem: &[u8]) -> String {
         let cert = openssl::x509::X509::from_pem(cert_pem).expect("cert pem");
         let der = cert.to_der().expect("cert der");
@@ -1145,11 +1162,6 @@ mod tests {
                 fingerprint_sha256: fingerprint_hex(cert_pem),
                 trust_anchor_pems: vec![cert_pem_str],
                 intermediate_ca_pems: vec![],
-                revocation_crl_pems: vec![],
-                ocsp_mode: OcspMode::Disabled,
-                ocsp_failure_mode: OcspFailureMode::HardFail,
-                stapled_ocsp_responses_der: vec![],
-                responder_ocsp_responses_der: vec![],
                 signing_cert_pem: None,
                 signing_key_pem: None,
                 recipient_cert_pem: None,
@@ -1212,7 +1224,6 @@ mod tests {
         As4SendOutput {
             message_id: message_id.to_string(),
             action: "urn:test:action".into(),
-            traceparent: None,
             http_content_type: "application/soap+xml".into(),
             soap_envelope: SoapEnvelope {
                 action: "urn:test:action".into(),
@@ -1245,14 +1256,7 @@ mod tests {
         receipt: &[u8],
         policy: &As4ReceiptPolicy,
     ) -> Result<As4SyncSignal> {
-        verify_sync_response(
-            session,
-            &test_bus(),
-            sent,
-            receipt,
-            "application/soap+xml",
-            policy,
-        )
+        verify_sync_response(session, None, sent, receipt, "application/soap+xml", policy)
     }
 
     // ── Happy path ────────────────────────────────────────────────────────
@@ -1272,20 +1276,44 @@ mod tests {
         )
         .expect("signed receipt");
 
-        let verified = verify(&session, &sent, &receipt, &As4ReceiptPolicy::regulated())
+        let verified = verify(&session, &sent, &receipt, &views::as4_receipt())
             .expect("verification succeeds")
             .into_receipt()
             .expect("receipt not error");
 
         assert!(verified.signed, "receipt signature must be verified");
         assert!(verified.non_repudiation.is_verified());
-        assert!(verified.is_non_repudiation_evidence());
+        assert!((verified.signed && verified.non_repudiation.is_verified()));
         assert_eq!(verified.ref_to_message_id, sent.message_id);
         assert_eq!(
             verified.non_repudiation.references().len(),
             2,
             "both sent ds:References must be echoed"
         );
+    }
+
+    // ── A malformed receipt pin fails closed ───────────────────────────────
+
+    #[test]
+    fn malformed_receipt_pin_is_reported_as_malformed() {
+        let (cert_pem, key_pem) = keypair();
+        let session = session_trusting(&cert_pem);
+        let sent = sent_output("msg-bad-pin@example", &cert_pem, &key_pem);
+        let receipt = generate_signed_receipt_with_nri(
+            &session,
+            "receipt-bad-pin@partner",
+            &sent.message_id,
+            &sent_nri(&sent),
+            &receipt_credentials(&cert_pem, &key_pem),
+        )
+        .expect("signed receipt");
+
+        let mut policy = views::as4_receipt();
+        policy.expected_signer_fingerprint_sha256 = Some("aabbcc".into());
+        let err = verify(&session, &sent, &receipt, &policy)
+            .expect_err("a malformed receipt pin must be refused");
+        assert_eq!(err.code, ErrorCode::InvalidInput, "{}", err.message);
+        assert!(err.message.contains("malformed"), "{}", err.message);
     }
 
     // ── Prefix / CDATA robustness (the substring-scan failure modes) ───────
@@ -1311,7 +1339,7 @@ mod tests {
             .replace("<eb:", "<eb3:")
             .replace("</eb:", "</eb3:");
 
-        let mut policy = As4ReceiptPolicy::regulated();
+        let mut policy = views::as4_receipt();
         policy.require_signed_receipt = false;
 
         let verified = verify(&session, &sent, rewritten.as_bytes(), &policy)
@@ -1362,7 +1390,7 @@ mod tests {
         }
         assert!(wrapped.contains("\n          "), "test must actually wrap");
 
-        let mut policy = As4ReceiptPolicy::regulated();
+        let mut policy = views::as4_receipt();
         policy.require_signed_receipt = false;
 
         let verified = verify(&session, &sent, wrapped.as_bytes(), &policy)
@@ -1393,7 +1421,7 @@ mod tests {
             ),
         );
 
-        let mut policy = As4ReceiptPolicy::regulated();
+        let mut policy = views::as4_receipt();
         policy.require_signed_receipt = false;
 
         let verified = verify(&session, &sent, with_cdata.as_bytes(), &policy)
@@ -1422,7 +1450,7 @@ mod tests {
         )
         .expect("signed receipt");
 
-        let err = verify(&session, &sent, &receipt, &As4ReceiptPolicy::regulated())
+        let err = verify(&session, &sent, &receipt, &views::as4_receipt())
             .expect_err("digest mismatch must fail");
         assert_eq!(err.code, ErrorCode::SecurityVerificationFailed);
         assert!(
@@ -1448,7 +1476,7 @@ mod tests {
         )
         .expect("signed receipt");
 
-        let err = verify(&session, &sent, &receipt, &As4ReceiptPolicy::regulated())
+        let err = verify(&session, &sent, &receipt, &views::as4_receipt())
             .expect_err("partial NRI must fail");
         assert_eq!(err.code, ErrorCode::SecurityVerificationFailed);
         assert!(err.message.contains("does not echo a ds:Reference"));
@@ -1464,16 +1492,16 @@ mod tests {
             generate_receipt_with_nri(&session, "receipt-empty@partner", &sent.message_id, &[])
                 .expect("receipt");
 
-        let err = verify(&session, &sent, &receipt, &As4ReceiptPolicy::regulated())
+        let err = verify(&session, &sent, &receipt, &views::as4_receipt())
             .expect_err("empty NRI must fail under the regulated policy");
         assert_eq!(err.code, ErrorCode::SecurityVerificationFailed);
 
-        let verified = verify(&session, &sent, &receipt, &As4ReceiptPolicy::relaxed())
+        let verified = verify(&session, &sent, &receipt, &relaxed())
             .expect("relaxed accepts")
             .into_receipt()
             .expect("receipt");
         assert_eq!(verified.non_repudiation, As4NonRepudiation::NotProvided);
-        assert!(!verified.is_non_repudiation_evidence());
+        assert!(!(verified.signed && verified.non_repudiation.is_verified()));
     }
 
     #[test]
@@ -1497,7 +1525,7 @@ mod tests {
         )
         .expect("signed receipt");
 
-        let err = verify(&session, &sent, &receipt, &As4ReceiptPolicy::regulated())
+        let err = verify(&session, &sent, &receipt, &views::as4_receipt())
             .expect_err("unexpected reference must fail in strict mode");
         assert_eq!(err.code, ErrorCode::InteropViolation);
         assert!(err.message.contains("never signed"));
@@ -1519,7 +1547,7 @@ mod tests {
         )
         .expect("receipt");
 
-        let err = verify(&session, &sent, &receipt, &As4ReceiptPolicy::relaxed())
+        let err = verify(&session, &sent, &receipt, &relaxed())
             .expect_err("mismatched RefToMessageId must fail");
         assert_eq!(err.code, ErrorCode::InteropViolation);
         assert!(err.message.contains("does not match the sent message id"));
@@ -1539,7 +1567,7 @@ mod tests {
         )
         .expect("receipt");
 
-        let err = verify(&session, &sent, &receipt, &As4ReceiptPolicy::regulated())
+        let err = verify(&session, &sent, &receipt, &views::as4_receipt())
             .expect_err("unsigned receipt must fail when NRR is required");
         assert_eq!(err.code, ErrorCode::SecurityVerificationFailed);
         assert!(err.message.contains("no ds:Signature"));
@@ -1561,7 +1589,7 @@ mod tests {
         )
         .expect("signed receipt");
 
-        let err = verify(&session, &sent, &receipt, &As4ReceiptPolicy::regulated())
+        let err = verify(&session, &sent, &receipt, &views::as4_receipt())
             .expect_err("receipt signed by an unpinned cert must fail");
         assert_eq!(err.code, ErrorCode::SecurityVerificationFailed);
     }
@@ -1574,7 +1602,7 @@ mod tests {
         let session = session_trusting(&cert_pem);
         let sent = sent_output("msg-error@example", &cert_pem, &key_pem);
 
-        let error_signal = crate::as4::generate_error_signal(
+        let error_signal = crate::as4::signals::generate_error_signal(
             &session,
             "error-1@partner",
             &sent.message_id,
@@ -1584,27 +1612,24 @@ mod tests {
         )
         .expect("error signal");
 
-        let signal = verify(
-            &session,
-            &sent,
-            &error_signal,
-            &As4ReceiptPolicy::regulated(),
-        )
-        .expect("error signal parses");
+        let signal = verify(&session, &sent, &error_signal, &views::as4_receipt())
+            .expect("error signal parses");
 
         let received = signal.error().expect("must classify as an error signal");
-        assert!(received.is_failure());
         assert_eq!(
             received.ref_to_message_id.as_deref(),
             Some(&*sent.message_id)
         );
         assert_eq!(received.errors.len(), 1);
         assert_eq!(
-            received.errors[0].code(),
+            As4ErrorCode::from_ebms_code(&received.errors[0].error_code),
             Some(As4ErrorCode::InvalidReceipt)
         );
         assert_eq!(
-            received.errors[0].parsed_severity(),
+            received.errors[0]
+                .severity
+                .as_deref()
+                .and_then(As4ErrorSeverity::from_ebms_severity),
             Some(As4ErrorSeverity::Failure)
         );
         assert!(
@@ -1616,7 +1641,6 @@ mod tests {
 
         let err = signal.into_receipt().expect_err("into_receipt must fail");
         assert_eq!(err.code, ErrorCode::InteropViolation);
-        assert!(err.message.contains("EBMS:0302"));
     }
 
     // ── Malformed / hostile responses ─────────────────────────────────────
@@ -1627,8 +1651,7 @@ mod tests {
         let session = session_trusting(&cert_pem);
         let sent = sent_output("msg-empty@example", &cert_pem, &key_pem);
 
-        let err = verify(&session, &sent, b"", &As4ReceiptPolicy::relaxed())
-            .expect_err("empty body must fail");
+        let err = verify(&session, &sent, b"", &relaxed()).expect_err("empty body must fail");
         assert_eq!(err.code, ErrorCode::ParseFailed);
     }
 
@@ -1638,7 +1661,7 @@ mod tests {
         let session = session_trusting(&cert_pem);
         let sent = sent_output("msg-large@example", &cert_pem, &key_pem);
 
-        let mut policy = As4ReceiptPolicy::relaxed();
+        let mut policy = relaxed();
         policy.max_receipt_bytes = 64;
         let err = verify(&session, &sent, &vec![b'x'; 4096], &policy)
             .expect_err("oversized body must fail");
@@ -1652,8 +1675,8 @@ mod tests {
         let sent = sent_output("msg-nosignal@example", &cert_pem, &key_pem);
 
         let body = br#"<S12:Envelope xmlns:S12="http://www.w3.org/2003/05/soap-envelope"><S12:Body/></S12:Envelope>"#;
-        let err = verify(&session, &sent, body, &As4ReceiptPolicy::relaxed())
-            .expect_err("missing SignalMessage must fail");
+        let err =
+            verify(&session, &sent, body, &relaxed()).expect_err("missing SignalMessage must fail");
         assert_eq!(err.code, ErrorCode::ParseFailed);
         assert!(err.message.contains("no eb:SignalMessage"));
     }
@@ -1673,7 +1696,7 @@ mod tests {
             generate_receipt_with_nri(&session, "receipt-dup@partner", &sent.message_id, &refs)
                 .expect("receipt");
 
-        let mut policy = As4ReceiptPolicy::regulated();
+        let mut policy = views::as4_receipt();
         policy.require_signed_receipt = false;
         let err = verify(&session, &sent, &receipt, &policy)
             .expect_err("duplicate reference URIs must fail");
@@ -1695,11 +1718,11 @@ mod tests {
         )
         .expect("receipt");
         let stale = String::from_utf8(receipt).expect("utf8").replace(
-            &crate::time_utils::format_rfc3339_secs(std::time::SystemTime::now()),
+            &crate::time_utils::format_rfc3339_secs(crate::clock::system().now()),
             "2001-01-01T00:00:00Z",
         );
 
-        let mut policy = As4ReceiptPolicy::regulated();
+        let mut policy = views::as4_receipt();
         policy.require_signed_receipt = false;
         let err = verify(&session, &sent, stale.as_bytes(), &policy)
             .expect_err("stale timestamp must fail");
@@ -1772,7 +1795,7 @@ xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\">\
 <eb:Receipt><ebbpsig:NonRepudiationInformation>{nri}</ebbpsig:NonRepudiationInformation></eb:Receipt>\
 </eb:SignalMessage></eb:Messaging>\
 </S12:Header><S12:Body wsu:Id=\"only-body\"/></S12:Envelope>",
-            ts = crate::time_utils::format_rfc3339_secs(std::time::SystemTime::now()),
+            ts = crate::time_utils::format_rfc3339_secs(crate::clock::system().now()),
             ref_id = sent.message_id,
         );
 
@@ -1792,13 +1815,8 @@ xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\">\
             &format!("<wsse:Security>{signature_xml}</wsse:Security>"),
         );
 
-        let err = verify(
-            &session,
-            &sent,
-            signed.as_bytes(),
-            &As4ReceiptPolicy::regulated(),
-        )
-        .expect_err("a receipt whose eb:Messaging is unsigned must be rejected");
+        let err = verify(&session, &sent, signed.as_bytes(), &views::as4_receipt())
+            .expect_err("a receipt whose eb:Messaging is unsigned must be rejected");
 
         assert_eq!(err.code, ErrorCode::SecurityVerificationFailed);
         assert!(
@@ -1829,7 +1847,7 @@ xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\">\
 <eb:Receipt/></eb:SignalMessage>",
         );
 
-        let mut policy = As4ReceiptPolicy::regulated();
+        let mut policy = views::as4_receipt();
         policy.require_signed_receipt = false;
         let err = verify(&session, &sent, doubled.as_bytes(), &policy)
             .expect_err("bundled signals must be rejected");
@@ -1845,7 +1863,7 @@ xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\">\
         let session = session_trusting(&cert_pem);
         let sent = sent_output("msg-ours@example", &cert_pem, &key_pem);
 
-        let foreign_error = crate::as4::generate_error_signal(
+        let foreign_error = crate::as4::signals::generate_error_signal(
             &session,
             "error-foreign@partner",
             "someone-elses-message@example",
@@ -1855,13 +1873,8 @@ xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\">\
         )
         .expect("error signal");
 
-        let err = verify(
-            &session,
-            &sent,
-            &foreign_error,
-            &As4ReceiptPolicy::regulated(),
-        )
-        .expect_err("an error signal for another message must not be attributed to ours");
+        let err = verify(&session, &sent, &foreign_error, &views::as4_receipt())
+            .expect_err("an error signal for another message must not be attributed to ours");
         assert_eq!(err.code, ErrorCode::InteropViolation);
         assert!(err.message.contains("refusing to attribute"));
     }
@@ -1880,12 +1893,12 @@ xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\">\
             &sent_nri(&sent),
         )
         .expect("receipt");
-        let ts = crate::time_utils::format_rfc3339_secs(std::time::SystemTime::now());
+        let ts = crate::time_utils::format_rfc3339_secs(crate::clock::system().now());
         let without_ts = String::from_utf8(receipt)
             .expect("utf8")
             .replace(&format!("<eb:Timestamp>{ts}</eb:Timestamp>"), "");
 
-        let mut policy = As4ReceiptPolicy::regulated();
+        let mut policy = views::as4_receipt();
         policy.require_signed_receipt = false;
         let err = verify(&session, &sent, without_ts.as_bytes(), &policy)
             .expect_err("a missing timestamp must not skip the replay window");
@@ -1921,7 +1934,7 @@ xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\">\
             ),
         );
 
-        let mut policy = As4ReceiptPolicy::regulated();
+        let mut policy = views::as4_receipt();
         policy.require_signed_receipt = false;
         let err = verify(&session, &sent, injected.as_bytes(), &policy)
             .expect_err("a duplicated eb:RefToMessageId must be rejected");
@@ -1960,7 +1973,7 @@ xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\">\
             ),
         );
 
-        let mut policy = As4ReceiptPolicy::regulated();
+        let mut policy = views::as4_receipt();
         policy.require_signed_receipt = false;
         let err = verify(&session, &sent, moved.as_bytes(), &policy).expect_err(
             "digests outside the eb:Receipt must not satisfy the non-repudiation check",
@@ -1988,27 +2001,12 @@ xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\">\
             "</eb:Receipt><eb:Error errorCode=\"EBMS:0004\" severity=\"failure\"/>",
         );
 
-        let mut policy = As4ReceiptPolicy::regulated();
+        let mut policy = views::as4_receipt();
         policy.require_signed_receipt = false;
         let err = verify(&session, &sent, with_error.as_bytes(), &policy)
             .expect_err("a signal cannot both acknowledge and reject");
         assert_eq!(err.code, ErrorCode::InteropViolation);
         assert!(err.message.contains("both an eb:Receipt and an eb:Error"));
-    }
-
-    #[test]
-    fn missing_severity_attribute_counts_as_failure() {
-        let received = As4ReceivedError {
-            error_code: "EBMS:0004".into(),
-            severity: None,
-            category: None,
-            origin: None,
-            ref_to_message_id: None,
-            short_description: None,
-            description: None,
-            error_detail: None,
-        };
-        assert!(received.is_failure(), "absent severity must fail closed");
     }
 
     /// PoC: wrap a legitimately signed receipt and inject an unsigned
@@ -2030,7 +2028,7 @@ xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\">\
             &key_pem,
         );
 
-        let genuine = crate::as4::generate_signed_receipt_with_nri(
+        let genuine = crate::as4::signals::generate_signed_receipt_with_nri(
             &session,
             "receipt-A@partner",
             &sent_a.message_id,
@@ -2063,18 +2061,18 @@ xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\">\
 </eb:MessageInfo>\
 <eb:Receipt><ebbpsig:NonRepudiationInformation>{nri_b}</ebbpsig:NonRepudiationInformation></eb:Receipt>\
 </eb:SignalMessage></eb:Messaging>",
-            ts = crate::time_utils::format_rfc3339_secs(std::time::SystemTime::now()),
+            ts = crate::time_utils::format_rfc3339_secs(crate::clock::system().now()),
             ref_id = sent_b.message_id,
         );
         let wrapped = genuine.replacen("<S12:Header>", &format!("<S12:Header>{forged_block}"), 1);
 
         let result = verify_sync_response(
             &session,
-            &test_bus(),
+            None,
             &sent_b,
             wrapped.as_bytes(),
             "application/soap+xml",
-            &As4ReceiptPolicy::regulated(),
+            &views::as4_receipt(),
         );
 
         let err = result.expect_err(

@@ -1,13 +1,13 @@
-/// M7 Performance Benchmarks: AS4 receive and WS-Security hot paths.
-///
-/// Measures:
-/// - SOAP XML parsing cost at various payload sizes
-/// - WS-Security signature reference parsing
-/// - Exclusive C14N canonicalization cost
-/// - MIME multipart boundary scanning
-///
-/// Run with: `cargo bench --bench as4_streaming_vs_buffer --features "as4"`
-use asx_rs::crypto::wssec::{
+//! Benchmarks for the AS4 receive and WS-Security hot paths:
+//!
+//! - SOAP XML parsing cost at various payload sizes
+//! - WS-Security signature reference parsing
+//! - Exclusive C14N canonicalization cost
+//! - MIME multipart boundary scanning
+//!
+//! Run with: `cargo bench --bench as4_streaming_vs_buffer --features "as4"`
+
+use asx::__fuzz::wssec::{
     WsSecCanonicalizationProfile, canonicalize_reference, parse_signature_references,
 };
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};

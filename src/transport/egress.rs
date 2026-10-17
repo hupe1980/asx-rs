@@ -1,70 +1,24 @@
-//! Async HTTP egress transport for AS2 and AS4.
-//!
-//! Requires the `client` feature flag.
-//!
-//! # Example — AS2
-//! ```ignore
-//! use asx_rs::transport::egress::{As2HttpTransport, TransportConfig};
-//! use asx_rs::as2::{send_sync, As2SendPolicy, As2SendCredentials, As2SendRequest};
-//!
-//! let transport = As2HttpTransport::new(TransportConfig::default())?;
-//! let output = send_sync(
-//!     &session,
-//!     &bus,
-//!     As2SendRequest {
-//!         message_id: msg_id,
-//!         payload,
-//!         policy,
-//!         credentials: Some(creds),
-//!     },
-//! )?;
-//! let outcome = transport.send("https://partner.example/as2", &output).await?;
-//! ```
-//!
-//! # Example — AS4
-//! ```ignore
-//! let transport = As4HttpTransport::new(TransportConfig::default())?;
-//! let output = asx_rs::as4::send_sync(
-//!     &session,
-//!     &bus,
-//!     asx_rs::as4::As4SendRequest {
-//!         message_id: msg_id,
-//!         payload,
-//!         policy,
-//!         credentials: Some(creds),
-//!         payload_filename: None,
-//!     },
-//! )?;
-//! let outcome = transport.send("https://partner.example/as4", &output).await?;
-//! ```
+//! Hardened HTTPS egress: address pinning, private-address refusal, body
+//! caps. The built-in [`crate::HttpClient`] (messages and revocation
+//! fetches) and the SMP client are built on it.
 
 use std::net::SocketAddr;
 use std::time::Duration;
 use zeroize::Zeroize;
 
 use crate::core::{AsxError, ErrorCode, ErrorContext, Result};
-use crate::http::HttpHeaders;
-
-#[cfg(feature = "as2")]
-use crate::as2::As2SendOutput;
-#[cfg(feature = "as4")]
-use crate::as4::As4SendOutput;
-#[cfg(feature = "as4")]
-use crate::core::SessionContext;
-#[cfg(feature = "as4")]
-use crate::observability::EventBus;
 
 // ── SSRF protection ─────────────────────────────────────────────────────────
 
-/// Validate an **OCSP responder URL** and return a client pinned to the
-/// addresses that were validated.
+/// Validate a **revocation URL** (a CRL distribution point or an OCSP
+/// responder) and return a client pinned to the addresses that were
+/// validated.
 ///
-/// The responder URL comes out of the certificate's AIA extension, so on an
-/// inbound message it is chosen by whoever presented the certificate — and
-/// revocation checking runs *while* trust is being established, i.e. before
-/// that party is trusted at all. Without this check a peer could point the
-/// responder at `169.254.169.254` or any internal address and have the server
-/// POST to it: a textbook SSRF with an attacker-supplied target.
+/// The URL comes out of a certificate a peer presented (CDP, AIA). The
+/// check runs only after the signature and the sender rule, but the URL is
+/// still the peer's choice: without this check it could point the fetch at
+/// `169.254.169.254` or any internal address — an SSRF with an
+/// attacker-supplied target.
 ///
 /// Plain HTTP is permitted here and nowhere else; see [`EgressSchemePolicy`].
 ///
@@ -72,9 +26,8 @@ use crate::observability::EventBus;
 ///
 /// [`ErrorCode::InvalidInput`] for a malformed URL, a non-HTTP scheme, or a
 /// host that is (or resolves to) a private, loopback or link-local address.
-// Only the OCSP fetcher uses these, and it exists only under `async-ocsp`.
-#[cfg(feature = "async-ocsp")]
-pub(crate) async fn validated_pinned_ocsp_client(
+#[cfg(all(feature = "http-client", any(feature = "as2", feature = "as4")))]
+pub(crate) async fn validated_pinned_revocation_client(
     url: &str,
     config: &TransportConfig,
     context: &'static str,
@@ -82,34 +35,34 @@ pub(crate) async fn validated_pinned_ocsp_client(
     let target = validate_egress_target(
         url,
         context,
-        EgressSchemePolicy::AllowPlaintextForSignedOcsp,
+        EgressSchemePolicy::AllowPlaintextForSignedRevocation,
     )
     .await?;
     let pinned = target
         .resolved_host
         .as_deref()
         .map(|host| (host, target.resolved_addrs.as_slice()));
-    build_ocsp_http_client(config, context, pinned)
+    build_revocation_http_client(config, context, pinned)
 }
 
-#[cfg(feature = "async-ocsp")]
-fn build_ocsp_http_client(
+#[cfg(all(feature = "http-client", any(feature = "as2", feature = "as4")))]
+fn build_revocation_http_client(
     config: &TransportConfig,
     context: &'static str,
     pinned_resolution: Option<(&str, &[SocketAddr])>,
 ) -> Result<reqwest::Client> {
     let mut builder = reqwest::Client::builder()
-        // Not `https_only`: RFC 6960 responders are commonly plain HTTP and the
-        // response is signed.
+        // Not `https_only`: CDPs and RFC 6960 responders are commonly plain
+        // HTTP and what they serve is signed (RFC 5280 §4.2.1.13).
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(config.connect_timeout)
         .timeout(config.request_timeout)
         .user_agent(&config.user_agent);
 
-    // Deliberately no `config.client_identity`: an OCSP responder is a third
-    // party, not the AS4 partner. Presenting the market-communication client
-    // certificate to it would disclose our identity to an unrelated service
-    // for no gain — RFC 6960 responses are signed, not client-authenticated.
+    // Deliberately no `config.client_identity`: a CDP or OCSP responder is a
+    // third party, not the partner. Presenting the market-communication
+    // client certificate to it would disclose our identity to an unrelated
+    // service for no gain; CRL access is anonymous (CP SM-PKI §2.4).
 
     if let Some((host, addrs)) = pinned_resolution {
         builder = builder.resolve_to_addrs(host, addrs);
@@ -118,7 +71,7 @@ fn build_ocsp_http_client(
     builder.build().map_err(|err| {
         AsxError::new(
             ErrorCode::TransportFailure,
-            format!("failed to build OCSP HTTP client: {err}"),
+            format!("failed to build revocation HTTP client: {err}"),
             ErrorContext::new(context),
         )
     })
@@ -138,9 +91,8 @@ fn build_ocsp_http_client(
 ///
 /// Whatever [`validate_egress_target_with_policy`] rejects, plus a
 /// client-construction failure.
-// Only the SMP client uses this; the AS2/AS4 transports pin inline because they
-// already hold a shared client for the IP-literal case.
-#[cfg(feature = "as4")]
+// Used by the built-in HTTP client and the SMP lookup.
+#[cfg(any(feature = "as2", feature = "as4"))]
 pub(crate) async fn validated_pinned_client(
     url: &str,
     config: &TransportConfig,
@@ -155,71 +107,32 @@ pub(crate) async fn validated_pinned_client(
 }
 
 #[derive(Debug, Clone)]
+#[cfg_attr(not(any(feature = "as2", feature = "as4")), allow(dead_code))]
 struct ValidatedEgressTarget {
-    url: reqwest::Url,
     /// Hostname used in URL authority, if the target was DNS-resolved.
     resolved_host: Option<String>,
     /// Concrete destination addresses selected during validation.
     resolved_addrs: Vec<SocketAddr>,
 }
 
-/// Require an egress URL to name a loopback address literally.
-///
-/// Used by the `testing`-only transports so their documented "loopback only"
-/// contract is enforced rather than merely asserted. Deliberately refuses
-/// hostnames — including `localhost` — that would need DNS to resolve: a
-/// resolver answer can point anywhere, and a test helper is not the place to
-/// re-litigate DNS rebinding.
-#[cfg(feature = "testing")]
-fn enforce_loopback_target(url: &str, context: &'static str) -> Result<()> {
-    let parsed = reqwest::Url::parse(url).map_err(|_| {
-        AsxError::new(
-            ErrorCode::InvalidInput,
-            format!("malformed egress URL: {url}"),
-            ErrorContext::new(context),
-        )
-    })?;
-
-    let is_loopback = parsed
-        .host_str()
-        .and_then(|host| {
-            host.trim_matches(['[', ']'])
-                .parse::<std::net::IpAddr>()
-                .ok()
-        })
-        .is_some_and(|ip| ip.is_loopback());
-
-    if !is_loopback {
-        return Err(AsxError::new(
-            ErrorCode::PolicyViolation,
-            format!(
-                "localhost testing transport refuses non-loopback target {url}; \
-                 use an explicit 127.0.0.1 or [::1] address, or the production \
-                 transport for real endpoints"
-            ),
-            ErrorContext::new(context),
-        ));
-    }
-
-    Ok(())
-}
-
 /// Whether an egress target may use plain HTTP.
 ///
-/// Almost nothing may: business payloads and SMP metadata go over TLS. OCSP is
-/// the exception the standard itself carves out — RFC 6960 responses are signed
-/// by the responder, so their integrity does not depend on the transport, and
-/// responders are routinely published as `http://` URLs in a certificate's AIA
-/// extension. Requiring HTTPS there would break revocation checking against
-/// most public PKIs.
+/// Almost nothing may: business payloads and SMP metadata go over TLS.
+/// Revocation data is the exception the standards carve out — CRLs and RFC
+/// 6960 responses are signed, so their integrity does not depend on the
+/// transport, and CDPs and responders are routinely published as `http://`
+/// URLs (RFC 5280 §4.2.1.13). Requiring HTTPS there would break revocation
+/// checking against most PKIs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(any(feature = "as2", feature = "as4")), allow(dead_code))]
 pub(crate) enum EgressSchemePolicy {
     /// HTTPS only.
     HttpsOnly,
-    /// HTTPS or plain HTTP. Only for RFC 6960 OCSP.
-    AllowPlaintextForSignedOcsp,
+    /// HTTPS or plain HTTP. Only for revocation fetches (CRL, OCSP).
+    AllowPlaintextForSignedRevocation,
 }
 
+#[cfg(any(feature = "as2", feature = "as4", test))]
 async fn validate_egress_target_with_policy(
     url: &str,
     context: &'static str,
@@ -254,7 +167,7 @@ async fn validate_egress_target(
 
     match parsed.scheme() {
         "https" => {}
-        "http" if scheme_policy == EgressSchemePolicy::AllowPlaintextForSignedOcsp => {}
+        "http" if scheme_policy == EgressSchemePolicy::AllowPlaintextForSignedRevocation => {}
         "http" => {
             return Err(AsxError::new(
                 ErrorCode::PolicyViolation,
@@ -331,7 +244,6 @@ async fn validate_egress_target(
     }
 
     Ok(ValidatedEgressTarget {
-        url: parsed,
         resolved_host,
         resolved_addrs,
     })
@@ -405,18 +317,55 @@ fn is_private_ipv4(ip: std::net::Ipv4Addr) -> bool {
         || a == 0               // 0.0.0.0/8 ("this host"; 0.0.0.0 routes to localhost)
         || (a == 100 && (64..=127).contains(&b)) // 100.64.0.0/10 carrier-grade NAT
         || (a == 192 && b == 0) // 192.0.0.0/24 IETF protocol assignments
+        || (a == 198 && (b == 18 || b == 19)) // 198.18.0.0/15 benchmarking (RFC 2544)
         || a >= 240 // 240.0.0.0/4 reserved (incl. 255/8)
 }
 
 /// IPv6 ranges that must not be reachable from egress.
+///
+/// Transition addresses that embed an IPv4 address — NAT64 `64:ff9b::/96`
+/// (RFC 6052) and `64:ff9b:1::/48` (RFC 8215), 6to4 `2002::/16` (RFC 3056)
+/// and IPv4-compatible `::/96` — are judged by the IPv4 they embed. Teredo
+/// `2001::/32` (RFC 4380) is refused wholesale: its embedded server address is
+/// not the destination.
 fn is_private_ipv6(ip: std::net::Ipv6Addr) -> bool {
+    let seg = ip.segments();
+    let low32 = std::net::Ipv4Addr::new(
+        (seg[6] >> 8) as u8,
+        seg[6] as u8,
+        (seg[7] >> 8) as u8,
+        seg[7] as u8,
+    );
+    let nat64_wkp = seg[0] == 0x0064 && seg[1] == 0xff9b && seg[2..6] == [0, 0, 0, 0];
+    let nat64_local = seg[0] == 0x0064 && seg[1] == 0xff9b && seg[2] == 0x0001;
+    let ipv4_compatible = seg[0..6] == [0, 0, 0, 0, 0, 0];
+    if nat64_wkp || nat64_local || ipv4_compatible {
+        // `::` and `::1` fall here and are private as 0.0.0.0/8.
+        return is_private_ipv4(low32);
+    }
+    if seg[0] == 0x2002 {
+        let embedded = std::net::Ipv4Addr::new(
+            (seg[1] >> 8) as u8,
+            seg[1] as u8,
+            (seg[2] >> 8) as u8,
+            seg[2] as u8,
+        );
+        return is_private_ipv4(embedded);
+    }
+
     ip.is_loopback()
         || ip.is_unspecified()
         || ip.is_multicast()
         // unique-local fc00::/7
-        || (ip.segments()[0] & 0xfe00) == 0xfc00
+        || (seg[0] & 0xfe00) == 0xfc00
         // link-local fe80::/10
-        || (ip.segments()[0] & 0xffc0) == 0xfe80
+        || (seg[0] & 0xffc0) == 0xfe80
+        // Teredo 2001::/32
+        || (seg[0] == 0x2001 && seg[1] == 0x0000)
+        // documentation 2001:db8::/32
+        || (seg[0] == 0x2001 && seg[1] == 0x0db8)
+        // discard-only 100::/64 (RFC 6666)
+        || seg[0..4] == [0x0100, 0, 0, 0]
 }
 
 /// Returns `true` when `host` is a private/loopback/link-local address or
@@ -451,6 +400,7 @@ pub(crate) fn is_private_host(host: &str) -> bool {
 /// WS-Security signature, and the two use different keys. This is the
 /// transport-layer one.
 #[derive(Clone)]
+#[cfg_attr(not(any(feature = "as2", feature = "as4")), allow(dead_code))]
 pub struct ClientIdentity {
     identity: reqwest::Identity,
     /// Retained for diagnostics only — the key material is not kept in PEM.
@@ -522,6 +472,7 @@ impl ClientIdentity {
     }
 
     /// The parsed backend identity.
+    #[cfg_attr(not(any(feature = "as2", feature = "as4")), allow(dead_code))]
     fn as_reqwest(&self) -> reqwest::Identity {
         self.identity.clone()
     }
@@ -538,7 +489,7 @@ pub struct TransportConfig {
     /// Timeout for the full request round-trip (from send to last byte of
     /// response body). Default: 60 s.
     pub request_timeout: Duration,
-    /// `User-Agent` header value. Default: `"asx/0.2"`.
+    /// `User-Agent` header value. Default: `asx/<crate version>`.
     pub user_agent: String,
     /// Maximum idle connections per host kept in the pool. Default: 4.
     pub pool_max_idle_per_host: usize,
@@ -546,8 +497,6 @@ pub struct TransportConfig {
     pub pool_idle_timeout: Duration,
     /// Client certificate presented when the partner requests one during the
     /// TLS handshake. Default: none (server-authenticated TLS only).
-    ///
-    /// Set it with [`with_client_identity`](Self::with_client_identity).
     pub client_identity: Option<ClientIdentity>,
 }
 
@@ -564,656 +513,49 @@ impl Default for TransportConfig {
     }
 }
 
-impl TransportConfig {
-    /// Override the connection timeout.
-    pub fn with_connect_timeout(mut self, timeout: Duration) -> Self {
-        self.connect_timeout = timeout;
-        self
-    }
-
-    /// Override the request timeout.
-    pub fn with_request_timeout(mut self, timeout: Duration) -> Self {
-        self.request_timeout = timeout;
-        self
-    }
-
-    /// Override the `User-Agent` header value.
-    pub fn with_user_agent(mut self, user_agent: impl Into<String>) -> Self {
-        self.user_agent = user_agent.into();
-        self
-    }
-
-    /// Present `identity` as the client certificate on every outbound
-    /// connection this transport makes.
-    ///
-    /// # Example
-    /// ```rust,ignore
-    /// let identity = ClientIdentity::from_pem(cert_chain_pem, key_pem)?;
-    /// let transport = As4HttpTransport::new(
-    ///     TransportConfig::default().with_client_identity(identity),
-    /// )?;
-    /// ```
-    pub fn with_client_identity(mut self, identity: ClientIdentity) -> Self {
-        self.client_identity = Some(identity);
-        self
-    }
-}
-
-// ── Shared response type ────────────────────────────────────────────────────
-
-/// The outcome of an HTTP transport send operation.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HttpSendOutcome {
-    /// HTTP status code returned by the partner.
-    pub status: u16,
-    /// Response headers as case-preserved key/value pairs.
-    pub headers: HttpHeaders,
-    /// Response body bytes.
-    pub body: std::sync::Arc<[u8]>,
-}
-
-impl HttpSendOutcome {
-    /// Returns `true` when the partner responded with a 2xx status code.
-    pub fn is_success(&self) -> bool {
-        (200..300).contains(&self.status)
-    }
-
-    /// Returns the value of the first response header matching `name`
-    /// (case-insensitive).
-    pub fn header(&self, name: &str) -> Option<&str> {
-        self.headers
-            .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case(name))
-            .map(|(_, v)| v.as_str())
-    }
-
-    /// Returns `true` when the response body appears to be a synchronous AS2
-    /// MDN (a `multipart/report` body returned immediately on the AS2 receive
-    /// endpoint's HTTP response).
-    pub fn is_sync_mdn(&self) -> bool {
-        self.header("Content-Type")
-            .map(|ct| ct.to_ascii_lowercase().contains("multipart/report"))
-            .unwrap_or(false)
-    }
-}
-
 // ── Error mapping ───────────────────────────────────────────────────────────
 
-#[cfg(any(feature = "as2", feature = "as4"))]
-fn reqwest_to_asx(err: reqwest::Error, context: &'static str) -> AsxError {
-    // reqwest's Display for request errors is just "error sending request for
-    // url (…)" — the actionable part (connection refused, reset, timeout, TLS
-    // failure) lives in the source chain. Flatten it so operators see the
-    // cause without attaching a debugger.
-    let mut message = format!("HTTP transport error: {err}");
-    let mut source = std::error::Error::source(&err);
-    while let Some(cause) = source {
-        message.push_str(": ");
-        message.push_str(&cause.to_string());
-        source = cause.source();
-    }
-    AsxError::new(
-        ErrorCode::TransportFailure,
-        message,
-        ErrorContext::new(context),
-    )
-}
-
-// ── AS2 HTTP transport ──────────────────────────────────────────────────────
-
-#[cfg(feature = "as2")]
-/// Async HTTP transport for AS2 messages, implementing the RFC 4130 §6
-/// HTTP binding.
+/// Read a response body, refusing more than `cap` bytes with
+/// [`ErrorCode::PayloadTooLarge`].
 ///
-/// The `http_headers` from [`As2SendOutput`] are forwarded verbatim.
-/// `Content-Length` is added automatically.
-///
-/// Use [`As2HttpTransport::new`] with a [`TransportConfig`] (or
-/// `TransportConfig::default()`) to construct an instance.
-#[derive(Debug)]
-pub struct As2HttpTransport {
-    client: reqwest::Client,
-    runtime_config: TransportConfig,
-}
-
-#[cfg(feature = "as2")]
-impl As2HttpTransport {
-    /// Create a new AS2 transport client from the given configuration.
-    ///
-    /// # Errors
-    /// Returns an error if the underlying `reqwest::Client` cannot be built
-    /// (typically a TLS initialisation failure).
-    pub fn new(config: TransportConfig) -> Result<Self> {
-        let client = build_http_client(&config, "as2_transport_init", None)?;
-        Ok(Self {
-            client,
-            runtime_config: config,
-        })
-    }
-
-    /// Send an AS2 message to `url` using a `POST` with RFC 4130 §6 required
-    /// headers.
-    ///
-    /// The headers computed by [`crate::as2::send_sync`] and stored in
-    /// `output.http_headers` are forwarded as-is. `Content-Length` is appended
-    /// automatically from the body length.
-    ///
-    /// # SSRF protection
-    /// Private / loopback / link-local IP ranges and the `localhost` hostname
-    /// are rejected unconditionally to prevent Server-Side Request Forgery.
-    /// HTTPS is required for all outbound requests.
-    ///
-    /// # AS2 MDN handling
-    /// When the partner sends a synchronous MDN in the HTTP response body,
-    /// [`HttpSendOutcome::is_sync_mdn`] will return `true`. Pass the
-    /// `outcome.body` to [`crate::as2::receive_sync`] to parse and
-    /// classify the delivery outcome.
-    ///
-    /// # Errors
-    /// Returns [`ErrorCode::InvalidInput`] for disallowed URLs.
-    /// Returns [`ErrorCode::TransportFailure`] on network or TLS errors.
-    pub async fn send(&self, url: &str, output: &As2SendOutput) -> Result<HttpSendOutcome> {
-        let target = validate_egress_target_with_policy(url, "as2_transport_send").await?;
-
-        let mut headers = reqwest::header::HeaderMap::new();
-
-        for (name, value) in &output.http_headers {
-            let key = reqwest::header::HeaderName::from_bytes(name.as_bytes()).map_err(|_| {
-                AsxError::new(
-                    ErrorCode::InvalidInput,
-                    format!("invalid HTTP header name '{name}'"),
-                    ErrorContext::new("as2_transport_send"),
-                )
-            })?;
-            let val = reqwest::header::HeaderValue::from_str(value).map_err(|_| {
-                AsxError::new(
-                    ErrorCode::InvalidInput,
-                    format!("invalid HTTP header value for '{name}'"),
-                    ErrorContext::new("as2_transport_send"),
-                )
-            })?;
-            headers.insert(key, val);
-        }
-
-        if let Some(traceparent) = &output.traceparent {
-            let val = reqwest::header::HeaderValue::from_str(traceparent).map_err(|_| {
-                AsxError::new(
-                    ErrorCode::InvalidInput,
-                    "invalid traceparent header value",
-                    ErrorContext::new("as2_transport_send"),
-                )
-            })?;
-            headers.insert(reqwest::header::HeaderName::from_static("traceparent"), val);
-        }
-
-        let body_bytes = output.mime.body.clone();
-
-        let client = if let Some(host) = target.resolved_host.as_deref() {
-            build_http_client(
-                &self.runtime_config,
-                "as2_transport_send",
-                Some((host, &target.resolved_addrs)),
-            )?
-        } else {
-            self.client.clone()
-        };
-
-        let response = client
-            .post(target.url.clone())
-            .headers(headers)
-            .body(body_bytes.to_vec())
-            .send()
-            .await
-            .map_err(|e| reqwest_to_asx(e, "as2_transport_send"))?;
-
-        let status = response.status().as_u16();
-        let resp_headers: Vec<(String, String)> = response
-            .headers()
-            .iter()
-            .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
-            .collect();
-
-        let body = response
-            .bytes()
-            .await
-            .map_err(|e| reqwest_to_asx(e, "as2_transport_recv_body"))?
-            .to_vec()
-            .into();
-
-        Ok(HttpSendOutcome {
-            status,
-            headers: HttpHeaders::from_vec(resp_headers),
-            body,
-        })
-    }
-
-    /// Send an asynchronous AS2 MDN to the partner's `url` (RFC 4130 §7.9.3).
-    ///
-    /// Use this after receiving an AS2 message that requested an asynchronous
-    /// MDN via the `Disposition-Notification-To` header. Build the MDN bytes
-    /// with [`crate::as2::generate_mdn`], then pass them here.
-    ///
-    /// Required headers (`AS2-Version`, `AS2-From`, `AS2-To`,
-    /// `Content-Type: multipart/report; ...`) are set automatically.
-    /// `message_id` is wrapped in angle brackets per RFC 2822 §3.6.4.
-    ///
-    /// # SSRF protection
-    /// The `url` is validated with the same private-address rejection rules as
-    /// [`Self::send`].
-    ///
-    /// # Errors
-    /// Returns [`ErrorCode::InvalidInput`] for disallowed URLs or empty IDs.
-    /// Returns [`ErrorCode::TransportFailure`] on network errors.
-    pub async fn send_async_mdn(&self, request: &As2AsyncMdnRequest) -> Result<HttpSendOutcome> {
-        let target = validate_egress_target_with_policy(&request.url, "as2_async_mdn_send").await?;
-
-        if request.as2_from.trim().is_empty() {
-            return Err(AsxError::new(
-                ErrorCode::InvalidInput,
-                "As2AsyncMdnRequest.as2_from must not be empty",
-                ErrorContext::new("as2_async_mdn_send"),
-            ));
-        }
-        if request.as2_to.trim().is_empty() {
-            return Err(AsxError::new(
-                ErrorCode::InvalidInput,
-                "As2AsyncMdnRequest.as2_to must not be empty",
-                ErrorContext::new("as2_async_mdn_send"),
-            ));
-        }
-
-        let stripped = request
-            .original_message_id
-            .trim()
-            .trim_matches(|c| c == '<' || c == '>');
-        let message_id = format!("<{stripped}>");
-        let mdn_content_type =
-            extract_as2_mdn_content_type(&request.mdn_bytes).unwrap_or_else(|| {
-                "multipart/report; report-type=disposition-notification".to_string()
-            });
-
-        let client = if let Some(host) = target.resolved_host.as_deref() {
-            build_http_client(
-                &self.runtime_config,
-                "as2_async_mdn_send",
-                Some((host, &target.resolved_addrs)),
-            )?
-        } else {
-            self.client.clone()
-        };
-
-        let response = client
-            .post(target.url.clone())
-            .header("AS2-Version", "1.2")
-            .header("AS2-From", &request.as2_from)
-            .header("AS2-To", &request.as2_to)
-            .header("Message-ID", &message_id)
-            .header("Content-Type", mdn_content_type)
-            .header("MIME-Version", "1.0")
-            .body(request.mdn_bytes.to_vec())
-            .send()
-            .await
-            .map_err(|e| reqwest_to_asx(e, "as2_async_mdn_send"))?;
-
-        let status = response.status().as_u16();
-        let resp_headers: HttpHeaders = response
-            .headers()
-            .iter()
-            .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
-            .collect();
-        let body = response
-            .bytes()
-            .await
-            .map_err(|e| reqwest_to_asx(e, "as2_async_mdn_recv_body"))?
-            .to_vec();
-
-        Ok(HttpSendOutcome {
-            status,
-            headers: resp_headers,
-            body: body.into(),
-        })
-    }
-}
-
-#[cfg(feature = "as2")]
-fn extract_as2_mdn_content_type(mdn_bytes: &[u8]) -> Option<String> {
-    let text = std::str::from_utf8(mdn_bytes).ok()?;
-    let (headers, _) = text.split_once("\r\n\r\n")?;
-    headers.lines().find_map(|line| {
-        let (name, value) = line.split_once(':')?;
-        if name.trim().eq_ignore_ascii_case("Content-Type") {
-            let ct = value.trim();
-            if ct.is_empty() {
-                None
-            } else {
-                Some(ct.to_string())
-            }
-        } else {
-            None
-        }
-    })
-}
-
-/// Request parameters for dispatching an asynchronous AS2 MDN (RFC 4130 §7.9.3).
-///
-/// Build `mdn_bytes` with [`crate::as2::generate_mdn`], then pass
-/// this struct to [`As2HttpTransport::send_async_mdn`].
-#[cfg(feature = "as2")]
-#[derive(Debug, Clone)]
-pub struct As2AsyncMdnRequest {
-    /// Partner's asynchronous MDN endpoint URL (from the inbound
-    /// `Disposition-Notification-To` or `Receipt-Delivery-Option` header).
-    pub url: String,
-    /// `Message-ID` of the original inbound AS2 message being acknowledged.
-    pub original_message_id: String,
-    /// MDN body bytes generated by [`crate::as2::generate_mdn`].
-    pub mdn_bytes: std::sync::Arc<[u8]>,
-    /// This party's AS2 identifier (`AS2-From` header value).
-    pub as2_from: String,
-    /// Partner's AS2 identifier (`AS2-To` header value).
-    pub as2_to: String,
-}
-
-// ── AS4 HTTP transport ──────────────────────────────────────────────────────
-
-#[cfg(feature = "as4")]
-/// Async SOAP-over-HTTP transport for AS4 messages, implementing the
-/// eDelivery AS4 HTTP binding (SOAP 1.2).
-///
-/// The transport sets the following HTTP headers automatically:
-/// - `Content-Type: application/soap+xml; charset=UTF-8; action="<action>"`
-/// - `Content-Length: <bytes>`
-///
-/// where `<action>` is taken from [`As4SendOutput::action`].
-#[derive(Debug)]
-pub struct As4HttpTransport {
-    client: reqwest::Client,
-    runtime_config: TransportConfig,
-}
-
-#[cfg(feature = "as4")]
-impl As4HttpTransport {
-    /// Create a new AS4 transport client from the given configuration.
-    ///
-    /// # Errors
-    /// Returns an error if the underlying `reqwest::Client` cannot be built.
-    pub fn new(config: TransportConfig) -> Result<Self> {
-        let client = build_http_client(&config, "as4_transport_init", None)?;
-        Ok(Self {
-            client,
-            runtime_config: config,
-        })
-    }
-
-    /// Send an AS4 SOAP envelope to `url` using a `POST` with SOAP 1.2
-    /// eDelivery HTTP binding headers.
-    ///
-    /// # SSRF protection
-    /// Private / loopback / link-local IP ranges are rejected. HTTPS is
-    /// required for all outbound requests.
-    ///
-    /// # Errors
-    /// Returns [`ErrorCode::InvalidInput`] for disallowed URLs.
-    /// Returns [`ErrorCode::TransportFailure`] on network or TLS errors.
-    pub async fn send(&self, url: &str, output: &As4SendOutput) -> Result<HttpSendOutcome> {
-        self.send_inner(url, output, true).await
-    }
-
-    /// Bypass SSRF / plain-HTTP guards for localhost-only integration tests.
-    ///
-    /// **Only available with `feature = "testing"`.**  The returned transport
-    /// connects to plain HTTP on loopback addresses (e.g. `http://127.0.0.1:…`)
-    /// to communicate with [`crate::as4::mock_endpoint::MockAs4Endpoint`].
-    /// Never expose this constructor in production builds.
-    #[cfg(feature = "testing")]
-    pub fn new_for_localhost_testing() -> Result<Self> {
-        let config = TransportConfig::default();
-        let client = reqwest::Client::builder()
-            // Redirects stay off even here: a loopback stub that answers 302 must
-            // not become a way to reach a non-loopback host.
-            .redirect(reqwest::redirect::Policy::none())
-            .connect_timeout(config.connect_timeout)
-            .timeout(config.request_timeout)
-            .user_agent(&config.user_agent)
-            .pool_max_idle_per_host(config.pool_max_idle_per_host)
-            .pool_idle_timeout(Some(config.pool_idle_timeout))
-            .build()
-            .map_err(|err| {
-                AsxError::new(
-                    ErrorCode::TransportFailure,
-                    format!("failed to build localhost test HTTP client: {err}"),
-                    ErrorContext::new("as4_transport_localhost_testing_init"),
-                )
-            })?;
-        Ok(Self {
-            client,
-            runtime_config: config,
-        })
-    }
-
-    /// Send to a loopback testing endpoint, bypassing the HTTPS and SSRF guards.
-    ///
-    /// The target **must** resolve to a loopback literal; anything else is
-    /// rejected. Without that check this would be an unrestricted plain-HTTP
-    /// sender wearing a "localhost" name, and the `testing` feature would become
-    /// a way to downgrade every egress guard at once.
-    ///
-    /// Only available with `feature = "testing"`.
-    #[cfg(feature = "testing")]
-    pub async fn send_to_localhost(
-        &self,
-        url: &str,
-        output: &As4SendOutput,
-    ) -> Result<HttpSendOutcome> {
-        enforce_loopback_target(url, "as4_transport_send_localhost")?;
-        self.send_inner(url, output, false).await
-    }
-
-    /// Send an AS4 message and verify the counterparty's synchronous signal.
-    ///
-    /// This is [`send`](Self::send) followed by
-    /// [`crate::as4::verify_sync_response`], which is the combination the
-    /// One-Way/Push MEP with Reception Awareness requires: the receipt arrives
-    /// on the same connection and is only evidence of delivery once its
-    /// signature and Non-Repudiation digests have been checked against the
-    /// message that was sent.
-    ///
-    /// Prefer this over `send` + hand-rolled response inspection.  Substring
-    /// scanning for `<eb:Receipt` misses conformant counterparties that use a
-    /// different namespace prefix or CDATA, and cannot verify NRR at all.
-    ///
-    /// # Example
-    /// ```rust,ignore
-    /// let sent = asx_rs::as4::send_async(&session, &bus, request).await?;
-    /// let outcome = transport
-    ///     .send_and_verify(&url, &session, &bus, &sent, &As4ReceiptPolicy::regulated())
-    ///     .await?;
-    ///
-    /// match outcome.signal {
-    ///     As4SyncSignal::Receipt(receipt) => {
-    ///         assert!(receipt.is_non_repudiation_evidence());
-    ///     }
-    ///     As4SyncSignal::Error(err) => {
-    ///         // Route on the ebMS3 code: retry vs dead-letter.
-    ///         tracing::error!(code = %err.summary(), "counterparty rejected the message");
-    ///     }
-    /// }
-    /// ```
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ErrorCode::TransportFailure`] when the counterparty answered
-    /// with a non-2xx status and no parseable `eb:SignalMessage` — a non-2xx
-    /// response that *does* carry an `eb:Error` signal is returned as
-    /// [`As4SyncSignal::Error`](crate::as4::As4SyncSignal::Error) instead, since the ebMS3 diagnostics are more
-    /// actionable than the HTTP status.  All verification failures surface with
-    /// the codes documented on [`crate::as4::verify_sync_response`].
-    pub async fn send_and_verify(
-        &self,
-        url: &str,
-        session: &SessionContext,
-        event_bus: &EventBus,
-        output: &As4SendOutput,
-        policy: &crate::as4::As4ReceiptPolicy,
-    ) -> Result<As4SendAndVerifyOutcome> {
-        let http = self.send_inner(url, output, true).await?;
-        finish_send_and_verify(session, event_bus, output, policy, http)
-    }
-
-    /// [`send_and_verify`](Self::send_and_verify) against a loopback testing
-    /// endpoint, bypassing the SSRF and plain-HTTP guards.
-    ///
-    /// The target must be a loopback literal — see
-    /// [`send_to_localhost`](Self::send_to_localhost).
-    ///
-    /// Only available with `feature = "testing"`.
-    #[cfg(feature = "testing")]
-    pub async fn send_and_verify_to_localhost(
-        &self,
-        url: &str,
-        session: &SessionContext,
-        event_bus: &EventBus,
-        output: &As4SendOutput,
-        policy: &crate::as4::As4ReceiptPolicy,
-    ) -> Result<As4SendAndVerifyOutcome> {
-        enforce_loopback_target(url, "as4_transport_send_verify_localhost")?;
-        let http = self.send_inner(url, output, false).await?;
-        finish_send_and_verify(session, event_bus, output, policy, http)
-    }
-
-    async fn send_inner(
-        &self,
-        url: &str,
-        output: &As4SendOutput,
-        validate_url: bool,
-    ) -> Result<HttpSendOutcome> {
-        let target = if validate_url {
-            validate_egress_target_with_policy(url, "as4_transport_send").await?
-        } else {
-            let parsed = reqwest::Url::parse(url).map_err(|_| {
-                AsxError::new(
-                    ErrorCode::InvalidInput,
-                    format!("malformed egress URL: {url}"),
-                    ErrorContext::new("as4_transport_send"),
-                )
-            })?;
-            ValidatedEgressTarget {
-                url: parsed,
-                resolved_host: None,
-                resolved_addrs: vec![],
-            }
-        };
-
-        let client = if let Some(host) = target.resolved_host.as_deref() {
-            build_http_client(
-                &self.runtime_config,
-                "as4_transport_send",
-                Some((host, &target.resolved_addrs)),
-            )?
-        } else {
-            self.client.clone()
-        };
-
-        let mut request = client
-            .post(target.url.clone())
-            .header("Content-Type", &output.http_content_type)
-            .body(output.soap_envelope.body.to_vec());
-
-        if let Some(traceparent) = &output.traceparent {
-            request = request.header("traceparent", traceparent);
-        }
-
-        let response = request
-            .send()
-            .await
-            .map_err(|e| reqwest_to_asx(e, "as4_transport_send"))?;
-
-        let status = response.status().as_u16();
-        let resp_headers: HttpHeaders = response
-            .headers()
-            .iter()
-            .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
-            .collect();
-
-        let body: Vec<u8> = response
-            .bytes()
-            .await
-            .map_err(|e| reqwest_to_asx(e, "as4_transport_recv_body"))?
-            .to_vec();
-
-        Ok(HttpSendOutcome {
-            status,
-            headers: resp_headers,
-            body: body.into(),
-        })
-    }
-}
-
-/// Result of [`As4HttpTransport::send_and_verify`].
-#[cfg(feature = "as4")]
-#[derive(Debug, Clone)]
-#[non_exhaustive]
-pub struct As4SendAndVerifyOutcome {
-    /// The raw HTTP exchange — status, headers and body — retained so callers
-    /// can log or persist the wire evidence alongside the verified signal.
-    pub http: HttpSendOutcome,
-    /// The verified `eb:Receipt`, or the counterparty's `eb:Error`.
-    pub signal: crate::as4::As4SyncSignal,
-}
-
-#[cfg(feature = "as4")]
-impl As4SendAndVerifyOutcome {
-    /// The verified receipt, or an error carrying the counterparty's ebMS3
-    /// diagnostics when the signal was an `eb:Error`.
-    pub fn into_receipt(self) -> Result<crate::as4::As4VerifiedReceipt> {
-        self.signal.into_receipt()
-    }
-}
-
-/// Shared tail of [`As4HttpTransport::send_and_verify`]: classify the HTTP
-/// outcome, then verify whatever signal the counterparty returned.
-#[cfg(feature = "as4")]
-fn finish_send_and_verify(
-    session: &SessionContext,
-    event_bus: &EventBus,
-    output: &As4SendOutput,
-    policy: &crate::as4::As4ReceiptPolicy,
-    http: HttpSendOutcome,
-) -> Result<As4SendAndVerifyOutcome> {
-    let content_type = http
-        .header("Content-Type")
-        .unwrap_or("application/soap+xml")
-        .to_string();
-
-    let signal = match crate::as4::verify_sync_response(
-        session,
-        event_bus,
-        output,
-        &http.body,
-        &content_type,
-        policy,
-    ) {
-        Ok(signal) => signal,
-        // A non-2xx status with an unparseable body is a transport-level
-        // failure: reporting "missing eb:Receipt" would hide the real cause.
-        Err(err) if !http.is_success() => {
-            return Err(AsxError::new(
-                ErrorCode::TransportFailure,
-                format!(
-                    "AS4 counterparty returned HTTP {} with no parseable eb:SignalMessage: {}",
-                    http.status, err.message
-                ),
-                ErrorContext::for_session_with_message(
-                    "as4_transport_send_and_verify",
-                    session,
-                    &output.message_id,
-                ),
-            ));
-        }
-        Err(err) => return Err(err),
+/// A declared `Content-Length` over the cap is refused before anything is
+/// read; otherwise chunks are accumulated until the cap would be exceeded, so
+/// at most `cap` plus one chunk is ever buffered. Every egress response body
+/// (partner sends, SMP, OCSP) goes through here: the peer chooses its size.
+pub(crate) async fn read_body_capped(
+    mut resp: reqwest::Response,
+    cap: usize,
+    stage: &'static str,
+) -> Result<bytes::Bytes> {
+    let too_large = |size: String| {
+        AsxError::new(
+            ErrorCode::PayloadTooLarge,
+            format!("response body {size} exceeds the {cap} byte limit"),
+            ErrorContext::new(stage),
+        )
     };
-
-    Ok(As4SendAndVerifyOutcome { http, signal })
+    if let Some(declared) = resp.content_length()
+        && declared > cap as u64
+    {
+        return Err(too_large(format!("of {declared} bytes (Content-Length)")));
+    }
+    let mut body = bytes::BytesMut::new();
+    while let Some(chunk) = resp.chunk().await.map_err(|err| {
+        AsxError::new(
+            ErrorCode::TransportFailure,
+            format!("failed to read response body: {err}"),
+            ErrorContext::new(stage),
+        )
+    })? {
+        if body.len().saturating_add(chunk.len()) > cap {
+            return Err(too_large(format!(
+                "of more than {} bytes",
+                body.len().saturating_add(chunk.len())
+            )));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body.freeze())
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────
@@ -1222,6 +564,112 @@ fn finish_send_and_verify(
 mod tests {
     use super::*;
 
+    /// Serve one HTTP response per connection: `head` then `body_chunks`.
+    async fn serve_once(head: String, body_chunks: Vec<Vec<u8>>) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let mut request = [0u8; 1024];
+            let _ = socket.read(&mut request).await;
+            let _ = socket.write_all(head.as_bytes()).await;
+            for chunk in body_chunks {
+                if socket.write_all(&chunk).await.is_err() {
+                    return;
+                }
+            }
+            let _ = socket.shutdown().await;
+        });
+        format!("http://{addr}/")
+    }
+
+    #[tokio::test]
+    async fn read_body_capped_refuses_oversized_bodies() {
+        const CAP: usize = 1024;
+        let client = reqwest::Client::new();
+
+        // (a) A declared Content-Length over the cap.
+        let url = serve_once(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                CAP + 1
+            ),
+            vec![vec![b'a'; CAP + 1]],
+        )
+        .await;
+        let resp = client.get(&url).send().await.expect("response");
+        let err = read_body_capped(resp, CAP, "capped_test")
+            .await
+            .expect_err("a Content-Length over the cap must be refused");
+        assert_eq!(err.code, ErrorCode::PayloadTooLarge, "{}", err.message);
+
+        // (b) A chunked body that streams past the cap.
+        let chunks: Vec<Vec<u8>> = (0..16)
+            .map(|_| {
+                let data = vec![b'b'; 256];
+                let mut chunk = format!("{:x}\r\n", data.len()).into_bytes();
+                chunk.extend_from_slice(&data);
+                chunk.extend_from_slice(b"\r\n");
+                chunk
+            })
+            .chain(std::iter::once(b"0\r\n\r\n".to_vec()))
+            .collect();
+        let url = serve_once(
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+                .to_string(),
+            chunks,
+        )
+        .await;
+        let resp = client.get(&url).send().await.expect("response");
+        let err = read_body_capped(resp, CAP, "capped_test")
+            .await
+            .expect_err("a chunked body past the cap must be refused");
+        assert_eq!(err.code, ErrorCode::PayloadTooLarge, "{}", err.message);
+
+        // Control: a body within the cap is returned whole.
+        let url = serve_once(
+            format!("HTTP/1.1 200 OK\r\nContent-Length: {CAP}\r\nConnection: close\r\n\r\n"),
+            vec![vec![b'c'; CAP]],
+        )
+        .await;
+        let resp = client.get(&url).send().await.expect("response");
+        let body = read_body_capped(resp, CAP, "capped_test")
+            .await
+            .expect("a body at the cap is accepted");
+        assert_eq!(body.len(), CAP);
+    }
+
+    #[test]
+    fn transition_benchmark_and_documentation_ranges_are_private() {
+        let private = [
+            "64:ff9b::10.0.0.1", // NAT64 (RFC 6052) embedding 10.0.0.1
+            "64:ff9b:1::a00:1",  // local-use NAT64 (RFC 8215) embedding 10.0.0.1
+            "2002:0a00:0001::1", // 6to4 (RFC 3056) embedding 10.0.0.1
+            "::10.0.0.1",        // IPv4-compatible
+            "2001:0::1",         // Teredo (RFC 4380)
+            "198.18.0.1",        // benchmarking (RFC 2544)
+            "2001:db8::1",       // documentation
+            "100::1",            // discard-only (RFC 6666)
+        ];
+        for addr in private {
+            let ip: std::net::IpAddr = addr.parse().expect(addr);
+            assert!(is_private_ip(ip), "{addr} must be private");
+        }
+        let public = [
+            "64:ff9b::8.8.8.8",
+            "2002:0808:0808::1",
+            "8.8.8.8",
+            "2606:4700::1111",
+        ];
+        for addr in public {
+            let ip: std::net::IpAddr = addr.parse().expect(addr);
+            assert!(!is_private_ip(ip), "{addr} must stay public");
+        }
+    }
+
     #[test]
     fn transport_config_defaults_are_sensible() {
         let cfg = TransportConfig::default();
@@ -1229,78 +677,6 @@ mod tests {
         assert_eq!(cfg.request_timeout, Duration::from_secs(60));
         assert!(cfg.user_agent.starts_with("asx/"));
         assert!(cfg.pool_max_idle_per_host > 0);
-    }
-
-    #[test]
-    fn http_send_outcome_is_success_range() {
-        let make = |status: u16| HttpSendOutcome {
-            status,
-            headers: HttpHeaders::new(),
-            body: vec![].into(),
-        };
-        assert!(make(200).is_success());
-        assert!(make(204).is_success());
-        assert!(!make(400).is_success());
-        assert!(!make(500).is_success());
-    }
-
-    #[test]
-    fn http_send_outcome_header_lookup_is_case_insensitive() {
-        let outcome = HttpSendOutcome {
-            status: 200,
-            headers: HttpHeaders::from_vec(vec![(
-                "content-type".into(),
-                "multipart/report; boundary=foo".into(),
-            )]),
-            body: vec![].into(),
-        };
-        assert_eq!(
-            outcome.header("Content-Type"),
-            Some("multipart/report; boundary=foo")
-        );
-        assert!(outcome.is_sync_mdn());
-    }
-
-    #[test]
-    fn http_send_outcome_is_sync_mdn_requires_multipart_report() {
-        let outcome = HttpSendOutcome {
-            status: 200,
-            headers: HttpHeaders::from_vec(vec![(
-                "Content-Type".into(),
-                "application/pkcs7-mime".into(),
-            )]),
-            body: vec![].into(),
-        };
-        assert!(!outcome.is_sync_mdn());
-    }
-
-    #[cfg(feature = "as2")]
-    #[test]
-    fn as2_transport_builds_with_default_config() {
-        As2HttpTransport::new(TransportConfig::default()).expect("should build without error");
-    }
-
-    #[cfg(feature = "as2")]
-    #[test]
-    fn extract_as2_mdn_content_type_reads_top_level_header() {
-        let mdn = b"Content-Type: multipart/report; report-type=disposition-notification; boundary=\"b\"\r\n\
-MIME-Version: 1.0\r\n\
-\r\n\
---b\r\n\
-Content-Type: text/plain\r\n\
-\r\n\
-ok\r\n\
---b--\r\n";
-
-        let ct = extract_as2_mdn_content_type(mdn).expect("content type");
-        assert!(ct.starts_with("multipart/report;"));
-        assert!(ct.contains("boundary=\"b\""));
-    }
-
-    #[cfg(feature = "as4")]
-    #[test]
-    fn as4_transport_builds_with_default_config() {
-        As4HttpTransport::new(TransportConfig::default()).expect("should build without error");
     }
 
     // ── SSRF protection ───────────────────────────────────────────────────────
@@ -1312,34 +688,6 @@ ok\r\n\
             .unwrap_err();
         assert_eq!(err.code, ErrorCode::InvalidInput);
         assert!(err.message.contains("ftp"));
-    }
-
-    /// The `testing` transports document a loopback-only contract; without
-    /// enforcement they were an unrestricted plain-HTTP sender, which would make
-    /// the `testing` feature a single switch that disables every egress guard.
-    #[cfg(feature = "testing")]
-    #[test]
-    fn loopback_guard_accepts_only_loopback_literals() {
-        for ok in [
-            "http://127.0.0.1:8080/as4",
-            "http://127.5.5.5/as4",
-            "http://[::1]:9090/as4",
-        ] {
-            enforce_loopback_target(ok, "test").unwrap_or_else(|e| panic!("{ok} must pass: {e}"));
-        }
-
-        for bad in [
-            "http://example.com/as4",
-            "https://partner.example/as4",
-            "http://10.0.0.5/as4",
-            "http://169.254.169.254/latest/meta-data",
-            // A hostname needs DNS to resolve, and the answer can point anywhere.
-            "http://localhost:8080/as4",
-        ] {
-            let err = enforce_loopback_target(bad, "test")
-                .expect_err("non-loopback literal must be refused");
-            assert_eq!(err.code, ErrorCode::PolicyViolation, "for {bad}");
-        }
     }
 
     #[tokio::test]
@@ -1382,7 +730,7 @@ ok\r\n\
 
     #[tokio::test]
     async fn validate_egress_url_rejects_ipv4_mapped_ipv6_and_reserved_v4() {
-        // Regression: IPv4-mapped IPv6 addresses must be canonicalized and
+        // IPv4-mapped IPv6 addresses must be canonicalized and
         // classified under the v4 rules, and additional reserved v4 ranges
         // (0.0.0.0/8, CGNAT, documentation) must be blocked — otherwise these
         // are SSRF bypasses to loopback / link-local / internal targets.
@@ -1424,7 +772,7 @@ ok\r\n\
     async fn validate_egress_url_accepts_public_https() {
         // 8.8.8.8 is a globally-routable public address (IP literal → no DNS
         // needed). RFC 5737 TEST-NET ranges are intentionally *not* used here:
-        // they are reserved/unroutable and are now rejected as non-global.
+        // they are reserved/unroutable and rejected as non-global.
         validate_egress_url("https://8.8.8.8/as2/receive", "ctx")
             .await
             .expect("public HTTPS should be accepted");

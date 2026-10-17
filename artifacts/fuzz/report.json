@@ -1,0 +1,16 @@
+{
+  "gate": "adversarial-fuzz",
+  "seed": 11936158450621202159,
+  "requested_iterations": 4000,
+  "executed_iterations": 13489,
+  "budget_ms": 2500,
+  "elapsed_ms": 2501,
+  "target_counts": {
+    "profile_loader": 4497,
+    "policy_resolver": 4496,
+    "wire_parsing": 4496
+  },
+  "panic_count": 0,
+  "invariant_violation_count": 0,
+  "failures": []
+}

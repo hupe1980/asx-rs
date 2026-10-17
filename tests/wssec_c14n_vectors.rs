@@ -1,7 +1,7 @@
 #![cfg(feature = "as4")]
 
-use asx_rs::core::ErrorCode;
-use asx_rs::crypto::wssec::{
+use asx::__fuzz::ErrorCode;
+use asx::__fuzz::wssec::{
     WsSecCanonicalizationProfile, WsSecOutboundKeyInfoProfile, WsSecVerifyOptions,
     canonical_vector_diff, canonicalize_reference,
     generate_xmlsig_signature_with_external_references, parse_signature_references,
@@ -25,7 +25,7 @@ fn build_multi_reference_unsigned_envelope() -> String {
         </eb:Messaging>
     </S12:Header>
     <S12:Body wsu:Id="body-1">
-        <eb:Payload id="payload-1">ABC</eb:Payload>
+        <eb:Payload Id="payload-1">ABC</eb:Payload>
     </S12:Body>
 </S12:Envelope>"#
                 .to_string()
@@ -48,7 +48,13 @@ fn build_multi_reference_signed_envelope(detached_bytes: &[u8]) -> String {
     )
     .expect("signature generation for mixed references");
 
-    unsigned.replacen("<S12:Header>", &format!("<S12:Header>{signature}"), 1)
+    unsigned.replacen(
+        "<S12:Header>",
+        &format!(
+            "<S12:Header><wsse:Security xmlns:wsse=\"http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd\">{signature}</wsse:Security>"
+        ),
+        1,
+    )
 }
 
 #[test]
@@ -168,14 +174,14 @@ fn canonicalization_is_stable_across_attribute_order_variants() {
     let xml_a = r#"<S12:Envelope xmlns:S12="http://www.w3.org/2003/05/soap-envelope"
         xmlns:eb="http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/">
     <S12:Body>
-        <eb:Payload id="payload-1" alpha="A" beta="B">ABC</eb:Payload>
+        <eb:Payload Id="payload-1" alpha="A" beta="B">ABC</eb:Payload>
     </S12:Body>
 </S12:Envelope>"#;
 
     let xml_b = r#"<S12:Envelope xmlns:eb="http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/"
         xmlns:S12="http://www.w3.org/2003/05/soap-envelope">
     <S12:Body>
-        <eb:Payload beta="B" id="payload-1" alpha="A">ABC</eb:Payload>
+        <eb:Payload beta="B" Id="payload-1" alpha="A">ABC</eb:Payload>
     </S12:Body>
 </S12:Envelope>"#;
 
@@ -197,7 +203,7 @@ fn default_profile_ignores_comments_for_digest_equivalence() {
     let xml_without_comment = r#"<S12:Envelope xmlns:S12="http://www.w3.org/2003/05/soap-envelope"
         xmlns:eb="http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/">
     <S12:Body>
-        <eb:Payload id="payload-1">ABC</eb:Payload>
+        <eb:Payload Id="payload-1">ABC</eb:Payload>
     </S12:Body>
 </S12:Envelope>"#;
 
@@ -205,7 +211,7 @@ fn default_profile_ignores_comments_for_digest_equivalence() {
         xmlns:eb="http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/">
     <S12:Body>
         <!-- transport intermediary comment that must not alter digest in default profile -->
-        <eb:Payload id="payload-1">ABC</eb:Payload>
+        <eb:Payload Id="payload-1">ABC</eb:Payload>
     </S12:Body>
 </S12:Envelope>"#;
 
@@ -234,7 +240,7 @@ fn inclusive_prefix_list_forces_visibly_unused_namespace_rendering() {
         xmlns:eb="http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/"
         xmlns:x="urn:partner:unused:prefix">
         <S12:Body>
-        <eb:Payload id="payload-1" role="sender">ABC</eb:Payload>
+        <eb:Payload Id="payload-1" role="sender">ABC</eb:Payload>
         </S12:Body>
     </S12:Envelope>"#;
 
@@ -271,14 +277,14 @@ fn processing_instruction_changes_digest_under_default_profile() {
     let without_pi = r#"<S12:Envelope xmlns:S12="http://www.w3.org/2003/05/soap-envelope"
         xmlns:eb="http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/">
         <S12:Body>
-        <eb:Payload id="payload-1">ABC</eb:Payload>
+        <eb:Payload Id="payload-1">ABC</eb:Payload>
         </S12:Body>
     </S12:Envelope>"#;
 
     let with_pi = r#"<S12:Envelope xmlns:S12="http://www.w3.org/2003/05/soap-envelope"
         xmlns:eb="http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/">
         <S12:Body>
-        <eb:Payload id="payload-1"><?partner keep-this?>ABC</eb:Payload>
+        <eb:Payload Id="payload-1"><?partner keep-this?>ABC</eb:Payload>
         </S12:Body>
     </S12:Envelope>"#;
 
@@ -304,26 +310,20 @@ fn processing_instruction_changes_digest_under_default_profile() {
 /// Whitespace between elements is part of the canonical octet stream.
 ///
 /// Neither Canonical XML 1.0 nor Exclusive C14N removes whitespace-only text
-/// nodes — they differ only in how namespace declarations are rendered. ASX
-/// used to strip them (`strip_blank_text: true` on the default profile), so it
-/// digested an octet stream no conformant implementation computes, and its own
-/// verifier agreed because it stripped too. The xmlsec1 oracle
-/// (`tests/interop_xmlsec_oracle.rs`) is what surfaced it.
-///
-/// The previous version of this test asserted the *opposite* — that the
-/// default profile "normalizes ignorable blank text differences" — and so
-/// locked the defect in.
+/// nodes — they differ only in how namespace declarations are rendered. A
+/// canonicalizer that strips them digests an octet stream no conformant
+/// implementation computes (cross-checked by `tests/interop_xmlsec_oracle.rs`).
 #[test]
 fn canonicalization_preserves_whitespace_between_elements() {
     let compact = r#"<S12:Envelope xmlns:S12="http://www.w3.org/2003/05/soap-envelope"
         xmlns:eb="http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/">
-        <S12:Body><eb:Payload id="payload-1"><eb:Chunk>A</eb:Chunk><eb:Chunk>B</eb:Chunk></eb:Payload></S12:Body>
+        <S12:Body><eb:Payload Id="payload-1"><eb:Chunk>A</eb:Chunk><eb:Chunk>B</eb:Chunk></eb:Payload></S12:Body>
     </S12:Envelope>"#;
 
     let expanded = r#"<S12:Envelope xmlns:S12="http://www.w3.org/2003/05/soap-envelope"
         xmlns:eb="http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/">
         <S12:Body>
-        <eb:Payload id="payload-1">
+        <eb:Payload Id="payload-1">
             <eb:Chunk>A</eb:Chunk>
             <eb:Chunk>B</eb:Chunk>
         </eb:Payload>
@@ -369,7 +369,7 @@ fn rejects_unsupported_transform_algorithm_in_reference_chain() {
             </ds:Signature>
         </S12:Header>
         <S12:Body>
-            <eb:Payload id="payload-1">ABC</eb:Payload>
+            <eb:Payload Id="payload-1">ABC</eb:Payload>
         </S12:Body>
     </S12:Envelope>"##;
 
@@ -401,7 +401,7 @@ fn rejects_unexpected_transform_child_elements_in_reference_chain() {
             </ds:Signature>
         </S12:Header>
         <S12:Body>
-            <eb:Payload id="payload-1">ABC</eb:Payload>
+            <eb:Payload Id="payload-1">ABC</eb:Payload>
         </S12:Body>
     </S12:Envelope>"##;
 
@@ -490,7 +490,7 @@ fn rejects_multiple_signature_elements_without_wsse_security_parent() {
             </ds:Signature>
         </S12:Header>
         <S12:Body>
-            <eb:Payload id="payload-1">ABC</eb:Payload>
+            <eb:Payload Id="payload-1">ABC</eb:Payload>
         </S12:Body>
     </S12:Envelope>"##;
 
@@ -592,7 +592,7 @@ fn rejects_semantically_duplicate_cid_reference_uris_during_parsing() {
 fn rejects_semantically_duplicate_cid_reference_uris_during_verification() {
     let xml = r##"<S12:Envelope xmlns:S12="http://www.w3.org/2003/05/soap-envelope"
             xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
-        <S12:Header>
+        <S12:Header><wsse:Security xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd">
             <ds:Signature>
                 <ds:SignedInfo>
                     <ds:Reference URI="cid:payload@example.com">
@@ -606,7 +606,7 @@ fn rejects_semantically_duplicate_cid_reference_uris_during_verification() {
                 </ds:SignedInfo>
                 <ds:SignatureValue>AQ==</ds:SignatureValue>
             </ds:Signature>
-        </S12:Header>
+        </wsse:Security></S12:Header>
         <S12:Body/>
     </S12:Envelope>"##;
 
@@ -679,7 +679,7 @@ fn rejects_percent_encoded_same_document_reference_uri_during_parsing() {
             </ds:Signature>
         </S12:Header>
         <S12:Body>
-            <eb:Payload id="payload-1">ABC</eb:Payload>
+            <eb:Payload Id="payload-1">ABC</eb:Payload>
         </S12:Body>
     </S12:Envelope>"##;
 
@@ -694,7 +694,7 @@ fn rejects_percent_encoded_same_document_reference_uri_during_canonicalization()
     let xml = r##"<S12:Envelope xmlns:S12="http://www.w3.org/2003/05/soap-envelope"
             xmlns:eb="http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/">
         <S12:Body>
-            <eb:Payload id="payload-1">ABC</eb:Payload>
+            <eb:Payload Id="payload-1">ABC</eb:Payload>
         </S12:Body>
     </S12:Envelope>"##;
 
@@ -724,7 +724,7 @@ fn rejects_same_document_reference_uri_with_fragment_whitespace_during_parsing()
             </ds:Signature>
         </S12:Header>
         <S12:Body>
-            <eb:Payload id="payload 1">ABC</eb:Payload>
+            <eb:Payload Id="payload 1">ABC</eb:Payload>
         </S12:Body>
     </S12:Envelope>"##;
 
@@ -751,7 +751,7 @@ fn rejects_same_document_reference_uri_with_nested_fragment_marker_during_parsin
             </ds:Signature>
         </S12:Header>
         <S12:Body>
-            <eb:Payload id="payload-1">ABC</eb:Payload>
+            <eb:Payload Id="payload-1">ABC</eb:Payload>
         </S12:Body>
     </S12:Envelope>"##;
 
@@ -765,7 +765,7 @@ fn rejects_same_document_reference_uri_with_fragment_whitespace_during_canonical
     let xml = r##"<S12:Envelope xmlns:S12="http://www.w3.org/2003/05/soap-envelope"
             xmlns:eb="http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/">
         <S12:Body>
-            <eb:Payload id="payload-1">ABC</eb:Payload>
+            <eb:Payload Id="payload-1">ABC</eb:Payload>
         </S12:Body>
     </S12:Envelope>"##;
 
@@ -795,7 +795,7 @@ fn rejects_same_document_reference_uri_with_non_ascii_fragment_during_parsing() 
             </ds:Signature>
         </S12:Header>
         <S12:Body>
-            <eb:Payload id="payload-1">ABC</eb:Payload>
+            <eb:Payload Id="payload-1">ABC</eb:Payload>
         </S12:Body>
     </S12:Envelope>"##;
 
@@ -809,7 +809,7 @@ fn rejects_same_document_reference_uri_with_non_ascii_fragment_during_canonicali
     let xml = r##"<S12:Envelope xmlns:S12="http://www.w3.org/2003/05/soap-envelope"
             xmlns:eb="http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/">
         <S12:Body>
-            <eb:Payload id="payload-1">ABC</eb:Payload>
+            <eb:Payload Id="payload-1">ABC</eb:Payload>
         </S12:Body>
     </S12:Envelope>"##;
 
@@ -837,7 +837,7 @@ fn rejects_same_document_reference_uri_with_empty_fragment_during_parsing() {
             </ds:Signature>
         </S12:Header>
         <S12:Body>
-            <eb:Payload id="payload-1">ABC</eb:Payload>
+            <eb:Payload Id="payload-1">ABC</eb:Payload>
         </S12:Body>
     </S12:Envelope>"##;
 
@@ -851,7 +851,7 @@ fn rejects_same_document_reference_uri_with_empty_fragment_during_canonicalizati
     let xml = r##"<S12:Envelope xmlns:S12="http://www.w3.org/2003/05/soap-envelope"
             xmlns:eb="http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/">
         <S12:Body>
-            <eb:Payload id="payload-1">ABC</eb:Payload>
+            <eb:Payload Id="payload-1">ABC</eb:Payload>
         </S12:Body>
     </S12:Envelope>"##;
 
@@ -878,7 +878,7 @@ fn rejects_same_document_reference_uri_with_invalid_fragment_character_during_pa
             </ds:Signature>
         </S12:Header>
         <S12:Body>
-            <eb:Payload id="payload-1">ABC</eb:Payload>
+            <eb:Payload Id="payload-1">ABC</eb:Payload>
         </S12:Body>
     </S12:Envelope>"##;
 
@@ -893,7 +893,7 @@ fn rejects_same_document_reference_uri_with_invalid_fragment_start_during_canoni
     let xml = r##"<S12:Envelope xmlns:S12="http://www.w3.org/2003/05/soap-envelope"
             xmlns:eb="http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/">
         <S12:Body>
-            <eb:Payload id="payload-1">ABC</eb:Payload>
+            <eb:Payload Id="payload-1">ABC</eb:Payload>
         </S12:Body>
     </S12:Envelope>"##;
 
@@ -971,7 +971,7 @@ fn rejects_same_document_reference_uri_with_namespace_like_fragment_during_parsi
             </ds:Signature>
         </S12:Header>
         <S12:Body>
-            <eb:Payload id="payload-1">ABC</eb:Payload>
+            <eb:Payload Id="payload-1">ABC</eb:Payload>
         </S12:Body>
     </S12:Envelope>"##;
 
@@ -986,7 +986,7 @@ fn rejects_same_document_reference_uri_with_namespace_like_fragment_during_canon
     let xml = r##"<S12:Envelope xmlns:S12="http://www.w3.org/2003/05/soap-envelope"
             xmlns:eb="http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/">
         <S12:Body>
-            <eb:Payload id="payload-1">ABC</eb:Payload>
+            <eb:Payload Id="payload-1">ABC</eb:Payload>
         </S12:Body>
     </S12:Envelope>"##;
 
@@ -1011,7 +1011,7 @@ fn special_xml_chars_in_text_content_are_escaped_in_canonical_form() {
     let xml = r#"<S12:Envelope xmlns:S12="http://www.w3.org/2003/05/soap-envelope"
             xmlns:eb="http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/">
         <S12:Body>
-            <eb:Payload id="payload-1">AT&amp;T &lt;Corp&gt; &amp; Partners</eb:Payload>
+            <eb:Payload Id="payload-1">AT&amp;T &lt;Corp&gt; &amp; Partners</eb:Payload>
         </S12:Body>
     </S12:Envelope>"#;
 
@@ -1036,7 +1036,7 @@ fn double_quote_in_attribute_value_is_escaped_in_canonical_form() {
     let xml = r#"<S12:Envelope xmlns:S12="http://www.w3.org/2003/05/soap-envelope"
             xmlns:eb="http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/">
         <S12:Body>
-            <eb:Payload id="payload-1" role="&quot;quoted&quot;">ABC</eb:Payload>
+            <eb:Payload Id="payload-1" role="&quot;quoted&quot;">ABC</eb:Payload>
         </S12:Body>
     </S12:Envelope>"#;
 
@@ -1061,7 +1061,7 @@ fn ancestor_utilized_namespace_declarations_propagate_into_canonical_form() {
             xmlns:ex="urn:example:ns"
             xmlns:eb="http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/">
         <S12:Body>
-            <eb:Payload id="payload-1">
+            <eb:Payload Id="payload-1">
                 <ex:Item>value</ex:Item>
             </eb:Payload>
         </S12:Body>
@@ -1085,7 +1085,7 @@ fn ancestor_unutilized_namespace_declarations_are_excluded_in_exclusive_canonica
             xmlns:unused="urn:not:used:here"
             xmlns:eb="http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/">
         <S12:Body>
-            <eb:Payload id="payload-1">ABC</eb:Payload>
+            <eb:Payload Id="payload-1">ABC</eb:Payload>
         </S12:Body>
     </S12:Envelope>"#;
 
@@ -1110,7 +1110,7 @@ fn default_namespace_undeclaration_is_excluded_when_not_needed() {
             xmlns:eb="http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/"
             xmlns="">
         <S12:Body>
-            <eb:Payload id="payload-1">ABC</eb:Payload>
+            <eb:Payload Id="payload-1">ABC</eb:Payload>
         </S12:Body>
     </S12:Envelope>"#;
 
@@ -1135,7 +1135,7 @@ fn namespace_declarations_precede_normal_attributes_in_canonical_form() {
     let xml = r#"<S12:Envelope xmlns:S12="http://www.w3.org/2003/05/soap-envelope"
             xmlns:eb="http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/">
         <S12:Body>
-            <eb:Payload id="payload-1" wsu:Id="p1"
+            <eb:Payload Id="payload-1" wsu:Id="p1"
                         xmlns:wsu="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd"
                         beta="b" alpha="a">ABC</eb:Payload>
         </S12:Body>
@@ -1150,7 +1150,7 @@ fn namespace_declarations_precede_normal_attributes_in_canonical_form() {
     let xmlns_wsu_pos = text.find("xmlns:wsu=").unwrap_or(usize::MAX);
     let alpha_pos = text.find(" alpha=").unwrap_or(usize::MAX);
     let beta_pos = text.find(" beta=").unwrap_or(usize::MAX);
-    let id_pos = text.find(" id=").unwrap_or(usize::MAX);
+    let id_pos = text.find(" Id=").unwrap_or(usize::MAX);
 
     // xmlns:S12 is visibly unused inside eb:Payload, so Exc-C14N must exclude it.
     assert!(
@@ -1173,10 +1173,10 @@ fn namespace_declarations_precede_normal_attributes_in_canonical_form() {
         xmlns_eb_pos < alpha_pos && xmlns_wsu_pos < alpha_pos,
         "namespace declarations must precede regular attributes in canonical form"
     );
-    // Regular attributes must be sorted: alpha < beta < id
-    // (Unicode code-point lexicographic order, §2.3).
+    // Regular attributes must be sorted: Id < alpha < beta
+    // (Unicode code-point lexicographic order, §2.3: 'I' is 0x49).
     assert!(
-        alpha_pos < beta_pos && beta_pos < id_pos,
+        id_pos < alpha_pos && alpha_pos < beta_pos,
         "regular attributes must be in Unicode code-point (lexicographic) order"
     );
     // Namespace declarations themselves must be sorted lexicographically:
@@ -1191,7 +1191,7 @@ fn namespace_declarations_precede_normal_attributes_in_canonical_form() {
 
 #[test]
 fn inclusive_c14n_renders_all_in_scope_namespace_declarations() {
-    use asx_rs::crypto::wssec::WsSecCanonicalizationKind;
+    use asx::__fuzz::wssec::WsSecCanonicalizationKind;
 
     // An element that uses only `eb:` but has `wsu:` in scope from an ancestor.
     // In Exclusive C14N, only `eb:` would be rendered.
@@ -1240,7 +1240,7 @@ fn inclusive_c14n_renders_all_in_scope_namespace_declarations() {
 
 #[test]
 fn inclusive_c14n_includes_non_utilized_ancestor_namespaces() {
-    use asx_rs::crypto::wssec::WsSecCanonicalizationKind;
+    use asx::__fuzz::wssec::WsSecCanonicalizationKind;
 
     // An element that only uses `eb:` but has `wsu:` declared on it from the
     // parent. In Inclusive C14N, wsu: MUST be rendered even if not used.
@@ -1275,7 +1275,7 @@ fn inclusive_c14n_includes_non_utilized_ancestor_namespaces() {
 
 #[test]
 fn inclusive_c14n_versus_exclusive_differ_on_non_utilized_namespaces() {
-    use asx_rs::crypto::wssec::WsSecCanonicalizationKind;
+    use asx::__fuzz::wssec::WsSecCanonicalizationKind;
 
     // Build a document where an element has extra namespaces in scope but
     // only utilizes one of them. Exclusive and Inclusive C14N must produce
@@ -1321,7 +1321,7 @@ fn inclusive_c14n_versus_exclusive_differ_on_non_utilized_namespaces() {
 
 #[test]
 fn parse_signature_references_accepts_inclusive_c14n_transform_uri() {
-    use asx_rs::crypto::wssec::WsSecCanonicalizationKind;
+    use asx::__fuzz::wssec::WsSecCanonicalizationKind;
 
     // A minimal ds:Signature with an Inclusive C14N Transform URI.
     let xml = r##"<root xmlns:ds="http://www.w3.org/2000/09/xmldsig#"
@@ -1353,7 +1353,7 @@ fn parse_signature_references_accepts_inclusive_c14n_transform_uri() {
 
 #[test]
 fn parse_signature_references_defaults_to_exclusive_c14n_kind() {
-    use asx_rs::crypto::wssec::WsSecCanonicalizationKind;
+    use asx::__fuzz::wssec::WsSecCanonicalizationKind;
 
     // A ds:Signature using the standard Exclusive C14N Transform URI.
     let xml = r##"<root xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
@@ -1379,7 +1379,7 @@ fn parse_signature_references_defaults_to_exclusive_c14n_kind() {
 
 #[test]
 fn inclusive_c14n_profile_helper_sets_correct_defaults() {
-    use asx_rs::crypto::wssec::WsSecCanonicalizationKind;
+    use asx::__fuzz::wssec::WsSecCanonicalizationKind;
 
     let profile = WsSecCanonicalizationProfile::inclusive();
     assert_eq!(profile.kind, WsSecCanonicalizationKind::Inclusive);
@@ -1388,7 +1388,7 @@ fn inclusive_c14n_profile_helper_sets_correct_defaults() {
 
 #[test]
 fn wssec_canonicalization_profile_algorithm_uri_is_correct() {
-    use asx_rs::crypto::wssec::WsSecCanonicalizationKind;
+    use asx::__fuzz::wssec::WsSecCanonicalizationKind;
 
     let exc = WsSecCanonicalizationProfile::default();
     assert_eq!(

@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<S12:Envelope xmlns:S12="http://www.w3.org/2003/05/soap-envelope" xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd" xmlns:wsu="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd"><S12:Header><wsse:Security><ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:SignedInfo><ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha256"/><ds:Reference URI="#body"><ds:Transforms><ds:Transform Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/></ds:Transforms><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue>XKaA+5p3jXwJGroQj9+Fidtpp6kcmoVKeMvg8UXGX1Y=</ds:DigestValue></ds:Reference></ds:SignedInfo><ds:SignatureValue>AOs4h3BDexTTuketuAtKQk4R9f0Mk3tFsBf47Vj0Zb+w3LK68i3ZCon04hDMqit/
+JjQG2neddDexMhuk/K6Amcb6ADtX9XycMbb0e9Awz2MUKK4ZnhXV97OmbZwE3zT1
++O6wtPgeP4IdKghju/sISZDCgPvhw7NYIPAgVXlt9qlFHFXp</ds:SignatureValue><ds:KeyInfo><ds:X509Data>
+<ds:X509Certificate>MIIB/DCCAV6gAwIBAgIURWTn4f4c/0qDvFh9dECTRiT1HbMwCgYIKoZIzj0EAwIw
+GTEXMBUGA1UEAwwOYXN4LWVjZHNhLXA1MjEwIBcNMjYxMDE2MTIxMTQ3WhgPMjEy
+NjA5MjIxMjExNDdaMBkxFzAVBgNVBAMMDmFzeC1lY2RzYS1wNTIxMIGbMBAGByqG
+SM49AgEGBSuBBAAjA4GGAAQAMjewA6jjUiJVCg+9EiLG0+CNgaKLRJqIl1ea95JN
+/dpBIaXpb8C2ddNkkMVFADiZ7IqCTJsf7W8yR8t4ksklGQYATCkWekUrdgFIKu/3
+dzqHnLmN6UMpJGdjJHmkDsCDwAmSBgHuKw0EC1zVPfLm2ncrfWvxLDrZW9Ay0/nC
+PTu1Y2CjPzA9MB0GA1UdDgQWBBRb/bGibIppkW87Hsd/r6auGJTVZjAMBgNVHRMB
+Af8EAjAAMA4GA1UdDwEB/wQEAwIHgDAKBggqhkjOPQQDAgOBiwAwgYcCQgDfGren
+3jlMLVkW9u0EMmHCSFF0SLqzbzfQNP9wLRe77D6dKDN0Oko17ByP1t4p8XjylMuB
+2n3kl0aiJmGVizXTIwJBf61x44L4PGwFqzdenSu2YMDADBTHvmkoDw61EWfjGO/K
+GrLGC8GpNpTWlhRGyzQA1yeCzSXVkZb/TRlm4D7rhUw=
+</ds:X509Certificate>
+</ds:X509Data></ds:KeyInfo></ds:Signature></wsse:Security></S12:Header><S12:Body wsu:Id="body"><m:Ping xmlns:m="urn:asx:test:ecdsa">BDEW ECDSA r||s witness</m:Ping></S12:Body></S12:Envelope>

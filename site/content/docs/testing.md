@@ -1,580 +1,132 @@
 +++
 title = "Testing"
-description = "Test scaffolding for embedders: fixtures, the interop matrix, mock endpoints, and the escape hatches gated behind the testing feature."
+description = "Testing an asx integration with asx-rs-testkit: test PKI, loopback partner, counting keys, store suites and trace capture."
 +++
 
-## Overview
-
-ASX has a multi-layer test strategy:
-
-| Layer | Location | Scope |
-|---|---|---|
-| Unit tests | `src/**` (`#[cfg(test)]`) | Individual functions, edge cases |
-| Integration tests | `tests/` | End-to-end protocol flows, concurrency |
-| Property tests | `tests/profile_property_invariants.rs` | Randomized profile stack invariants |
-| Interop matrix | `tests/fixtures/interop/` | Governed fixture corpus across strict/relaxed modes |
-| WS-Security vectors | `tests/wssec_c14n_vectors.rs`, `tests/wssec_strict_matrix.rs` | C14N golden vectors, strict signature/reference verification |
-| Session isolation | `tests/session_isolation_concurrency.rs` | Per-session policy isolation under concurrency |
-| Fuzz / adversarial | `artifacts/fuzz/` | Adversarial inputs to profile loader, policy resolver, wire parser |
-| Performance gate | `xtask/` | Regression detection against baseline ns/op values |
-
----
-
-## Running the Full Test Suite
-
-```bash
-cargo test --all-features
-```
-
-Runs all 913+ unit and integration tests across all test suites. Zero failures expected.
-
-Run specific feature combinations:
-```bash
-cargo test --features "as2,testing"
-cargo test --features "as4,testing,server"
-cargo test --features "as2,as4,testing,server"
-```
-
----
-
-## Integration Test Suites
-
-### AS2 flows
-
-```bash
-cargo test --all-features as2_send_golden
-cargo test --all-features as2_receive_mdn
-```
-
-### AS4 flows
-
-```bash
-cargo test --all-features as4_push_flow
-cargo test --all-features as4_pull_flow
-```
-
-Covers: SOAP envelope construction, WS-Security signing (RSA + ECDSA) and verification,
-AES-128-GCM encrypt/decrypt (RSA-OAEP **and** ECDH-ES + ConcatKDF + AES-128-KW), pull
-store enqueue/dequeue, Two-Way MEP correlation, Test Service detection.
-
----
-
-## Testing Helpers (`testing` feature)
-
-The `testing` feature enables a set of utilities that make it possible to write AS4
-integration tests **without** real X.509 PKI material (BDEW WIRK certificates, PEPPOL
-production PKI, etc.).
-
-> **Security:** The `testing` feature is blocked by `compile_error!` in release profile
-> builds. It must never appear in production binaries.
-
-### `InsecureBypassAs4Verifier`
-
-Skips all WS-Security checks on inbound AS4 push messages. Parity with
-`InsecureBypassTrustVerifier` on the AS2 side.
+`asx-rs-testkit` is built only on the public `asx` API and weakens no check:
+tests run the production security policy with throw-away keys. There is no
+test-only feature in `asx`.
 
 ```toml
 [dev-dependencies]
-asx-rs = { version = "0.15", features = ["as4", "testing"] }
+asx-rs-testkit = "0.16"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "test-util"] }
 ```
 
-```rust
-use asx_rs::as4::{
-    InsecureBypassAs4Verifier,
-    receive_push_with_custom_verifier,
-    As4ReceivePush, As4ReceivePushRequest,
-};
-use std::sync::Arc;
+Import it as `asx_testkit`.
 
-let outcome = receive_push_with_custom_verifier(
-    &session,
-    &bus,
-    As4ReceivePush { request, dedup, ordering: None },
-    InsecureBypassAs4Verifier,  // ← bypasses ALL WS-Security verification
-)
-.await?
-.into_inner();
+## A test PKI per profile
 
-// A first-seen outcome carries an unsettled dedup claim even in tests. Settle
-// it, or the next receive of the same message reports `InFlight` rather than
-// the `Duplicate` a replay test expects.
-let (output, claim) = outcome.unwrap_output();
-claim.accept().await?;
-```
+`asx_testkit::pki::TestCa` is a throw-away CA whose party constructors issue
+exactly what each profile's `build()` accepts:
 
-When active, a `tracing::warn!` is emitted so test logs are auditable and production
-log scraping can detect accidental non-test usage.
-
-### `MockAs4Endpoint`
-
-An in-process HTTP AS4 server that accepts any push message (signed or unsigned,
-encrypted or plain), records received messages in an async channel, and returns a
-synchronous AS4 receipt. Requires `testing + server` features.
-
-```toml
-[dev-dependencies]
-asx-rs = { version = "0.15", features = ["as4", "testing", "server"] }
-```
-
-```rust
-use asx_rs::as4::mock_endpoint::MockAs4Endpoint;
-use tokio::time::{timeout, Duration};
-
-// Simple case: bind to a random OS-assigned port — no PKI certificates needed.
-let endpoint = MockAs4Endpoint::bind("127.0.0.1:0").await.expect("bind");
-
-// Full sign+encrypt round-trip: configure a decryption key via builder.
-// The mock will decrypt ECDH-ES / RSA-OAEP inbound messages automatically.
-let endpoint = MockAs4Endpoint::builder()
-    .with_decryption_key_pem(my_ec_or_rsa_private_key_pem)
-    .bind("127.0.0.1:0")
-    .await
-    .expect("bind");
-
-// Full NRR round-trip: make the mock answer with a *signed* receipt whose
-// MessagePartNRInformation echoes the inbound signature's digests, so
-// `verify_sync_response` under `As4ReceiptPolicy::regulated()` has real
-// evidence to check.  Without this the mock replies with an unsigned receipt
-// carrying an empty <NonRepudiationInformation/>, which `regulated()` rejects.
-let endpoint = MockAs4Endpoint::builder()
-    .with_receipt_signing_material(receiver_cert_pem, receiver_key_pem)
-    .bind("127.0.0.1:0")
-    .await
-    .expect("bind");
-
-let url = endpoint.local_url(); // "http://127.0.0.1:PORT/as4/inbox"
-
-// Send an AS4 message to `url` using any AS4 client...
-
-// Wait for the first message (returns None if the endpoint is dropped).
-let msg = timeout(Duration::from_secs(5), endpoint.next_received())
-    .await
-    .expect("timed out")
-    .expect("endpoint closed");
-
-assert_eq!(msg.action, "urn:bdew:as4:service:UTILMD");
-assert_eq!(msg.from_party_ids, &["9900000000001"]);
-assert!(!msg.payload.is_empty());
-
-// Alias for ergonomics (matching feedback API):
-let msg = endpoint.next_message().await;
-
-// Drain all messages already received without waiting:
-let all = endpoint.drain_received().await;
-```
-
-`MockReceivedMessage` fields:
-- `action` — `<eb:Action>` value
-- `service` — `<eb:Service>` value, if present
-- `message_id` — `<eb:MessageId>`
-- `from_party_ids` — all `<eb:From/eb:PartyId>` values (contains the **sender** GLN)
-- `to_party_ids` — all `<eb:To/eb:PartyId>` values (contains the **receiver** GLN)
-- `conversation_id` — `<eb:ConversationId>`, if present
-- `ref_to_message_id` — `<eb:RefToMessageId>` (Two-Way MEP correlation)
-- `payload` — decrypted, de-SBDH-stripped business payload bytes
-
-Party ID population: for a typical BDEW send where the session `session_id` is the
-sender GLN and `partner_id` is the receiver GLN, `from_party_ids[0]` == sender GLN
-and `to_party_ids[0]` == receiver GLN, as written by `SoapEnvelopeBuilder`.
-
-### `EventBus::new_for_testing()`
-
-A zero-config `BestEffort` event bus that never fails on emit when no broadcast subscriber
-is active. Use this in integration tests that do not assert on protocol events.
-
-```rust
-use asx_rs::observability::EventBus;
-
-// Requires the `testing` feature. Equivalent to:
-// EventBus::builder().capacity(256).emission_mode(EventEmissionMode::BestEffort).build()
-let bus = EventBus::new_for_testing();
-```
-
-> **Production note:** `new_for_testing()` silently discards all protocol events and
-> audit records. For production use, `EventBus::new(capacity)` (strict transactional) or
-> `EventBus::new_regulated(capacity, audit_sink)` are the correct APIs.
-
-### `As4HttpTransport::new_for_localhost_testing()`
-
-An HTTP transport that bypasses SSRF validation and HTTPS-only enforcement, enabling
-integration tests to POST to `MockAs4Endpoint` at `http://127.0.0.1:…` using the same
-`As4HttpTransport` code path as production.
-
-```rust
-use asx_rs::transport::egress::As4HttpTransport;
-
-let transport = As4HttpTransport::new_for_localhost_testing()?;
-let outcome = transport.send_to_localhost(&endpoint.local_url(), &output).await?;
-assert!(outcome.is_success());
-```
-
-To cover receipt verification too, use the verifying counterpart. The sending
-session must pin the mock's receipt-signing certificate (via
-`cert_handle.fingerprint_sha256`, or
-`As4ReceiptPolicy::with_expected_signer_fingerprint`):
-
-```rust
-use asx_rs::as4::As4ReceiptPolicy;
-
-let outcome = transport
-    .send_and_verify_to_localhost(
-        &endpoint.local_url(), &session, &bus, &output,
-        &As4ReceiptPolicy::regulated(),
-    )
-    .await?;
-
-assert!(outcome.into_receipt()?.is_non_repudiation_evidence());
-```
-
-This keeps test coverage over `As4HttpTransport`'s `Content-Type` headers, receipt
-inspection, and connection pooling — none of which are exercised by a raw `reqwest::Client`.
-
-### Foreign-implementation oracles
-
-Testing against yourself proves agreement with yourself. These are `#[ignore]`d
-so `cargo test` stays hermetic, and run in the `interop-docker-oracles` CI job:
-
-| Oracle | What it witnesses |
+| Constructor | Issues |
 |---|---|
-| `interop_xmlsec_oracle` | C14N and digests, against the XMLDSig reference implementation |
-| `interop_openssl_smime_oracle` | AS2 S/MIME, both directions, against the `openssl` CLI |
-| `interop_holodeck_counterparty` | A signed AS4 push and NRR receipt, against Holodeck B2B |
-| `interop_peppol_smp_oracle` | A **real production Peppol SMP signature**, against the real Peppol PKI |
-| `interop_redis_storage_conformance` | `DedupStorage` against a real Redis, including a non-atomic one that must fail |
-| `interop_peppol_sml_discovery` | The participant name we compute, against the live production SML |
+| `TestCa::sm_pki().bdew_party(mp_id)` | separate BrainpoolP256r1 signing, encryption and TLS key pairs, each with the MP-ID as the subject's OU (BDEW 1.2 §2.3.4.4, RzÜ AS4 2.6 §5.2), party type `…:unregistered:BDEW` |
+| `ca.peppol_party(cn)` | one RSA AP certificate for signing and encryption, `cn` as the CN (the party id) |
+| `ca.rsa_party(name)` | separate RSA 2048 pairs (eDelivery, ENTSOG) |
+| `ca.as2_party(as2_id)` | one RSA 2048 pair for signing and decryption |
 
-```text
-cargo test --all-features --test interop_peppol_smp_oracle
-cargo test --all-features --test interop_redis_storage_conformance -- --ignored --nocapture
-```
+A `TestParty` gives `local()` (`LocalParty` with signer, decrypter and TLS
+identity), `partner(endpoint)` (`Partner` with pinned certificates) and
+`anchor()`. For revocation tests, `TestCa::issue_with` takes a validity window;
+`TestCa::crl` and `TestCa::ocsp` produce signed DER responses.
 
-The SMP oracle is not `#[ignore]`d: its fixture is captured, so it needs no
-network. Its signer certificate expires **2028-02-23**, and a test says so in
-those words when it does.
+## A loopback partner
 
-### `DedupConformance` and friends
-
-Before trusting a durable backend, run the conformance suite against it — it
-races concurrent claims and checks every settlement rule, and reports rather
-than panics:
+`asx_testkit::loopback::Loopback` is an `HttpClient` that hands a request for a
+mounted URL to that URL's `Inbound`, without socket or TLS. Clones share their
+routes:
 
 ```rust
-use asx_rs::storage::conformance::DedupConformance;
+use asx::{as4::{As4, Message, UserMessage}, MemoryDedup, Payload, Profile, Reject, Verified};
+use asx_testkit::{loopback::Loopback, pki::TestCa};
 
-#[tokio::test]
-async fn our_dedup_conforms() {
-    let report = DedupConformance::new(&MyFactory { pool }).run().await;
-    assert!(report.passed(), "{report}");
+async fn deliver(msg: Verified<UserMessage>) -> Result<(), Reject> {
+    assert_eq!(msg.payloads()[0].bytes().as_ref(), b"UNA:+.? '");
+    Ok(())
+}
+
+#[tokio::main]
+async fn main() -> asx::Result<()> {
+    let ca = TestCa::sm_pki();
+    let (a, b) = (ca.bdew_party("9900000000001"), ca.bdew_party("9900000000002"));
+    let (a_url, b_url) = ("https://a.example/as4", "https://b.example/as4");
+    let net = Loopback::new();
+
+    let receiver = As4::builder(Profile::bdew())
+        .local(b.local())
+        .trust_anchor(b.anchor())
+        .partner(a.partner(a_url))
+        .http_client(net.clone())
+        .build()?;
+    net.mount(b_url, receiver.inbound(MemoryDedup::default(), deliver));
+
+    let sender = As4::builder(Profile::bdew())
+        .local(a.local())
+        .trust_anchor(a.anchor())
+        .partner(b.partner(b_url))
+        .http_client(net.clone())
+        .build()?;
+    let receipt = sender
+        .send(Message::to(&b.partner(b_url))
+            .service("https://www.bdew.de/as4/communication/services/MP")
+            .payload(Payload::new(b"UNA:+.? '".to_vec(), "application/octet-stream")))
+        .await?;
+    assert_eq!(receipt.signer(), &b.signing.certificate());
+    assert_eq!(net.requests(), 1);
+    Ok(())
 }
 ```
 
-The factory returns a **fresh handle onto the same store**, which is how the
-suite distinguishes a durable backend from one that only says it is. See the
-[persistence guide](@/docs/persistence.md).
+`Loopback::intercept` rewrites responses before the sender sees them (e.g. a
+tampered receipt must be `Indeterminate`); `last_request` returns the request
+as sent.
 
-### `DurableInMemoryDedupBackend`
+## Testing your handler
 
-An in-memory `TtlDedupStorage` wrapper that advertises `is_durable() = true`, allowing
-it to pass the strict durable-backend guard that fires at production receive entry points.
+`Verified` has no public constructor, so test a handler through the loopback:
+mount your `inbound` and send from a second client, as above. Keep business
+logic in a function of plain values (`message_id`, `from`, payload bytes) and
+unit-test that directly. Payloads carry their media type: on AS4 the `eb:PartInfo`
+`MimeType`, on AS2 the Content-Type of the signed entity (of the inner MIME
+entity when compressed).
 
-```rust
-use asx_rs::storage::DurableInMemoryDedupBackend;
-use std::sync::Arc;
+## External keys
 
-let dedup: Arc<dyn asx_rs::storage::DedupStorage> = Arc::new(
-    DurableInMemoryDedupBackend::new(std::time::Duration::from_secs(3600)),
-);
-```
+`asx_testkit::keys::CountingKeys` wraps a test key pair behind `Signer` and
+`Decrypter`, counts private-key operations (`signs()`, `decrypts()`) and can
+simulate an outage (`fail()`).
 
-### Self-signed keypair generators
+## Conformance suites for your stores
 
-Generate minimal self-signed X.509 certificates for test use. Eliminates the need for
-downstream crates to add `openssl` or `rcgen` as dev-dependencies.
+- `asx_testkit::dedup::conformance` checks a `DedupStore`
+  ([persistence](@/docs/persistence.md#check-your-store-before-production)).
+- `asx_testkit::audit::conformance` checks an `AuditSink`
+  ([observability](@/docs/observability.md#check-your-sink-before-production)).
+- `asx_testkit::audit::MemoryAuditSink` is a durable in-memory sink whose clones
+  share one store; `records()` returns what was written.
 
-```rust
-use asx_rs::fixtures::{EcCurve, generate_self_signed_ec_keypair, generate_self_signed_rsa_keypair};
+## Asserting on telemetry
 
-// EC keypairs — for ECDSA signing and/or ECDH-ES encryption:
-let (cert_pem, key_pem) = generate_self_signed_ec_keypair("test-ap", EcCurve::BrainpoolP256r1);
-let (cert_pem, key_pem) = generate_self_signed_ec_keypair("peppol-ap", EcCurve::P256);
-let (cert_pem, key_pem) = generate_self_signed_ec_keypair("p384-ap",  EcCurve::P384);
-
-// RSA keypair — for RSA-SHA256 signing and/or RSA-OAEP encryption:
-let (cert_pem, key_pem) = generate_self_signed_rsa_keypair("rsa-ap", 2048);
-```
-
-Supported `EcCurve` variants:
-
-| Variant | OID | Profiles |
-|---|---|---|
-| `P256` | 1.2.840.10045.3.1.7 | PEPPOL, general AS4 |
-| `P384` | 1.3.132.0.34 | Higher-assurance |
-| `P521` | 1.3.132.0.35 | Higher-assurance |
-| `BrainpoolP256r1` | 1.3.36.3.3.2.8.1.1.7 | BDEW AS4-Profil / BSI TR-03116-3 |
-| `BrainpoolP384r1` | 1.3.36.3.3.2.8.1.1.11 | BSI |
-
-Generated certificates have:
-- `KeyUsage` (critical): `digitalSignature` + `keyAgreement` (EC) or `keyEncipherment` (RSA)
-- `BasicConstraints` (critical): `CA:FALSE`
-- Validity: 10 years
-- Self-signed with SHA-256
-
-### Custom `As4Verifier` implementations
-
-Under `testing`, the `As4Verifier` sealed trait becomes implementable by external crates
-via the `verifier_seal` re-export:
+`asx_testkit::trace::TraceCapture` collects spans and events while it is the
+default subscriber; names and fields are on the
+[observability page](@/docs/observability.md#spans):
 
 ```rust
-use asx_rs::as4::{As4Verifier, verifier_seal, types::As4PushPolicy};
-use asx_rs::core::{Result, SessionContext};
+use asx_testkit::trace::TraceCapture;
 
-struct RecordingVerifier {
-    calls: std::sync::atomic::AtomicUsize,
-}
-
-impl verifier_seal::Sealed for RecordingVerifier {}
-
-impl As4Verifier for RecordingVerifier {
-    fn verify_security(
-        &self,
-        _session: &SessionContext,
-        _policy: &As4PushPolicy,
-        _soap_xml: &str,
-        _soap_doc: &roxmltree::Document<'_>,
-        _message_id: &str,
-        _external_reference: Option<(&str, &[u8])>,
-    ) -> Result<()> {
-        self.calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        Ok(())
+fn capture_spans() {
+    let capture = TraceCapture::new();
+    let _guard = capture.set_default();
+    // ... run an exchange on a current-thread runtime ...
+    for span in capture.spans_named("asx.send") {
+        println!("{span:?}");
     }
 }
 ```
 
----
+## The crate's own evidence
 
-## Interop Fixture Repository
-
-
-The interop fixture corpus governs AS2 MIME and AS4 SOAP strict/relaxed flows with declared expected outcomes.
-
-### Fixture catalog
-
-Location: `tests/fixtures/interop/catalog.json`
-
-Schema (`schema_version: "1.0"`):
-
-```json
-{
-  "schema_version": "1.0",
-  "fixtures": [
-    {
-      "fixture_id": "as2-strict-001",
-      "protocol": "As2Mime",
-      "mode": "Strict",
-      "grouping": {
-        "partner_id": "partner-a",
-        "profile_name": "strict-edelivery",
-        "protocol_stage": "send"
-      },
-      "payload_path": "partner-a/strict/send/payload.mime",
-      "expected_outcome": "SuccessConfirmed",
-      "reason_annotations": ["RFC 4130 §6 compliant headers, signed"]
-    }
-  ]
-}
-```
-
-### Required coverage
-
-The catalog must contain at least one fixture for each combination:
-- `As2Mime/Strict`
-- `As2Mime/Relaxed`
-- `As4Soap/Strict`
-- `As4Soap/Relaxed`
-
-### Validate the repository
-
-```bash
-cargo run -p xtask -- fixture-repo-validate tests/fixtures/interop/catalog.json
-```
-
-Validation checks: schema version, non-empty fixture set, unique IDs, non-empty grouping metadata, non-empty reason annotations, payload file existence, protocol-specific file extension (`.mime` for AS2, `.xml` for AS4).
-
----
-
-## Interop Matrix Executor
-
-Runs all interop fixtures across policy/profile combinations and produces a machine-readable `MatrixSummary`:
-
-```bash
-cargo run -p xtask --all-features -- interop-matrix \
-  tests/fixtures/interop/catalog.json \
-  tests/fixtures/interop/quarantine.json \
-  3    # iteration count for flake detection
-# or:
-scripts/run_interop_matrix.sh
-```
-
-`MatrixSummary` output includes per-fixture pass/fail, observed error code, flakiness status, and quarantine owner.
-
-### Quarantine policy
-
-Flaky fixtures are allowed in CI only when listed in `tests/fixtures/interop/quarantine.json` with an owner assignment. Unquarantined flaky fixtures are blocking. The matrix runner exits non-zero when:
-- Any fixture fails
-- Any fixture is flaky without a quarantine entry
-
----
-
-## WS-Security Canonicalization Golden Vectors
-
-`tests/wssec_c14n_vectors.rs` validates the custom Exclusive C14N implementation against deterministic golden vectors:
-
-```bash
-cargo test --all-features wssec_c14n_vectors
-cargo test --all-features wssec_strict_matrix
-# Run as explicit gate:
-scripts/run_wssec_vector_gate.sh
-# or:
-cargo run -p xtask --all-features -- wssec-vector-gate
-```
-
-Covered scenarios:
-- Strict canonicalization against golden vector file
-- Signature reference verification for a signed fixture
-- Wrapped reference URI rejection under strict URI normalization rules
-- Whitespace-preserving digest mismatch rejection under strict canonicalization rules
-- Namespace propagation, attribute ordering, text/attribute escaping
-- PI node forwarding, comment stripping, comment preservation
-- InclusiveNamespaces PrefixList with ancestor binding rendering
-
-Vector mismatch output uses `canonical_vector_diff(expected, actual)` — deterministic line-based diffs with expected/actual markers for reproducible triage.
-
----
-
-## Session Isolation and Concurrency
-
-`tests/session_isolation_concurrency.rs` validates session-scoped policy isolation under concurrent execution:
-
-```bash
-cargo test --all-features session_isolation_concurrency
-```
-
-Covered:
-- Strict and relaxed session pairs executing concurrently without policy leakage
-- Session-scoped exception behavior remains isolated
-- Cross-session contamination attempts fail
-- Per-session event ordering validated for critical audit/signing sequences
-- AS2 concurrent strict-vs-relaxed MDN boundary-quirk flow
-- AS4 concurrent strict-vs-relaxed UserMessage parse flow
-
----
-
-## Property Tests
-
-`tests/profile_property_invariants.rs` uses randomized inputs to verify profile stack invariants:
-
-```bash
-cargo test --all-features profile_property_invariants
-```
-
-Covered invariants:
-- Deterministic resolution stability under randomized layer combinations (same input always produces same output)
-- Monotonic precedence for partner overlays (last applicable partner layer wins)
-- Fail-fast validation for malformed/conflicting policy combinations
-
----
-
-## Fuzz and Adversarial Testing
-
-The adversarial fuzz gate runs seeded adversarial cases over three targets:
-
-1. **Profile loader** — `RegionalProfilePack::from_json` + regional pack application
-2. **Policy resolver** — `ProfileStack::validate` + `resolve` determinism
-3. **Wire parsing** — `WireEnvelope::from_http_request_with_limits`, stream bounded reads, transfer fingerprinting
-
-```bash
-scripts/run_fuzz_gate.sh 4000 2500 artifacts/fuzz
-# or:
-cargo run -p xtask --all-features -- fuzz-gate 4000 2500 artifacts/fuzz
-```
-
-Arguments: `[iterations] [budget_ms] [output_dir]`
-
-Fail conditions:
-- Any panic
-- Determinism violation (different output for same input)
-- Missing remediation hints or empty error messaging
-- Stream/accounting mismatch
-
-**Reproducer handling**: On failure, the gate minimizes the input payload by deterministic truncation and stores a reproducer in `artifacts/fuzz/reproducers/` as JSON with base64 bytes. CI uploads `artifacts/fuzz/` as a triage artifact.
-
----
-
-## Performance Gate
-
-The authoritative baseline is [`benches/perf-baseline.txt`](https://github.com/hupe1980/asx-rs/blob/main/benches/perf-baseline.txt),
-measured on the CI Linux runner in release. It is not restated here: two copies
-of the same numbers drift, and the file is the one the gate reads.
-
-Only benchmarks the gate's feature set compiles may appear in it — an entry with
-no matching measurement is a gate failure, not a skip. The receive-path
-benchmarks sit behind `testing`, which is a `compile_error!` in release, so they
-run under a debug `just perf-gate` and are not baselined.
-
-CI enforces a **25 % maximum regression**. The values are environment-relative;
-they are not hardware claims.
-
-Run the performance gate:
-
-```bash
-just perf-gate
-```
-
-The feature list is explicit rather than `--all-features`, because the crate
-refuses to compile a `--release` build with `testing` — so
-`cargo run --release -p xtask --all-features` does not build:
-
-```bash
-FEATURES="as2,as4,client,server,trace,compression,async-ocsp,interop-strict"
-
-# Check against the baseline (fails on a >25% regression):
-cargo run --release -p xtask --no-default-features --features "$FEATURES" -- \
-  perf-gate --iterations 2000 --check-baseline benches/perf-baseline.txt --max-regression 0.25
-
-# Record a new one:
-cargo run --release -p xtask --no-default-features --features "$FEATURES" -- \
-  perf-gate --iterations 2000 --write-baseline benches/perf-baseline.txt
-```
-
----
-
-## Transport Server Tests (No Network)
-
-Server handler tests use `tower::ServiceExt::oneshot` — no listening socket required:
-
-```toml
-[dev-dependencies]
-tower = { version = "0.5", features = ["util"] }
-```
-
-```rust
-use tower::ServiceExt;
-
-let response = as2_router(Arc::new(handler), "/as2/receive")
-    .oneshot(request)
-    .await
-    .unwrap();
-assert_eq!(response.status(), 200);
-```
-
-12 server integration tests ship with the crate and run as part of `cargo test --all-features`.
-
----
-
-## Testing Feature Flag
-
-```toml
-asx-rs = { version = "0.15", features = ["testing"] }
-```
-
-The `testing` feature exposes `asx_rs::fixtures` and `asx_rs::matrix` — test scaffold modules with `InteropFixtureMetadata`, `FixtureCatalog`, `MatrixSummary`, and related helpers. These are not part of the production library surface and are absent from builds without this feature.
+How this crate itself is tested against foreign implementations is on the
+[conformance page](@/docs/conformance.md).

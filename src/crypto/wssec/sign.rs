@@ -1,18 +1,52 @@
+//! XMLDSig signature generation: *prepare* → one key-seam call → *finish*.
+//!
+//! Every signature the crate produces runs through the same three steps:
+//!
+//! 1. [`prepare_signed_info`] — pure: digests every reference with the one
+//!    reference digest, writes `ds:SignedInfo` with [`XmlOut`] and
+//!    canonicalizes it (the bytes that are signed are the canonical form of
+//!    the bytes that are emitted, so the two cannot diverge);
+//! 2. [`SigningKeyProvider::sign`] — the only private-key operation: RSA
+//!    PKCS #1 v1.5 octets, ECDSA as ASN.1 DER;
+//! 3. [`finish_signature`] — pure: converts the raw value to its wire form
+//!    (ECDSA `r ‖ s`, XMLDSig 1.1 §6.4.3) and writes `ds:Signature` /
+//!    `ds:KeyInfo`.
+//!
+//! The split lets an asynchronous signer (`Signer::sign(alg, data)`) be
+//! awaited between *prepare* and *finish*.
+
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
-use super::canonicalize::canonicalize_reference;
-use super::{DS_NS, SHA256_URI, SWA_ATTACHMENT_CONTENT_TRANSFORM_URI, XML_EXC_C14N_URI};
+use super::canonicalize::{
+    canonicalize_reference_digest_from_same_document_target_id_with_inclusive_ns,
+    normalize_same_document_uri, try_serialize_node,
+};
 use super::{
-    WsSecCanonicalizationProfile, WsSecCanonicalizedReference, WsSecOutboundKeyInfoProfile,
+    WsSecCanonicalizationKind, WsSecCanonicalizationProfile, WsSecDigestMethod,
+    WsSecOutboundKeyInfoProfile,
 };
 use crate::core::{AsxError, ErrorCode, ErrorContext, Result};
+use crate::crypto::alg::{KeyFamily, TransformAlg};
 use crate::crypto::signing::{PemSigningKeyProvider, SignatureAlgorithm, SigningKeyProvider};
+use crate::xml::{self, XmlFragment, XmlLimits, XmlOut, ns};
+
+const STAGE: &str = "wssec_generate_signature";
+
+/// The digest of every `ds:Reference` — same-document and `cid:` alike —
+/// whatever the signature method's hash (eDelivery AS4 1.15 §3.2.6,
+/// BDEW AS4-Profil 1.2 §2.2.6.2.1). One value feeds the computation and the
+/// declaration, so they cannot disagree.
+pub(crate) const REFERENCE_DIGEST: WsSecDigestMethod = WsSecDigestMethod::Sha256;
 
 /// Generate an XML Signature `<ds:Signature>` element for the given
-/// same-document `reference_uris` within `envelope_xml`, using the key
-/// provider's preferred algorithm with Exclusive C14N.
+/// same-document `reference_uris` within `envelope_xml`, using the key's
+/// default algorithm (`rsa-sha256` or `ecdsa-sha256`) with Exclusive C14N.
+///
+/// Every `ds:Reference` is digested with, and declares, SHA-256. An ECDSA
+/// `ds:SignatureValue` is emitted as XMLDSig 1.1 `r ‖ s` (64 octets on
+/// P-256 and brainpoolP256r1, 96 on P-384, 132 on P-521).
 ///
 /// # Cancel Safety
 ///
@@ -30,13 +64,7 @@ pub fn generate_xmlsig_signature(
     signing_cert_pem: &[u8],
     key_info_profile: WsSecOutboundKeyInfoProfile,
 ) -> Result<String> {
-    if reference_uris.is_empty() {
-        return Err(AsxError::new(
-            ErrorCode::InvalidInput,
-            "XMLDSig signature must contain at least one ds:Reference",
-            ErrorContext::new("wssec_generate_signature"),
-        ));
-    }
+    require_references(reference_uris)?;
     let provider = PemSigningKeyProvider::from_pem(signing_key_pem, signing_cert_pem)?;
     generate_xmlsig_signature_with_provider(
         envelope_xml,
@@ -47,7 +75,9 @@ pub fn generate_xmlsig_signature(
     )
 }
 
-/// Generate XMLDSig with optional external reference bodies, e.g. MIME `cid:` attachments.
+/// Generate XMLDSig with external reference bodies, e.g. MIME `cid:`
+/// attachments (`(uri, digest input)` pairs). Encoding and digests as for
+/// [`generate_xmlsig_signature`].
 pub fn generate_xmlsig_signature_with_external_references(
     envelope_xml: &str,
     reference_uris: &[&str],
@@ -66,12 +96,8 @@ pub fn generate_xmlsig_signature_with_external_references(
     )
 }
 
-/// Generate XMLDSig with optional external reference bodies using a pre-parsed
-/// key/certificate pair to avoid repeated PEM parsing on hot paths.
-///
-/// Prefer `generate_xmlsig_signature_with_provider` for new code; this
-/// overload exists for callers that already hold an `openssl::pkey::PKey` and
-/// `openssl::x509::X509` object (e.g., caches populated by `prepare_for_policy`).
+/// [`generate_xmlsig_signature_with_external_references`] for a key and
+/// certificate that are already parsed (no PEM parsing on hot paths).
 pub fn generate_xmlsig_signature_with_external_references_preparsed(
     envelope_xml: &str,
     reference_uris: &[&str],
@@ -80,88 +106,18 @@ pub fn generate_xmlsig_signature_with_external_references_preparsed(
     signing_cert: &openssl::x509::X509Ref,
     key_info_profile: WsSecOutboundKeyInfoProfile,
 ) -> Result<String> {
-    // Determine algorithm from key type, defaulting to SHA-256 for both RSA/EC.
-    let algorithm = match signing_key.id() {
-        openssl::pkey::Id::RSA | openssl::pkey::Id::RSA_PSS => SignatureAlgorithm::RsaSha256,
-        openssl::pkey::Id::EC => SignatureAlgorithm::EcdsaSha256,
-        other => {
-            return Err(AsxError::new(
-                ErrorCode::SecurityVerificationFailed,
-                format!(
-                    "XMLDSig signing key type {:?} is not supported; \
-                     use an RSA or any ECDSA-capable EC key (P-256, P-384, P-521, BrainpoolP256r1, etc.)",
-                    other
-                ),
-                ErrorContext::new("wssec_generate_signature"),
-            ));
-        }
-    };
-    generate_xmlsig_signature_core(
+    let provider =
+        PemSigningKeyProvider::from_parts(signing_key.to_owned(), signing_cert.to_owned())?;
+    generate_xmlsig_signature_with_provider(
         envelope_xml,
         reference_uris,
         external_references,
-        |data| {
-            use openssl::sign::Signer;
-            let mut signer =
-                Signer::new(algorithm.message_digest(), signing_key).map_err(|_err| {
-                    AsxError::new(
-                        ErrorCode::SecurityVerificationFailed,
-                        "failed to initialize XMLDSig signer",
-                        ErrorContext::new("wssec_generate_signature"),
-                    )
-                })?;
-            signer.update(data).map_err(|_err| {
-                AsxError::new(
-                    ErrorCode::SecurityVerificationFailed,
-                    "failed to feed SignedInfo bytes to signer",
-                    ErrorContext::new("wssec_generate_signature"),
-                )
-            })?;
-            signer.sign_to_vec().map_err(|_err| {
-                AsxError::new(
-                    ErrorCode::SecurityVerificationFailed,
-                    "XMLDSig signing operation failed",
-                    ErrorContext::new("wssec_generate_signature"),
-                )
-            })
-        },
-        || {
-            signing_cert.to_der().map_err(|_err| {
-                AsxError::new(
-                    ErrorCode::SecurityVerificationFailed,
-                    "failed to DER-encode XMLDSig signing certificate",
-                    ErrorContext::new("wssec_generate_signature"),
-                )
-            })
-        },
-        XmlSigKeyParams {
-            algorithm,
-            // Provide RSA key value components for RSA-SHA256 interop.
-            rsa_key_value: if matches!(
-                algorithm,
-                SignatureAlgorithm::RsaSha256
-                    | SignatureAlgorithm::RsaSha384
-                    | SignatureAlgorithm::RsaSha512
-            ) {
-                signing_key.rsa().ok().map(|rsa| {
-                    (
-                        BASE64_STANDARD.encode(rsa.n().to_vec()),
-                        BASE64_STANDARD.encode(rsa.e().to_vec()),
-                    )
-                })
-            } else {
-                None
-            },
-            key_info_profile,
-        },
+        &provider,
+        key_info_profile,
     )
 }
 
-/// Generate XMLDSig using a [`SigningKeyProvider`] for HSM/cloud-KMS integration.
-///
-/// This is the recommended API for new code. Pass a [`PemSigningKeyProvider`]
-/// for in-memory keys, or any custom type implementing [`SigningKeyProvider`]
-/// for HSM / cloud KMS backends.
+/// Generate XMLDSig through a [`SigningKeyProvider`] (HSM / cloud KMS).
 pub(crate) fn generate_xmlsig_signature_with_provider(
     envelope_xml: &str,
     reference_uris: &[&str],
@@ -169,382 +125,371 @@ pub(crate) fn generate_xmlsig_signature_with_provider(
     provider: &dyn SigningKeyProvider,
     key_info_profile: WsSecOutboundKeyInfoProfile,
 ) -> Result<String> {
-    // Validate inputs before any crypto operations.
-    if reference_uris.is_empty() {
-        return Err(AsxError::new(
-            ErrorCode::InvalidInput,
-            "XMLDSig signature must contain at least one ds:Reference",
-            ErrorContext::new("wssec_generate_signature"),
-        ));
-    }
     let algorithm = provider.preferred_algorithm();
-    let cert_der = provider.certificate_der()?;
-
-    // Extract RSA modulus/exponent from the DER-encoded certificate for
-    // `ds:RSAKeyValue` interop (some partners require it alongside X509Data).
-    let rsa_key_value = if matches!(
-        algorithm,
-        SignatureAlgorithm::RsaSha256
-            | SignatureAlgorithm::RsaSha384
-            | SignatureAlgorithm::RsaSha512
-    ) {
-        openssl::x509::X509::from_der(&cert_der)
-            .ok()
-            .and_then(|cert| cert.public_key().ok())
-            .and_then(|pk| pk.rsa().ok())
-            .map(|rsa| {
-                (
-                    BASE64_STANDARD.encode(rsa.n().to_vec()),
-                    BASE64_STANDARD.encode(rsa.e().to_vec()),
-                )
-            })
-    } else {
-        None
-    };
-
-    generate_xmlsig_signature_core(
-        envelope_xml,
-        reference_uris,
-        external_references,
-        |data| provider.sign(data, algorithm),
-        || Ok(cert_der.clone()),
-        XmlSigKeyParams {
-            algorithm,
-            rsa_key_value,
-            key_info_profile,
-        },
-    )
+    let span = tracing::debug_span!(
+        target: "asx",
+        "asx.sign",
+        algorithm = algorithm.algorithm_uri(),
+        reference_count = reference_uris.len() + external_references.len(),
+    );
+    span.in_scope(|| {
+        require_references(reference_uris)?;
+        let doc = xml::parse(envelope_xml, XmlLimits::ENVELOPE, STAGE)?;
+        let prepared = prepare_signed_info(&doc, reference_uris, external_references, algorithm)?;
+        let raw_signature = provider.sign(&prepared.canonical_signed_info, algorithm)?;
+        let cert_der = provider.certificate_der()?;
+        finish_signature(prepared, raw_signature, &cert_der, key_info_profile)
+            .map(XmlFragment::into_string)
+    })
 }
 
-/// Core XMLDSig generation with pluggable sign / cert-der callbacks.
-///
-/// All public variants funnel through here so the formatting logic is written
-/// exactly once.
-///
-/// `key_params` bundles the non-closure key metadata (algorithm, RSA key value
-/// components, and KeyInfo profile) so the argument count stays below the
-/// `too_many_arguments` threshold while preserving the HRTB flexibility needed
-/// for closure `sign_fn` and `cert_der_fn`.
-struct XmlSigKeyParams {
-    algorithm: SignatureAlgorithm,
-    rsa_key_value: Option<(String, String)>,
-    key_info_profile: WsSecOutboundKeyInfoProfile,
-}
-
-fn generate_xmlsig_signature_core(
+/// Parse the envelope as it will be sent and prepare its `SignedInfo` under
+/// an `asx.sign` span: the pure first half of the signing split.
+pub(crate) fn prepare_envelope_signature(
     envelope_xml: &str,
     reference_uris: &[&str],
     external_references: &[(&str, &[u8])],
-    sign_fn: impl Fn(&[u8]) -> Result<Vec<u8>>,
-    cert_der_fn: impl Fn() -> Result<Vec<u8>>,
-    key_params: XmlSigKeyParams,
-) -> Result<String> {
-    let XmlSigKeyParams {
-        algorithm,
-        rsa_key_value,
-        key_info_profile,
-    } = key_params;
+    algorithm: SignatureAlgorithm,
+) -> Result<PreparedSignature> {
+    let span = tracing::debug_span!(
+        target: "asx",
+        "asx.sign",
+        algorithm = algorithm.algorithm_uri(),
+        reference_count = reference_uris.len() + external_references.len(),
+    );
+    span.in_scope(|| {
+        require_references(reference_uris)?;
+        let doc = xml::parse(envelope_xml, XmlLimits::ENVELOPE, STAGE)?;
+        prepare_signed_info(&doc, reference_uris, external_references, algorithm)
+    })
+}
+
+fn require_references(reference_uris: &[&str]) -> Result<()> {
     if reference_uris.is_empty() {
         return Err(AsxError::new(
             ErrorCode::InvalidInput,
             "XMLDSig signature must contain at least one ds:Reference",
-            ErrorContext::new("wssec_generate_signature"),
+            ErrorContext::new(STAGE),
         ));
     }
+    Ok(())
+}
 
-    let external_map: HashMap<&str, &[u8]> = external_references.iter().copied().collect();
+/// One prepared `ds:Reference`.
+#[derive(Debug)]
+pub(crate) struct PreparedReference {
+    pub(crate) uri: String,
+    pub(crate) transform: TransformAlg,
+    pub(crate) digest: Vec<u8>,
+}
+
+/// Output of [`prepare_signed_info`]: everything but the signature value.
+#[derive(Debug)]
+pub(crate) struct PreparedSignature {
+    pub(crate) algorithm: SignatureAlgorithm,
+    /// `ds:SignedInfo` as it is emitted.
+    pub(crate) signed_info: XmlFragment,
+    /// Its Exclusive C14N: the bytes the key seam signs.
+    pub(crate) canonical_signed_info: Vec<u8>,
+}
+
+/// Digest every reference of `doc` (the envelope as it will be sent, parsed
+/// with the envelope limits) and of `external` (`cid:` digest inputs), and
+/// write the canonical `ds:SignedInfo`. Pure: no key is used.
+pub(crate) fn prepare_signed_info(
+    doc: &roxmltree::Document<'_>,
+    reference_uris: &[&str],
+    external: &[(&str, &[u8])],
+    algorithm: SignatureAlgorithm,
+) -> Result<PreparedSignature> {
+    require_references(reference_uris)?;
+    let ref_digest = REFERENCE_DIGEST;
+    let external: HashMap<&str, &[u8]> = external.iter().copied().collect();
+    let profile = WsSecCanonicalizationProfile::default();
 
     let mut references = Vec::with_capacity(reference_uris.len());
-    for reference_uri in reference_uris {
-        let reference = if reference_uri.starts_with("cid:") {
-            let payload = external_map.get(reference_uri).copied().ok_or_else(|| {
+    for &uri in reference_uris {
+        let (transform, digest) = if uri.starts_with("cid:") {
+            let payload = external.get(uri).copied().ok_or_else(|| {
                 AsxError::new(
                     ErrorCode::InvalidInput,
                     format!(
-                        "missing external reference bytes for URI {reference_uri}; \
+                        "missing external reference bytes for URI {uri}; \
                          include it in external_references"
                     ),
-                    ErrorContext::new("wssec_generate_signature")
-                        .with_message_id((*reference_uri).to_string()),
+                    ErrorContext::new(STAGE).with_message_id(uri.to_string()),
                 )
             })?;
-            let digest =
-                openssl::hash::hash(algorithm.message_digest(), payload).map_err(|_err| {
+            let digest = openssl::hash::hash(ref_digest.message_digest(), payload)
+                .map_err(|_err| {
                     AsxError::new(
                         ErrorCode::SecurityVerificationFailed,
                         "failed to digest external reference payload",
-                        ErrorContext::new("wssec_generate_signature")
-                            .with_message_id((*reference_uri).to_string()),
+                        ErrorContext::new(STAGE).with_message_id(uri.to_string()),
                     )
-                })?;
-            WsSecCanonicalizedReference {
-                uri: (*reference_uri).to_string(),
-                canonical_bytes: Vec::new(),
-                digest_value_base64: BASE64_STANDARD.encode(digest),
-            }
+                })?
+                .to_vec();
+            (TransformAlg::AttachmentContent, digest)
         } else {
-            canonicalize_reference(
-                envelope_xml,
-                reference_uri,
-                WsSecCanonicalizationProfile::default(),
-            )?
+            let target_id = normalize_same_document_uri(uri)?;
+            let digest =
+                canonicalize_reference_digest_from_same_document_target_id_with_inclusive_ns(
+                    doc, uri, target_id, &profile, None, ref_digest,
+                )?;
+            (
+                TransformAlg::C14n(WsSecCanonicalizationKind::Exclusive),
+                digest,
+            )
         };
-        references.push(reference);
+        references.push(PreparedReference {
+            uri: uri.to_string(),
+            transform,
+            digest,
+        });
     }
 
-    let sig_algo_uri = algorithm.algorithm_uri();
-    let signed_info_xml = build_signed_info_xml(&references, sig_algo_uri, XML_EXC_C14N_URI);
-    let signed_info_c14n = canonicalize_signed_info_xml(&signed_info_xml)?;
+    let signed_info = write_signed_info(algorithm, ref_digest, &references)?;
+    let canonical_signed_info = canonicalize_signed_info(&signed_info)?;
+    Ok(PreparedSignature {
+        algorithm,
+        signed_info,
+        canonical_signed_info,
+    })
+}
 
-    let signature_value = sign_fn(&signed_info_c14n)?;
-    let signature_value_b64 = BASE64_STANDARD.encode(signature_value);
+/// `ds:SignedInfo` in Canonical XML element form.
+///
+/// XMLDSig §4.3.3.2: a same-document `#id` reference dereferences to a
+/// node-set that, absent a transform, is serialized with *inclusive* C14N; we
+/// digest with exclusive C14N, so the transform is declared. A `cid:`
+/// reference dereferences to an octet stream and declares the WSS SwA
+/// `Attachment-Content-Signature-Transform`, which the AS4 profile mandates and
+/// WSS4J-based receivers require. Schema order inside `ds:Reference` is
+/// `Transforms?, DigestMethod, DigestValue`.
+fn write_signed_info(
+    algorithm: SignatureAlgorithm,
+    ref_digest: WsSecDigestMethod,
+    references: &[PreparedReference],
+) -> Result<XmlFragment> {
+    let mut out = XmlOut::canonical();
+    out.start("ds:SignedInfo")?.ns("ds", ns::DS)?;
+    out.start("ds:CanonicalizationMethod")?
+        .attr(
+            "Algorithm",
+            WsSecCanonicalizationKind::Exclusive.uri(),
+            "ds:CanonicalizationMethod/@Algorithm",
+        )?
+        .end()?;
+    out.start("ds:SignatureMethod")?
+        .attr(
+            "Algorithm",
+            algorithm.algorithm_uri(),
+            "ds:SignatureMethod/@Algorithm",
+        )?
+        .end()?;
+    for reference in references {
+        out.start("ds:Reference")?
+            .attr("URI", &reference.uri, "ds:Reference/@URI")?;
+        out.start("ds:Transforms")?
+            .start("ds:Transform")?
+            .attr(
+                "Algorithm",
+                reference.transform.uri(),
+                "ds:Transform/@Algorithm",
+            )?
+            .end()?
+            .end()?;
+        out.start("ds:DigestMethod")?
+            .attr(
+                "Algorithm",
+                ref_digest.algorithm_uri(),
+                "ds:DigestMethod/@Algorithm",
+            )?
+            .end()?;
+        out.leaf(
+            "ds:DigestValue",
+            &BASE64_STANDARD.encode(&reference.digest),
+            "ds:DigestValue",
+        )?;
+        out.end()?;
+    }
+    out.end()?;
+    out.finish()?.into_fragment()
+}
 
-    let cert_der = cert_der_fn()?;
-    let cert_der_b64 = BASE64_STANDARD.encode(cert_der);
+/// Exclusive C14N of the written `ds:SignedInfo`: the signed bytes.
+fn canonicalize_signed_info(signed_info: &XmlFragment) -> Result<Vec<u8>> {
+    let doc = xml::parse(signed_info.as_str(), XmlLimits::ENVELOPE, STAGE)?;
+    let mut canonical = String::with_capacity(signed_info.as_str().len());
+    try_serialize_node(
+        doc.root_element(),
+        &mut canonical,
+        &WsSecCanonicalizationProfile::default(),
+        &BTreeMap::new(),
+    )
+    .map_err(|_err| {
+        AsxError::new(
+            ErrorCode::SecurityVerificationFailed,
+            "failed to canonicalize ds:SignedInfo",
+            ErrorContext::new(STAGE),
+        )
+    })?;
+    Ok(canonical.into_bytes())
+}
 
-    let key_info_xml = match key_info_profile {
+/// Assemble `ds:Signature` from a prepared `SignedInfo`, the key seam's raw
+/// signature and the signer certificate. Pure: no key is used.
+pub(crate) fn finish_signature(
+    prepared: PreparedSignature,
+    raw_signature: Vec<u8>,
+    signer_cert_der: &[u8],
+    key_info: WsSecOutboundKeyInfoProfile,
+) -> Result<XmlFragment> {
+    let signer_cert = openssl::x509::X509::from_der(signer_cert_der).map_err(|err| {
+        AsxError::new(
+            ErrorCode::SecurityVerificationFailed,
+            format!("the signing certificate is not DER X.509: {err}"),
+            ErrorContext::new(STAGE),
+        )
+    })?;
+    // ECDSA: the seam returns DER; the wire carries `r ‖ s`.
+    let signature_value = prepared.algorithm.to_wire(raw_signature, &signer_cert)?;
+    let cert_b64 = BASE64_STANDARD.encode(signer_cert_der);
+
+    let mut out = XmlOut::new();
+    out.start("ds:Signature")?.ns("ds", ns::DS)?;
+    out.fragment(&prepared.signed_info)?;
+    out.leaf(
+        "ds:SignatureValue",
+        &BASE64_STANDARD.encode(&signature_value),
+        "ds:SignatureValue",
+    )?;
+    out.start("ds:KeyInfo")?;
+    match key_info {
+        // WSS 1.1.1 §7.7: KeyInfo in a WS-Security header carries a
+        // SecurityTokenReference to the `wsse:BinarySecurityToken` that
+        // `WsSecurityHeaderBuilder` emits; WSS4J-based receivers reject a bare
+        // ds:X509Data with UNSUPPORTED_SECURITY_TOKEN.
         WsSecOutboundKeyInfoProfile::BinarySecurityTokenX509v3 => {
-            // SecurityTokenReference pointing to the wsse:BinarySecurityToken
-            // with wsu:Id="X509Token" that WsSecurityHeaderBuilder emits when
-            // built with `with_signing_cert`. WSS 1.1.1 §7.7 requires KeyInfo
-            // in a WS-Security header to carry an STR — WSS4J-based receivers
-            // reject a bare ds:X509Data with UNSUPPORTED_SECURITY_TOKEN.
-            const WSSE_NS_URI: &str =
-                "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd";
-            const X509V3_VALUE_TYPE: &str = "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-x509-token-profile-1.0#X509v3";
-            format!(
-                "<ds:KeyInfo><wsse:SecurityTokenReference xmlns:wsse=\"{WSSE_NS_URI}\">\
-                 <wsse:Reference URI=\"#X509Token\" ValueType=\"{X509V3_VALUE_TYPE}\"/>\
-                 </wsse:SecurityTokenReference></ds:KeyInfo>"
-            )
+            write_token_reference(&mut out, "#X509Token", ns::WSSE_X509V3_VALUE_TYPE)?;
+        }
+        WsSecOutboundKeyInfoProfile::X509PKIPathv1 => {
+            write_token_reference(
+                &mut out,
+                "#X509PKIPathToken",
+                ns::WSSE_X509_PKIPATH_VALUE_TYPE,
+            )?;
         }
         WsSecOutboundKeyInfoProfile::X509DataAndRsaKeyValue => {
-            if let Some((modulus_b64, exponent_b64)) = rsa_key_value {
-                format!(
-                    "<ds:KeyInfo><ds:X509Data><ds:X509Certificate>{}</ds:X509Certificate></ds:X509Data><ds:KeyValue><ds:RSAKeyValue><ds:Modulus>{}</ds:Modulus><ds:Exponent>{}</ds:Exponent></ds:RSAKeyValue></ds:KeyValue></ds:KeyInfo>",
-                    cert_der_b64, modulus_b64, exponent_b64
-                )
-            } else {
-                // EC key — X509Data only (RFC 4051 §2.3: no ECKeyValue variant)
-                format!(
-                    "<ds:KeyInfo><ds:X509Data><ds:X509Certificate>{}</ds:X509Certificate></ds:X509Data></ds:KeyInfo>",
-                    cert_der_b64
-                )
+            write_x509_data(&mut out, &cert_b64)?;
+            // RFC 4051 §2.3 has no ECKeyValue variant: an EC key gets
+            // X509Data only.
+            if prepared.algorithm.key_family() == KeyFamily::Rsa
+                && let Some((modulus, exponent)) = rsa_key_value(signer_cert_der)
+            {
+                out.start("ds:KeyValue")?.start("ds:RSAKeyValue")?;
+                out.leaf("ds:Modulus", &modulus, "ds:Modulus")?;
+                out.leaf("ds:Exponent", &exponent, "ds:Exponent")?;
+                out.end()?.end()?;
             }
         }
-        WsSecOutboundKeyInfoProfile::X509DataOnly => format!(
-            "<ds:KeyInfo><ds:X509Data><ds:X509Certificate>{}</ds:X509Certificate></ds:X509Data></ds:KeyInfo>",
-            cert_der_b64
-        ),
-        WsSecOutboundKeyInfoProfile::X509PKIPathv1 => {
-            // SecurityTokenReference pointing to the wsse:BinarySecurityToken
-            // with wsu:Id="X509PKIPathToken" that the caller must place in the
-            // wsse:Security header via WsSecurityHeaderBuilder::with_signing_cert_pkipath_der.
-            const WSSE_NS_URI: &str =
-                "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd";
-            const PKIPATH_VALUE_TYPE: &str = "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-x509-token-profile-1.0#X509PKIPathv1";
-            format!(
-                "<ds:KeyInfo><wsse:SecurityTokenReference xmlns:wsse=\"{WSSE_NS_URI}\">\
-                 <wsse:Reference URI=\"#X509PKIPathToken\" ValueType=\"{PKIPATH_VALUE_TYPE}\"/>\
-                 </wsse:SecurityTokenReference></ds:KeyInfo>"
-            )
-        }
-    };
-
-    Ok(format!(
-        "<ds:Signature xmlns:ds=\"{}\">{}<ds:SignatureValue>{}</ds:SignatureValue>{}</ds:Signature>",
-        DS_NS, signed_info_xml, signature_value_b64, key_info_xml
-    ))
-}
-fn build_signed_info_xml(
-    references: &[WsSecCanonicalizedReference],
-    sig_algo_uri: &str,
-    c14n_algo_uri: &str,
-) -> String {
-    // Build the Exclusive-C14N canonical form of ds:SignedInfo directly, rather
-    // than round-tripping through a format string, a roxmltree parse and a
-    // serialize.
-    //
-    // The generated SignedInfo has a fixed, fully-determined structure:
-    //   - `xmlns:ds` is declared on the root element and NOT re-declared on
-    //     children (Exc-C14N §2: emit only when not inherited from a rendered
-    //     ancestor).
-    //   - Empty elements in Canonical XML use explicit open + close tags, never
-    //     the XML shorthand `<elem/>`.
-    //   - Attributes are sorted lexicographically by (namespace-uri, local-name);
-    //     since every child element here has exactly one attribute (`Algorithm`)
-    //     with no namespace, this ordering is trivially satisfied.
-    //   - All attribute values used here are algorithm URIs or base64 strings —
-    //     they contain no characters (`&`, `<`, `"`, control chars) that require
-    //     XML entity escaping.
-    //
-    // Correctness is verified by the `signed_info_canonical_bytes_match_roundtrip`
-    // unit test below, which asserts that the output is byte-for-byte identical to
-    // what the old `canonicalize_signed_info_xml` round-trip produced.
-    let mut refs_xml = String::new();
-    for reference in references {
-        // XMLDSig §4.3.3.2: dereferencing a same-document `#id` URI yields a
-        // *node-set*, and absent a transform the signature application must
-        // serialise it with **inclusive** Canonical XML. We digest with
-        // exclusive C14N, so the transform has to be declared — otherwise a
-        // conformant verifier canonicalizes differently than we did and every
-        // digest mismatches. (Our own verifier applies exclusive
-        // unconditionally, which is exactly why this was invisible in-house
-        // until an independent oracle was pointed at it.)
-        //
-        // A `cid:` reference dereferences to an octet stream, not a node-set,
-        // so no canonicalization applies. The WSS SwA profile 1.1 transform is
-        // declared — `Attachment-Content-Signature-Transform`, whose digest
-        // input for binary content types is exactly the raw attachment bytes we
-        // digest. The AS4 profile mandates this transform on attachment
-        // references, and WSS4J-based receivers (phase4, Domibus, Oxalis)
-        // refuse a cid: reference that does not declare it.
-        //
-        // Schema order inside ds:Reference is `Transforms?, DigestMethod,
-        // DigestValue`. Empty elements are written open+close, per C14N.
-        let transforms_xml = if reference.uri.starts_with("cid:") {
-            format!(
-                "<ds:Transforms\
-><ds:Transform Algorithm=\"{SWA_ATTACHMENT_CONTENT_TRANSFORM_URI}\"\
-></ds:Transform\
-></ds:Transforms>"
-            )
-        } else {
-            format!(
-                "<ds:Transforms\
-><ds:Transform Algorithm=\"{XML_EXC_C14N_URI}\"\
-></ds:Transform\
-></ds:Transforms>"
-            )
-        };
-
-        refs_xml.push_str(&format!(
-            "<ds:Reference URI=\"{uri}\"\
->{transforms}\
-<ds:DigestMethod Algorithm=\"{dig}\"\
-></ds:DigestMethod\
-><ds:DigestValue>{val}</ds:DigestValue\
-></ds:Reference>",
-            uri = reference.uri,
-            transforms = transforms_xml,
-            dig = SHA256_URI,
-            val = reference.digest_value_base64
-        ));
+        WsSecOutboundKeyInfoProfile::X509DataOnly => write_x509_data(&mut out, &cert_b64)?,
     }
-
-    format!(
-        "<ds:SignedInfo xmlns:ds=\"{ns}\"\
-><ds:CanonicalizationMethod Algorithm=\"{c14n}\"\
-></ds:CanonicalizationMethod\
-><ds:SignatureMethod Algorithm=\"{sig}\"\
-></ds:SignatureMethod\
->{refs}\
-</ds:SignedInfo>",
-        ns = DS_NS,
-        c14n = c14n_algo_uri,
-        sig = sig_algo_uri,
-        refs = refs_xml
-    )
+    out.end()?;
+    out.end()?;
+    out.finish()?.into_fragment()
 }
 
-/// Return the Exclusive C14N bytes of the given `signed_info_xml` string.
-///
-/// The caller (`generate_xmlsig_signature`) already produces a canonical
-/// `signed_info_xml` via `build_signed_info_xml`.  This function exists as a
-/// named boundary so the call chain is easy to follow and so the unit test can
-/// verify correctness independently.
-pub(crate) fn canonicalize_signed_info_xml(signed_info_xml: &str) -> Result<Vec<u8>> {
-    // `build_signed_info_xml` already produces Exc-C14N bytes — return them
-    // directly.  The previous approach (format → roxmltree parse → serialize)
-    // was eliminated because the output structure is fully deterministic and
-    // the round-trip added one heap allocation and one XML parse per signing
-    // operation with no correctness benefit.
-    Ok(signed_info_xml.as_bytes().to_vec())
+fn write_token_reference(out: &mut XmlOut, uri: &str, value_type: &'static str) -> Result<()> {
+    out.start("wsse:SecurityTokenReference")?
+        .ns("wsse", ns::WSSE)?;
+    // WS-I BSP R5215 / WSS X.509 Token Profile 1.1 §3.4: a reference to a
+    // `#X509PKIPathv1` token names its type; WSS4J (phase4) refuses the
+    // reference without it.
+    if value_type == ns::WSSE_X509_PKIPATH_VALUE_TYPE {
+        out.ns("wsse11", ns::WSSE11)?.attr(
+            "wsse11:TokenType",
+            ns::WSSE_X509_PKIPATH_VALUE_TYPE,
+            "wsse11:TokenType",
+        )?;
+    }
+    out.start("wsse:Reference")?
+        .attr("URI", uri, "wsse:Reference/@URI")?
+        .attr("ValueType", value_type, "wsse:Reference/@ValueType")?
+        .end()?;
+    out.end()?;
+    Ok(())
+}
+
+fn write_x509_data(out: &mut XmlOut, cert_b64: &str) -> Result<()> {
+    out.start("ds:X509Data")?;
+    out.leaf("ds:X509Certificate", cert_b64, "ds:X509Certificate")?;
+    out.end()?;
+    Ok(())
+}
+
+/// Base64 modulus and exponent of an RSA certificate key, for the optional
+/// `ds:RSAKeyValue` some partners require alongside X509Data.
+fn rsa_key_value(cert_der: &[u8]) -> Option<(String, String)> {
+    let rsa = openssl::x509::X509::from_der(cert_der)
+        .ok()?
+        .public_key()
+        .ok()?
+        .rsa()
+        .ok()?;
+    Some((
+        BASE64_STANDARD.encode(rsa.n().to_vec()),
+        BASE64_STANDARD.encode(rsa.e().to_vec()),
+    ))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::super::canonicalize::{is_ds_element, try_serialize_node};
+    use super::super::canonicalize::is_ds_element;
     use super::*;
-    use crate::crypto::wssec::RSA_SHA256_URI;
-    use std::collections::BTreeMap;
 
-    /// `build_signed_info_xml` must produce byte-for-byte what a
-    /// `roxmltree` parse-and-serialize round-trip produces.
-    ///
-    /// The direct construction is only safe while that holds: `ds:SignedInfo`
-    /// is what the signature is computed over, so a one-byte divergence is an
-    /// unverifiable signature.
+    fn reference(uri: &str) -> PreparedReference {
+        PreparedReference {
+            uri: uri.to_string(),
+            transform: TransformAlg::C14n(WsSecCanonicalizationKind::Exclusive),
+            digest: vec![0u8; 32],
+        }
+    }
+
+    /// The written `ds:SignedInfo` is already canonical: what is emitted is
+    /// what is signed.
     #[test]
-    fn signed_info_canonical_bytes_match_roundtrip() {
-        use roxmltree::Document;
-
-        let digest_b64 = "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=";
-        let reference = WsSecCanonicalizedReference {
-            uri: "#as4-message-id".to_string(),
-            canonical_bytes: b"dummy".to_vec(),
-            digest_value_base64: digest_b64.to_string(),
-        };
-
-        // New direct path.
-        let references = vec![reference];
-        let direct_xml = build_signed_info_xml(&references, RSA_SHA256_URI, XML_EXC_C14N_URI);
-        let direct_bytes = canonicalize_signed_info_xml(&direct_xml).unwrap();
-
-        // Old round-trip path (kept here for comparison only).
-        let old_format = format!(
-            "<ds:SignedInfo xmlns:ds=\"{ns}\"><ds:CanonicalizationMethod Algorithm=\"{c14n}\"/><ds:SignatureMethod Algorithm=\"{sig}\"/><ds:Reference URI=\"{uri}\"><ds:Transforms><ds:Transform Algorithm=\"{c14n}\"/></ds:Transforms><ds:DigestMethod Algorithm=\"{dig}\"/><ds:DigestValue>{val}</ds:DigestValue></ds:Reference></ds:SignedInfo>",
-            ns = DS_NS,
-            c14n = XML_EXC_C14N_URI,
-            sig = RSA_SHA256_URI,
-            uri = "#as4-message-id",
-            dig = SHA256_URI,
-            val = digest_b64
-        );
-        let wrapped = format!("<root xmlns:ds=\"{}\">{}</root>", DS_NS, old_format);
-        let doc = Document::parse(&wrapped).unwrap();
-        let signed_info_node = doc
-            .descendants()
-            .find(|n| n.is_element() && is_ds_element(*n, "SignedInfo"))
-            .unwrap();
-        let mut old_c14n = String::new();
-        try_serialize_node(
-            signed_info_node,
-            &mut old_c14n,
-            &WsSecCanonicalizationProfile::default(),
-            &BTreeMap::new(),
+    fn signed_info_is_emitted_in_canonical_form() {
+        let references = vec![reference("#as4-message-id"), reference("cid:a@b")];
+        let signed_info = write_signed_info(
+            SignatureAlgorithm::RsaSha256,
+            WsSecDigestMethod::Sha256,
+            &references,
         )
-        .expect("serialize signed info");
-        let old_bytes = old_c14n.into_bytes();
-
-        assert_eq!(
-            direct_bytes,
-            old_bytes,
-            "direct SignedInfo bytes must be identical to round-trip output;\
-             \n  direct: {}\n  roundtrip: {}",
-            String::from_utf8_lossy(&direct_bytes),
-            String::from_utf8_lossy(&old_bytes),
-        );
+        .unwrap();
+        let canonical = canonicalize_signed_info(&signed_info).unwrap();
+        assert_eq!(signed_info.as_str().as_bytes(), canonical.as_slice());
     }
 
     #[test]
     fn signed_info_contains_all_references() {
-        let references = vec![
-            WsSecCanonicalizedReference {
-                uri: "#as4-message-id".to_string(),
-                canonical_bytes: Vec::new(),
-                digest_value_base64: "a".to_string(),
-            },
-            WsSecCanonicalizedReference {
-                uri: "#as4-body".to_string(),
-                canonical_bytes: Vec::new(),
-                digest_value_base64: "b".to_string(),
-            },
-        ];
-
-        let signed_info = build_signed_info_xml(&references, RSA_SHA256_URI, XML_EXC_C14N_URI);
-        assert!(signed_info.contains("<ds:Reference URI=\"#as4-message-id\""));
-        assert!(signed_info.contains("<ds:Reference URI=\"#as4-body\""));
+        let references = vec![reference("#as4-message-id"), reference("#as4-body")];
+        let signed_info = write_signed_info(
+            SignatureAlgorithm::RsaSha256,
+            WsSecDigestMethod::Sha256,
+            &references,
+        )
+        .unwrap();
+        assert!(
+            signed_info
+                .as_str()
+                .contains("<ds:Reference URI=\"#as4-message-id\"")
+        );
+        assert!(
+            signed_info
+                .as_str()
+                .contains("<ds:Reference URI=\"#as4-body\"")
+        );
     }
 
     #[test]
@@ -560,5 +505,203 @@ mod tests {
 
         assert_eq!(err.code, ErrorCode::InvalidInput);
         assert!(err.message.contains("at least one ds:Reference"));
+    }
+
+    /// A provider whose method hash is SHA-384: the reference digest must not
+    /// follow it.
+    #[derive(Debug)]
+    struct Sha384Provider(PemSigningKeyProvider);
+
+    impl SigningKeyProvider for Sha384Provider {
+        fn sign(&self, data: &[u8], algorithm: SignatureAlgorithm) -> Result<Vec<u8>> {
+            self.0.sign(data, algorithm)
+        }
+        fn certificate_der(&self) -> Result<Vec<u8>> {
+            self.0.certificate_der()
+        }
+        fn preferred_algorithm(&self) -> SignatureAlgorithm {
+            SignatureAlgorithm::RsaSha384
+        }
+    }
+
+    pub(super) const SECURED_ENVELOPE: &str = concat!(
+        r#"<S:Envelope xmlns:S="http://www.w3.org/2003/05/soap-envelope" "#,
+        r#"xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd" "#,
+        r#"xmlns:wsu="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd">"#,
+        r#"<S:Header><wsse:Security></wsse:Security></S:Header>"#,
+        r#"<S:Body wsu:Id="body"><p xmlns="urn:asx:sign">payload</p></S:Body></S:Envelope>"#
+    );
+
+    pub(super) fn splice(signature: &str) -> String {
+        SECURED_ENVELOPE.replacen(
+            "<wsse:Security></wsse:Security>",
+            &format!("<wsse:Security>{signature}</wsse:Security>"),
+            1,
+        )
+    }
+
+    #[test]
+    fn cid_digest_matches_declared_method() {
+        use crate::crypto::wssec::{WsSecVerifyOptions, verify_enveloped_signature};
+        let (cert_pem, key_pem) = crate::test_support::self_signed_rsa("asx-sha384-provider");
+        let provider =
+            Sha384Provider(PemSigningKeyProvider::from_pem(&key_pem, &cert_pem).unwrap());
+        let payload: &[u8] = b"attachment octets";
+        let signature = generate_xmlsig_signature_with_provider(
+            SECURED_ENVELOPE,
+            &["#body", "cid:part@asx.test"],
+            &[("cid:part@asx.test", payload)],
+            &provider,
+            WsSecOutboundKeyInfoProfile::X509DataOnly,
+        )
+        .unwrap();
+        assert!(signature.contains("xmldsig-more#rsa-sha384"));
+
+        let doc = roxmltree::Document::parse(&signature).unwrap();
+        for method in doc
+            .descendants()
+            .filter(|n| n.is_element() && is_ds_element(*n, "DigestMethod"))
+        {
+            assert_eq!(
+                method.attribute("Algorithm"),
+                Some(WsSecDigestMethod::Sha256.algorithm_uri())
+            );
+        }
+        let cid_value = doc
+            .descendants()
+            .find(|n| n.is_element() && n.attribute("URI") == Some("cid:part@asx.test"))
+            .and_then(|r| {
+                r.children()
+                    .find(|c| c.is_element() && is_ds_element(*c, "DigestValue"))
+            })
+            .and_then(|v| v.text())
+            .unwrap();
+        assert_eq!(
+            cid_value,
+            BASE64_STANDARD.encode(openssl::sha::sha256(payload)),
+            "the cid: DigestValue must be the SHA-256 it declares"
+        );
+
+        let external = [("cid:part@asx.test", payload)];
+        verify_enveloped_signature(
+            &splice(&signature),
+            WsSecVerifyOptions::new().with_external_references(&external),
+        )
+        .expect("the signature verifies with its attachment");
+    }
+
+    /// Counts calls into the key seam and can hand back `r ‖ s` instead of
+    /// the DER the provider contract requires.
+    #[derive(Debug)]
+    struct CountingProvider {
+        inner: PemSigningKeyProvider,
+        calls: std::sync::atomic::AtomicUsize,
+        raw_r_concat_s: bool,
+    }
+
+    impl SigningKeyProvider for CountingProvider {
+        fn sign(&self, data: &[u8], algorithm: SignatureAlgorithm) -> Result<Vec<u8>> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let der = self.inner.sign(data, algorithm)?;
+            if !self.raw_r_concat_s {
+                return Ok(der);
+            }
+            let sig = openssl::ecdsa::EcdsaSig::from_der(&der).unwrap();
+            let mut raw = sig.r().to_vec_padded(32).unwrap();
+            raw.extend(sig.s().to_vec_padded(32).unwrap());
+            Ok(raw)
+        }
+        fn certificate_der(&self) -> Result<Vec<u8>> {
+            self.inner.certificate_der()
+        }
+        fn preferred_algorithm(&self) -> SignatureAlgorithm {
+            SignatureAlgorithm::EcdsaSha256
+        }
+    }
+
+    fn bp256_provider(raw_r_concat_s: bool) -> CountingProvider {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/wssec/ecdsa/");
+        let key = std::fs::read(format!("{dir}bp256.key.pem")).unwrap();
+        let cert = std::fs::read(format!("{dir}bp256.cert.pem")).unwrap();
+        CountingProvider {
+            inner: PemSigningKeyProvider::from_pem(&key, &cert).unwrap(),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            raw_r_concat_s,
+        }
+    }
+
+    /// Every signature goes through the provider exactly once, and the DER it
+    /// returns reaches the wire as the 64-octet `r ‖ s` of XMLDSig 1.1
+    /// §6.4.3 (BrainpoolP256r1, the BDEW curve).
+    #[test]
+    fn signing_seam_called_once_and_der_converted() {
+        let provider = bp256_provider(false);
+        let signature = generate_xmlsig_signature_with_provider(
+            SECURED_ENVELOPE,
+            &["#body"],
+            &[],
+            &provider,
+            WsSecOutboundKeyInfoProfile::X509DataOnly,
+        )
+        .unwrap();
+        assert_eq!(
+            provider.calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "one call into the key seam per signature"
+        );
+        let doc = roxmltree::Document::parse(&signature).unwrap();
+        let value = doc
+            .descendants()
+            .find(|n| n.is_element() && is_ds_element(*n, "SignatureValue"))
+            .and_then(|n| n.text())
+            .unwrap();
+        let bytes = BASE64_STANDARD.decode(value.trim()).unwrap();
+        // 2·l octets; the verifier below accepts only r ‖ s.
+        assert_eq!(bytes.len(), 64, "r ‖ s, not DER");
+
+        crate::crypto::wssec::verify_enveloped_signature(
+            &splice(&signature),
+            crate::crypto::wssec::WsSecVerifyOptions::new(),
+        )
+        .expect("the r ‖ s signature verifies");
+    }
+
+    /// The provider contract is DER. A provider that already returns `r ‖ s`
+    /// is refused at the seam rather than emitting a value no peer verifies.
+    #[test]
+    fn provider_returning_raw_r_concat_s_fails_signing() {
+        let provider = bp256_provider(true);
+        let err = generate_xmlsig_signature_with_provider(
+            SECURED_ENVELOPE,
+            &["#body"],
+            &[],
+            &provider,
+            WsSecOutboundKeyInfoProfile::X509DataOnly,
+        )
+        .expect_err("a non-DER provider output must fail signing");
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(err.code, ErrorCode::SecurityVerificationFailed, "{err:?}");
+    }
+
+    /// A caller-chosen reference URI must not break out of the `URI`
+    /// attribute: the bytes are inside `ds:SignedInfo`, so an unescaped `"`
+    /// would make the sender sign XML it did not intend.
+    #[test]
+    fn signed_info_reference_uri_is_attribute_escaped() {
+        let uri = "cid:a\"b<c&d@x";
+        let signed_info = write_signed_info(
+            SignatureAlgorithm::RsaSha256,
+            WsSecDigestMethod::Sha256,
+            &[reference(uri)],
+        )
+        .unwrap();
+        let xml = signed_info.as_str();
+        let doc = roxmltree::Document::parse(xml)
+            .unwrap_or_else(|e| panic!("SignedInfo must stay well-formed: {e}\n{xml}"));
+        let reference = doc
+            .descendants()
+            .find(|n| n.is_element() && is_ds_element(*n, "Reference"))
+            .expect("ds:Reference");
+        assert_eq!(reference.attribute("URI"), Some(uri));
     }
 }

@@ -1,14 +1,10 @@
-#![cfg(all(feature = "as4", feature = "client", feature = "dns"))]
+#![cfg(all(feature = "peppol", feature = "http-client"))]
 //! Live-network oracle for BDXL participant discovery.
 //!
 //! # Why this exists
 //!
 //! Discovery decides *where a message goes*, and every offline check of it is a
-//! check against a document. Before this suite existed, the crate hashed the
-//! wrong string into the wrong DNS name in two decommissioned zones, using a
-//! scheme the network had already migrated away from — four independent
-//! defects, guarded by a unit test that asserted an MD5 hex string is 32
-//! characters long (D48).
+//! check against a document.
 //!
 //! The offline vectors in `smp::bdxl` pin the *computation* to the
 //! specification's own worked example. This pins the *result* to what the
@@ -27,7 +23,7 @@
 //! mean the network moved. Read it as "the assumption expired", and check the
 //! Peppol *Policy for use of Identifiers* and the SML zone before changing code.
 
-use asx_rs::smp::{
+use asx::__fuzz::smp::{
     BdxlResolver, HickoryBdxlResolver, PEPPOL_PRODUCTION_SML_ZONE, PEPPOL_TEST_SML_ZONE,
     bdxl_dns_name, select_smp_base_url,
 };
@@ -46,8 +42,7 @@ fn resolver() -> HickoryBdxlResolver {
 
 /// The name this crate computes must be the name the SML answers on.
 ///
-/// This is the assertion that would have failed on every one of D48's four
-/// defects, and that no offline test can make.
+/// No offline test can make this assertion.
 #[tokio::test]
 #[ignore = "requires network access to the Peppol production SML"]
 async fn production_sml_answers_the_name_the_crate_computes() {

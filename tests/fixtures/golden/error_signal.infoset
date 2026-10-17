@@ -1,0 +1,11 @@
+{http://www.w3.org/2003/05/soap-envelope}Envelope
+  {http://www.w3.org/2003/05/soap-envelope}Header
+    {http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/}Messaging @{http://www.w3.org/2003/05/soap-envelope}mustUnderstand="true"
+      {http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/}SignalMessage
+        {http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/}MessageInfo
+          {http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/}Timestamp = "*"
+          {http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/}MessageId = "err-a<b&c\"d'e>f"
+          {http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/}RefToMessageId = "ref-a<b&c\"d'e>f"
+        {http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/}Error @{}category="CONTENT" @{}errorCode="EBMS:0003" @{}origin="ebMS" @{}severity="Failure"
+          {http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/}Description @{http://www.w3.org/XML/1998/namespace}lang="en" = "description a<b&c\"d'e>f"
+  {http://www.w3.org/2003/05/soap-envelope}Body

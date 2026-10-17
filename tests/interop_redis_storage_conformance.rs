@@ -1,29 +1,22 @@
-#![cfg(all(feature = "as4", feature = "testing"))]
-//! The storage seam, against a **real** network-backed store.
+#![cfg(feature = "as4")]
+//! The dedup seam, against a **real** network-backed store.
 //!
 //! # Why this exists
 //!
-//! `DedupStorage` returns `BoxFuture` so that Redis/PostgreSQL/DynamoDB
-//! backends can implement it natively, and `cluster_safe()` — which the strict
-//! production startup gate *requires* — means an out-of-process store by
-//! definition. Every in-tree implementation is in-memory and resolves on the
-//! first poll, so that half of the trait had never been driven by anything. A
-//! single poll followed by a panic survived every gate the crate has, and the
-//! backend the gate demands would have panicked on the first inbound message
-//! (D61, R18).
-//!
-//! `DedupConformance` now includes a yielding backend and a blocking-context
-//! check, which closes the class in-tree. This closes it out of tree: the same
-//! argument that makes Holodeck worth more than a mock applies to a database.
+//! `DedupStore` returns `BoxFuture` so that Redis/PostgreSQL/DynamoDB backends
+//! can implement it natively. Every in-tree implementation is in-memory and
+//! resolves on the first poll, so that half of the trait is never driven by
+//! anything in-tree except a simulated yield. This drives it against a real
+//! Redis.
 //!
 //! What a real store adds over the in-tree doubles:
 //!
 //! - **Genuine network latency** on every call, so the future really suspends.
 //! - **Real atomicity**, or its absence. The suite races concurrent claims;
-//!   here they race through a socket against a single-threaded server, which is
-//!   where a `GET`-then-`SET` implementation actually loses.
-//! - **A real reconnect.** The conformance factory hands out a *fresh
-//!   connection*, so "state survives a reconnect" means what it says.
+//!   here they race through a socket against a single-threaded server, which
+//!   is where a `GET`-then-`SET` implementation actually loses.
+//! - **A real lease** on the server's clock, and fencing by lease token: a
+//!   stale holder must not settle a key that was re-claimed.
 //!
 //! # Running
 //!
@@ -33,10 +26,17 @@
 //! cargo test --all-features --test interop_redis_storage_conformance -- --ignored --nocapture
 //! ```
 
-use std::sync::Arc;
+#[path = "common/peers.rs"]
+mod peers;
+#[allow(unreachable_pub)]
+#[path = "common/ported_as4.rs"]
+mod ported;
 
-use asx_rs::storage::conformance::{DedupConformance, StorageFactory};
-use asx_rs::storage::{BoxFuture, DedupStorage, DedupVerdict};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
+
+use asx::{BoxFuture, Claim, ClaimToken, DedupStore};
+use asx_testkit::dedup::{self, DedupHarness, conformance};
 use testcontainers::core::{IntoContainerPort, WaitFor};
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{ContainerAsync, GenericImage};
@@ -44,128 +44,162 @@ use testcontainers::{ContainerAsync, GenericImage};
 const REDIS_IMAGE: &str = "redis";
 const REDIS_TAG: &str = "7-alpine";
 
-/// How long an unsettled claim is held before the lease expires.
-const CLAIM_LEASE_SECS: u64 = 300;
+/// How long an unsettled claim is held before the lease expires. Short, so
+/// the suite can wait it out on the server's clock (it cannot be paused).
+const CLAIM_LEASE: Duration = Duration::from_secs(4);
 /// How long an accepted key suppresses replays. RFC 4130 §5.2.1 wants 48h.
 const REPLAY_WINDOW_SECS: u64 = 48 * 3600;
 
-/// A `DedupStorage` on Redis, written the way the persistence guide says to.
+type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
+/// A `DedupStore` on Redis, written the way the persistence guide says to.
 ///
-/// Both state transitions that must not race are single `EVAL`s, because Redis
-/// executes a script atomically. The alternative — `SET NX`, then `GET` to find
-/// out why it failed — has a window in which the other attempt settles, and the
-/// conformance suite's concurrency check is built to find exactly that.
+/// Every state transition that must not race is a single `EVAL`, because
+/// Redis executes a script atomically. A claim stores `held:<token>` with a
+/// fencing token from `INCR`; `accept` and `abandon` compare it.
 #[derive(Debug)]
 struct RedisDedup {
     client: redis::Client,
+    /// Isolates one store from another on the same server.
+    namespace: String,
 }
 
 impl RedisDedup {
-    fn new(url: &str) -> Self {
+    fn new(url: &str, namespace: impl Into<String>) -> Self {
         Self {
             client: redis::Client::open(url).expect("redis url"),
+            namespace: namespace.into(),
         }
     }
 
-    async fn conn(&self) -> asx_rs::Result<redis::aio::MultiplexedConnection> {
-        self.client
-            .get_multiplexed_async_connection()
-            .await
-            .map_err(storage_err)
+    fn key(&self, key: &str) -> String {
+        format!("{}:{key}", self.namespace)
+    }
+
+    async fn conn(&self) -> Result<redis::aio::MultiplexedConnection, BoxError> {
+        // Fail closed: a backend that cannot answer must never read as "not seen".
+        Ok(self.client.get_multiplexed_async_connection().await?)
     }
 }
 
-fn storage_err(e: impl std::fmt::Display) -> asx_rs::AsxError {
-    // Fail closed: a backend that cannot answer must never read as "not seen".
-    asx_rs::AsxError::new(
-        asx_rs::ErrorCode::ReliabilityFailure,
-        format!("redis dedup backend failure: {e}"),
-        asx_rs::ErrorContext::new("redis_dedup"),
-    )
-}
-
-/// Take the key, or report what already holds it — in one atomic step.
+/// Take the key under a fresh fencing token, or report what holds it — in
+/// one atomic step.
 const CLAIM_SCRIPT: &str = r#"
 local current = redis.call('GET', KEYS[1])
 if current == 'accepted' then return 'duplicate' end
-if current == 'inflight' then return 'inflight' end
-redis.call('SET', KEYS[1], 'inflight', 'EX', ARGV[1])
-return 'claimed'
+if current then return 'inflight' end
+local token = tostring(redis.call('INCR', KEYS[2]))
+redis.call('SET', KEYS[1], 'held:' .. token, 'PX', ARGV[1])
+return 'claimed:' .. token
 "#;
 
-/// Release the key, but only while it is still unsettled: an already-accepted
-/// key must survive a late abandon, or a processed message is delivered twice.
-const ABANDON_SCRIPT: &str = r#"
-if redis.call('GET', KEYS[1]) == 'inflight' then
-  redis.call('DEL', KEYS[1])
+/// Settle the key, but only for its current holder.
+const ACCEPT_SCRIPT: &str = r#"
+if redis.call('GET', KEYS[1]) ~= 'held:' .. ARGV[1] then
+  return redis.error_reply('stale or unknown claim token')
 end
+redis.call('SET', KEYS[1], 'accepted', 'EX', ARGV[2])
 return 1
 "#;
 
-impl DedupStorage for RedisDedup {
-    fn is_durable(&self) -> bool {
-        true
-    }
+/// Release the key, but only while the token still holds it: an accepted or
+/// re-claimed key must survive a late abandon.
+const ABANDON_SCRIPT: &str = r#"
+if redis.call('GET', KEYS[1]) ~= 'held:' .. ARGV[1] then
+  return redis.error_reply('stale or unknown claim token')
+end
+redis.call('DEL', KEYS[1])
+return 1
+"#;
 
-    fn cluster_safe(&self) -> bool {
-        true
+fn verdict(answer: &str) -> Claim {
+    match answer.strip_prefix("claimed:") {
+        Some(token) => Claim::Claimed(ClaimToken::new(token)),
+        None if answer == "duplicate" => Claim::Duplicate,
+        None => Claim::InFlight,
     }
+}
 
-    fn claim<'a>(&'a self, key: &'a str) -> BoxFuture<'a, asx_rs::Result<DedupVerdict>> {
+impl DedupStore for RedisDedup {
+    fn claim<'a>(&'a self, key: &'a str) -> BoxFuture<'a, Result<Claim, BoxError>> {
         Box::pin(async move {
             let mut conn = self.conn().await?;
-            let verdict: String = redis::Script::new(CLAIM_SCRIPT)
-                .key(key)
-                .arg(CLAIM_LEASE_SECS)
+            let answer: String = redis::Script::new(CLAIM_SCRIPT)
+                .key(self.key(key))
+                .key(format!("{}:fence", self.namespace))
+                .arg(CLAIM_LEASE.as_millis() as u64)
                 .invoke_async(&mut conn)
-                .await
-                .map_err(storage_err)?;
-            Ok(match verdict.as_str() {
-                "claimed" => DedupVerdict::Claimed,
-                "duplicate" => DedupVerdict::Duplicate,
-                _ => DedupVerdict::InFlight,
-            })
+                .await?;
+            Ok(verdict(&answer))
         })
     }
 
-    fn accept<'a>(&'a self, key: &'a str) -> BoxFuture<'a, asx_rs::Result<()>> {
+    fn accept<'a>(
+        &'a self,
+        key: &'a str,
+        token: &'a ClaimToken,
+    ) -> BoxFuture<'a, Result<(), BoxError>> {
         Box::pin(async move {
             let mut conn = self.conn().await?;
-            // Unconditional, so a retried settlement is not an error.
-            let _: () = redis::cmd("SET")
-                .arg(key)
-                .arg("accepted")
-                .arg("EX")
+            let _: i64 = redis::Script::new(ACCEPT_SCRIPT)
+                .key(self.key(key))
+                .arg(token.as_str())
                 .arg(REPLAY_WINDOW_SECS)
-                .query_async(&mut conn)
-                .await
-                .map_err(storage_err)?;
+                .invoke_async(&mut conn)
+                .await?;
             Ok(())
         })
     }
 
-    fn abandon<'a>(&'a self, key: &'a str) -> BoxFuture<'a, asx_rs::Result<()>> {
+    fn abandon<'a>(
+        &'a self,
+        key: &'a str,
+        token: &'a ClaimToken,
+    ) -> BoxFuture<'a, Result<(), BoxError>> {
         Box::pin(async move {
             let mut conn = self.conn().await?;
             let _: i64 = redis::Script::new(ABANDON_SCRIPT)
-                .key(key)
+                .key(self.key(key))
+                .arg(token.as_str())
                 .invoke_async(&mut conn)
-                .await
-                .map_err(storage_err)?;
+                .await?;
             Ok(())
         })
     }
 }
 
-/// Hands out a **fresh connection** each time, which is what makes the
-/// suite's reconnect check meaningful.
-struct RedisFactory {
+/// Hands out a store in a fresh namespace each time (an empty store), each
+/// with its own client, so every check also crosses a fresh connection.
+struct RedisHarness {
     url: String,
+    prefix: &'static str,
+    opened: AtomicU64,
 }
 
-impl StorageFactory<dyn DedupStorage> for RedisFactory {
-    fn connect(&self) -> Arc<dyn DedupStorage> {
-        Arc::new(RedisDedup::new(&self.url))
+impl RedisHarness {
+    fn new(url: String, prefix: &'static str) -> Self {
+        Self {
+            url,
+            prefix,
+            opened: AtomicU64::new(0),
+        }
+    }
+    fn namespace(&self) -> String {
+        format!(
+            "{}-{}",
+            self.prefix,
+            self.opened.fetch_add(1, Ordering::SeqCst)
+        )
+    }
+}
+
+impl DedupHarness for RedisHarness {
+    type Store = RedisDedup;
+    fn open(&self) -> RedisDedup {
+        RedisDedup::new(&self.url, self.namespace())
+    }
+    fn lease(&self) -> Duration {
+        CLAIM_LEASE
     }
 }
 
@@ -185,44 +219,65 @@ async fn start_redis() -> (ContainerAsync<GenericImage>, String) {
     (container, url)
 }
 
-/// **The oracle.** The whole dedup contract, against a real store.
+/// **The oracle.** The whole dedup contract, against a real store. Unpaused:
+/// the lease runs on the server's clock.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires Docker"]
 async fn redis_dedup_backend_conforms() {
     let (_container, url) = start_redis().await;
-
-    let report = DedupConformance::new(&RedisFactory { url })
-        .key_prefix("asx-redis-conformance")
-        .concurrency(16)
-        .run()
-        .await;
-
+    let failures = conformance(&RedisHarness::new(url, "asx-redis-conformance")).await;
     assert!(
-        report.passed(),
-        "a Redis-backed DedupStorage must satisfy the contract the protocol \
-         paths depend on:\n{report}"
+        failures.is_empty(),
+        "a Redis-backed DedupStore must satisfy the contract the receive path \
+         depends on:\n{failures:#?}"
     );
 }
 
-/// The check the in-tree doubles cannot make: a backend that really yields,
-/// driven from the blocking context the AS4 receive pipeline runs in.
+/// The check the in-tree doubles cannot make: a store that really suspends,
+/// behind a real `Inbound` — claimed, accepted, then answered as a duplicate.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires Docker"]
-async fn redis_dedup_survives_the_blocking_receive_context() {
+async fn redis_dedup_backs_a_real_inbound() {
+    use peers::Preset;
     let (_container, url) = start_redis().await;
-    let backend: Arc<dyn DedupStorage> = Arc::new(RedisDedup::new(&url));
+    let p = peers::pair(Preset::Edelivery);
+    p.sender
+        .send(Preset::Edelivery.message(&p.to_b, b"x"))
+        .await
+        .expect("delivered");
+    let request = p.loopback.last_request().unwrap();
+    let inbound =
+        ported::accepting_inbound(&p.receiver, RedisDedup::new(&url, "asx-redis-inbound"));
+    let (status, body) = ported::post(&inbound, ported::clone_request(&request)).await;
+    assert_eq!(
+        status,
+        http::StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    let (status, _) = ported::post(&inbound, request).await;
+    assert_eq!(status, http::StatusCode::OK, "duplicate receipted");
 
-    let key = "asx-redis-blocking-context";
-    let verdict = tokio::task::spawn_blocking({
-        let backend = Arc::clone(&backend);
-        let key = key.to_string();
-        move || asx_rs::storage::drive_dedup_future(backend.claim(&key))
-    })
-    .await
-    .expect("join")
-    .expect("a network-backed claim must be driven to completion, not polled once");
-
-    assert_eq!(verdict, DedupVerdict::Claimed);
+    let store = RedisDedup::new(&url, "asx-redis-inbound");
+    let mut conn = store.conn().await.expect("connection");
+    let keys: Vec<String> = redis::cmd("KEYS")
+        .arg("asx-redis-inbound:*")
+        .query_async(&mut conn)
+        .await
+        .expect("keys");
+    let settled: Vec<String> = {
+        let mut values = Vec::new();
+        for key in keys.iter().filter(|k| !k.ends_with(":fence")) {
+            let value: String = redis::cmd("GET")
+                .arg(key)
+                .query_async(&mut conn)
+                .await
+                .expect("get");
+            values.push(value);
+        }
+        values
+    };
+    assert_eq!(settled, ["accepted"], "one key, accepted");
 }
 
 /// A deliberately non-atomic implementation must **fail** the suite.
@@ -236,67 +291,72 @@ async fn a_get_then_set_redis_backend_fails_the_race_check() {
     #[derive(Debug)]
     struct GetThenSet(RedisDedup);
 
-    impl DedupStorage for GetThenSet {
-        fn is_durable(&self) -> bool {
-            true
-        }
-        fn cluster_safe(&self) -> bool {
-            true
-        }
-        fn claim<'a>(&'a self, key: &'a str) -> BoxFuture<'a, asx_rs::Result<DedupVerdict>> {
+    impl DedupStore for GetThenSet {
+        fn claim<'a>(&'a self, key: &'a str) -> BoxFuture<'a, Result<Claim, BoxError>> {
             Box::pin(async move {
                 let mut conn = self.0.conn().await?;
                 // Two round trips: the classic mistake. Another caller can
                 // claim between the GET and the SET.
                 let current: Option<String> = redis::cmd("GET")
-                    .arg(key)
+                    .arg(self.0.key(key))
                     .query_async(&mut conn)
-                    .await
-                    .map_err(storage_err)?;
+                    .await?;
                 match current.as_deref() {
-                    Some("accepted") => return Ok(DedupVerdict::Duplicate),
-                    Some(_) => return Ok(DedupVerdict::InFlight),
+                    Some("accepted") => return Ok(Claim::Duplicate),
+                    Some(_) => return Ok(Claim::InFlight),
                     None => {}
                 }
-                let _: () = redis::cmd("SET")
-                    .arg(key)
-                    .arg("inflight")
-                    .arg("EX")
-                    .arg(CLAIM_LEASE_SECS)
+                // Widen the window so every concurrent claimer reads the key
+                // as absent: the race must happen on every run, or the
+                // conformance check could pass this broken store by luck.
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                let token: u64 = redis::cmd("INCR")
+                    .arg(format!("{}:fence", self.0.namespace))
                     .query_async(&mut conn)
-                    .await
-                    .map_err(storage_err)?;
-                Ok(DedupVerdict::Claimed)
+                    .await?;
+                let _: () = redis::cmd("SET")
+                    .arg(self.0.key(key))
+                    .arg(format!("held:{token}"))
+                    .arg("PX")
+                    .arg(CLAIM_LEASE.as_millis() as u64)
+                    .query_async(&mut conn)
+                    .await?;
+                Ok(Claim::Claimed(ClaimToken::new(token.to_string())))
             })
         }
-        fn accept<'a>(&'a self, key: &'a str) -> BoxFuture<'a, asx_rs::Result<()>> {
-            self.0.accept(key)
+        fn accept<'a>(
+            &'a self,
+            key: &'a str,
+            token: &'a ClaimToken,
+        ) -> BoxFuture<'a, Result<(), BoxError>> {
+            self.0.accept(key, token)
         }
-        fn abandon<'a>(&'a self, key: &'a str) -> BoxFuture<'a, asx_rs::Result<()>> {
-            self.0.abandon(key)
+        fn abandon<'a>(
+            &'a self,
+            key: &'a str,
+            token: &'a ClaimToken,
+        ) -> BoxFuture<'a, Result<(), BoxError>> {
+            self.0.abandon(key, token)
         }
     }
 
-    struct Factory {
-        url: String,
-    }
-    impl StorageFactory<dyn DedupStorage> for Factory {
-        fn connect(&self) -> Arc<dyn DedupStorage> {
-            Arc::new(GetThenSet(RedisDedup::new(&self.url)))
+    struct Racy(RedisHarness);
+    impl DedupHarness for Racy {
+        type Store = GetThenSet;
+        fn open(&self) -> GetThenSet {
+            GetThenSet(self.0.open())
+        }
+        fn lease(&self) -> Duration {
+            CLAIM_LEASE
         }
     }
 
     let (_container, url) = start_redis().await;
-    let report = DedupConformance::new(&Factory { url })
-        .key_prefix("asx-redis-racy")
-        .concurrency(32)
-        .run()
-        .await;
-
-    let failed: Vec<_> = report.failures().iter().map(|c| c.id).collect();
+    let failures = conformance(&Racy(RedisHarness::new(url, "asx-redis-racy"))).await;
+    let failed: Vec<_> = failures.iter().map(|f| f.check).collect();
     assert!(
-        failed.contains(&"dedup.concurrent_claim_admits_exactly_one"),
+        failed.contains(&dedup::CONCURRENT_CLAIM_ADMITS_EXACTLY_ONE),
         "a GET-then-SET backend must fail the race check, or the suite is not \
-         checking what it claims to:\n{report}"
+         checking what it claims to:\n{failures:#?}"
     );
 }

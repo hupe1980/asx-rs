@@ -11,24 +11,13 @@
 //! | `HsmSigningKeyProvider` *(user-supplied)* | PKCS#11 slot | PCI-DSS / HIPAA / eIDAS regulated |
 //! | `KmsSigningKeyProvider` *(user-supplied)* | AWS/GCP/Azure KMS | Cloud-native deployments |
 //!
-//! ## Example — PEM key provider
+//! ## Output encoding
 //!
-//! ```rust,no_run
-//! use asx_rs::crypto::signing::{PemSigningKeyProvider, SigningKeyProvider};
-//! use std::sync::Arc;
-//!
-//! # let signing_key_pem: &[u8] = b"";
-//! # let signing_cert_pem: &[u8] = b"";
-//! let provider: Arc<dyn SigningKeyProvider> =
-//!     Arc::new(PemSigningKeyProvider::from_pem(
-//!         signing_key_pem,
-//!         signing_cert_pem,
-//!     ).expect("valid key/cert PEM"));
-//!
-//! // Pass `provider` to `As4SendCredentials::with_signing_key_provider(provider)`.
-//! ```
+//! [`SigningKeyProvider::sign`](crate::crypto::signing::SigningKeyProvider::sign) returns what key stores return: RSA PKCS #1
+//! v1.5 signature octets, ECDSA as an ASN.1 DER `ECDSA-Sig-Value`. The XMLDSig
+//! layer converts ECDSA to the fixed-width `r ‖ s` that XMLDSig 1.1 §6.4.3
+//! puts on the wire; any other encoding fails signing.
 
-use openssl::hash::MessageDigest;
 use openssl::pkey::{PKey, Private};
 use openssl::sign::Signer;
 use openssl::x509::X509;
@@ -36,59 +25,12 @@ use openssl::x509::X509;
 use crate::core::{AsxError, ErrorCode, ErrorContext, Result};
 
 // ---------------------------------------------------------------------------
-// Algorithm enum
+// Algorithm enum (defined in the registry, `crypto::alg`)
 // ---------------------------------------------------------------------------
 
-/// Signature algorithm for outbound XMLDSig / WS-Security operations.
-///
-/// The variants mirror the W3C XML Signature / IETF RFC 4051 algorithm URIs.
-/// The library currently supports RSA-PKCS1-v1.5 and ECDSA; RSA-PSS is not
-/// yet wired because it is absent from the normative AS4 profiles.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[non_exhaustive]
-pub enum SignatureAlgorithm {
-    /// RSA with SHA-256 — the PEPPOL AS4 / CEF eDelivery baseline.
-    RsaSha256,
-    /// RSA with SHA-384 — available for higher-assurance configurations.
-    RsaSha384,
-    /// RSA with SHA-512 — available for higher-assurance configurations.
-    RsaSha512,
-    /// ECDSA with SHA-256 — increasingly common for new PEPPOL Access Points.
-    EcdsaSha256,
-    /// ECDSA with SHA-384.
-    EcdsaSha384,
-    /// ECDSA with SHA-512.
-    EcdsaSha512,
-}
+pub use crate::crypto::alg::SignatureAlgorithm;
 
 impl SignatureAlgorithm {
-    /// Returns the canonical W3C algorithm URI for embedding in
-    /// `<ds:SignatureMethod Algorithm="..."/>`.
-    pub fn algorithm_uri(self) -> &'static str {
-        use crate::crypto::wssec::{
-            ECDSA_SHA256_URI, ECDSA_SHA384_URI, ECDSA_SHA512_URI, RSA_SHA256_URI, RSA_SHA384_URI,
-            RSA_SHA512_URI,
-        };
-        match self {
-            Self::RsaSha256 => RSA_SHA256_URI,
-            Self::RsaSha384 => RSA_SHA384_URI,
-            Self::RsaSha512 => RSA_SHA512_URI,
-            Self::EcdsaSha256 => ECDSA_SHA256_URI,
-            Self::EcdsaSha384 => ECDSA_SHA384_URI,
-            Self::EcdsaSha512 => ECDSA_SHA512_URI,
-        }
-    }
-
-    /// Returns the OpenSSL `MessageDigest` for the hash component of this
-    /// algorithm (used by the in-process `PemSigningKeyProvider`).
-    pub(crate) fn message_digest(self) -> MessageDigest {
-        match self {
-            Self::RsaSha256 | Self::EcdsaSha256 => MessageDigest::sha256(),
-            Self::RsaSha384 | Self::EcdsaSha384 => MessageDigest::sha384(),
-            Self::RsaSha512 | Self::EcdsaSha512 => MessageDigest::sha512(),
-        }
-    }
-
     /// Infer the preferred `SignatureAlgorithm` for a parsed `PKey`.
     pub(crate) fn from_pkey(key: &PKey<Private>) -> Option<Self> {
         match key.id() {
@@ -128,7 +70,11 @@ pub trait SigningKeyProvider: Send + Sync + std::fmt::Debug {
     /// The implementation is responsible for:
     /// 1. Hashing `data` with the digest appropriate for `algorithm`.
     /// 2. Performing the asymmetric signing operation (RSA PKCS1-v1.5 or ECDSA).
-    /// 3. Returning the raw DER / IEEE-P1363 signature bytes.
+    /// 3. Returning, for RSA, the PKCS #1 v1.5 signature octets and, for
+    ///    ECDSA, the ASN.1 DER `ECDSA-Sig-Value` (what OpenSSL, PKCS #11
+    ///    wrappers and the cloud KMS APIs return). The XMLDSig layer converts
+    ///    ECDSA to `r ‖ s` (XMLDSig 1.1 §6.4.3); any other encoding fails
+    ///    signing.
     ///
     /// The caller (XMLDSig pipeline) passes the canonical `ds:SignedInfo` bytes
     /// as `data`.  No pre-hashing is performed by the caller.
@@ -142,9 +88,7 @@ pub trait SigningKeyProvider: Send + Sync + std::fmt::Debug {
     /// Preferred signing algorithm for this provider.
     ///
     /// The XMLDSig builder uses this to choose the `<ds:SignatureMethod>`
-    /// algorithm URI.  A caller may override with a different algorithm
-    /// (e.g. to upgrade from SHA-256 to SHA-384) but the provider's
-    /// `sign` implementation MUST accept that algorithm.
+    /// algorithm URI. Reference digests are SHA-256 whatever this returns.
     fn preferred_algorithm(&self) -> SignatureAlgorithm;
 }
 
@@ -247,13 +191,39 @@ impl PemSigningKeyProvider {
         })
     }
 
-    /// Override the preferred signing algorithm.
-    ///
-    /// Use this to opt in to SHA-384 or SHA-512 for an existing RSA key without
-    /// having to re-parse the PEM material.
-    pub fn with_algorithm(mut self, algorithm: SignatureAlgorithm) -> Self {
-        self.preferred = algorithm;
-        self
+    /// A provider over an already-parsed key and certificate (the pre-parsed
+    /// signing path). The certificate must carry the key's public half.
+    #[cfg(feature = "as4")]
+    pub(crate) fn from_parts(key: PKey<Private>, cert: X509) -> Result<Self> {
+        let ctx = || ErrorContext::new("signing_key_provider_from_parts");
+        let cert_pubkey = cert.public_key().map_err(|_err| {
+            AsxError::new(
+                ErrorCode::SecurityVerificationFailed,
+                "signing certificate does not contain a usable public key",
+                ctx(),
+            )
+        })?;
+        if !key.public_eq(&cert_pubkey) {
+            return Err(AsxError::new(
+                ErrorCode::SecurityVerificationFailed,
+                "signing certificate public key does not match the private key",
+                ctx(),
+            ));
+        }
+        let preferred = SignatureAlgorithm::from_pkey(&key).ok_or_else(|| {
+            AsxError::new(
+                ErrorCode::SecurityVerificationFailed,
+                "XMLDSig signing key type is not supported; use an RSA or EC key \
+                 (P-256, P-384, P-521, brainpoolP256r1, …)",
+                ctx(),
+            )
+        })?;
+        Ok(Self {
+            key,
+            cert,
+            preferred,
+            key_pem: Vec::new(),
+        })
     }
 }
 
@@ -399,27 +369,14 @@ mod tests {
     }
 
     #[test]
-    fn with_algorithm_overrides_preferred() {
-        let (key_pem, cert_pem) = gen_rsa_pem_pair();
-        let provider = PemSigningKeyProvider::from_pem(&key_pem, &cert_pem)
-            .unwrap()
-            .with_algorithm(SignatureAlgorithm::RsaSha384);
-        assert_eq!(
-            provider.preferred_algorithm(),
-            SignatureAlgorithm::RsaSha384
-        );
-    }
-
-    #[test]
-    fn algorithm_uri_matches_wssec_constants() {
-        use crate::crypto::wssec::{ECDSA_SHA256_URI, RSA_SHA256_URI};
+    fn algorithm_uri_matches_the_rfc_9231_identifiers() {
         assert_eq!(
             SignatureAlgorithm::RsaSha256.algorithm_uri(),
-            RSA_SHA256_URI
+            "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"
         );
         assert_eq!(
             SignatureAlgorithm::EcdsaSha256.algorithm_uri(),
-            ECDSA_SHA256_URI
+            "http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha256"
         );
     }
 

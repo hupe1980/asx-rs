@@ -1,0 +1,67 @@
+{
+  "action": "urn:example:action",
+  "conversation_id": "<volatile>",
+  "direction": "outbound",
+  "disposition": "receipt",
+  "ebms_code": null,
+  "error_kind": null,
+  "local_party": "audit-sender",
+  "message_id": "urn:uuid:audit-golden@asx.test",
+  "message_timestamp": "<volatile>",
+  "mic": null,
+  "outcome": "delivered",
+  "partner": "audit-partner",
+  "profile": "strict",
+  "protocol": "as4",
+  "quirks": [],
+  "record_id": "<volatile>",
+  "recorded_at": "<volatile>",
+  "ref_to_message_id": null,
+  "references": [
+    {
+      "digest": "<volatile>",
+      "digest_algorithm": "http://www.w3.org/2001/04/xmlenc#sha256",
+      "uri": "#as4-messaging"
+    },
+    {
+      "digest": "<volatile>",
+      "digest_algorithm": "http://www.w3.org/2001/04/xmlenc#sha256",
+      "uri": "#as4-body"
+    },
+    {
+      "digest": "<volatile>",
+      "digest_algorithm": "http://www.w3.org/2001/04/xmlenc#sha256",
+      "uri": "cid:<volatile>"
+    }
+  ],
+  "service": "http://example.org/example",
+  "signal": {
+    "bytes": "<volatile>",
+    "message_id": "<volatile>",
+    "nrr": [
+      {
+        "digest": "<volatile>",
+        "digest_algorithm": "http://www.w3.org/2001/04/xmlenc#sha256",
+        "uri": "#as4-messaging"
+      },
+      {
+        "digest": "<volatile>",
+        "digest_algorithm": "http://www.w3.org/2001/04/xmlenc#sha256",
+        "uri": "#as4-body"
+      },
+      {
+        "digest": "<volatile>",
+        "digest_algorithm": "http://www.w3.org/2001/04/xmlenc#sha256",
+        "uri": "cid:<volatile>"
+      }
+    ],
+    "ref_to_message_id": "urn:uuid:audit-golden@asx.test",
+    "sha256": "<volatile>",
+    "signed": true,
+    "timestamp": "<volatile>"
+  },
+  "signer": {
+    "certificate_der": "<volatile>",
+    "fingerprint_sha256": "<volatile>"
+  }
+}

@@ -1,39 +1,9 @@
-use std::sync::Arc;
-
 use super::{
-    As2PreparedSendCredentials, As2SendCredentials, As2SendOutput, As2SendPolicy, AsxError,
-    AsxEvent, ErrorCode, ErrorContext, EventBus, InteropMode, MimeEnvelope, Result, SessionContext,
-    emit_protocol_event, extract_content_type_header,
+    As2SendPolicy, AsxError, ErrorCode, ErrorContext, MimeEnvelope, Result, SessionContext,
+    extract_content_type_header,
     mic::{build_outbound_entity, compute_mic},
     pipeline,
 };
-use crate::http::HttpHeaders;
-use crate::reliability::{RetryConfig, RetryScheduler};
-use crate::transport::trace_context::generate_traceparent;
-
-#[derive(Debug, Clone)]
-pub struct As2SendRequest {
-    pub message_id: String,
-    pub payload: Vec<u8>,
-    pub policy: As2SendPolicy,
-    /// Per-request signing / encryption credentials.
-    ///
-    /// - `None` — use the signing cert, signing key, and recipient cert stored
-    ///   in the session's `CertHandle` (set via
-    ///   `SessionContextBuilder::with_signing_cert_pem` /
-    ///   `with_signing_key_pem` / `with_recipient_cert_pem`).
-    /// - `Some(creds)` — use `creds` exactly, ignoring session-level
-    ///   credential material.  Use this for per-message overrides.
-    pub credentials: Option<As2SendCredentials>,
-}
-
-#[derive(Debug, Clone)]
-pub struct As2SendPreparedRequest {
-    pub message_id: String,
-    pub payload: Vec<u8>,
-    pub policy: As2SendPolicy,
-    pub prepared: As2PreparedSendCredentials,
-}
 
 /// Validate an AS2 identifier value against RFC 4130 §4 grammar.
 ///
@@ -98,153 +68,26 @@ fn validate_as2_from_identifier(
     Ok(())
 }
 
-fn validate_as2_send_runtime_inputs(
+/// The signed (or, unprotected, sent) MIME entity of an outbound message and
+/// its MIC (RFC 4130 §7.3.1).
+pub(crate) struct OutboundEntity {
+    pub(crate) entity: Vec<u8>,
+    pub(crate) mic_base64: String,
+    pub(crate) digest_alg: &'static str,
+}
+
+/// Validate the send inputs and build the entity the signature and the MIC
+/// cover. The private-key step follows in [`super::cms_keys`].
+pub(crate) fn outbound_entity(
     session: &SessionContext,
+    message_id: &str,
+    payload: &[u8],
     policy: &As2SendPolicy,
-    prepared: &As2PreparedSendCredentials,
-) -> Result<()> {
-    let stage = "as2_send_validate";
-
-    if !policy.as2_from_id.trim().is_empty() {
-        validate_as2_from_identifier(stage, session, policy.as2_from_id.as_str())?;
-    }
-
-    if policy.sign {
-        let signing_cert = prepared.signing_cert.as_ref().ok_or_else(|| {
-            AsxError::new(
-                ErrorCode::PolicyViolation,
-                "AS2 signing certificate is missing",
-                ErrorContext::for_session(stage, session),
-            )
-        })?;
-        let signing_key = prepared.signing_key.as_ref().ok_or_else(|| {
-            AsxError::new(
-                ErrorCode::PolicyViolation,
-                "AS2 signing key is missing",
-                ErrorContext::for_session(stage, session),
-            )
-        })?;
-
-        let _ = signing_cert;
-        let _ = signing_key;
-    }
-
-    if policy.encrypt {
-        let recipient_cert = prepared.recipient_cert.as_ref().ok_or_else(|| {
-            AsxError::new(
-                ErrorCode::PolicyViolation,
-                "AS2 recipient certificate is missing",
-                ErrorContext::for_session(stage, session),
-            )
-        })?;
-
-        let _ = recipient_cert;
-    }
-
-    Ok(())
-}
-
-#[cfg_attr(feature = "trace", tracing::instrument(skip_all, fields(partner_id = %session.partner_id())))]
-pub fn send_sync(
-    session: &SessionContext,
-    event_bus: &EventBus,
-    request: As2SendRequest,
-) -> Result<As2SendOutput> {
-    let As2SendRequest {
-        message_id,
-        payload,
-        policy,
-        credentials: credentials_opt,
-    } = request;
-
-    // Resolve effective credentials: per-request `Some(c)` is merged with the
-    // session CertHandle for any `None` fields, so callers only need to supply
-    // the fields they actually want to override.  `None` credentials fall back
-    // entirely to the session.
-    let session_creds;
-    let credentials = {
-        let ch = session.cert_handle();
-        let session_signing_cert = ch
-            .signing_cert_pem
-            .as_ref()
-            .map(|s| Arc::from(s.as_bytes()));
-        let session_signing_key = ch.signing_key_pem.as_ref().map(|s| s.as_bytes().to_vec());
-        let session_recipient_cert = ch
-            .recipient_cert_pem
-            .as_ref()
-            .map(|s| Arc::from(s.as_bytes()));
-        match credentials_opt {
-            None => {
-                session_creds = As2SendCredentials {
-                    signing_cert_pem: session_signing_cert,
-                    signing_key_pem: session_signing_key,
-                    recipient_cert_pem: session_recipient_cert,
-                };
-                &session_creds
-            }
-            Some(ref c) => {
-                // Partial override: use per-request value when set, fall back
-                // to session material for each `None` field individually.
-                session_creds = As2SendCredentials {
-                    signing_cert_pem: c.signing_cert_pem.clone().or(session_signing_cert),
-                    signing_key_pem: c.signing_key_pem.clone().or(session_signing_key),
-                    recipient_cert_pem: c.recipient_cert_pem.clone().or(session_recipient_cert),
-                };
-                &session_creds
-            }
-        }
-    };
-
-    let prepared =
-        credentials.prepare_for_policy(&policy, "as2_send_validate", ErrorCode::PolicyViolation)?;
-    send_sync_prepared(
-        session,
-        event_bus,
-        As2SendPreparedRequest {
-            message_id,
-            payload,
-            policy,
-            prepared,
-        },
-    )
-}
-
-#[cfg_attr(feature = "trace", tracing::instrument(skip_all, fields(partner_id = %session.partner_id())))]
-pub fn send_sync_prepared(
-    session: &SessionContext,
-    event_bus: &EventBus,
-    request: As2SendPreparedRequest,
-) -> Result<As2SendOutput> {
-    let As2SendPreparedRequest {
-        message_id,
-        payload,
-        policy,
-        prepared,
-    } = request;
-    send_sync_prepared_ref(session, event_bus, message_id, payload, policy, &prepared)
-}
-
-fn send_sync_prepared_ref(
-    session: &SessionContext,
-    event_bus: &EventBus,
-    message_id: String,
-    payload: Vec<u8>,
-    policy: As2SendPolicy,
-    prepared: &As2PreparedSendCredentials,
-) -> Result<As2SendOutput> {
-    // Relaxed interop normalizes these in place below; strict builds never
-    // mutate them, so the rebinding exists only under the feature.
-    #[cfg(feature = "interop-relaxed")]
-    let mut message_id = message_id;
-    #[cfg(feature = "interop-relaxed")]
-    let mut payload = payload;
-    pipeline::validate_message_id(&message_id, "as2_send_validate", session)?;
-    crate::presets::enforce_strict_runtime_bootstrap_for_strict_interop(
-        "as2_send_validate",
-        session,
-        policy.interop_mode,
-    )?;
+    content_type: Option<&str>,
+) -> Result<OutboundEntity> {
+    pipeline::validate_message_id(message_id, "as2_send_validate", session)?;
     tracing::debug!(
+        target: "asx",
         session_id = %session.session_id(),
         partner_id = %session.partner_id(),
         message_id = %message_id,
@@ -252,240 +95,142 @@ fn send_sync_prepared_ref(
         encrypt = policy.encrypt,
         "AS2 send: building outbound message",
     );
-
-    if policy.interop_mode == InteropMode::Strict && payload.is_empty() {
+    if payload.is_empty() {
         return Err(AsxError::new(
             ErrorCode::PolicyViolation,
             "strict interop mode rejects empty AS2 payload",
             ErrorContext::for_session("as2_send_strict_policy", session),
         ));
     }
-
-    #[cfg(feature = "interop-relaxed")]
-    if policy.interop_mode == InteropMode::Relaxed {
-        message_id = message_id.trim().to_string();
-        if payload.is_empty() {
-            payload = b"\n".to_vec();
-        }
+    if !policy.as2_from_id.trim().is_empty() {
+        validate_as2_from_identifier("as2_send_validate", session, policy.as2_from_id.as_str())?;
     }
-
-    validate_as2_send_runtime_inputs(session, &policy, prepared)?;
-    pipeline::validate_signing_credentials(
-        policy.sign,
-        prepared.signing_key.is_some(),
-        prepared.signing_cert.is_some(),
-        "as2_send_validate",
-        "AS2",
-        session,
-    )?;
-    pipeline::validate_encryption_credentials(
-        policy.encrypt,
-        prepared.recipient_cert.is_some(),
-        "as2_send_validate",
-        "AS2",
-        session,
-    )?;
-    pipeline::emit_outbound_prepared(
-        event_bus,
-        session,
-        &message_id,
-        super::AsxProtocol::As2,
-        policy.fail_closed_audit_events,
-    )?;
 
     // RFC 4130 §7.3.1 fixes the MIC input, and it depends on what protection is
     // applied. Build the MIME entity *after* compression, because the entity
     // that gets signed is the compressed one — MIC'ing the uncompressed payload
     // would produce a value the receiver can never reproduce.
-    let mut payload_to_send = payload;
-    #[cfg(feature = "compression")]
-    if policy.compress {
-        payload_to_send = compress_payload(&payload_to_send)?;
-    }
-
-    let entity_content_type = payload_entity_content_type(&policy);
-    let mic_input: Vec<u8> = if policy.sign || policy.encrypt {
-        // Signed/encrypted: the MIC covers the MIME entity — headers included.
-        build_outbound_entity(entity_content_type, &payload_to_send)
+    let compressed;
+    let payload = if policy.compress {
+        compressed = compress_payload(payload)?;
+        compressed.as_slice()
     } else {
-        // Unsigned and unencrypted: content only, no MIME headers at all.
-        payload_to_send.clone()
+        payload
     };
-
-    let (mic_base64, digest_alg_str) = compute_mic(&mic_input, policy.mic_algorithm);
-    emit_protocol_event(
-        event_bus,
-        session,
-        AsxEvent::MicComputed {
-            message_id: message_id.clone().into(),
-            digest_alg: digest_alg_str,
-            mic_base64: mic_base64.clone(),
-        },
-        policy.fail_closed_audit_events,
-        "as2_send_mic_computed",
-    )?;
-
-    if policy.sign || policy.encrypt {
-        // Sign/encrypt the entity, not the bare payload, so the receiver
-        // recovers the payload's real media type and digests the same octets.
-        payload_to_send = mic_input.clone();
-    }
-
-    if policy.sign {
-        let key = prepared.signing_key.as_ref().ok_or_else(|| {
-            AsxError::new(
-                ErrorCode::PolicyViolation,
-                "AS2 signing key is missing",
-                ErrorContext::for_session("as2_send_sign", session),
-            )
-        })?;
-        let cert = prepared.signing_cert.as_ref().ok_or_else(|| {
-            AsxError::new(
-                ErrorCode::PolicyViolation,
-                "AS2 signing certificate is missing",
-                ErrorContext::for_session("as2_send_sign", session),
-            )
-        })?;
-        payload_to_send = sign_payload(&payload_to_send, key, cert)?;
-        pipeline::emit_message_signed(
-            event_bus,
-            session,
-            &message_id,
-            policy.fail_closed_audit_events,
-        )?;
-    }
-
-    if policy.encrypt {
-        let recipient_cert = prepared.recipient_cert.as_ref().ok_or_else(|| {
-            AsxError::new(
-                ErrorCode::PolicyViolation,
-                "AS2 recipient certificate is missing",
-                ErrorContext::for_session("as2_send_encrypt", session),
-            )
-        })?;
-        payload_to_send = encrypt_payload(&payload_to_send, recipient_cert, &policy)?;
-        pipeline::emit_message_encrypted(
-            event_bus,
-            session,
-            &message_id,
-            policy.fail_closed_audit_events,
-        )?;
-    }
-
-    let mime = build_mime_envelope(payload_to_send, &policy);
-    let http_headers = build_as2_http_headers(session, &policy, &message_id, &mime);
-
-    let traceparent = generate_traceparent(&session.correlation_scope().root_id, &message_id);
-
-    Ok(As2SendOutput {
-        message_id,
-        mime,
+    let entity_content_type = payload_entity_content_type(policy, content_type);
+    // Signed/encrypted: the MIC covers the MIME entity — headers included.
+    // Unsigned and unencrypted: content only, no MIME headers at all. Either
+    // way it is what is signed, encrypted or sent, so the receiver recovers
+    // the payload's real media type and digests the same octets.
+    let entity: Vec<u8> = if policy.sign || policy.encrypt {
+        build_outbound_entity(entity_content_type, payload)
+    } else {
+        payload.to_vec()
+    };
+    let (mic_base64, digest_alg) = compute_mic(&entity, policy.mic_algorithm);
+    Ok(OutboundEntity {
+        entity,
         mic_base64,
-        digest_alg: digest_alg_str,
-        traceparent: Some(traceparent),
-        http_headers,
+        digest_alg,
     })
 }
 
-pub async fn send_async(
-    session: &SessionContext,
-    event_bus: &EventBus,
-    request: As2SendRequest,
-) -> Result<As2SendOutput> {
-    let scheduler = RetryScheduler::new(RetryConfig::default());
-    let request = request;
-
-    scheduler
-        .retry_with_decider(
-            || {
-                let blocking_session = session.clone();
-                let blocking_bus = event_bus.clone();
-                let error_session = session.clone();
-                let request = request.clone();
-                async move {
-                    let permit = crate::core::CryptoAdmissionControl::process_global()
-                        .acquire("as2_send_async_admission", &blocking_session)
-                        .await?;
-                    tokio::task::spawn_blocking(move || {
-                        let _permit = permit;
-                        send_sync(&blocking_session, &blocking_bus, request)
-                    })
-                    .await
-                    .map_err(|err| {
-                        AsxError::new(
-                            ErrorCode::TransportFailure,
-                            format!("AS2 send blocking task failed: {err}"),
-                            ErrorContext::for_session("as2_send_async_join", &error_session),
-                        )
-                    })?
-                }
-            },
-            |err| pipeline::classify_send_retry(err).should_retry,
-        )
-        .await
+/// Encrypt the signed entity to `recipient` (when the policy encrypts) and
+/// wrap the result for HTTP.
+pub(crate) fn envelope(
+    signed: Vec<u8>,
+    recipient: Option<&openssl::x509::X509Ref>,
+    policy: &As2SendPolicy,
+    content_type: Option<&str>,
+) -> Result<MimeEnvelope> {
+    let body = match (policy.encrypt, recipient) {
+        (true, Some(recipient)) => encrypt_payload(&signed, recipient, policy)?,
+        (true, None) => {
+            return Err(AsxError::new(
+                ErrorCode::PolicyViolation,
+                "AS2 recipient certificate is missing",
+                ErrorContext::new("as2_send_encrypt"),
+            ));
+        }
+        (false, _) => signed,
+    };
+    Ok(build_mime_envelope(body, policy, content_type))
 }
 
-pub async fn send_async_prepared(
-    session: &SessionContext,
-    event_bus: &EventBus,
-    request: As2SendPreparedRequest,
-) -> Result<As2SendOutput> {
-    let scheduler = RetryScheduler::new(RetryConfig::default());
-    let request = Arc::new(request);
-
-    scheduler
-        .retry_with_decider(
-            || {
-                let blocking_session = session.clone();
-                let blocking_bus = event_bus.clone();
-                let error_session = session.clone();
-                let request = Arc::clone(&request);
-                async move {
-                    let permit = crate::core::CryptoAdmissionControl::process_global()
-                        .acquire("as2_send_async_admission", &blocking_session)
-                        .await?;
-                    tokio::task::spawn_blocking(move || {
-                        let _permit = permit;
-                        let request = request.as_ref();
-                        send_sync_prepared_ref(
-                            &blocking_session,
-                            &blocking_bus,
-                            request.message_id.clone(),
-                            request.payload.clone(),
-                            request.policy.clone(),
-                            &request.prepared,
-                        )
-                    })
-                    .await
-                    .map_err(|err| {
-                        AsxError::new(
-                            ErrorCode::TransportFailure,
-                            format!("AS2 send blocking task failed: {err}"),
-                            ErrorContext::for_session("as2_send_async_join", &error_session),
-                        )
-                    })?
-                }
-            },
-            |err| pipeline::classify_send_retry(err).should_retry,
+/// The crafting hook behind `asx::__fuzz::as2_raw_message`: an AS2 entity
+/// carrying `payload`, signed by `signer` (`(cert PEM, key PEM)`) and
+/// encrypted to `recipient_cert_pem` only when given. Returns
+/// `(Content-Type, body)`.
+///
+/// The clients always sign and encrypt; the receive suites use this to present
+/// an `Inbound` with what a client never sends (an unsigned or unencrypted
+/// message, a signer that is not the pinned one). The signature is made by
+/// the same CMS assembly as the client's (`super::cms_keys`).
+pub fn raw_message(
+    payload: &[u8],
+    content_type: &str,
+    as2_from: &str,
+    signer: Option<(&[u8], &[u8])>,
+    recipient_cert_pem: Option<&[u8]>,
+) -> Result<(String, Vec<u8>)> {
+    let refuse = |detail: String| {
+        AsxError::new(
+            ErrorCode::PolicyViolation,
+            detail,
+            ErrorContext::new("as2_raw_message"),
         )
-        .await
+    };
+    let partner = crate::party::Partner::new(as2_from);
+    let resolved = crate::profile::resolve(
+        &crate::profile::Profile::as2(),
+        &partner,
+        &crate::clock::system(),
+    );
+    let mut policy = super::client::send_view(&resolved, as2_from);
+    policy.sign = signer.is_some();
+    policy.encrypt = recipient_cert_pem.is_some();
+    let recipient = recipient_cert_pem
+        .map(openssl::x509::X509::from_pem)
+        .transpose()
+        .map_err(|_| {
+            refuse("AS2 recipient certificate is not a valid PEM X.509 certificate".into())
+        })?;
+    let session = SessionContext::new("raw", as2_from, "strict")?;
+    let entity = outbound_entity(&session, "raw", payload, &policy, Some(content_type))?;
+    let signed = match signer {
+        Some((cert, key)) => {
+            let pair =
+                crate::keys::KeyPair::from_pem(cert, key).map_err(|e| refuse(e.to_string()))?;
+            super::cms_keys::sign_detached_ready(&pair, &entity.entity, session.clock().now())
+                .map_err(|e| refuse(e.to_string()))?
+        }
+        None => entity.entity,
+    };
+    let mime = envelope(signed, recipient.as_deref(), &policy, Some(content_type))?;
+    Ok((mime.content_type, mime.body.to_vec()))
 }
 
 /// Media type stamped on the outbound MIME entity.
 ///
 /// When compression is applied the entity carries the compressed octets, so it
 /// is labelled as such rather than as the original business media type.
-fn payload_entity_content_type(policy: &As2SendPolicy) -> &'static str {
-    #[cfg(feature = "compression")]
+fn payload_entity_content_type<'a>(
+    policy: &As2SendPolicy,
+    content_type: Option<&'a str>,
+) -> &'a str {
     if policy.compress {
         return crate::crypto::compression::AS2_COMPRESSED_CONTENT_TYPE;
     }
-    policy
-        .payload_content_type
+    content_type
+        .or(policy.payload_content_type)
         .unwrap_or("application/octet-stream")
 }
 
-fn build_mime_envelope(payload_to_send: Vec<u8>, policy: &As2SendPolicy) -> MimeEnvelope {
+fn build_mime_envelope(
+    payload_to_send: Vec<u8>,
+    policy: &As2SendPolicy,
+    content_type: Option<&str>,
+) -> MimeEnvelope {
     if policy.encrypt {
         return MimeEnvelope {
             content_type: "application/pkcs7-mime; smime-type=enveloped-data; name=\"smime.p7m\""
@@ -507,39 +252,9 @@ fn build_mime_envelope(payload_to_send: Vec<u8>, policy: &As2SendPolicy) -> Mime
     // the HTTP entity body under its own media type. There is no multipart
     // wrapper — inventing one would change the octets the receiver MICs.
     MimeEnvelope {
-        content_type: payload_entity_content_type(policy).to_string(),
+        content_type: payload_entity_content_type(policy, content_type).to_string(),
         body: payload_to_send.into(),
     }
-}
-
-fn build_as2_http_headers(
-    session: &SessionContext,
-    policy: &As2SendPolicy,
-    message_id: &str,
-    mime: &MimeEnvelope,
-) -> HttpHeaders {
-    let as2_from = if policy.as2_from_id.trim().is_empty() {
-        session.session_id().to_string()
-    } else {
-        policy.as2_from_id.clone()
-    };
-
-    HttpHeaders::from_vec(vec![
-        ("AS2-Version".to_string(), "1.2".to_string()),
-        ("AS2-From".to_string(), as2_from),
-        ("AS2-To".to_string(), session.partner_id().to_string()),
-        ("Message-ID".to_string(), format!("<{message_id}@asx>")),
-        ("MIME-Version".to_string(), "1.0".to_string()),
-        ("Content-Type".to_string(), mime.content_type.clone()),
-    ])
-}
-
-fn sign_payload(
-    payload: &[u8],
-    signing_key: &openssl::pkey::PKeyRef<openssl::pkey::Private>,
-    signing_cert: &openssl::x509::X509Ref,
-) -> Result<Vec<u8>> {
-    crate::crypto::as2_smime::sign_smime_message_preparsed(payload, signing_key, signing_cert)
 }
 
 fn encrypt_payload(
@@ -556,7 +271,6 @@ fn encrypt_payload(
 
 /// RFC 5402 AS2 compression: CMS `CompressedData` (ZLIB), not a bare gzip
 /// stream — see [`crate::crypto::compression`].
-#[cfg(feature = "compression")]
 fn compress_payload(payload: &[u8]) -> Result<Vec<u8>> {
     crate::crypto::compression::compress_cms_zlib(payload, 6)
 }

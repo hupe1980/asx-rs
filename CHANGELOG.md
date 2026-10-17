@@ -15,7 +15,65 @@ Versioning follows the [SemVer policy](#semver-policy) below.
 
 ---
 
-## [0.15.0] — unreleased
+## [Unreleased]
+
+## [0.16.0] — 2026-10-17
+
+0.16.0 is a hard cut: one small async API replaces the 0.15 API, with no
+deprecation shims. A `Profile` preset (`bdew`, `peppol`, `edelivery_1_15`,
+`entsog`, `as2`) fixes every security and wire setting; `As4`/`As2` clients
+send and return a `Verified<Receipt>`, and one `Inbound` tower `Service`
+receives, verifies, deduplicates and answers. Encrypted AS4 does not
+interoperate with asx 0.15: upgrade every asx peer together.
+
+### Wire / crypto
+
+- AS4 signs, then encrypts (WSS SwA 1.1 §5.5 envelope, one `xenc:EncryptedKey`, AES-GCM parts as `application/octet-stream`); every AS4 preset signs and encrypts.
+- `Profile::bdew()`: ECDH-ES/ConcatKDF on brainpoolP256r1 with an SKI recipient reference; others use RSA-OAEP-SHA-256 with a BST.
+- ECDSA `ds:SignatureValue` is XMLDSig 1.1 `r ‖ s`; DER is refused.
+- Inbound AS4 verifies the signature before any private-key operation; every decryption failure is one `EBMS:0102`.
+- Inbound XML Encryption parameters (KDF, curve, OAEP) are required and checked; `rsa-1_5`, `rsa-oaep-mgf1p`, SHA-1 MGF and CBC are refused.
+- `eb:Property` values are element text; `eb:PartInfo` properties are read from the signed `eb:Messaging` only, and a property repeated in one `eb:PartInfo` is refused.
+- `eb:MessageId` carries no `wsu:Id`; a PKIPath token reference carries `wsse11:TokenType`, and the last certificate of the path is the signer.
+- BDEW header: gzip always, fixed Action, roles and `AgreementRef`, empty `ConversationId`, no `eb:MessageProperties`.
+- BDEW path switch (`requestSwitch`/`confirmSwitch`) is sent and accepted.
+- BDEW accepts an unconfigured sender whose SM-PKI certificate carries the claimed MP-ID as subject OU.
+- Content-IDs and gzip output are deterministic, so a resend reproduces every digest.
+- `eb:Timestamp` is accepted up to 300 s ahead and 24 h back.
+- Revocation: every non-anchor certificate of a verified signer path is checked against its CRL distribution points (BDEW: CRL only, with the three-day distrust rule; other profiles: CRL, then OCSP).
+- Duplicates get a fresh signed receipt (AS4) or `processed/warning: duplicate-document` (AS2); a message in flight gets HTTP 503; a handler refusal gets `EBMS:0202` or `processed/error: unexpected-processing-error`.
+- The ebMS3 test service is receipted, never delivered.
+- An unsigned AS4 message is answered `EBMS:0103`; unsigned or unencrypted AS2 is refused `insufficient-message-security`.
+- AS2 always requests a signed MDN with `sha-256` and sends `Message-ID: <id>` as given (an RFC 2822 msg-id).
+- AS2 surfaces the Content-Type of the signed entity; an RFC 5402 compressed entity must contain a MIME entity, else `decompression-failed`.
+- Peppol payload parts carry no `Content-Disposition`.
+
+### API
+
+- Library name `asx` (package `asx-rs`); features `as2`, `as4`, `http-client` (default), `peppol`, `metrics`.
+- `As4::builder(Profile)` / `As2::builder(Profile)` with `LocalParty`, `Partner`, trust anchors, `Builder::crl_signer`, an `HttpClient` and an optional `AuditSink`.
+- `as4::Message`, `as2::Message`, `Payload`; `send` returns `Verified<Receipt>`; `As2::send_async_mdn` and `verify_async_mdn` with `PendingMdn`.
+- `inbound(dedup, handler)` returns an `Inbound` tower `Service`; the handler receives `Verified<UserMessage>` or `Verified<Received>`, each payload with its declared media type.
+- `DedupStore` claims with a `ClaimToken` (`accept`/`abandon` fenced by it); `MemoryDedup` for tests and single processes.
+- Keys behind the async `Signer` and `Decrypter` traits; `KeyPair` and `Certificate` for PEM.
+- One `Error` with `kind()`, `is_retryable()`, `ebms_code()`, `mdn_disposition()` and the evidence.
+- `AuditSink` and the opaque, serializable `AuditRecord` for every exchange leg.
+- Telemetry: `tracing` spans under target `asx`, and counters and histograms with the `metrics` feature.
+- `peppol::Smp` for SMP lookup through BDXL.
+
+### Removed
+
+- The 0.15 API: free functions, request/policy/session types, P-Modes, transports, ingress, verifiers, `presets`, `storage`, `wire`, `http`, `interop`.
+- Pull, split/join, ordered delivery, AS2 streaming and spooling, the event bus, the axum server router.
+- Relaxed interop mode, per-message security settings and revocation settings (OCSP modes, static CRLs, stapled responses).
+- Features `crypto`, `client`, `server`, `compression`, `trace`, `async-ocsp`, `dns`, `testing`, `interop-strict`, `interop-relaxed`, `prometheus`, `opentelemetry`.
+- Test support moved to the dev-only `asx-rs-testkit` crate.
+
+Every 0.15 name and its replacement: [migration guide](https://hupe1980.github.io/asx-rs/docs/migration/).
+
+---
+
+## [0.15.0] — 2026-09-20
 
 Deduplication became two-phase, which is a breaking change to the storage seam
 and to both receive outcomes. The change was forced by a delivery-correctness

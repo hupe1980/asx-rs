@@ -1,120 +1,86 @@
-/*!
-# asx-rs — AS2/AS4 EDI protocol library
-
-`asx-rs` is an async-native, memory-safe Rust library for the AS2 (RFC 4130) and
-AS4 (OASIS ebMS3 + eDelivery) EDI transport protocols. The crate is published as
-`asx-rs`; the library itself is imported as `asx_rs`.
-
-## Feature flags
-
- The crate uses Cargo feature flags to limit the compiled surface and dependency
- tree.  The **default** feature set is
- `["interop-strict", "async-ocsp", "compression", "trace"]`.
-
-| Feature | Enables | Required by |
-|---|---|---|
-| `as2` | AS2 send/receive free functions (`as2::send_sync`, `as2::receive_sync`) and async wrappers (`as2::send_async`, `as2::receive_async`) | anything using AS2 |
-| `as4` | AS4 send/receive free functions (`as4::send_sync`, `as4::receive_push_sync`), receipt verification (`as4::verify_sync_response`), `As4PullStore`, and protocol configuration (`pmode`, `types`) | anything using AS4 |
-| `compression` | Zlib/GZIP payload compression via `flate2` | AS2/AS4 `policy.compress = true` (default) |
-| `async-ocsp` | Async OCSP responder fetching via `reqwest` | production OCSP validation |
-| `interop-strict` | **(default)** Strict interop mode as the default. Governs header/ambiguity handling only — **not** the security policy; see [`InteropMode`](core::InteropMode) | All profiles |
-| `interop-relaxed` | Relaxed mode helpers available alongside strict | Legacy partner interop |
-| `trace` | Experimental `tracing` instrumentation for selected protocol paths | Observability |
-| `prometheus` | Built-in Prometheus/OpenMetrics text `MetricsSink` adapter (`observability::PrometheusMetricsSink`) | Native metrics export |
-| `opentelemetry` | OpenTelemetry `MetricsSink` adapter (`observability::OtelMetricsSink`) | Native metrics export |
-| `dns` | Built-in BDXL resolver (`smp::HickoryBdxlResolver`) for Peppol/CEF participant discovery | `SmlDiscovery::Naptr` without a custom `BdxlResolver` |
-| `testing` | Exposes `fixtures` and `matrix` test-scaffold modules | Integration test harness |
-| `server` | Axum router integration (`as2_router`, `as4_router`, `As2AxumHandler`, `As4AxumHandler`) | HTTP receive |
-| `client` | Async HTTP egress transport via `reqwest` (`As2HttpTransport`, `As4HttpTransport`) | HTTP send |
-
-`reqwest` dependency note:
-- Enabling `async-ocsp` pulls `reqwest` for OCSP HTTP fetches.
-- Enabling `client` also pulls `reqwest` for protocol egress transports.
-- Enabling both features reuses the same crate dependency; there is no second HTTP stack.
-
-### Minimal feature combinations
-
-```toml
-# AS2 only (sign, encrypt, OCSP; compression is enabled by default):
-asx-rs = { version = "0.15", features = ["as2", "async-ocsp"] }
-
-# AS4 only (sign, encrypt; compression is enabled by default):
-asx-rs = { version = "0.15", features = ["as4", "async-ocsp"] }
-
-# Both protocols with compression:
-asx-rs = { version = "0.15", features = ["as2", "as4", "compression", "async-ocsp"] }
-
-# AS4 with Peppol/CEF dynamic discovery:
-asx-rs = { version = "0.15", features = ["as4", "client", "dns"] }
-
-# Both protocols, relaxed interop for legacy partners:
-asx-rs = { version = "0.15", features = ["as2", "as4", "interop-relaxed", "async-ocsp"] }
-
-```
-
-> **Note:** `as2` and `as4` are **not** in the default feature set.
-> Adding `asx-rs` without explicit features compiles only the shared
-> infrastructure (`core`, `crypto`, `reliability`, `observability`).
-
-## Security notes
-
-- AS2 trust-verifier traits are intentionally open so applications and tests can
-  supply their own verification backends. Prefer local deterministic test
-  verifiers over crate-exported bypass helpers.
-- PKIX chain validation requires at least one trust-anchor PEM in
-  `CertHandle::trust_anchor_pems` (fail-closed when empty).
-- OCSP freshness checking (thisUpdate/nextUpdate) is enforced automatically
-  when `OcspMode` is not `Disabled`.
-- HTTP egress transports are HTTPS-only.
-*/
+//! AS2 and AS4 messaging. Start at [`as4::As4::builder`] or
+//! [`as2::As2::builder`].
+//!
+//! `asx-rs` is an async, memory-safe library for the AS2 (RFC 4130) and AS4
+//! (OASIS ebMS3 + eDelivery) EDI transport protocols. The crate is published
+//! as `asx-rs`; the library is imported as `asx`.
+//!
+//! A client is built once from a [`Profile`] (every security and wire setting
+//! of a network, cited), the [`LocalParty`], the [`Partner`]s and the trust
+//! anchors. It sends a message and returns the partner's receipt or MDN only
+//! as a [`Verified`] value, and its `inbound` endpoint verifies, deduplicates
+//! ([`DedupStore`]) and answers before calling a [`Handler`].
+//!
+//! ## Feature flags
+//!
+//! | Feature | Enables |
+//! |---|---|
+//! | `as2` (default) | [`as2`] |
+//! | `as4` (default) | [`as4`] |
+//! | `http-client` (default) | the built-in HTTPS [`HttpClient`] |
+//! | `peppol` | [`peppol`]: SMP lookup through BDXL with the bundled DNS resolver; implies `as4` |
+//! | `metrics` | counters and histograms through the [`metrics`](https://docs.rs/metrics) facade |
+//!
+//! Without `http-client`, pass an [`HttpClient`] to [`Builder::http_client`].
+//!
+//! ## Observability
+//!
+//! Every send, receive, verification and audit write runs inside a `tracing`
+//! span under target `asx` (`RUST_LOG=asx=info`); the library never installs a
+//! subscriber or a metrics recorder, and nothing an observer does changes a
+//! protocol outcome. Evidence of each exchange leg goes to an [`AuditSink`].
+//! Span, field and metric names are a documented contract.
 
 // The crate parses MIME, SOAP, XML and CMS straight off the network. Memory
 // safety there is the entire point, so `unsafe` is not merely absent — it
 // cannot be added.
 #![forbid(unsafe_code)]
+// A build with one protocol (or none), or without the built-in HTTP client,
+// compiles shared building blocks only the missing feature calls. Dead code is
+// checked where every block has a caller: the default build.
+#![cfg_attr(
+    not(all(feature = "as2", feature = "as4", feature = "http-client")),
+    allow(dead_code, unused_imports)
+)]
 
-pub mod core;
-#[cfg(any(feature = "as2", feature = "as4"))]
-pub mod credentials;
-pub mod crypto;
-pub mod http;
-pub mod interop;
-pub mod lifecycle;
-pub mod observability;
-pub mod presets;
-#[cfg(feature = "as4")]
+mod audit;
+mod clock;
+#[allow(unreachable_pub)]
+pub(crate) mod core;
+#[allow(unreachable_pub)]
+pub(crate) mod crypto;
+// The AS4 timestamp helpers and the audit record's `recorded_at` share it.
+#[cfg_attr(not(feature = "as4"), allow(dead_code))]
 pub(crate) mod time_utils;
 
-// Compile-time guards for invalid feature combinations.
-#[cfg(all(feature = "server", not(any(feature = "as2", feature = "as4"))))]
-compile_error!(
-    "the `server` feature requires at least one of `as2` or `as4` to be enabled alongside it; \
-     e.g. features = [\"server\", \"as2\"] or features = [\"server\", \"as4\"]"
-);
-
-// Block `testing` in release profile.  The guard uses the `cargo_release_profile`
-// cfg flag emitted by build.rs (derived from the `PROFILE` env var) rather than
-// `not(debug_assertions)`, which can be defeated by
-// `[profile.release] debug-assertions = true` in an embedder's Cargo.toml.
-#[cfg(all(feature = "testing", cargo_release_profile))]
-compile_error!(
-    "the `testing` feature must not be enabled in release builds; \
-     remove `testing` from your feature list for production or release workflows"
-);
-
-#[cfg(feature = "testing")]
-pub mod fixtures;
-#[cfg(feature = "testing")]
-pub mod matrix;
-pub mod reliability;
+#[cfg(any(feature = "as2", feature = "as4"))]
+pub(crate) mod runtime;
 #[cfg(feature = "as4")]
-pub mod sbdh;
+#[allow(unreachable_pub)]
+pub(crate) mod sbdh;
 #[cfg(any(feature = "as2", feature = "as4"))]
 pub(crate) mod send_pipeline;
-pub mod storage;
-pub mod transport;
+mod telemetry;
+#[cfg(test)]
+pub(crate) mod test_support;
+// The README and the site pages, compiled as doctests (`src/docs.rs`).
+#[cfg(all(
+    doctest,
+    feature = "as2",
+    feature = "as4",
+    feature = "http-client",
+    feature = "peppol",
+    feature = "metrics"
+))]
+mod docs;
+#[allow(unreachable_pub)]
+pub(crate) mod transport;
 #[cfg(any(feature = "as2", feature = "as4"))]
-pub mod wire;
+#[allow(unreachable_pub)]
+pub(crate) mod wire;
+/// One XML parser, one writer, one namespace table.
+#[cfg(feature = "as4")]
+pub(crate) mod xml;
 
 #[cfg(feature = "as2")]
 pub mod as2;
@@ -122,24 +88,104 @@ pub mod as2;
 #[cfg(feature = "as4")]
 pub mod as4;
 
-#[cfg(feature = "client")]
-#[cfg(feature = "as4")]
-pub mod smp;
+#[cfg(feature = "peppol")]
+#[allow(unreachable_pub)]
+pub(crate) mod smp;
 
 /// Peppol network rules that sit above a single protocol.
-#[cfg(feature = "as4")]
+#[cfg(feature = "peppol")]
 pub mod peppol;
 
-pub use core::{AsxError, CryptoAdmissionControl, ErrorCode, ErrorContext, Result};
+// ── The client API ────────────────────────────────────────────────────────────
 #[cfg(any(feature = "as2", feature = "as4"))]
-pub use credentials::PartnerCredentials;
+mod builder;
+mod dedup;
+mod error;
+#[cfg(any(feature = "as2", feature = "as4"))]
+mod http_client;
+#[cfg(any(feature = "as2", feature = "as4"))]
+mod inbound;
+#[cfg(any(feature = "as2", feature = "as4"))]
+mod keys;
+#[cfg(any(feature = "as2", feature = "as4"))]
+mod party;
+#[cfg(any(feature = "as2", feature = "as4"))]
+mod profile;
+/// The one revocation validator.
+#[cfg(any(feature = "as2", feature = "as4"))]
+pub(crate) mod revocation;
+#[cfg(any(feature = "as2", feature = "as4"))]
+mod verified;
 
-#[cfg(test)]
-mod tests {
-    use crate::core::InteropMode;
+pub use audit::{AuditDurability, AuditRecord, AuditSink};
+#[cfg(any(feature = "as2", feature = "as4"))]
+pub use builder::Builder;
+#[doc(hidden)]
+pub use dedup::__dedup_key;
+pub use dedup::{Claim, ClaimToken, DedupStore, MemoryDedup};
+#[doc(hidden)]
+pub use error::__mapping;
+pub use error::{BoxFuture, Error, ErrorKind, Result};
+#[cfg(any(feature = "as2", feature = "as4"))]
+pub use http_client::HttpClient;
+#[cfg(any(feature = "as2", feature = "as4"))]
+pub use inbound::{Handler, Inbound, Reject};
+#[cfg(any(feature = "as2", feature = "as4"))]
+pub use keys::{Certificate, Decrypter, KeyOp, KeyPair, SignatureAlgorithm, Signer};
+#[cfg(any(feature = "as2", feature = "as4"))]
+pub use party::{LocalParty, Partner};
+#[cfg(any(feature = "as2", feature = "as4"))]
+#[doc(hidden)]
+pub use profile::probe as __profile_probe;
+#[cfg(any(feature = "as2", feature = "as4"))]
+pub use profile::{Profile, Quirk};
+#[cfg(any(feature = "as2", feature = "as4"))]
+pub use verified::{Payload, Receipt, Verified};
 
-    #[test]
-    fn default_interop_mode_is_strict() {
-        assert_eq!(InteropMode::default(), InteropMode::Strict);
+/// Entry points of the vector, oracle, property and fuzz suites: the
+/// crate-private XML-security and SMP building blocks those suites drive
+/// directly. **Not part of the API**: hidden from the
+/// documentation, excluded from the public-API snapshot, and changed without
+/// notice. Applications use the clients.
+#[doc(hidden)]
+pub mod __fuzz {
+    pub use crate::core::{
+        AsxError, ErrorCode, ErrorContext, Result, SessionContext, SessionContextBuilder,
+    };
+    #[cfg(any(feature = "as2", feature = "as4"))]
+    pub use crate::crypto::CertFingerprint;
+    #[cfg(feature = "as4")]
+    pub use crate::crypto::{soap_builder, wssec};
+    /// The revocation module's decision on static material.
+    #[cfg(any(feature = "as2", feature = "as4"))]
+    pub use crate::revocation::vectors as revocation;
+    #[cfg(feature = "peppol")]
+    pub mod smp {
+        pub use crate::smp::*;
+    }
+    // Crate-private generators the vector and property suites drive to craft
+    // inputs the clients never produce (a receipt without NRI, odd MDNs).
+    #[cfg(feature = "as2")]
+    pub use crate::as2::mdn::{generate_mdn, generate_signed_mdn};
+    #[cfg(feature = "as2")]
+    pub use crate::as2::send_path::raw_message as as2_raw_message;
+    #[cfg(feature = "as2")]
+    pub use crate::as2::types::As2MdnSigningCredentials;
+    #[cfg(feature = "as4")]
+    pub use crate::as4::signals::{
+        generate_error_signal, generate_receipt, generate_receipt_with_nri,
+        generate_signed_receipt_with_nri,
+    };
+    #[cfg(feature = "as4")]
+    pub use crate::as4::types::{
+        As4ErrorCode, As4ErrorSeverity, As4NriReference, As4ReceiptCredentials,
+    };
+    #[cfg(feature = "as2")]
+    pub use crate::crypto::as2_smime::sign_smime_message;
+    #[cfg(feature = "as2")]
+    pub use crate::crypto::compression::{AS2_COMPRESSED_CONTENT_TYPE, compress_cms_zlib};
+    #[cfg(feature = "as4")]
+    pub mod sbdh {
+        pub use crate::sbdh::*;
     }
 }

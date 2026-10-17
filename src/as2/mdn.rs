@@ -1,10 +1,7 @@
 use super::{
-    As2MdnMode, As2ReceivePolicy, As2TrustVerifier, AsxError, ErrorCode, EventBus, InteropDecision,
-    InteropExceptionCode, InteropMode, MAX_AS2_MDN_BYTES, ParsedMdn, ReceivedBodyHandle, Result,
-    SessionContext, emit_audit_event, enforce_exception, enforce_payload_limit,
-    evaluate_exception_guardrail,
+    As2MdnSigningCredentials, As2TrustVerifier, AsxError, ErrorCode, ErrorContext,
+    MAX_AS2_MDN_BYTES, ParsedMdn, Result, SessionContext, enforce_payload_limit,
 };
-use crate::interop::InteropGuardrailOutcome;
 
 const AS2_MISSING_FINAL_RECIPIENT_REASON_CODE: &str = "as2_missing_final_recipient";
 use base64::{Engine as _, engine::general_purpose::STANDARD};
@@ -31,33 +28,6 @@ fn parse_mdn_fields_from_bytes(raw: &[u8]) -> Result<MdnFields> {
     parse_mdn_fields(text)
 }
 
-/// Extract the `original_message_id` from raw MDN bytes (walks the MIME parts
-/// looking for `message/disposition-notification`).
-///
-/// Used by [`crate::as2::correlate_async_mdn`].
-pub(super) fn extract_original_message_id(raw: &[u8]) -> Option<String> {
-    let parsed_mail = mailparse::parse_mail(raw).ok()?;
-    // Find the disposition-notification part and decode its body.
-    let body = find_disposition_notification_body_bytes(&parsed_mail)?;
-    let (_, original_message_id, _, _) = parse_mdn_fields_from_bytes(&body).ok()?;
-    original_message_id
-}
-
-/// Walk a parsed MIME tree looking for a `message/disposition-notification` part.
-/// Returns the decoded body bytes of the first matching part.
-fn find_disposition_notification_body_bytes(mail: &mailparse::ParsedMail<'_>) -> Option<Vec<u8>> {
-    let ct = mail.ctype.mimetype.to_ascii_lowercase();
-    if ct == "message/disposition-notification" {
-        return mail.get_body_raw().ok();
-    }
-    for sub in &mail.subparts {
-        if let Some(b) = find_disposition_notification_body_bytes(sub) {
-            return Some(b);
-        }
-    }
-    None
-}
-
 fn normalize_received_mic_value(value: &str) -> (&str, Option<&str>) {
     // RFC 4130 §7.4.3: Received-Content-MIC = base64-value *WSP "," *WSP micalg
     let mut parts = value.splitn(2, ',');
@@ -72,16 +42,15 @@ fn normalize_received_mic_value(value: &str) -> (&str, Option<&str>) {
 /// the algorithm name are validated.  This prevents a MITM from substituting
 /// a MIC computed with a weaker algorithm while leaving the digest field
 /// unchanged (RFC 4130 §7.4.3).
-fn mic_values_match(actual: &str, expected: &str) -> bool {
+pub(super) fn mic_values_match(actual: &str, expected: &str) -> bool {
     let (actual_digest, actual_alg) = normalize_received_mic_value(actual);
     let (expected_digest, expected_alg) = normalize_received_mic_value(expected);
 
     // Strip whitespace before decoding. A `Received-Content-MIC` travels in a
     // MIME header, and RFC 5322 §2.2.3 lets a header fold across lines — so a
-    // conformant partner's digest can arrive with a CRLF and a space inside it.
-    // Decoding that with the strict engine fails, which used to drop the
-    // comparison to raw string equality and report a MIC mismatch: a delivered
-    // message declared undelivered. Same defect class as the XML base64 path.
+    // conformant partner's digest can arrive with a CRLF and a space inside it,
+    // and the strict engine refuses that: a delivered message would read as a
+    // MIC mismatch.
     let unfold = |v: &str| -> String { v.chars().filter(|c| !c.is_ascii_whitespace()).collect() };
     let actual_compact = unfold(actual_digest);
     let expected_compact = unfold(expected_digest);
@@ -107,14 +76,14 @@ fn mic_values_match(actual: &str, expected: &str) -> bool {
     }
 }
 
-pub(super) fn parse_mdn(
+/// [`parse_mdn`], also returning the certificate (DER) whose signature
+/// verified, for a signed MDN.
+pub(super) fn parse_mdn_with_signer(
     raw: &[u8],
-    policy: As2ReceivePolicy,
     require_signed_mdn: bool,
     session: &SessionContext,
-    event_bus: &EventBus,
     verifier: &dyn As2TrustVerifier,
-) -> Result<(ParsedMdn, Vec<&'static str>)> {
+) -> Result<(ParsedMdn, Option<Vec<u8>>, Vec<openssl::x509::X509>)> {
     enforce_payload_limit("as2_receive_mdn_parse", raw.len(), MAX_AS2_MDN_BYTES)?;
     if raw.is_empty() {
         return Err(AsxError::new(
@@ -134,56 +103,68 @@ pub(super) fn parse_mdn(
         )
     })?;
 
-    let mut interop_reasons: Vec<&'static str> = Vec::new();
-
     let boundary = parsed_mail.ctype.params.get("boundary");
     let has_signed_content_type = is_signed_mdn(&parsed_mail);
 
     // RFC 4130 §7.3: if a signed receipt was requested, an unsigned MDN is a
     // non-repudiation downgrade and must not be silently accepted.
     if require_signed_mdn && !has_signed_content_type {
-        match policy.interop_mode {
-            InteropMode::Strict => {
-                return Err(AsxError::new(
-                    ErrorCode::SecurityVerificationFailed,
-                    "a signed MDN was requested but the received MDN is not multipart/signed",
-                    super::ErrorContext::for_session("as2_receive_mdn_verify", session),
-                ));
-            }
-            #[cfg(feature = "interop-relaxed")]
-            InteropMode::Relaxed => {
-                interop_reasons.push("mdn_signature_required_but_absent");
-            }
-        }
+        return Err(AsxError::new(
+            ErrorCode::SecurityVerificationFailed,
+            "a signed MDN was requested but the received MDN is not multipart/signed",
+            super::ErrorContext::for_session("as2_receive_mdn_verify", session),
+        ));
     }
 
-    if has_signed_content_type {
-        let mdn_body = ReceivedBodyHandle::InMemory(Arc::from(raw));
-        let verify_result = verifier.verify_and_decrypt(session, &mdn_body);
-        match policy.interop_mode {
-            InteropMode::Strict => {
-                verify_result.map_err(|err| {
-                    AsxError::new(
-                        ErrorCode::SecurityVerificationFailed,
-                        format!("signed MDN signature verification failed: {err}"),
-                        super::ErrorContext::for_session("as2_receive_mdn_verify", session),
-                    )
-                })?;
-            }
-            #[cfg(feature = "interop-relaxed")]
-            InteropMode::Relaxed => {
-                if verify_result.is_err() {
-                    interop_reasons.push("mdn_signature_verification_failed");
-                }
-            }
-        }
-    }
-    let notification_part = resolve_mdn_notification_part(&parsed_mail, &policy, session)?;
-    if policy.interop_mode == InteropMode::Strict
-        && notification_part.is_none()
-        && !has_signed_content_type
-        && !is_report_mdn(&parsed_mail)
+    // A present signature that fails is fatal.
+    let verified_entity = if has_signed_content_type {
+        let mdn_body: Arc<[u8]> = Arc::from(raw);
+        let trust = verifier
+            .verify_and_decrypt(session, &mdn_body)
+            .map_err(|err| {
+                AsxError::new(
+                    ErrorCode::SecurityVerificationFailed,
+                    format!("signed MDN signature verification failed: {err}"),
+                    super::ErrorContext::for_session("as2_receive_mdn_verify", session),
+                )
+            })?;
+        trust.protected_entity
+    } else {
+        None
+    };
+
+    // For a verified signed MDN, read every field from the verified entity —
+    // never from a second, independent parse of the raw bytes, which may
+    // split the MIME differently from the verifier.
+    let verified_mail = verified_entity
+        .as_ref()
+        .map(|entity| {
+            parse_mail(entity.entity()).map_err(|_| {
+                AsxError::new(
+                    ErrorCode::ParseFailed,
+                    "failed to parse verified mdn entity",
+                    super::ErrorContext::for_session("as2_receive_mdn_parse", session),
+                )
+            })
+        })
+        .transpose()?;
+    // The boundary rule below reads the outer entity; for a signed MDN the
+    // report is the signed content, and the same rule applies to it.
+    if let Some(entity_mail) = verified_mail.as_ref()
+        && entity_mail.ctype.mimetype.starts_with("multipart/")
+        && !entity_mail.ctype.params.contains_key("boundary")
     {
+        return Err(AsxError::new(
+            ErrorCode::InteropViolation,
+            "signed mdn multipart content-type is missing boundary parameter",
+            super::ErrorContext::for_session("as2_receive_mdn_boundary", session),
+        ));
+    }
+    let notification_part = match verified_mail.as_ref() {
+        Some(entity_mail) => resolve_signed_content_notification_part(entity_mail, session)?,
+        None => resolve_mdn_notification_part(&parsed_mail, session)?,
+    };
+    if notification_part.is_none() && !has_signed_content_type && !is_report_mdn(&parsed_mail) {
         return Err(AsxError::new(
             ErrorCode::InteropViolation,
             "strict AS2 policy requires MDN multipart/report or multipart/signed content-type",
@@ -193,34 +174,11 @@ pub(super) fn parse_mdn(
 
     let top_level_multipart = parsed_mail.ctype.mimetype.starts_with("multipart/");
     if top_level_multipart && boundary.is_none() {
-        let outcome = evaluate_exception_guardrail(
-            session,
-            policy.interop_mode,
-            &policy.interop_exceptions,
-            InteropExceptionCode::As2AllowMissingMdnBoundary,
-        );
-        emit_audit_event(
-            event_bus,
-            session,
-            super::AsxEvent::InteropGuardrailEvaluated {
-                message_id: Arc::from("unknown"),
-                code: InteropExceptionCode::As2AllowMissingMdnBoundary.reason_code(),
-                outcome: outcome.as_str(),
-                detail: "missing_mdn_boundary",
-            },
-            policy.fail_closed_audit_events,
-            "as2_receive_mdn_parse",
-        )?;
-        match enforce_exception(
-            session,
-            policy.interop_mode,
-            &policy.interop_exceptions,
-            InteropExceptionCode::As2AllowMissingMdnBoundary,
-            "as2_receive_mdn_boundary",
+        return Err(AsxError::new(
+            ErrorCode::InteropViolation,
             "mdn multipart content-type is missing boundary parameter",
-        )? {
-            InteropDecision::RelaxedException { reason_code } => interop_reasons.push(reason_code),
-        }
+            super::ErrorContext::for_session("as2_receive_mdn_boundary", session),
+        ));
     }
 
     let (final_recipient, original_message_id, disposition, received_content_mic) =
@@ -233,6 +191,8 @@ pub(super) fn parse_mdn(
                 )
             })?;
             parse_mdn_fields_from_bytes(&body)?
+        } else if let Some(entity) = verified_entity.as_ref() {
+            parse_mdn_fields_from_bytes(entity.entity())?
         } else {
             parse_mdn_fields_from_bytes(raw)?
         };
@@ -245,10 +205,9 @@ pub(super) fn parse_mdn(
         ));
     };
 
-    if policy.interop_mode == InteropMode::Strict
-        && !disposition
-            .to_ascii_lowercase()
-            .contains("automatic-action/")
+    if !disposition
+        .to_ascii_lowercase()
+        .contains("automatic-action/")
     {
         return Err(AsxError::new(
             ErrorCode::InteropViolation,
@@ -258,22 +217,12 @@ pub(super) fn parse_mdn(
     }
 
     if final_recipient.is_none() {
-        emit_audit_event(
-            event_bus,
-            session,
-            super::AsxEvent::InteropGuardrailEvaluated {
-                message_id: original_message_id
-                    .as_deref()
-                    .unwrap_or("unknown")
-                    .to_string()
-                    .into(),
-                code: AS2_MISSING_FINAL_RECIPIENT_REASON_CODE,
-                outcome: InteropGuardrailOutcome::Denied.as_str(),
-                detail: "missing_final_recipient",
-            },
-            policy.fail_closed_audit_events,
-            "as2_receive_mdn_parse",
-        )?;
+        tracing::debug!(
+            target: "asx",
+            message_id = original_message_id.as_deref().unwrap_or("unknown"),
+            code = AS2_MISSING_FINAL_RECIPIENT_REASON_CODE,
+            "interop guardrail denied: MDN missing Final-Recipient"
+        );
         return Err(AsxError::new(
             ErrorCode::InteropViolation,
             "AS2 MDN missing final-recipient is not allowed",
@@ -281,6 +230,13 @@ pub(super) fn parse_mdn(
         ));
     }
 
+    let signer_der = verified_entity
+        .as_ref()
+        .and_then(|entity| entity.signer_der().map(<[u8]>::to_vec));
+    let signer_path = verified_entity
+        .as_ref()
+        .map(|entity| entity.signer_path().to_vec())
+        .unwrap_or_default();
     Ok((
         ParsedMdn {
             final_recipient,
@@ -289,7 +245,8 @@ pub(super) fn parse_mdn(
             received_content_mic,
             is_signed: has_signed_content_type,
         },
-        interop_reasons,
+        signer_der,
+        signer_path,
     ))
 }
 
@@ -320,69 +277,13 @@ pub(super) fn extract_content_type_header(mime_bytes: &[u8]) -> Option<String> {
     }
 }
 
-pub(super) fn classify_mdn_outcome(
-    mdn: &ParsedMdn,
-    mdn_mode: As2MdnMode,
-    expected_mic: Option<&str>,
-) -> super::DeliveryOutcome {
-    if mdn_mode == As2MdnMode::None {
-        return super::DeliveryOutcome::SuccessConfirmed;
-    }
-
-    let parsed = parse_disposition(&mdn.disposition);
-
-    if parsed.disposition_type.eq_ignore_ascii_case("failed") {
-        return super::DeliveryOutcome::FailureConfirmed;
-    }
-
-    if parsed.disposition_type.eq_ignore_ascii_case("processed")
-        && parsed
-            .modifier
-            .is_some_and(|modifier| modifier.eq_ignore_ascii_case("error"))
-    {
-        return super::DeliveryOutcome::FailureConfirmed;
-    }
-
-    if parsed.disposition_type.eq_ignore_ascii_case("processed")
-        && parsed
-            .modifier
-            .is_some_and(|modifier| modifier.eq_ignore_ascii_case("warning"))
-    {
-        return super::DeliveryOutcome::AcceptedPendingVerification;
-    }
-
-    if parsed.disposition_type.eq_ignore_ascii_case("processed") {
-        match expected_mic {
-            Some(expected) => match &mdn.received_content_mic {
-                Some(actual) => {
-                    if mic_values_match(actual, expected) {
-                        super::DeliveryOutcome::SuccessConfirmed
-                    } else {
-                        super::DeliveryOutcome::FailureConfirmed
-                    }
-                }
-                None => {
-                    if mdn_mode == As2MdnMode::Asynchronous {
-                        super::DeliveryOutcome::AcceptedPendingVerification
-                    } else {
-                        super::DeliveryOutcome::Indeterminate
-                    }
-                }
-            },
-            None => super::DeliveryOutcome::SuccessConfirmed,
-        }
-    } else {
-        super::DeliveryOutcome::Indeterminate
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ParsedDisposition<'a> {
-    disposition_type: &'a str,
-    modifier: Option<&'a str>,
+pub(super) struct ParsedDisposition<'a> {
+    pub(super) disposition_type: &'a str,
+    pub(super) modifier: Option<&'a str>,
 }
 
-fn parse_disposition(disposition: &str) -> ParsedDisposition<'_> {
+pub(super) fn parse_disposition(disposition: &str) -> ParsedDisposition<'_> {
     let action_part = disposition
         .split_once(';')
         .map(|(_, action)| action.trim())
@@ -549,19 +450,16 @@ fn disposition_notification_parts<'a>(report: &'a ParsedMail<'a>) -> Vec<&'a Par
 ///
 /// Two reports carrying two disposition notifications are ambiguous about the
 /// delivery outcome, so the ambiguity is refused rather than resolved by
-/// document order (D5).
+/// document order.
 fn report_notification_part<'a>(
     report: &'a ParsedMail<'a>,
-    policy: &As2ReceivePolicy,
     session: &SessionContext,
 ) -> Result<Option<&'a ParsedMail<'a>>> {
     if report.subparts.is_empty() {
         return Ok(None);
     }
 
-    let strict = policy.interop_mode == InteropMode::Strict;
-
-    if strict && report.subparts.len() > 3 {
+    if report.subparts.len() > 3 {
         return Err(AsxError::new(
             ErrorCode::InteropViolation,
             "strict AS2 policy requires multipart/report to contain only the human-readable part, machine-readable part, and optional returned content",
@@ -582,7 +480,7 @@ fn report_notification_part<'a>(
 
     match candidates.first().copied() {
         // RFC 3798 §3 places the machine-readable part second.
-        Some(part) if strict && report.subparts.get(1).map(std::ptr::from_ref) != Some(part) => {
+        Some(part) if report.subparts.get(1).map(std::ptr::from_ref) != Some(part) => {
             Err(AsxError::new(
                 ErrorCode::InteropViolation,
                 "strict AS2 policy requires multipart/report body part 2 to be message/disposition-notification",
@@ -590,14 +488,11 @@ fn report_notification_part<'a>(
             ))
         }
         Some(part) => Ok(Some(part)),
-        None if strict => Err(AsxError::new(
+        None => Err(AsxError::new(
             ErrorCode::InteropViolation,
             "strict AS2 policy requires multipart/report body part 2 to be message/disposition-notification",
             super::ErrorContext::for_session("as2_receive_mdn_parse", session),
         )),
-        // Relaxed widens the *absent* case only: no machine-readable part means
-        // no verdict, never a verdict read out of another part (D12).
-        None => Ok(None),
     }
 }
 
@@ -609,45 +504,49 @@ fn report_notification_part<'a>(
 /// choose the delivery outcome by putting the header in a human-readable part.
 fn resolve_mdn_notification_part<'a>(
     parsed_mail: &'a ParsedMail<'a>,
-    policy: &As2ReceivePolicy,
     session: &SessionContext,
 ) -> Result<Option<&'a ParsedMail<'a>>> {
     if is_report_mdn(parsed_mail) {
-        return report_notification_part(parsed_mail, policy, session);
+        return report_notification_part(parsed_mail, session);
     }
 
     if is_signed_mdn(parsed_mail) {
         let Some(signed) = parsed_mail.subparts.first() else {
             return Ok(None);
         };
-
-        if signed
-            .ctype
-            .mimetype
-            .eq_ignore_ascii_case("message/disposition-notification")
-        {
-            return Ok(Some(signed));
-        }
-
-        if is_report_mdn(signed) {
-            return report_notification_part(signed, policy, session);
-        }
-
-        if policy.interop_mode == InteropMode::Strict {
-            return Err(AsxError::new(
-                ErrorCode::InteropViolation,
-                format!(
-                    "AS2 signed MDN content is '{}'; a disposition notification must be \
-                     message/disposition-notification or multipart/report",
-                    signed.ctype.mimetype
-                ),
-                super::ErrorContext::for_session("as2_receive_mdn_parse", session),
-            ));
-        }
-        return Ok(None);
+        return resolve_signed_content_notification_part(signed, session);
     }
 
     Ok(None)
+}
+
+/// Locate the notification inside the signed content of a `multipart/signed`
+/// MDN — either the first MIME subpart or the verifier's protected entity.
+fn resolve_signed_content_notification_part<'a>(
+    signed: &'a ParsedMail<'a>,
+    session: &SessionContext,
+) -> Result<Option<&'a ParsedMail<'a>>> {
+    if signed
+        .ctype
+        .mimetype
+        .eq_ignore_ascii_case("message/disposition-notification")
+    {
+        return Ok(Some(signed));
+    }
+
+    if is_report_mdn(signed) {
+        return report_notification_part(signed, session);
+    }
+
+    Err(AsxError::new(
+        ErrorCode::InteropViolation,
+        format!(
+            "AS2 signed MDN content is '{}'; a disposition notification must be \
+             message/disposition-notification or multipart/report",
+            signed.ctype.mimetype
+        ),
+        super::ErrorContext::for_session("as2_receive_mdn_parse", session),
+    ))
 }
 
 #[cfg(test)]
@@ -656,9 +555,7 @@ mod mic_match_tests {
 
     /// RFC 5322 §2.2.3 lets a MIME header fold across lines, so a conformant
     /// partner's `Received-Content-MIC` can arrive with a CRLF and a space
-    /// inside the base64. Strict decoding failed on that and the comparison
-    /// fell back to raw string equality — reporting a MIC mismatch, i.e. a
-    /// delivered message declared undelivered.
+    /// inside the base64; it must still compare equal.
     #[test]
     fn folded_received_content_mic_header_still_matches() {
         let digest = "hvfkN/qlp/zhXR3cuerq6jd2Z7g+/Z9nDkNbLmXcU0k=";
@@ -693,28 +590,8 @@ mod mic_match_tests {
 mod notification_part_tests {
     use super::*;
 
-    fn policy(mode: InteropMode) -> As2ReceivePolicy {
-        As2ReceivePolicy {
-            interop_mode: mode,
-            ..As2ReceivePolicy::default()
-        }
-    }
-
     fn session() -> SessionContext {
         SessionContext::new("s", "p", "strict").expect("session")
-    }
-
-    /// The interop modes this build compiles. `Relaxed` exists only under the
-    /// `interop-relaxed` feature.
-    fn modes() -> Vec<InteropMode> {
-        #[cfg(feature = "interop-relaxed")]
-        {
-            vec![InteropMode::Strict, InteropMode::Relaxed]
-        }
-        #[cfg(not(feature = "interop-relaxed"))]
-        {
-            vec![InteropMode::Strict]
-        }
     }
 
     fn signed_mdn(inner: &str) -> String {
@@ -730,7 +607,7 @@ mod notification_part_tests {
     }
 
     /// A report with no `message/disposition-notification` part yields no
-    /// verdict. Falling back to the part at index 1 lets a counterparty put a
+    /// verdict. Falling back to the part at index 1 would let a counterparty put a
     /// forged `Disposition:` line in a human-readable part and have it read as
     /// the delivery outcome.
     #[test]
@@ -748,21 +625,9 @@ mod notification_part_tests {
         ));
         let parsed = mailparse::parse_mail(raw.as_bytes()).expect("parse");
 
-        let err = resolve_mdn_notification_part(&parsed, &policy(InteropMode::Strict), &session())
+        let err = resolve_mdn_notification_part(&parsed, &session())
             .expect_err("strict must refuse a report with no machine-readable part");
         assert_eq!(err.code, ErrorCode::InteropViolation);
-
-        // Relaxed widens the absent case only — no verdict, not a wrong one.
-        #[cfg(feature = "interop-relaxed")]
-        {
-            let relaxed =
-                resolve_mdn_notification_part(&parsed, &policy(InteropMode::Relaxed), &session())
-                    .expect("relaxed tolerates the absence");
-            assert!(
-                relaxed.is_none(),
-                "a forged Disposition in a text/plain part must never become the verdict"
-            );
-        }
     }
 
     /// Signed content that is not an MDN at all is not an MDN.
@@ -774,15 +639,9 @@ mod notification_part_tests {
         ));
         let parsed = mailparse::parse_mail(raw.as_bytes()).expect("parse");
 
-        let err = resolve_mdn_notification_part(&parsed, &policy(InteropMode::Strict), &session())
+        let err = resolve_mdn_notification_part(&parsed, &session())
             .expect_err("strict must refuse non-MDN signed content");
         assert!(err.message.contains("text/html"), "{}", err.message);
-        #[cfg(feature = "interop-relaxed")]
-        assert!(
-            resolve_mdn_notification_part(&parsed, &policy(InteropMode::Relaxed), &session())
-                .expect("relaxed does not error")
-                .is_none()
-        );
     }
 
     /// The well-formed shape still resolves, signed and unsigned alike.
@@ -800,8 +659,8 @@ mod notification_part_tests {
             "--REP--"
         ));
         let parsed = mailparse::parse_mail(raw.as_bytes()).expect("parse");
-        for mode in modes() {
-            let part = resolve_mdn_notification_part(&parsed, &policy(mode), &session())
+        {
+            let part = resolve_mdn_notification_part(&parsed, &session())
                 .expect("conformant MDN resolves")
                 .expect("machine-readable part present");
             assert_eq!(part.ctype.mimetype, "message/disposition-notification");
@@ -817,14 +676,14 @@ mod notification_part_tests {
             "Disposition: automatic-action/MDN-sent-automatically; processed"
         ));
         let parsed = mailparse::parse_mail(raw.as_bytes()).expect("parse");
-        let part = resolve_mdn_notification_part(&parsed, &policy(InteropMode::Strict), &session())
+        let part = resolve_mdn_notification_part(&parsed, &session())
             .expect("resolves")
             .expect("part present");
         assert_eq!(part.ctype.mimetype, "message/disposition-notification");
     }
 
     /// Two machine-readable parts are two verdicts. Refuse rather than let
-    /// document order pick (D5).
+    /// document order pick.
     #[test]
     fn two_disposition_notification_parts_are_refused() {
         let raw = concat!(
@@ -839,11 +698,132 @@ mod notification_part_tests {
             "--REP--\r\n"
         );
         let parsed = mailparse::parse_mail(raw.as_bytes()).expect("parse");
-        for mode in modes() {
-            let err = resolve_mdn_notification_part(&parsed, &policy(mode), &session())
-                .expect_err("two verdicts are ambiguous in every mode");
+        {
+            let err = resolve_mdn_notification_part(&parsed, &session())
+                .expect_err("two verdicts are ambiguous");
             assert_eq!(err.code, ErrorCode::InteropViolation);
             assert!(err.message.contains("more than one"), "{}", err.message);
         }
     }
+}
+
+use crate::crypto::as2_smime::sign_smime_message;
+
+pub fn generate_signed_mdn(
+    session: &SessionContext,
+    original_message_id: &str,
+    disposition: &str,
+    received_content_mic: Option<&str>,
+    signing: &As2MdnSigningCredentials,
+) -> Result<Vec<u8>> {
+    let report = generate_mdn(
+        session,
+        original_message_id,
+        disposition,
+        received_content_mic,
+    )?;
+
+    sign_smime_message(
+        &report,
+        signing.signing_key_pem.as_slice(),
+        signing.signing_cert_pem.as_slice(),
+    )
+}
+
+pub fn generate_mdn(
+    session: &SessionContext,
+    original_message_id: &str,
+    disposition: &str,
+    received_content_mic: Option<&str>,
+) -> Result<Vec<u8>> {
+    if original_message_id.trim().is_empty() {
+        return Err(AsxError::new(
+            ErrorCode::InvalidInput,
+            "original_message_id must not be empty",
+            ErrorContext::for_session("as2_generate_mdn", session),
+        ));
+    }
+    if disposition.trim().is_empty() {
+        return Err(AsxError::new(
+            ErrorCode::InvalidInput,
+            "disposition must not be empty",
+            ErrorContext::for_session("as2_generate_mdn", session),
+        ));
+    }
+    // Every value below is placed in a header or notification line: a CR, LF
+    // or NUL would end the line and inject another field.
+    for (field, value) in [
+        ("original_message_id", original_message_id),
+        ("disposition", disposition),
+        ("received_content_mic", received_content_mic.unwrap_or("")),
+        ("partner_id", session.partner_id()),
+    ] {
+        if value.bytes().any(|b| matches!(b, b'\r' | b'\n' | 0)) {
+            return Err(AsxError::new(
+                ErrorCode::InvalidInput,
+                format!("{field} must not contain CR, LF or NUL"),
+                ErrorContext::for_session("as2_generate_mdn", session),
+            ));
+        }
+    }
+
+    Ok(mdn_report(
+        session.partner_id(),
+        original_message_id,
+        disposition,
+        received_content_mic,
+        "The message has been received and processed by ASX.",
+    ))
+}
+
+/// The RFC 3798 `multipart/report` of an MDN. The caller has checked every
+/// value for CR, LF and NUL.
+pub(crate) fn mdn_report(
+    final_recipient: &str,
+    original_message_id: &str,
+    disposition: &str,
+    received_content_mic: Option<&str>,
+    text: &str,
+) -> Vec<u8> {
+    let boundary = mdn_boundary_from_message_id(original_message_id);
+
+    let mut notification_part = format!(
+        "Final-Recipient: rfc822; {}\r\nOriginal-Message-ID: {}\r\nDisposition: {}\r\n",
+        final_recipient, original_message_id, disposition
+    );
+    if let Some(mic) = received_content_mic {
+        notification_part.push_str(&format!("Received-Content-MIC: {}\r\n", mic.trim()));
+    }
+
+    // RFC 3798 MDN wire shape: multipart/report with human-readable + machine-readable parts.
+    let mdn = format!(
+        "Content-Type: multipart/report; report-type=disposition-notification; boundary=\"{boundary}\"\r\n\
+MIME-Version: 1.0\r\n\
+\r\n\
+--{boundary}\r\n\
+Content-Type: text/plain; charset=us-ascii\r\n\
+\r\n\
+{text}\r\n\
+\r\n\
+--{boundary}\r\n\
+Content-Type: message/disposition-notification\r\n\
+\r\n\
+{notification_part}\
+\r\n\
+--{boundary}--\r\n"
+    );
+
+    mdn.into_bytes()
+}
+
+fn mdn_boundary_from_message_id(original_message_id: &str) -> String {
+    // FNV-1a: fast non-cryptographic hash sufficient for MIME boundary uniqueness.
+    const OFFSET: u64 = 14_695_981_039_346_656_037;
+    const PRIME: u64 = 1_099_511_628_211;
+    let mut h: u64 = OFFSET;
+    for &b in original_message_id.as_bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(PRIME);
+    }
+    format!("asx-mdn-{h:016x}")
 }

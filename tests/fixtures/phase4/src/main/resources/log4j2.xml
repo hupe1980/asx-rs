@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Configuration status="WARN">
+  <Appenders>
+    <Console name="stdout" target="SYSTEM_OUT">
+      <PatternLayout pattern="%d{HH:mm:ss.SSS} %-5level [%t] %c{1} - %msg%n"/>
+    </Console>
+  </Appenders>
+  <Loggers>
+    <Logger name="org.apache.wss4j" level="warn"/>
+    <Logger name="org.apache.xml.security" level="warn"/>
+    <Root level="info"><AppenderRef ref="stdout"/></Root>
+  </Loggers>
+</Configuration>

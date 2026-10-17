@@ -1,1194 +1,138 @@
-#![cfg_attr(not(feature = "interop-relaxed"), allow(unused_imports, dead_code))]
-use super::*;
-use crate::as4::As4ReceiveOutcome;
-use crate::as4::conversation_gate::As4ConversationOrderGate;
-use crate::as4::send::As4SendRequest;
-#[cfg(feature = "interop-relaxed")]
-use crate::as4::send_sync_fragmented;
-use crate::as4::types::{
-    As4PushPolicyBuilder, As4ReceivePushProgress, As4ReceivePushRequest, As4SendCredentials,
-    As4SendPolicyBuilder, FragmentScopePolicy,
-};
-use crate::core::{CertHandle, ErrorCode, OcspFailureMode, OcspMode, SessionContext};
-use crate::reliability::InMemoryDedupBackend;
-use crate::storage::{BoxFuture, DedupStorage, DedupVerdict};
-use openssl::asn1::Asn1Time;
-use openssl::bn::BigNum;
-use openssl::hash::MessageDigest;
-use openssl::nid::Nid;
-use openssl::pkey::PKey;
-use openssl::rsa::Rsa;
-use openssl::x509::{X509, X509NameBuilder};
-use std::sync::Arc;
-use std::time::Duration;
+use crate::core::Result;
+use crate::core::{ErrorCode, SessionContext};
 
-#[derive(Debug)]
-struct DurableTestDedup(InMemoryDedupBackend);
+// ── CompressionType from the signed eb:Messaging, as text ───────────────────
 
-impl DedupStorage for DurableTestDedup {
-    fn is_durable(&self) -> bool {
-        true
-    }
+const COMPRESSION_ENVELOPE: &str = concat!(
+    r#"<S:Envelope xmlns:S="http://www.w3.org/2003/05/soap-envelope" "#,
+    r#"xmlns:eb="http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/">"#,
+    r#"<S:Header><eb:Messaging><eb:UserMessage><eb:PayloadInfo>"#,
+    r#"<eb:PartInfo href="cid:signed@asx.test"><eb:PartProperties>"#,
+    r#"<eb:Property name="MimeType">application/xml</eb:Property>"#,
+    r#"<eb:Property name="CompressionType">application/gzip</eb:Property>"#,
+    r#"</eb:PartProperties></eb:PartInfo></eb:PayloadInfo></eb:UserMessage></eb:Messaging></S:Header>"#,
+    r#"<S:Body><eb:PartInfo href="cid:injected@asx.test"><eb:PartProperties>"#,
+    r#"<eb:Property name="CompressionType" value="application/gzip"/>"#,
+    r#"</eb:PartProperties></eb:PartInfo></S:Body></S:Envelope>"#
+);
 
-    fn cluster_safe(&self) -> bool {
-        true
-    }
-
-    fn claim<'a>(&'a self, idempotency_key: &'a str) -> BoxFuture<'a, Result<DedupVerdict>> {
-        self.0.claim(idempotency_key)
-    }
-
-    fn accept<'a>(&'a self, idempotency_key: &'a str) -> BoxFuture<'a, Result<()>> {
-        self.0.accept(idempotency_key)
-    }
-
-    fn abandon<'a>(&'a self, idempotency_key: &'a str) -> BoxFuture<'a, Result<()>> {
-        self.0.abandon(idempotency_key)
-    }
+fn compression_of(xml: &str) -> Result<std::collections::HashMap<String, String>> {
+    let session = SessionContext::new("s-compression", "partner", "strict").expect("session");
+    let doc = crate::xml::parse(xml, crate::xml::XmlLimits::ENVELOPE, "test").expect("parse");
+    super::payload::part_properties(&session, &doc, "msg-compression").map(|p| p.compression)
 }
 
-fn test_as4_credentials() -> As4SendCredentials {
-    let rsa = Rsa::generate(2048).expect("rsa");
-    let pkey = PKey::from_rsa(rsa).expect("pkey");
-
-    let mut name = X509NameBuilder::new().expect("name builder");
-    name.append_entry_by_nid(Nid::COMMONNAME, "asx-as4-receive-test")
-        .expect("cn");
-    let name = name.build();
-
-    let mut serial = BigNum::new().expect("serial");
-    serial
-        .pseudo_rand(64, openssl::bn::MsbOption::MAYBE_ZERO, false)
-        .expect("serial rand");
-    let serial = serial.to_asn1_integer().expect("serial asn1");
-
-    let mut builder = X509::builder().expect("x509 builder");
-    builder.set_version(2).expect("version");
-    builder.set_serial_number(&serial).expect("serial");
-    builder.set_subject_name(&name).expect("subject");
-    builder.set_issuer_name(&name).expect("issuer");
-    builder.set_pubkey(&pkey).expect("pubkey");
-    let not_before = Asn1Time::days_from_now(0).expect("not_before");
-    let not_after = Asn1Time::days_from_now(365).expect("not_after");
-    builder.set_not_before(&not_before).expect("nb");
-    builder.set_not_after(&not_after).expect("na");
-    builder
-        .sign(&pkey, MessageDigest::sha256())
-        .expect("sign cert");
-    let cert = builder.build();
-
-    As4SendCredentials {
-        signing_cert_pem: Some(cert.to_pem().expect("cert pem").into()),
-        signing_key_pem: Some(pkey.private_key_to_pem_pkcs8().expect("private key pem")),
-        recipient_cert_pem: Some(cert.to_pem().expect("recipient cert pem").into()),
-    }
-}
-
-fn session_with_trust(
-    session_id: &str,
-    partner_id: &str,
-    creds: &As4SendCredentials,
-) -> SessionContext {
-    let cert_pem = creds
-        .signing_cert_pem
-        .as_ref()
-        .expect("test creds must have signing cert");
-    let cert_pem_str = String::from_utf8(cert_pem.to_vec()).expect("cert pem utf8");
-    let cert = X509::from_pem(cert_pem).expect("cert parse");
-    let cert_digest = cert
-        .digest(MessageDigest::sha256())
-        .expect("cert sha256 fingerprint");
-    let cert_fingerprint = cert_digest
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-    SessionContext::new(session_id, partner_id, "strict")
-        .expect("session")
-        .with_cert_handle(CertHandle {
-            trust_anchor_pems: vec![cert_pem_str],
-            fingerprint_sha256: cert_fingerprint,
-            ocsp_mode: OcspMode::Disabled,
-            ocsp_failure_mode: OcspFailureMode::HardFail,
-            ..CertHandle::new("recv-test-cert")
-        })
-        .expect("cert handle")
-}
-
-#[cfg(feature = "interop-relaxed")]
-#[cfg(not(feature = "testing"))]
+/// The compression flag is read from the one `eb:Messaging` the signature
+/// covers, as element text; a second, unsigned `eb:PartInfo` elsewhere in the
+/// envelope changes nothing.
 #[test]
-fn durable_dedup_receive_push_rejects_non_durable_backend() {
-    let session = SessionContext::new("sess-dedup", "partner-a", "strict").expect("session");
-    let bus = EventBus::new(16).expect("bus");
-    let policy = As4PushPolicyBuilder::new()
-        .interop(crate::core::InteropMode::Relaxed)
-        .fail_closed_audit_events(false)
-        .build()
-        .expect("policy");
-    let request = As4ReceivePushRequest {
-        http_content_type: "application/soap+xml".into(),
-        payload: Arc::from(b"<s:Envelope xmlns:s='http://www.w3.org/2003/05/soap-envelope'><s:Header><wsse:Security xmlns:wsse='http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd'/></s:Header><s:Body/></s:Envelope>".as_slice()),
-        receipt_payload: None,
-policy,
-        authenticated_sender_scope: None,
-    };
-    let dedup: Arc<dyn DedupStorage> = Arc::new(InMemoryDedupBackend::new(Duration::from_secs(60)));
-
-    let err = receive_push_sync(
-        &session,
-        &bus,
-        As4ReceivePushSync {
-            request,
-            dedup: dedup.clone(),
-            signer_pins: None,
-        },
-    )
-    .expect_err("non-durable dedup backend must be rejected");
-
-    assert_eq!(err.code, ErrorCode::ReliabilityFailure);
-    assert!(err.message.contains("durable dedup backend"));
-}
-
-#[cfg(not(feature = "testing"))]
-#[test]
-fn wssec_verifier_unsigned_path_requires_signature_when_missing() {
-    let session =
-        SessionContext::new("sess-registered-pin", "partner-a", "strict").expect("session");
-    let policy = As4PushPolicy {
-        require_signed_push: true,
-        fail_closed_audit_events: false,
-        ..As4PushPolicy::default()
-    };
-    let xml =
-        "<s:Envelope xmlns:s='http://www.w3.org/2003/05/soap-envelope'><s:Header/></s:Envelope>";
-    let doc = roxmltree::Document::parse(xml).expect("document");
-
-    let err = As4WsSecVerifier
-        .verify_security(super::verifier::As4SecurityVerification {
-            session: &session,
-            policy: &policy,
-            soap_xml: xml,
-            soap_doc: &doc,
-            message_id: "msg-registered",
-            external_references: &[],
-            from_party_id: "partner-a",
-            permitted_signers: &[],
-        })
-        .expect_err("unsigned strict receive should fail when signature is required");
-
-    assert_eq!(err.code, ErrorCode::SecurityVerificationFailed);
-    assert!(err.message.contains("signature is required"));
-}
-
-#[cfg(all(feature = "interop-relaxed", feature = "testing"))]
-#[tokio::test]
-async fn ordered_receive_requires_conversation_id() {
-    let creds = test_as4_credentials();
-    let session = session_with_trust("sess-ordered-no-conv", "partner-a", &creds);
-    let bus = EventBus::new(16).expect("bus");
-
-    // A ConversationId-less envelope can only come from a *third-party* sender:
-    // asx's own send path always emits the schema-mandatory element (defaulting
-    // to "1"). Hand-craft the non-conformant inbound message the way such a
-    // peer would produce it.
-    let boundary = "asx-no-conv-boundary";
-    let cid = "payload-no-conv@example.com";
-    let soap = format!(
-        "<S12:Envelope xmlns:S12='http://www.w3.org/2003/05/soap-envelope' \
-xmlns:eb='http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/' \
-xmlns:wsse='http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd' \
-xmlns:xop='http://www.w3.org/2004/08/xop/include'>\
-<S12:Header><wsse:Security/><eb:Messaging S12:mustUnderstand='true'><eb:UserMessage>\
-<eb:MessageInfo><eb:MessageId>ordered-no-conv-id@test</eb:MessageId></eb:MessageInfo>\
-<eb:CollaborationInfo><eb:Service>urn:test:svc</eb:Service>\
-<eb:Action>urn:test:no-conv</eb:Action></eb:CollaborationInfo>\
-<eb:PartyInfo><eb:From><eb:PartyId>partner-a</eb:PartyId></eb:From>\
-<eb:To><eb:PartyId>sess-ordered-no-conv</eb:PartyId></eb:To></eb:PartyInfo>\
-</eb:UserMessage></eb:Messaging></S12:Header>\
-<S12:Body><xop:Include href='cid:{cid}'/></S12:Body></S12:Envelope>"
-    );
-    let mut multipart = format!(
-        "--{boundary}\r\nContent-Type: application/xop+xml; charset=UTF-8; type=\"application/soap+xml\"\r\nContent-ID: <soap-root@example.com>\r\n\r\n{soap}\r\n--{boundary}\r\nContent-Type: application/octet-stream\r\nContent-ID: <{cid}>\r\n\r\n"
-    )
-    .into_bytes();
-    multipart.extend_from_slice(b"no-conv-payload");
-    multipart.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
-
-    let policy = As4PushPolicyBuilder::new()
-        .interop(crate::core::InteropMode::Relaxed)
-        .fail_closed_audit_events(false)
-        .timestamp_freshness_window(None)
-        .allow_unsigned_push(true)
-        .build()
-        .expect("policy");
-
-    let dedup: Arc<dyn DedupStorage> = Arc::new(DurableTestDedup(InMemoryDedupBackend::new(
-        Duration::from_secs(60),
-    )));
-    let gate = As4ConversationOrderGate::new(64);
-    let dedup_backend = Arc::clone(&dedup);
-
-    let err = receive_push(
-        &session,
-        &bus,
-        As4ReceivePush {
-            request: As4ReceivePushRequest {
-                http_content_type: format!("multipart/related; boundary={boundary}"),
-                payload: Arc::from(multipart),
-                receipt_payload: None,
-                policy,
-                authenticated_sender_scope: None,
-            },
-            dedup: dedup_backend,
-            ordering: Some(&gate),
-            signer_pins: None,
-        },
-    )
-    .await
-    .expect_err("missing ConversationId must fail");
-
+fn compression_type_read_as_text_from_signed_messaging() {
+    let types = compression_of(COMPRESSION_ENVELOPE).expect("compression types");
     assert_eq!(
-        err.code,
-        ErrorCode::PolicyViolation,
-        "unexpected error: {err:?}"
+        types.get("signed@asx.test").map(String::as_str),
+        Some("application/gzip")
     );
     assert!(
-        err.message.contains("ConversationId"),
-        "unexpected message: {}",
-        err.message
+        !types.contains_key("injected@asx.test"),
+        "a PartInfo outside eb:Messaging must not be read: {types:?}"
     );
 }
 
-struct SlowVerifier {
-    _marker: (),
-}
-
-impl SlowVerifier {
-    fn new() -> Self {
-        Self { _marker: () }
-    }
-}
-
-impl private::Sealed for SlowVerifier {}
-
-impl As4Verifier for SlowVerifier {
-    fn verify_security(&self, ctx: super::verifier::As4SecurityVerification<'_>) -> Result<()> {
-        if ctx.message_id == "msg-1" {
-            std::thread::sleep(Duration::from_millis(120));
-        } else {
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        Ok(())
-    }
-}
-
-/// Durable audit sink for the ordered-receive tests.
-///
-/// The strict AS4 receive policy is fail-closed on audit events and the builder
-/// refuses `fail_closed_audit_events(false)` outside `testing` builds, so these
-/// tests supply a sink that satisfies the guard instead of disabling it.
-#[derive(Debug)]
-struct DurableTestAuditSink(crate::observability::audit_sink::InMemoryAuditSink);
-
-impl crate::observability::audit_sink::DurableAuditSink for DurableTestAuditSink {
-    fn durability(&self) -> crate::observability::audit_sink::AuditSinkDurability {
-        crate::observability::audit_sink::AuditSinkDurability::Durable
-    }
-    fn has_replay_cursor_integrity_protection(&self) -> bool {
-        true
-    }
-    fn store_event(
-        &self,
-        event: &crate::observability::audit_sink::AuditEvent,
-    ) -> crate::core::Result<()> {
-        self.0.store_event(event)
-    }
-    fn retrieve_events_from(
-        &self,
-        cursor: &crate::observability::audit_sink::ReplayCursor,
-        limit: usize,
-    ) -> crate::core::Result<Vec<crate::observability::audit_sink::AuditEvent>> {
-        self.0.retrieve_events_from(cursor, limit)
-    }
-    fn current_cursor(
-        &self,
-    ) -> crate::core::Result<crate::observability::audit_sink::ReplayCursor> {
-        self.0.current_cursor()
-    }
-    fn acknowledge_cursor(
-        &self,
-        cursor: &crate::observability::audit_sink::ReplayCursor,
-    ) -> crate::core::Result<()> {
-        self.0.acknowledge_cursor(cursor)
-    }
-    fn clear(&self) -> crate::core::Result<()> {
-        self.0.clear()
-    }
-}
-
-/// A bus the strict receive path can emit on with no live subscriber.
-#[derive(Debug, Default)]
-struct DurableTestReconciliation;
-
-impl crate::storage::ReconciliationStorage for DurableTestReconciliation {
-    fn is_durable(&self) -> bool {
-        true
-    }
-    fn cluster_safe(&self) -> bool {
-        true
-    }
-    fn enqueue<'a>(
-        &'a self,
-        _request: crate::reliability::ReconciliationRequest,
-    ) -> BoxFuture<'a, Result<bool>> {
-        Box::pin(async { Ok(true) })
-    }
-    fn queued_requests(
-        &self,
-    ) -> BoxFuture<'_, Result<Vec<crate::reliability::ReconciliationRequest>>> {
-        Box::pin(async { Ok(Vec::new()) })
-    }
-    fn resolve<'a>(&'a self, _idempotency_key: &'a str) -> BoxFuture<'a, Result<bool>> {
-        Box::pin(async { Ok(true) })
-    }
-}
-
-/// A session carrying a real strict-runtime bootstrap token.
-///
-/// The strict receive entry points refuse a session without one, so these tests
-/// mint the token the same way a deployment does rather than reaching for the
-/// `testing` escape hatch — which would make them pass only in builds that
-/// enable that feature.
-fn ordered_test_session(session_id: &str, bus: &EventBus) -> SessionContext {
-    let dedup: Arc<dyn DedupStorage> = Arc::new(DurableTestDedup(InMemoryDedupBackend::new(
-        Duration::from_secs(60),
-    )));
-    let reconciliation = DurableTestReconciliation;
-    let token = crate::presets::StrictRuntimeBootstrap::new("as4_ordered_tests")
-        .event_bus(bus)
-        .dedup(dedup.as_ref())
-        .reconciliation(&reconciliation)
-        .validate()
-        .expect("strict runtime bootstrap");
-    token.bind(&SessionContext::new(session_id, "partner-a", "strict").expect("session"))
-}
-
-fn ordered_test_bus() -> EventBus {
-    EventBus::builder()
-        .capacity(16)
-        .audit_sink(Arc::new(DurableTestAuditSink(
-            crate::observability::audit_sink::InMemoryAuditSink::new().expect("audit sink"),
-        )))
-        .emission_mode(crate::observability::EventEmissionMode::StrictWithAuditFallback)
-        .build()
-        .expect("ordered test bus")
-}
-
-fn ordered_test_multipart_payload(
-    message_id: &str,
-    ref_to_message_id: Option<&str>,
-) -> (Arc<[u8]>, String) {
-    let boundary = format!("asx-ordered-boundary-{message_id}");
-    let cid = format!("payload-{message_id}@example.com");
-    let ref_to_xml = ref_to_message_id
-        .map(|value| format!("<eb:RefToMessageId>{value}</eb:RefToMessageId>"))
-        .unwrap_or_default();
-
-    let soap = format!(
-        "<S12:Envelope xmlns:S12='http://www.w3.org/2003/05/soap-envelope' xmlns:eb='http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/' xmlns:wsse='http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd' xmlns:xop='http://www.w3.org/2004/08/xop/include'><S12:Header><wsse:Security/><eb:Messaging S12:mustUnderstand='true'><eb:UserMessage><eb:MessageInfo><eb:MessageId>{message_id}</eb:MessageId>{ref_to_xml}</eb:MessageInfo><eb:CollaborationInfo><eb:Action>urn:test:action</eb:Action><eb:ConversationId>conv-stage-e</eb:ConversationId></eb:CollaborationInfo><eb:PartyInfo><eb:From><eb:PartyId>from-a</eb:PartyId></eb:From><eb:To><eb:PartyId>to-b</eb:PartyId></eb:To></eb:PartyInfo><eb:MessageProperties><eb:Property name='originalSender' value='from-a'/><eb:Property name='finalRecipient' value='to-b'/><eb:Property name='trackingIdentifier' value='{message_id}'/></eb:MessageProperties></eb:UserMessage></eb:Messaging></S12:Header><S12:Body><xop:Include href='cid:{cid}'/></S12:Body></S12:Envelope>",
+/// ebMS3 `Property` is simpleContent with only a `name`
+/// attribute; a `value` attribute is not read, and a property that carries
+/// only one is refused naming it.
+#[test]
+fn property_value_attribute_is_not_read() {
+    let xml = COMPRESSION_ENVELOPE.replace(
+        r#"<eb:Property name="CompressionType">application/gzip</eb:Property>"#,
+        r#"<eb:Property name="CompressionType" value="application/gzip"/>"#,
     );
-
-    let mut payload = format!(
-        "--{boundary}\r\nContent-Type: application/xop+xml; charset=UTF-8; type=\"application/soap+xml\"\r\nContent-ID: <soap-root@example.com>\r\n\r\n{soap}\r\n--{boundary}\r\nContent-Type: application/octet-stream\r\nContent-ID: <{cid}>\r\n\r\n"
-    )
-    .into_bytes();
-    payload.extend_from_slice(b"ordered-payload");
-    payload.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
-
-    (
-        Arc::from(payload),
-        format!("multipart/related; boundary={boundary}"),
-    )
-}
-
-/// The turn must still be held when the caller gets the message.
-///
-/// A turn released inside the receive call leaves the application delivering
-/// with no lock at all, so nothing about delivery is ordered however careful
-/// the gate is (D54).
-#[tokio::test]
-async fn ordered_receive_still_holds_the_turn_when_it_returns() {
-    let bus = ordered_test_bus();
-    let session = ordered_test_session("sess-ordered-hold", &bus);
-    let policy = As4PushPolicyBuilder::new().build().expect("policy");
-    let dedup: Arc<dyn crate::storage::DedupStorage> = Arc::new(DurableTestDedup(
-        InMemoryDedupBackend::new(Duration::from_secs(60)),
-    ));
-    let gate = Arc::new(As4ConversationOrderGate::new(64));
-    let (payload, content_type) = ordered_test_multipart_payload("msg-hold", None);
-
-    let ordered = ordered_async::receive_push_with_verifier(
-        &session,
-        &bus,
-        As4ReceivePushRequest {
-            http_content_type: content_type,
-            payload,
-            receipt_payload: None,
-            policy,
-            authenticated_sender_scope: None,
-        },
-        dedup,
-        Some(gate.as_ref()),
-        Arc::new(SlowVerifier::new()),
-        None,
-    )
-    .await
-    .expect("receive");
-
+    let err = compression_of(&xml).expect_err("a value-only property is refused");
+    assert_eq!(err.code, ErrorCode::InteropViolation);
     assert!(
-        ordered.holds_turn(),
-        "the conversation turn must outlive the receive call, or delivery is unserialized"
-    );
-    assert!(matches!(ordered.get(), As4ReceiveOutcome::FirstSeen { .. }));
-
-    // A second arrival in the same conversation cannot proceed while the first
-    // turn is held.
-    let (payload2, content_type2) = ordered_test_multipart_payload("msg-hold-2", None);
-    let session2 = session.clone();
-    let bus2 = bus.clone();
-    let gate2 = gate.clone();
-    let dedup2: Arc<dyn crate::storage::DedupStorage> = Arc::new(DurableTestDedup(
-        InMemoryDedupBackend::new(Duration::from_secs(60)),
-    ));
-    let policy2 = As4PushPolicyBuilder::new().build().expect("policy");
-    let blocked = tokio::spawn(async move {
-        ordered_async::receive_push_with_verifier(
-            &session2,
-            &bus2,
-            As4ReceivePushRequest {
-                http_content_type: content_type2,
-                payload: payload2,
-                receipt_payload: None,
-                policy: policy2,
-                authenticated_sender_scope: None,
-            },
-            dedup2,
-            Some(gate2.as_ref()),
-            Arc::new(SlowVerifier::new()),
-            None,
-        )
-        .await
-        .map(|ordered| ordered.holds_turn())
-    });
-
-    tokio::time::sleep(Duration::from_millis(80)).await;
-    assert!(
-        !blocked.is_finished(),
-        "the second message must wait for the first turn to be released"
-    );
-
-    drop(ordered);
-    assert!(
-        blocked.await.expect("join").expect("second receive"),
-        "the second message takes the turn once the first releases it"
-    );
-}
-
-/// A second `eb:ConversationId` is refused rather than resolved by document
-/// order.
-///
-/// It is `maxOccurs="1"` in ebMS3 Core, and it is the key the ordering gate
-/// queues on — so "first wins" lets document order decide which conversation a
-/// message belongs to, and a byte scanner, a schema validator and a downstream
-/// MSH need not pick the same one (D5). Found by a test written for the
-/// mismatch guard, which could not construct a mismatch because the parser
-/// happily accepted the decoy.
-#[tokio::test]
-async fn ordered_receive_rejects_a_duplicated_conversation_id() {
-    let bus = ordered_test_bus();
-    let session = ordered_test_session("sess-ordered-swap", &bus);
-    let policy = As4PushPolicyBuilder::new().build().expect("policy");
-    let dedup: Arc<dyn crate::storage::DedupStorage> = Arc::new(DurableTestDedup(
-        InMemoryDedupBackend::new(Duration::from_secs(60)),
-    ));
-    let gate = Arc::new(As4ConversationOrderGate::new(64));
-
-    // Two `eb:ConversationId` elements: the bounded scanner reserves under the
-    // first it sees, the parser resolves the message to another.
-    let (payload, content_type) = ordered_test_multipart_payload("msg-swap", None);
-    let swapped = String::from_utf8_lossy(&payload).replace(
-        "<eb:CollaborationInfo><eb:Action>",
-        "<eb:CollaborationInfo><eb:ConversationId>conv-decoy</eb:ConversationId><eb:Action>",
-    );
-
-    let err = ordered_async::receive_push_with_verifier(
-        &session,
-        &bus,
-        As4ReceivePushRequest {
-            http_content_type: content_type,
-            payload: Arc::from(swapped.into_bytes()),
-            receipt_payload: None,
-            policy,
-            authenticated_sender_scope: None,
-        },
-        dedup,
-        Some(gate.as_ref()),
-        Arc::new(SlowVerifier::new()),
-        None,
-    )
-    .await
-    .expect_err("a UserMessage with two ConversationIds must be refused");
-    assert_eq!(err.code, ErrorCode::InteropViolation, "{err:?}");
-    assert!(
-        err.message.contains("duplicate ConversationId"),
+        err.message.contains("Property") && err.message.contains("CompressionType"),
         "{}",
         err.message
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn ordered_receive_reserves_arrival_order_but_allows_parallel_heavy_verify() {
-    let bus = ordered_test_bus();
-    let session = ordered_test_session("sess-ordered-stage-e", &bus);
-    let policy = As4PushPolicyBuilder::new().build().expect("policy");
-    let dedup: Arc<dyn crate::storage::DedupStorage> = Arc::new(DurableTestDedup(
-        InMemoryDedupBackend::new(Duration::from_secs(60)),
-    ));
-    let gate = Arc::new(As4ConversationOrderGate::new(64));
-    let verifier = Arc::new(SlowVerifier::new());
-
-    let (payload_a, content_type_a) = ordered_test_multipart_payload("msg-1", None);
-    let (payload_b, content_type_b) = ordered_test_multipart_payload("msg-2", None);
-    let request_a = As4ReceivePushRequest {
-        http_content_type: content_type_a,
-        payload: payload_a,
-        receipt_payload: None,
-        policy: policy.clone(),
-        authenticated_sender_scope: None,
-    };
-    let request_b = As4ReceivePushRequest {
-        http_content_type: content_type_b,
-        payload: payload_b,
-        receipt_payload: None,
-        policy,
-        authenticated_sender_scope: None,
-    };
-
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(4);
-
-    let s1 = session.clone();
-    let b1 = bus.clone();
-    let d1 = dedup.clone();
-    let g1 = gate.clone();
-    let v1 = verifier.clone();
-    let tx1 = tx.clone();
-    let t1 = tokio::spawn(async move {
-        ordered_async::receive_push_with_verifier(
-            &s1,
-            &b1,
-            request_a,
-            d1,
-            Some(g1.as_ref()),
-            v1,
-            None,
-        )
-        .await
-        .expect(
-            "msg-1 must actually be received; a discarded error makes the \
-                 ordering assertion below meaningless",
+/// A part property named twice in one `eb:PartInfo` is ambiguous: refused,
+/// whichever value comes last.
+#[test]
+fn a_repeated_part_property_is_refused() {
+    for (name, value) in [
+        ("CompressionType", "application/gzip"),
+        ("MimeType", "text/plain"),
+    ] {
+        let repeated = format!(r#"<eb:Property name="{name}">{value}</eb:Property>"#);
+        let xml = COMPRESSION_ENVELOPE.replacen(
+            "</eb:PartProperties>",
+            &format!("{repeated}</eb:PartProperties>"),
+            1,
         );
-        tx1.send("msg-1".to_string()).await.expect("send msg-1");
-    });
-
-    tokio::time::sleep(Duration::from_millis(10)).await;
-
-    let s2 = session.clone();
-    let b2 = bus.clone();
-    let d2 = dedup.clone();
-    let g2 = gate.clone();
-    let v2 = verifier.clone();
-    let tx2 = tx.clone();
-    let t2 = tokio::spawn(async move {
-        ordered_async::receive_push_with_verifier(
-            &s2,
-            &b2,
-            request_b,
-            d2,
-            Some(g2.as_ref()),
-            v2,
-            None,
-        )
-        .await
-        .expect(
-            "msg-2 must actually be received; a discarded error makes the \
-                 ordering assertion below meaningless",
-        );
-        tx2.send("msg-2".to_string()).await.expect("send msg-2");
-    });
-
-    let first = rx.recv().await.expect("first completion");
-    let second = rx.recv().await.expect("second completion");
-
-    t1.await.expect("join t1");
-    t2.await.expect("join t2");
-
-    assert_eq!(first, "msg-1");
-    assert_eq!(second, "msg-2");
-}
-
-#[cfg(feature = "interop-relaxed")]
-#[tokio::test]
-async fn ordered_receive_rejects_response_before_original_completion() {
-    let session =
-        SessionContext::new("sess-ordered-ref-to", "partner-a", "strict").expect("session");
-    let bus = EventBus::new(16).expect("bus");
-    let policy = As4PushPolicyBuilder::new()
-        .interop(crate::core::InteropMode::Relaxed)
-        .fail_closed_audit_events(false)
-        .build()
-        .expect("policy");
-    let dedup: Arc<dyn crate::storage::DedupStorage> = Arc::new(DurableTestDedup(
-        InMemoryDedupBackend::new(Duration::from_secs(60)),
-    ));
-    let gate = As4ConversationOrderGate::new(64);
-    let verifier: Arc<dyn As4Verifier + Send + Sync> = Arc::new(SlowVerifier::new());
-
-    let (early_payload, early_content_type) =
-        ordered_test_multipart_payload("msg-response", Some("msg-original"));
-    let early_response = As4ReceivePushRequest {
-        http_content_type: early_content_type,
-        payload: early_payload,
-        receipt_payload: None,
-        policy: policy.clone(),
-        authenticated_sender_scope: None,
-    };
-
-    let _err = ordered_async::receive_push_with_verifier(
-        &session,
-        &bus,
-        early_response,
-        Arc::clone(&dedup),
-        Some(&gate),
-        Arc::clone(&verifier),
-        None,
-    )
-    .await
-    .expect_err("response before original must fail");
-
-    let (original_payload, original_content_type) =
-        ordered_test_multipart_payload("msg-original", None);
-    let original = As4ReceivePushRequest {
-        http_content_type: original_content_type,
-        payload: original_payload,
-        receipt_payload: None,
-        policy: policy.clone(),
-        authenticated_sender_scope: None,
-    };
-    ordered_async::receive_push_with_verifier(
-        &session,
-        &bus,
-        original,
-        Arc::clone(&dedup),
-        Some(&gate),
-        Arc::clone(&verifier),
-        None,
-    )
-    .await
-    .expect("original should pass");
-
-    let (valid_response_payload, valid_response_content_type) =
-        ordered_test_multipart_payload("msg-response", Some("msg-original"));
-    let valid_response = As4ReceivePushRequest {
-        http_content_type: valid_response_content_type,
-        payload: valid_response_payload,
-        receipt_payload: None,
-        policy,
-        authenticated_sender_scope: None,
-    };
-    ordered_async::receive_push_with_verifier(
-        &session,
-        &bus,
-        valid_response,
-        dedup,
-        Some(&gate),
-        verifier,
-        None,
-    )
-    .await
-    .expect("response should pass after original completion");
-}
-
-#[cfg(feature = "interop-relaxed")]
-#[tokio::test]
-async fn ordered_fragment_aware_receive_completes_in_conversation_turn_order() {
-    let creds = test_as4_credentials();
-    let session = session_with_trust("sess-ordered-fragment-aware", "partner-a", &creds);
-    let bus = EventBus::new(32).expect("bus");
-    let send_policy = As4SendPolicyBuilder::new()
-        .interop(crate::core::InteropMode::Relaxed)
-        .sign(true)
-        .encrypt(false)
-        .fail_closed_audit_events(false)
-        .action("urn:test:ordered-fragment")
-        .conversation_id("conv-ordered-fragment")
-        .service("urn:test:svc", "")
-        .signing_cert_pem(
-            creds
-                .signing_cert_pem
-                .as_ref()
-                .expect("signing cert")
-                .clone(),
-        )
-        .signing_key_pem(creds.signing_key_pem.as_ref().expect("signing key").clone())
-        .build()
-        .expect("send policy")
-        .0;
-    let fragments = send_sync_fragmented(
-        &session,
-        &bus,
-        "mid-ordered-fragment".to_string(),
-        vec![b'o'; 4096],
-        send_policy,
-        Some(creds),
-        1024,
-    )
-    .expect("fragment split");
-
-    let request = As4ReceivePushRequest {
-        http_content_type: fragments[0].http_content_type.clone(),
-        payload: fragments[0].body.clone(),
-        receipt_payload: None,
-        policy: {
-            let builder = As4PushPolicyBuilder::new().interop(crate::core::InteropMode::Relaxed);
-            #[cfg(feature = "testing")]
-            let builder = builder.allow_unsigned_push(true);
-            builder
-                .fail_closed_audit_events(false)
-                .build()
-                .expect("policy")
-        },
-        authenticated_sender_scope: Some(Arc::from("partner-a")),
-    };
-    let dedup: Arc<dyn crate::storage::DedupStorage> = Arc::new(DurableTestDedup(
-        InMemoryDedupBackend::new(Duration::from_secs(60)),
-    ));
-    let gate = As4ConversationOrderGate::new(32);
-    let fragment_joiner = Arc::new(std::sync::Mutex::new(As4FragmentJoiner::new()));
-
-    let progress = receive_push_fragment_aware(
-        &session,
-        &bus,
-        As4ReceivePush {
-            request,
-            dedup,
-            ordering: Some(&gate),
-            signer_pins: None,
-        },
-        fragment_joiner,
-    )
-    .await
-    .expect("ordered fragment-aware receive");
-
-    assert!(
-        !progress.holds_turn(),
-        "an incomplete fragment group is not delivered, so it must not hold the conversation"
-    );
-    match progress.get() {
-        As4ReceivePushProgress::PendingFragment { .. } => {}
-        As4ReceivePushProgress::Complete { .. } => {}
-        As4ReceivePushProgress::Duplicate { .. } => panic!("unexpected duplicate"),
-        As4ReceivePushProgress::InFlight { .. } => panic!("unexpected in-flight claim"),
+        let err = compression_of(&xml).expect_err("a repeated property is refused");
+        assert_eq!(err.code, ErrorCode::InteropViolation, "{name}");
+        assert!(err.message.contains(name), "{}", err.message);
     }
 }
 
-#[cfg(feature = "interop-relaxed")]
-#[tokio::test]
-async fn async_fragment_aware_receive_accepts_typed_request() {
-    let creds = test_as4_credentials();
-    let session = session_with_trust("sess-async-fragment-aware", "partner-a", &creds);
-    let bus = EventBus::new(32).expect("bus");
-    let send_policy = As4SendPolicyBuilder::new()
-        .interop(crate::core::InteropMode::Relaxed)
-        .sign(true)
-        .encrypt(false)
-        .fail_closed_audit_events(false)
-        .action("urn:test:async-fragment")
-        .service("urn:test:svc", "")
-        .signing_cert_pem(
-            creds
-                .signing_cert_pem
-                .as_ref()
-                .expect("signing cert")
-                .clone(),
-        )
-        .signing_key_pem(creds.signing_key_pem.as_ref().expect("signing key").clone())
-        .build()
-        .expect("send policy")
-        .0;
+// ── The inbound eb:Timestamp window ─────────────────────────────────────────
 
-    let fragments = send_sync_fragmented(
-        &session,
-        &bus,
-        "mid-async-fragment".to_string(),
-        vec![b'a'; 3072],
-        send_policy,
-        Some(creds),
-        1024,
-    )
-    .expect("fragment split");
-
-    let request = As4ReceivePushRequest {
-        http_content_type: fragments[0].http_content_type.clone(),
-        payload: fragments[0].body.clone(),
-        receipt_payload: None,
-        policy: {
-            let builder = As4PushPolicyBuilder::new().interop(crate::core::InteropMode::Relaxed);
-            #[cfg(feature = "testing")]
-            let builder = builder.allow_unsigned_push(true);
-            builder
-                .fail_closed_audit_events(false)
-                .build()
-                .expect("policy")
-        },
-        authenticated_sender_scope: Some(Arc::from("partner-a")),
-    };
-
-    let dedup: Arc<dyn crate::storage::DedupStorage> = Arc::new(DurableTestDedup(
-        InMemoryDedupBackend::new(Duration::from_secs(300)),
-    ));
-    let fragment_joiner = Arc::new(std::sync::Mutex::new(As4FragmentJoiner::new()));
-
-    let progress = receive_push_fragment_aware(
-        &session,
-        &bus,
-        As4ReceivePush {
-            request,
-            dedup,
-            ordering: None,
-            signer_pins: None,
-        },
-        fragment_joiner,
-    )
-    .await
-    .expect("async fragment-aware receive")
-    .into_inner();
-
-    match progress {
-        As4ReceivePushProgress::PendingFragment { .. } => {}
-        As4ReceivePushProgress::Complete { .. } => {}
-        As4ReceivePushProgress::Duplicate { .. } => panic!("unexpected duplicate"),
-        As4ReceivePushProgress::InFlight { .. } => panic!("unexpected in-flight claim"),
+/// A message stamped at `sent`, judged by `processing`'s window at the
+/// clock's reading.
+fn stamped(sent: std::time::SystemTime) -> crate::as4::ParsedAs4UserMessage {
+    crate::as4::ParsedAs4UserMessage {
+        message_id: "window@asx.test".to_string(),
+        timestamp: Some(crate::time_utils::format_rfc3339_secs(sent)),
+        ..Default::default()
     }
 }
 
-/// Regression: `FragmentScopePolicy::RequireAuthenticatedScope` must not touch
-/// non-fragmented messages.
-///
-/// Profiles that never fragment (BDEW MaKo, for example) send a single
-/// `eb:UserMessage` and have no transport-layer scope to supply.  They must be
-/// able to keep the secure default and pass `authenticated_sender_scope: None`
-/// without downgrading to `UseSoapSenderId` — otherwise the "workaround" would
-/// weaken the policy for the fragments that might arrive later.
-#[cfg(feature = "interop-relaxed")]
-#[tokio::test]
-async fn non_fragmented_message_is_accepted_with_require_authenticated_scope_and_no_scope() {
-    let creds = test_as4_credentials();
-    let session = session_with_trust("sess-nonfragment-scope", "partner-a", &creds);
-    let bus = EventBus::new(32).expect("bus");
+fn judged(
+    parsed: &crate::as4::ParsedAs4UserMessage,
+    clock: &crate::clock::ManualClock,
+) -> Result<()> {
+    use crate::clock::Clock;
+    let window = crate::profile::receive_view(&crate::Profile::bdew())
+        .timestamp_window
+        .expect("the profile bounds eb:Timestamp");
+    parsed.check_timestamp_freshness(window, clock.now())
+}
 
-    let (send_policy, send_credentials) = As4SendPolicyBuilder::new()
-        .interop(crate::core::InteropMode::Relaxed)
-        .sign(true)
-        .encrypt(false)
-        .fail_closed_audit_events(false)
-        .action("urn:test:non-fragment")
-        .service("urn:test:svc", "")
-        .signing_cert_pem(
-            creds
-                .signing_cert_pem
-                .as_ref()
-                .expect("signing cert")
-                .clone(),
-        )
-        .signing_key_pem(creds.signing_key_pem.as_ref().expect("signing key").clone())
-        .build()
-        .expect("send policy");
-
-    let sent = crate::as4::send_sync(
-        &session,
-        &bus,
-        crate::as4::As4SendRequest {
-            message_id: "mid-non-fragment-scope".to_string(),
-            payload: b"single-user-message-payload".to_vec(),
-            policy: send_policy,
-            credentials: Some(send_credentials),
-            payload_filename: None,
-            ..As4SendRequest::default()
-        },
-    )
-    .expect("send_sync");
-
-    let policy = {
-        let builder = As4PushPolicyBuilder::new().interop(crate::core::InteropMode::Relaxed);
-        #[cfg(feature = "testing")]
-        let builder = builder.allow_unsigned_push(true);
-        builder
-            .fail_closed_audit_events(false)
-            .timestamp_freshness_window(None)
-            // Explicit, even though it is the default — this is the assertion.
-            .fragment_scope_policy(FragmentScopePolicy::RequireAuthenticatedScope)
-            .build()
-            .expect("policy")
-    };
-
-    let request = As4ReceivePushRequest {
-        http_content_type: sent.http_content_type.clone(),
-        payload: Arc::clone(&sent.soap_envelope.body),
-        receipt_payload: None,
-        policy,
-        authenticated_sender_scope: None,
-    };
-
-    let dedup: Arc<dyn crate::storage::DedupStorage> = Arc::new(DurableTestDedup(
-        InMemoryDedupBackend::new(Duration::from_secs(300)),
-    ));
-    let fragment_joiner = Arc::new(std::sync::Mutex::new(As4FragmentJoiner::new()));
-
-    let progress = receive_push_fragment_aware(
-        &session,
-        &bus,
-        As4ReceivePush {
-            request,
-            dedup,
-            ordering: None,
-            signer_pins: None,
-        },
-        fragment_joiner,
-    )
-    .await
-    .expect(
-        "a non-fragmented UserMessage must be accepted with \
-         RequireAuthenticatedScope and authenticated_sender_scope = None",
-    );
-
-    match progress.into_inner() {
-        As4ReceivePushProgress::Complete { output, .. } => {
-            assert_eq!(output.user_message.message_id, "mid-non-fragment-scope");
-        }
-        other => panic!("expected a completed receive, got {other:?}"),
+/// Retry vs freshness: a retry reuses `Message::timestamp`, so a message stamped
+/// an hour ago (retried after a transport failure) is accepted — the past
+/// bound is the dedup retention (24 h), within which a replay is a duplicate.
+#[test]
+fn timestamp_in_the_past_is_accepted_within_the_dedup_retention() {
+    let sent = crate::clock::system().now();
+    let parsed = stamped(sent);
+    let clock = crate::clock::ManualClock::at(sent);
+    for after in [0, 299, 301, 3_600, 23 * 3_600, 24 * 3_600] {
+        clock.set(sent + std::time::Duration::from_secs(after));
+        judged(&parsed, &clock).unwrap_or_else(|e| panic!("{after} s later: {e}"));
     }
 }
 
-#[cfg(feature = "interop-relaxed")]
+/// Beyond the dedup retention a replay could no longer be recognised as a
+/// duplicate: refused.
 #[test]
-fn fragment_aware_receive_reassembles_and_processes_message() {
-    let creds = test_as4_credentials();
-    let session = session_with_trust("sess-fragment-aware", "partner-a", &creds);
-    let bus = EventBus::new(32).expect("bus");
-
-    let payload = vec![b'f'; 4096];
-    let send_payload = payload.clone();
-    let (send_policy, _send_credentials) = As4SendPolicyBuilder::new()
-        .interop(crate::core::InteropMode::Relaxed)
-        .sign(true)
-        .encrypt(false)
-        .fail_closed_audit_events(false)
-        .action("urn:test:fragment-aware")
-        .service("urn:test:svc", "")
-        .signing_cert_pem(
-            creds
-                .signing_cert_pem
-                .as_ref()
-                .expect("signing cert")
-                .clone(),
-        )
-        .signing_key_pem(creds.signing_key_pem.as_ref().expect("signing key").clone())
-        .build()
-        .expect("send policy");
-
-    let fragments = send_sync_fragmented(
-        &session,
-        &bus,
-        "mid-fragment-aware".to_string(),
-        send_payload,
-        send_policy,
-        Some(creds.clone()),
-        1024,
-    )
-    .expect("fragment split");
-
-    let receive_policy = As4PushPolicyBuilder::new()
-        .interop(crate::core::InteropMode::Relaxed)
-        .fail_closed_audit_events(false);
-    #[cfg(feature = "testing")]
-    let receive_policy = receive_policy.allow_unsigned_push(true);
-    let receive_policy = receive_policy.build().expect("receive policy");
-    let dedup: Arc<dyn DedupStorage> = Arc::new(DurableTestDedup(InMemoryDedupBackend::new(
-        Duration::from_secs(300),
-    )));
-    let mut joiner = As4FragmentJoiner::new();
-
-    let mut completed = None;
-    for fragment in fragments {
-        let request = As4ReceivePushRequest {
-            http_content_type: fragment.http_content_type,
-            payload: fragment.body,
-            receipt_payload: None,
-            policy: receive_policy.clone(),
-            authenticated_sender_scope: Some(Arc::from("partner-a")),
-        };
-
-        let progress = receive_push_sync_fragment_aware(
-            &session,
-            &bus,
-            As4ReceivePushSync {
-                request,
-                dedup: dedup.clone(),
-                signer_pins: None,
-            },
-            &mut joiner,
-        )
-        .expect("fragment-aware receive");
-
-        if let As4ReceivePushProgress::Complete { output: out, .. } = progress {
-            completed = Some(*out);
-        }
-    }
-
-    let output = completed.expect("final fragment should complete reassembly");
-    assert_eq!(output.payload.as_ref().as_ref(), payload.as_slice());
-    assert_eq!(output.user_message.action, "urn:test:fragment-aware");
+fn timestamp_older_than_the_dedup_retention_is_refused() {
+    let sent = crate::clock::system().now();
+    let parsed = stamped(sent);
+    let clock = crate::clock::ManualClock::at(sent);
+    clock.advance(std::time::Duration::from_secs(24 * 3_600 + 1));
+    let err = judged(&parsed, &clock).expect_err("older than 24 h");
+    assert_eq!(err.code, ErrorCode::SecurityVerificationFailed);
 }
 
-#[cfg(feature = "interop-relaxed")]
+/// The future bound stays the clock skew of eDelivery 1.15 §5.1.3 (300 s).
 #[test]
-fn non_fragment_aware_receive_rejects_message_fragment_payload() {
-    let creds = test_as4_credentials();
-    let session = session_with_trust("sess-fragment-reject", "partner-a", &creds);
-    let bus = EventBus::new(16).expect("bus");
-    let (send_policy, _send_credentials) = As4SendPolicyBuilder::new()
-        .interop(crate::core::InteropMode::Relaxed)
-        .sign(true)
-        .encrypt(false)
-        .fail_closed_audit_events(false)
-        .action("urn:test:fragment-reject")
-        .service("urn:test:svc", "")
-        .signing_cert_pem(
-            creds
-                .signing_cert_pem
-                .as_ref()
-                .expect("signing cert")
-                .clone(),
-        )
-        .signing_key_pem(creds.signing_key_pem.as_ref().expect("signing key").clone())
-        .build()
-        .expect("send policy");
-
-    let fragments = send_sync_fragmented(
-        &session,
-        &bus,
-        "mid-fragment-reject".to_string(),
-        vec![b'r'; 2048],
-        send_policy,
-        Some(creds),
-        1024,
-    )
-    .expect("fragment split");
-
-    let fragment = fragments.into_iter().next().expect("first fragment");
-    let request = As4ReceivePushRequest {
-        http_content_type: fragment.http_content_type,
-        payload: fragment.body,
-        receipt_payload: None,
-        policy: {
-            let builder = As4PushPolicyBuilder::new()
-                .interop(crate::core::InteropMode::Relaxed)
-                .fail_closed_audit_events(false);
-            #[cfg(feature = "testing")]
-            let builder = builder.allow_unsigned_push(true);
-            builder.build().expect("policy")
-        },
-        authenticated_sender_scope: Some(Arc::from("partner-a")),
-    };
-    let dedup: Arc<dyn DedupStorage> = Arc::new(DurableTestDedup(InMemoryDedupBackend::new(
-        Duration::from_secs(60),
-    )));
-
-    let err = receive_push_sync(
-        &session,
-        &bus,
-        As4ReceivePushSync {
-            request,
-            dedup: dedup.clone(),
-            signer_pins: None,
-        },
-    )
-    .expect_err("non-fragment-aware receive should reject MessageFragment payload");
-
-    assert_eq!(err.code, ErrorCode::PolicyViolation);
-    assert!(err.message.contains("fragment-aware"));
-}
-
-// ---------------------------------------------------------------------------
-// Regulated inbound-encryption configuration
-// ---------------------------------------------------------------------------
-
-/// The split-invariant footgun: enabling the requirement without a key must
-/// still be rejected, so the combined constructors below are the safe path.
-#[test]
-fn require_encrypted_inbound_without_a_key_is_rejected() {
-    let err = As4PushPolicyBuilder::new()
-        .require_encrypted_inbound(true)
-        .build()
-        .expect_err("require_encrypted_inbound without a key must not build");
-
-    assert_eq!(err.code, ErrorCode::InvalidInput);
-    assert!(err.message.contains("inbound_decryption_key_pem"));
-}
-
-#[test]
-fn regulated_with_decryption_key_sets_both_halves_of_the_invariant() {
-    let creds = test_as4_credentials();
-    let key_pem = creds.signing_key_pem.as_ref().expect("signing key").clone();
-
-    let policy = crate::as4::As4PushPolicy::regulated_with_decryption_key(key_pem.clone());
-
-    assert!(policy.require_encrypted_inbound);
-    assert_eq!(
-        policy.inbound_decryption_key_pem.as_deref(),
-        Some(key_pem.as_slice())
-    );
-    // Everything else must still match the fail-closed regulated preset.
-    let baseline = crate::as4::As4PushPolicy::regulated();
-    assert_eq!(policy.interop, baseline.interop);
-    assert_eq!(policy.require_signed_push, baseline.require_signed_push);
-    assert_eq!(
-        policy.require_signed_receipt,
-        baseline.require_signed_receipt
-    );
-    assert_eq!(
-        policy.fail_closed_audit_events,
-        baseline.fail_closed_audit_events
-    );
-    assert_eq!(
-        policy.timestamp_freshness_window,
-        baseline.timestamp_freshness_window
-    );
-    assert_eq!(policy.fragment_scope_policy, baseline.fragment_scope_policy);
-}
-
-#[test]
-fn builder_with_mandatory_inbound_encryption_matches_the_constructor() {
-    let creds = test_as4_credentials();
-    let key_pem = creds.signing_key_pem.as_ref().expect("signing key").clone();
-
-    let built = As4PushPolicyBuilder::regulated()
-        .with_mandatory_inbound_encryption(key_pem.clone())
-        .build()
-        .expect("mandatory inbound encryption must build in one call");
-
-    assert_eq!(
-        built,
-        crate::as4::As4PushPolicy::regulated_with_decryption_key(key_pem)
-    );
+fn timestamp_more_than_300_s_in_the_future_is_refused() {
+    let now = crate::clock::system().now();
+    let clock = crate::clock::ManualClock::at(now);
+    judged(&stamped(now + std::time::Duration::from_secs(300)), &clock)
+        .expect("300 s ahead is within the skew");
+    let err = judged(&stamped(now + std::time::Duration::from_secs(301)), &clock)
+        .expect_err("301 s ahead");
+    assert_eq!(err.code, ErrorCode::SecurityVerificationFailed);
 }

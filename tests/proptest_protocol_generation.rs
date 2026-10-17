@@ -1,25 +1,33 @@
 // Property-based testing for protocol generation and parsing invariants
 // Ensures that generated messages can be parsed back consistently
 
-#![cfg(all(feature = "as2", feature = "as4", feature = "testing"))]
+#![cfg(all(feature = "as2", feature = "as4"))]
 
-use asx_rs::as4::{
-    As4PushPolicyBuilder, As4ReceivePushRequest, As4ReceivePushSync, generate_receipt,
-    receive_push_sync,
-};
+#[path = "common/peers.rs"]
+mod peers;
 
-use asx_rs::as2::{
-    As2MdnMode, As2MicAlgorithm, As2SendCredentials, As2SendPolicy, As2SendRequest, SmimeCipher,
-    generate_mdn, send_sync as as2_send,
-};
-use asx_rs::core::{InteropMode, SessionContext};
-use asx_rs::observability::EventBus;
-use asx_rs::reliability::InMemoryDedupBackend;
+use asx::__fuzz::SessionContext;
+use asx::__fuzz::generate_mdn;
+use asx::__fuzz::generate_receipt;
 use proptest::prelude::*;
+use std::sync::OnceLock;
+use tower::ServiceExt;
 
-// Strategy for valid AS2 message IDs (RFC 2822-like, but simplified for testing)
-fn as2_message_id_strategy() -> impl Strategy<Value = String> {
-    r"[a-zA-Z0-9._+-]{1,64}@[a-zA-Z0-9.-]{1,64}".prop_map(|s| s.to_string())
+/// One receiving AS4 `Inbound` shared by every case.
+fn inbound() -> &'static (tokio::runtime::Runtime, asx::Inbound) {
+    static INBOUND: OnceLock<(tokio::runtime::Runtime, asx::Inbound)> = OnceLock::new();
+    INBOUND.get_or_init(|| {
+        let p = peers::pair(peers::Preset::Bdew);
+        let inbound = p.receiver.inbound(
+            asx::MemoryDedup::default(),
+            |_m: asx::Verified<asx::as4::UserMessage>| async { Ok::<(), asx::Reject>(()) },
+        );
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        (rt, inbound)
+    })
 }
 
 // Strategy for valid disposition values
@@ -51,58 +59,6 @@ proptest! {
         prop_assert!(result.is_ok(), "MDN generation failed: {:?}", result);
     }
 
-    /// Property: AS2 send produces deterministic output for same inputs
-    #[test]
-    fn prop_as2_send_deterministic(
-        message_id in as2_message_id_strategy(),
-        payload_size in 10usize..2048usize,
-    ) {
-        let session = SessionContext::new("p-test", "partner", "strict")
-            .expect("valid session");
-
-        let payload = vec![0xAB; payload_size];
-        let policy = As2SendPolicy {
-            interop_mode: InteropMode::Strict,
-            fail_closed_audit_events: false,
-            sign: true,
-            encrypt: true,
-            compress: false,
-            payload_content_type: None,
-            as2_from_id: String::new(),
-            mic_algorithm: As2MicAlgorithm::Sha256,
-            encryption_cipher: SmimeCipher::Aes256Cbc,
-        };
-
-        let result1 = as2_send(
-            &session,
-            &EventBus::new(256).expect("bus"),
-            As2SendRequest {
-                message_id: message_id.clone(),
-                payload: payload.clone(),
-                policy: policy.clone(),
-                credentials: Some(As2SendCredentials::default()),
-            },
-        );
-
-        let result2 = as2_send(
-            &session,
-            &EventBus::new(256).expect("bus"),
-            As2SendRequest {
-                message_id: message_id.clone(),
-                payload,
-                policy,
-                credentials: Some(As2SendCredentials::default()),
-            },
-        );
-
-        // Same inputs should produce same MIC for deterministic verification
-        prop_assert_eq!(
-            result1.as_ref().map(|m| &m.mic_base64),
-            result2.as_ref().map(|m| &m.mic_base64),
-            "AS2 send not deterministic"
-        );
-    }
-
     /// Property: AS4 receipt generation produces valid structure
     #[test]
     fn prop_as4_receipt_generation_valid(
@@ -111,7 +67,7 @@ proptest! {
         let session = SessionContext::new("p-test", "partner", "strict")
             .expect("valid session");
 
-        let result: asx_rs::core::Result<Vec<u8>> =
+        let result: asx::__fuzz::Result<Vec<u8>> =
             generate_receipt(&session, "receipt-id", &message_id);
 
         prop_assert!(
@@ -142,7 +98,7 @@ proptest! {
         session_id in r"[a-zA-Z0-9._-]{1,32}",
         partner_id in r"[a-zA-Z0-9._-]{1,32}",
     ) {
-        use asx_rs::core::ErrorContext;
+        use asx::__fuzz::ErrorContext;
 
         let ctx1 = ErrorContext::new("test")
             .with_session_and_partner(&session_id, &partner_id);
@@ -158,56 +114,25 @@ proptest! {
         );
     }
 
-    /// Property: MDN mode validation accepts only known valid modes
-    #[test]
-    fn prop_as2_mdn_mode_coverage(mode in 0u8..2u8) {
-        // Ensure all MDN mode variants can be used
-        let valid_modes = [
-            As2MdnMode::Synchronous,
-            As2MdnMode::Asynchronous,
-        ];
-
-        // This is more of a compile-time check, but ensures the strategy is exercised
-        let _ = valid_modes.len();
-        let _ = mode;
-    }
-
     /// Property: Large payloads within limits are handled correctly
     #[test]
     fn prop_as4_large_payload_handling(
         payload_size in 10_000usize..100_000usize,
     ) {
-        let session = SessionContext::new("p-test", "partner", "strict")
-            .expect("valid session");
-
+        let (rt, inbound) = inbound();
         let payload = vec![0xAB; payload_size];
-
-        let bus = EventBus::new(32).expect("bus");
-        let dedup: std::sync::Arc<dyn asx_rs::storage::DedupStorage> =
-        std::sync::Arc::new(InMemoryDedupBackend::default());
-
-        // This should not panic or cause memory issues
-        let result = receive_push_sync(
-            &session,
-            &bus,
-            As4ReceivePushSync {
-                request: As4ReceivePushRequest {
-                    http_content_type: "multipart/related".into(),
-                    payload: payload.into(),
-                    receipt_payload: None,
-                    policy: As4PushPolicyBuilder::new()
-                        .allow_unsigned_push(true)
-                        .fail_closed_audit_events(false)
-                        .build()
-                        .expect("policy"),
-                    authenticated_sender_scope: None,
-                },
-                dedup: dedup.clone(),
-                signer_pins: None,
-            },
+        let mut request = http::Request::new(http_body_util::Full::new(bytes::Bytes::from(payload)));
+        *request.method_mut() = http::Method::POST;
+        request.headers_mut().insert(
+            http::header::CONTENT_TYPE,
+            http::HeaderValue::from_static("multipart/related"),
         );
+        // This should not panic or cause memory issues
+        let response = rt
+            .block_on(inbound.clone().oneshot(request))
+            .unwrap_or_else(|never| match never {});
 
-        // Result can be either Ok or parse error, but should not crash
-        let _ = result;
+        // Arbitrary bytes are not a message: refused, never a crash.
+        prop_assert!(!response.status().is_success(), "accepted: {}", response.status());
     }
 }

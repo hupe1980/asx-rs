@@ -1,144 +1,43 @@
-//! AS4 inbound receive pipeline — push, stream, and partial-verify paths.
+//! AS4 inbound verification, called by `As4::inbound` (`super::inbound`).
 //!
-//! # Pipeline architecture
-//!
-//! The receive pipeline is split across 13 sub-modules with the following responsibilities:
+//! The order is fixed: [`authenticate_inbound`] (bounded parse, sender
+//! authorization, `SignatureValue` and same-document digests, `eb:To`), then
+//! the caller's revocation check of the signer path, then [`open_inbound`]
+//! (freshness, payload set = `eb:PartInfo`, envelope, decryption, `cid:`
+//! digests over the decrypted bytes, decompression). No key is used before
+//! the signature verified; the dedup claim is taken by the caller afterwards.
 //!
 //! | Module | Role |
 //! |--------|------|
-//! | [`entrypoints`] | Public API surface: sync, async, fragment-aware, and ordered variants |
-//! | [`sync_core`] | Core synchronous receive-and-dedup logic shared by all sync paths |
-//! | [`async_bridge`] | Bridges the sync core onto the Tokio async runtime |
-//! | [`async_completion`] | Async completion path for long-running dedup/receipt correlations |
-//! | [`ordered`] | Conversation-ordered receive (per-party FIFO guarantee) |
-//! | [`ordered_async`] | Async wrapper for conversation-ordered receive |
-//! | [`processing`] | Message classification: fragment detection, routing, policy enforcement |
-//! | [`payload`] | Payload extraction and decryption (xmlenc, XOP) |
-//! | [`metadata`] | UserMessage metadata parsing (MessageInfo, PartyInfo, CollaborationInfo) |
-//! | [`receipt`] | Receipt (AS4 Signal) correlation and verification |
-//! | [`verifier`] | WS-Security signature and PKIX chain verification |
-//! | [`verifier_wrappers`] | Policy-aware wrappers that plumb `RevocationPolicy` into the verifier |
-//! | [`runtime_guards`] | Tokio runtime pre-condition guards (prevent blocking calls on async executors) |
+//! | `metadata` | Parse the envelope and verify its WS-Security header |
+//! | `processing` | `authenticate_inbound` and `open_inbound` |
+//! | `payload` | Declared parts, part properties, restored types, decompression |
+//! | `verifier` | `As4Verifier`, `As4WsSecVerifier`, attachment-coverage checks |
 //!
-//! ## Request flow
-//!
-//! ```text
-//! HTTP layer
-//!   └─ entrypoints::receive_push_sync / async
-//!        └─ sync_core::receive_push_inner
-//!             ├─ processing::maybe_handle_fragment_message
-//!             │    ├─ [fragment] → large_message::As4FragmentJoiner
-//!             │    └─ [complete] → verifier + payload + metadata
-//!             └─ verifier_wrappers::verify_push_message
-//!                  └─ verifier::verify_enveloped_signature + validate_pkix_chain
-//! ```
-//!
-//! ## Fragment scope policy
-//!
-//! **This policy applies to fragmented messages only.**  It is consulted after
-//! an inbound message has been identified as carrying an `mf:MessageFragment`
-//! (ebMS3 Part 2 §5); ordinary single-`UserMessage` pushes never reach it.
-//!
-//! Profiles that do not use fragmentation at all — BDEW MaKo, for example — can
-//! therefore leave `fragment_scope_policy` at its secure default and always pass
-//! `authenticated_sender_scope: None`.  No override is needed, and setting
-//! [`FragmentScopePolicy::UseSoapSenderId`] to "make `None` safe" would only
-//! weaken the policy if fragments ever did arrive.
-//!
-//! For **fragmented** messages, when `fragment_scope_policy` is
-//! [`FragmentScopePolicy::RequireAuthenticatedScope`] (default),
-//! `As4ReceivePushRequest::authenticated_sender_scope` **must** be `Some(_)` — a transport-layer
-//! identity (e.g., mTLS client certificate CN) that cannot be forged by the message sender.
-//! When it is `None`, the pipeline returns [`crate::core::ErrorCode::PolicyViolation`].
-//!
-//! Use [`FragmentScopePolicy::UseSoapSenderId`] only for closed networks where SOAP-level
-//! sender identity is trusted (e.g., within a single organisation's internal EDI backbone).
+//! ebMS3 Part 2 split/join and conversation ordering are not supported.
 
-use super::large_message::As4FragmentJoiner;
-mod async_bridge;
-mod async_completion;
-#[doc(hidden)]
-mod entrypoints;
 mod metadata;
-mod ordered;
-pub use ordered::As4Ordered;
-mod ordered_async;
 mod payload;
 mod processing;
-mod receipt;
-mod runtime_guards;
-mod sync_core;
 mod verifier;
-mod verifier_wrappers;
-use super::types::{As4PushPolicy, As4ReceivePushProgress};
-use crate::core::{PayloadInput, Result, SessionContext};
-use crate::observability::EventBus;
-use crate::storage::DedupStorage;
-use std::sync::Arc;
+use crate::core::Result;
 
-pub use entrypoints::{
-    As4ReceivePush, As4ReceivePushSync, receive_push, receive_push_fragment_aware,
-    receive_push_sync, receive_push_sync_fragment_aware,
-};
-#[cfg(feature = "testing")]
-pub use entrypoints::{receive_push_sync_with_custom_verifier, receive_push_with_custom_verifier};
-#[cfg(feature = "testing")]
-pub use verifier::InsecureBypassAs4Verifier;
-#[cfg(all(test, not(feature = "testing")))]
-pub(crate) use verifier::private;
-#[cfg(feature = "testing")]
-pub use verifier::private;
-pub use verifier::{As4Verifier, As4WsSecVerifier};
-use verifier_wrappers::receive_push_sync_with_verifier;
+pub(crate) use processing::{TO_PARTY_STAGE, VerifiedInbound, authenticate_inbound, open_inbound};
+pub(super) use verifier::{As4Verifier, As4WsSecVerifier};
 
-/// Bundled context passed through the inner receive pipeline.
-///
-/// Grouping the five invariant parameters into a single struct eliminates
-/// repeated argument lists, reduces stack pressure on every inlined call,
-/// and makes it straightforward to add cross-cutting context (e.g. a
-/// correlation scope) without touching every function signature.
-pub(super) struct As4PushReceiveCtx<'a> {
-    pub(super) session: &'a SessionContext,
-    pub(super) event_bus: &'a EventBus,
-    pub(super) policy: &'a As4PushPolicy,
-    pub(super) dedup_backend: &'a Arc<dyn DedupStorage>,
-    pub(super) verifier: &'a (dyn As4Verifier + Send + Sync),
-    /// Per-partner permitted signers. `None` falls back to the session's
-    /// single-partner pin.
-    pub(super) signer_pins: Option<&'a Arc<dyn super::As4SignerPins>>,
+/// Who may sign as the claimed sender.
+pub(crate) struct SenderAuthorization {
+    /// Pinned signer certificates; empty when the rule alone decides.
+    pub(crate) pins: Vec<crate::crypto::CertFingerprint>,
+    /// The profile rule over the signer certificate (DER).
+    pub(crate) check: Option<Box<crate::crypto::wssec::verify::SignerCheck>>,
 }
 
-fn receive_push_inner(
-    ctx: &As4PushReceiveCtx<'_>,
-    payload_input: PayloadInput<'_>,
-    receipt_payload: Option<&[u8]>,
-    http_content_type: &str,
-    fragment_joiner: Option<&mut As4FragmentJoiner>,
-    authenticated_sender_scope: Option<&str>,
-) -> Result<As4ReceivePushProgress> {
-    runtime_guards::enforce_receive_push_runtime_guards(
-        ctx.session,
-        ctx.event_bus,
-        ctx.policy,
-        ctx.dedup_backend.as_ref(),
-    )?;
-
-    let payload_bytes = payload_input.as_slice();
-
-    if let Some(fragment_progress) = processing::maybe_handle_fragment_message(
-        ctx,
-        payload_bytes,
-        receipt_payload,
-        http_content_type,
-        fragment_joiner,
-        authenticated_sender_scope,
-    )? {
-        return Ok(fragment_progress);
-    }
-
-    processing::process_non_fragment_push(ctx, payload_bytes, receipt_payload, http_content_type)
+/// Resolves the claimed sender (unauthenticated `eb:From`) to the rule its
+/// signature must satisfy. Refusing here refuses before any signature work.
+pub(crate) trait SenderAuthorizer: Send + Sync {
+    fn authorize(&self, parsed: &super::ParsedAs4UserMessage) -> Result<SenderAuthorization>;
 }
 
 #[cfg(test)]
-#[cfg_attr(not(feature = "interop-relaxed"), allow(unused_imports))]
 mod tests;

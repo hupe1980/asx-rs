@@ -1,10 +1,6 @@
-//! Lightweight RFC 3339 timestamp utilities backed by `std::time`.
-//!
-//! Replaces the unconditional `chrono` dependency for the narrow use-cases
-//! in the AS4 protocol layer: second-level timestamp generation and inbound
-//! timestamp freshness validation.  All functions operate on Unix epoch
-//! seconds (i64) and produce / consume the `YYYY-MM-DDTHH:MM:SSZ` profile
-//! of RFC 3339.
+//! Minimal RFC 3339 date/time helpers on `std::time`: protocol timestamp
+//! generation, inbound timestamp parsing and the audit record's millisecond
+//! form. Calendar arithmetic works on signed Unix epoch seconds.
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -12,14 +8,53 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 // Public(crate) API
 // ---------------------------------------------------------------------------
 
-/// Format a [`SystemTime`] as an RFC 3339 UTC timestamp with second precision.
-///
-/// Output format: `YYYY-MM-DDTHH:MM:SSZ`
-///
-/// If `t` is before the Unix epoch (clock misconfiguration), the epoch
-/// instant `1970-01-01T00:00:00Z` is substituted.  Protocol timestamps are
-/// always "now" or "now + N seconds" so this branch is unreachable in normal
-/// operation.
+/// Signed Unix seconds of `t` (negative before 1970).
+pub(crate) fn unix_secs(t: SystemTime) -> i64 {
+    match t.duration_since(UNIX_EPOCH) {
+        Ok(d) => i64::try_from(d.as_secs()).unwrap_or(i64::MAX),
+        Err(e) => i64::try_from(e.duration().as_secs()).map_or(i64::MIN, |s| -s),
+    }
+}
+
+/// Unix seconds of an OpenSSL-printed ASN.1 time (`ASN1_TIME_print`:
+/// `"Jan  2 03:04:05 2026 GMT"`, optionally with fractional seconds, which are
+/// dropped). The only way to read an `Asn1GeneralizedTimeRef` without unsafe
+/// code.
+pub(crate) fn parse_openssl_print_time(s: &str) -> Option<i64> {
+    let mut it = s.split_whitespace();
+    let month = match it.next()? {
+        "Jan" => 1,
+        "Feb" => 2,
+        "Mar" => 3,
+        "Apr" => 4,
+        "May" => 5,
+        "Jun" => 6,
+        "Jul" => 7,
+        "Aug" => 8,
+        "Sep" => 9,
+        "Oct" => 10,
+        "Nov" => 11,
+        "Dec" => 12,
+        _ => return None,
+    };
+    let day: i64 = it.next()?.parse().ok()?;
+    let hms = it.next()?;
+    let hms = hms.split('.').next()?;
+    let mut parts = hms.split(':').map(|p| p.parse::<i64>().ok());
+    let (h, mi, sec) = (parts.next()??, parts.next()??, parts.next()??);
+    let year: i64 = it.next()?.parse().ok()?;
+    if it.next()? != "GMT" || it.next().is_some() {
+        return None;
+    }
+    if !(1..=31).contains(&day) || h > 23 || mi > 59 || sec > 60 {
+        return None;
+    }
+    let days = calendar_to_days(year, month, day)?;
+    Some(days * 86_400 + h * 3600 + mi * 60 + sec)
+}
+
+/// Format a [`SystemTime`] as `YYYY-MM-DDTHH:MM:SSZ` (RFC 3339 UTC, second
+/// precision). A time before the Unix epoch formats as the epoch.
 pub(crate) fn format_rfc3339_secs(t: SystemTime) -> String {
     let epoch_secs = t
         .duration_since(UNIX_EPOCH)
@@ -27,6 +62,29 @@ pub(crate) fn format_rfc3339_secs(t: SystemTime) -> String {
         .as_secs() as i64;
     let (y, mo, d, h, mi, s) = epoch_secs_to_calendar(epoch_secs);
     format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}Z")
+}
+
+/// Format a [`SystemTime`] as RFC 3339 UTC with exactly three fractional
+/// digits: `YYYY-MM-DDTHH:MM:SS.mmmZ` (the audit record's `recorded_at`).
+pub(crate) fn format_rfc3339_millis(t: SystemTime) -> String {
+    let since = t.duration_since(UNIX_EPOCH).unwrap_or(Duration::ZERO);
+    let (y, mo, d, h, mi, s) = epoch_secs_to_calendar(since.as_secs() as i64);
+    let ms = since.subsec_millis();
+    format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}.{ms:03}Z")
+}
+
+/// Parse exactly the form [`format_rfc3339_millis`] writes. Anything else —
+/// another precision, an offset, a missing `Z` — is `None`: the stored form
+/// is a contract, not a liberal input.
+pub(crate) fn parse_rfc3339_millis(s: &str) -> Option<SystemTime> {
+    let b = s.as_bytes();
+    if b.len() != 24 || b[19] != b'.' || b[23] != b'Z' {
+        return None;
+    }
+    let secs = parse_rfc3339_to_unix_secs(s)?;
+    let ms = parse_fixed::<3>(&b[20..23])?;
+    let secs = u64::try_from(secs).ok()?;
+    Some(UNIX_EPOCH + Duration::from_secs(secs) + Duration::from_millis(ms))
 }
 
 /// Parse an RFC 3339 timestamp string and return the number of seconds since
@@ -135,7 +193,7 @@ fn calendar_to_days(y: i64, m: i64, d: i64) -> Option<i64> {
 /// Convert Unix epoch seconds to `(year, month, day, hour, minute, second)`.
 ///
 /// Inverse of [`calendar_to_days`] combined with time-of-day decomposition.
-/// Correct for the full `i64` range; used only with `SystemTime::now()`.
+/// Correct for the full `i64` range; used with clock readings.
 fn epoch_secs_to_calendar(secs: i64) -> (i32, u8, u8, u8, u8, u8) {
     let z = secs.div_euclid(86400) + 719468;
     let era = z.div_euclid(146097) as i32;
@@ -178,6 +236,29 @@ fn parse_fixed<const N: usize>(b: &[u8]) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn openssl_printed_times_parse_to_unix_seconds() {
+        use openssl::asn1::Asn1Time;
+        for secs in [0_i64, 86_399, 1_700_000_000, 1_767_225_600, 4_102_444_799] {
+            let printed = Asn1Time::from_unix(secs).unwrap().to_string();
+            assert_eq!(parse_openssl_print_time(&printed), Some(secs), "{printed}");
+        }
+        assert_eq!(
+            parse_openssl_print_time("Jan  2 03:04:05.123 2026 GMT"),
+            parse_openssl_print_time("Jan  2 03:04:05 2026 GMT")
+        );
+        assert_eq!(parse_openssl_print_time("Foo  2 03:04:05 2026 GMT"), None);
+        assert_eq!(parse_openssl_print_time("Jan  2 03:04:05 2026 CET"), None);
+        assert_eq!(parse_openssl_print_time(""), None);
+    }
+
+    #[test]
+    fn unix_secs_is_signed() {
+        assert_eq!(unix_secs(UNIX_EPOCH + Duration::from_secs(5)), 5);
+        assert_eq!(unix_secs(UNIX_EPOCH - Duration::from_secs(5)), -5);
+    }
+
     use super::*;
 
     #[test]

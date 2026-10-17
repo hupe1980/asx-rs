@@ -41,8 +41,8 @@ pub const MLS_TYPE_FAILURE_ONLY: &str = "FAILURE_ONLY";
 /// Build the Peppol participant identifier of a Service Provider from its Seat
 /// ID, for registering or addressing MLS.
 ///
-/// ```
-/// use asx_rs::peppol::mls;
+/// ```text
+/// use asx::peppol::mls;
 ///
 /// // Network Policy rule MLS-2's worked example: seat POP987654.
 /// assert_eq!(mls::spis_participant_id("987654"), "0242:987654");
@@ -57,9 +57,9 @@ pub fn spis_participant_id(seat_id: &str) -> String {
 /// a receiver that forgets to look never mistakes "unspecified" for "send
 /// everything".
 ///
-/// ```
-/// # use asx_rs::sbdh::{SbdhHeader, SbdhScope, peppol_scope};
-/// # use asx_rs::peppol::mls;
+/// ```text
+/// # use asx::sbdh::{SbdhHeader, SbdhScope, peppol_scope};
+/// # use asx::peppol::mls;
 /// # fn example(header: &SbdhHeader) {
 /// // Absent => FAILURE_ONLY, never "all".
 /// assert_eq!(mls::mls_type(header), mls::MLS_TYPE_FAILURE_ONLY);

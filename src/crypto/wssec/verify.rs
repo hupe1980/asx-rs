@@ -1,6 +1,5 @@
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
-use openssl::hash::MessageDigest;
 use openssl::sign::Verifier as OsslVerifier;
 use roxmltree::Document;
 use std::borrow::Cow;
@@ -15,24 +14,24 @@ use super::canonicalize::{
     normalize_same_document_uri, try_serialize_node,
 };
 use super::x509::{
-    extract_rsa_keyvalue_from_cert, pkey_from_rsa_components,
-    validate_cert_public_key_matches_rsa_keyvalue, validate_pkix_chain_and_revocation,
+    ValidatedChain, extract_rsa_keyvalue_from_cert, pkey_from_rsa_components,
+    validate_cert_public_key_matches_rsa_keyvalue, validate_chain_offline,
     validate_x509_certificate,
 };
 use super::{
-    ECDSA_SHA256_URI, ECDSA_SHA384_URI, ECDSA_SHA512_URI, RSA_SHA256_URI, RSA_SHA384_URI,
-    RSA_SHA512_URI, SWA_ATTACHMENT_CONTENT_TRANSFORM_URI, XML_EXC_C14N_URI, XML_INC_C14N_URI,
-};
-use super::{
-    RevocationPolicy, WsSecCanonicalizationKind, WsSecCanonicalizationProfile, WsSecDigestMethod,
+    ChainPolicy, WsSecCanonicalizationKind, WsSecCanonicalizationProfile, WsSecDigestMethod,
     WsSecSignatureReference,
 };
-use crate::core::{AsxError, ErrorCode, ErrorContext, OcspFailureMode, OcspMode, Result};
+use crate::core::{AsxError, ErrorCode, ErrorContext, Result};
+use crate::crypto::alg::{KeyFamily, TransformAlg};
+use crate::crypto::signing::SignatureAlgorithm;
 
 const WSSE_NS: &str =
     "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd";
 const WSU_NS: &str =
     "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd";
+/// Namespace of `ec:InclusiveNamespaces` (Exc-C14N §3).
+const EXC_C14N_NS: &str = crate::xml::ns::EXC_C14N;
 const WSSE_X509_PKIPATHV1_VALUE_TYPE_SUFFIX: &str = "#X509PKIPathv1";
 const WSSE_X509_V3_VALUE_TYPE_SUFFIX: &str = "#X509v3";
 
@@ -66,6 +65,9 @@ struct ParsedWsSecSignatureMaterialBorrowed<'a> {
 struct ParsedWsSecSignatureEnvelopeBorrowed<'a> {
     references: Vec<WsSecSignatureReferenceBorrowed<'a>>,
     signature_material: ParsedWsSecSignatureMaterialBorrowed<'a>,
+    /// The `wsse:Security` header that contains the primary `ds:Signature`,
+    /// when the signature sits directly inside one.
+    security_header: Option<roxmltree::Node<'a, 'a>>,
 }
 
 #[derive(Clone, Copy)]
@@ -121,6 +123,7 @@ impl std::fmt::Write for OsslVerifierFmtWriter<'_, '_> {
 pub fn parse_signature_references(xml: &str) -> Result<Vec<WsSecSignatureReference>> {
     let doc = parse_wssec_document(
         xml,
+        crate::xml::XmlLimits::ENVELOPE,
         "wssec_parse_references",
         "failed to parse XML while reading signature references",
     )?;
@@ -191,15 +194,39 @@ fn parse_signature_references_from_doc_optional_borrowed<'a>(
 
     Ok(Some(parse_signature_references_from_signed_info_borrowed(
         signed_info,
+        SignedDocClass::UserMessage,
     )?))
 }
 
 fn parse_signature_envelope_from_doc_optional_borrowed<'a>(
     doc: &'a Document<'a>,
+    class: SignedDocClass,
 ) -> Result<Option<ParsedWsSecSignatureEnvelopeBorrowed<'a>>> {
     let Some(signature) = find_single_signature_node(doc, "wssec_parse_references")? else {
         return Ok(None);
     };
+
+    // In a SOAP envelope the primary signature is a
+    // WS-Security header entry — a direct child of wsse:Security — and
+    // nowhere else.
+    let root = doc.root_element();
+    let soap = matches!(
+        root.tag_name().namespace(),
+        Some(crate::xml::ns::SOAP12 | crate::xml::ns::SOAP11)
+    ) && root.tag_name().name() == "Envelope";
+    let in_security = signature.parent().is_some_and(|p| {
+        p.is_element()
+            && p.tag_name().name() == "Security"
+            && p.tag_name().namespace() == Some(WSSE_NS)
+    });
+    if soap && !in_security {
+        return Err(AsxError::new(
+            ErrorCode::SecurityVerificationFailed,
+            "the ds:Signature of a SOAP envelope must be a direct child of a wsse:Security \
+             header block; a signature elsewhere is not a WS-Security signature",
+            ErrorContext::new("wssec_parse_references"),
+        ));
+    }
 
     let signed_info = signature
         .children()
@@ -211,22 +238,31 @@ fn parse_signature_envelope_from_doc_optional_borrowed<'a>(
                 ErrorContext::new("wssec_parse_references"),
             )
         })?;
-    let refs = parse_signature_references_from_signed_info_borrowed(signed_info)?;
+    let refs = parse_signature_references_from_signed_info_borrowed(signed_info, class)?;
     let signature_material = parse_signature_material_components_from_signature_with_signed_info(
         doc,
         signature,
         signed_info,
     )?;
 
+    let security_header = signature.parent().filter(|p| {
+        p.is_element()
+            && p.tag_name().name() == "Security"
+            && p.tag_name().namespace() == Some(WSSE_NS)
+    });
+
     Ok(Some(ParsedWsSecSignatureEnvelopeBorrowed {
         references: refs,
         signature_material,
+        security_header,
     }))
 }
 
 fn parse_signature_references_from_signed_info_borrowed<'a>(
     signed_info: roxmltree::Node<'a, 'a>,
+    class: SignedDocClass,
 ) -> Result<Vec<WsSecSignatureReferenceBorrowed<'a>>> {
+    enforce_reference_cap(signed_info, class)?;
     let mut refs: Vec<WsSecSignatureReferenceBorrowed<'a>> = Vec::new();
     let mut seen_uris: HashSet<ParsedReferenceDedupKey<'a>> = HashSet::new();
     for node in signed_info
@@ -241,6 +277,7 @@ fn parse_signature_references_from_signed_info_borrowed<'a>(
             )
         })?;
 
+        enforce_transform_cap(node, uri)?;
         let parsed_uri = parse_reference_uri(uri, "wssec_parse_references")?;
         let dedup_key = ParsedReferenceDedupKey::from(&parsed_uri);
         if !seen_uris.insert(dedup_key) {
@@ -299,6 +336,51 @@ fn parse_signature_references_from_signed_info_borrowed<'a>(
     }
 
     Ok(refs)
+}
+
+/// At most `class.max_references()` `ds:Reference`s, counted
+/// before any is parsed, digested or trusted (W3C XMLDSig Best Practices BP 9).
+fn enforce_reference_cap(
+    signed_info: roxmltree::Node<'_, '_>,
+    class: SignedDocClass,
+) -> Result<()> {
+    let count = signed_info
+        .descendants()
+        .filter(|n| n.is_element() && is_ds_element(*n, "Reference"))
+        .count();
+    if count > class.max_references() {
+        return Err(AsxError::new(
+            ErrorCode::SecurityVerificationFailed,
+            format!(
+                "{count} ds:Reference elements exceed the cap of {} for a {class:?} document",
+                class.max_references()
+            ),
+            ErrorContext::new("wssec_parse_references"),
+        ));
+    }
+    Ok(())
+}
+
+/// At most `SignedDocClass::MAX_TRANSFORMS` transforms per
+/// reference.
+fn enforce_transform_cap(reference: roxmltree::Node<'_, '_>, uri: &str) -> Result<()> {
+    let count = reference
+        .children()
+        .filter(|n| n.is_element() && is_ds_element(*n, "Transforms"))
+        .flat_map(|t| t.children())
+        .filter(|n| n.is_element() && is_ds_element(*n, "Transform"))
+        .count();
+    if count > SignedDocClass::MAX_TRANSFORMS {
+        return Err(AsxError::new(
+            ErrorCode::SecurityVerificationFailed,
+            format!(
+                "ds:Reference {uri} carries {count} transforms; at most {} are allowed",
+                SignedDocClass::MAX_TRANSFORMS
+            ),
+            ErrorContext::new("wssec_parse_references").with_message_id(uri.to_string()),
+        ));
+    }
+    Ok(())
 }
 
 /// Return the single relevant `ds:Signature` node for WS-Security verification.
@@ -367,9 +449,8 @@ fn find_single_signature_node<'a>(
 /// transform says otherwise. Defaulting to exclusive instead computes a
 /// different digest from the signer's whenever an ancestor declares a
 /// namespace the subtree does not use, and reports a valid signature as a
-/// forgery. (This is the verify-side counterpart of D2, which is why the
-/// signing path *states* the exclusive algorithm rather than relying on a
-/// default.)
+/// forgery. (This is also why the signing path *states* the exclusive
+/// algorithm rather than relying on a default.)
 ///
 /// A `cid:` reference dereferences to an octet stream, not a node-set, so no
 /// canonicalization runs on it at all; the value returned for one is inert.
@@ -380,9 +461,10 @@ fn default_c14n_kind(parsed_uri: &ParsedReferenceUri<'_>) -> WsSecCanonicalizati
     }
 }
 
-/// SwA transform that additionally covers selected MIME part headers.
-/// Not supported — AS4 mandates the content-only transform.
-const SWA_ATTACHMENT_COMPLETE_TRANSFORM_URI: &str = "http://docs.oasis-open.org/wss/oasis-wss-SwAProfile-1.1#Attachment-Complete-Signature-Transform";
+/// Fragment of the SwA transform that additionally covers selected MIME part
+/// headers. It has no registry row (AS4 mandates the content-only transform);
+/// the suffix only selects a more specific rejection message.
+const SWA_ATTACHMENT_COMPLETE_TRANSFORM_SUFFIX: &str = "#Attachment-Complete-Signature-Transform";
 
 /// Parse the `<ds:Transforms>` of a `<ds:Reference>` element.
 ///
@@ -408,7 +490,6 @@ fn parse_reference_transform_profile(
     uri: &str,
     parsed_uri: &ParsedReferenceUri<'_>,
 ) -> Result<(WsSecCanonicalizationKind, Vec<String>)> {
-    const EXC_C14N_NS: &str = "http://www.w3.org/2001/10/xml-exc-c14n#";
     const INCLUSIVE_NS_LOCAL: &str = "InclusiveNamespaces";
 
     let transforms = reference
@@ -430,10 +511,13 @@ fn parse_reference_transform_profile(
             .filter(|n| n.is_element() && is_ds_element(*n, "Transform"))
         {
             let alg = transform.attribute("Algorithm").unwrap_or("");
-            if alg == SWA_ATTACHMENT_CONTENT_TRANSFORM_URI {
+            if matches!(
+                TransformAlg::from_uri(alg),
+                Ok(TransformAlg::AttachmentContent)
+            ) {
                 continue;
             }
-            let detail = if alg == SWA_ATTACHMENT_COMPLETE_TRANSFORM_URI {
+            let detail = if alg.ends_with(SWA_ATTACHMENT_COMPLETE_TRANSFORM_SUFFIX) {
                 "the Attachment-Complete-Signature-Transform (MIME headers included in the \
                  digest) is not supported; AS4 mandates the content-only transform"
             } else {
@@ -458,22 +542,26 @@ fn parse_reference_transform_profile(
         .filter(|n| n.is_element() && is_ds_element(*n, "Transform"))
     {
         let alg = transform.attribute("Algorithm").unwrap_or("");
-        if alg == XML_INC_C14N_URI {
-            // Inclusive C14N has no InclusiveNamespaces child — the entire
-            // in-scope namespace set is implicitly included.
-            c14n_kind = WsSecCanonicalizationKind::Inclusive;
-            continue;
-        }
-        if alg != XML_EXC_C14N_URI {
-            return Err(AsxError::new(
-                ErrorCode::InteropViolation,
-                format!(
-                    "unsupported ds:Transform Algorithm \"{alg}\" in Reference {uri}; \
-                     supported algorithms: Exclusive C14N ({XML_EXC_C14N_URI}) and \
-                     Inclusive C14N ({XML_INC_C14N_URI})"
-                ),
-                ErrorContext::new("wssec_parse_references").with_message_id(uri.to_string()),
-            ));
+        match TransformAlg::from_uri(alg) {
+            Ok(TransformAlg::C14n(WsSecCanonicalizationKind::Inclusive)) => {
+                // Inclusive C14N has no InclusiveNamespaces child — the entire
+                // in-scope namespace set is implicitly included.
+                c14n_kind = WsSecCanonicalizationKind::Inclusive;
+                continue;
+            }
+            Ok(TransformAlg::C14n(WsSecCanonicalizationKind::Exclusive)) => {}
+            _ => {
+                return Err(AsxError::new(
+                    ErrorCode::InteropViolation,
+                    format!(
+                        "unsupported ds:Transform Algorithm \"{alg}\" in Reference {uri}; \
+                         supported algorithms: Exclusive C14N ({}) and Inclusive C14N ({})",
+                        WsSecCanonicalizationKind::Exclusive.uri(),
+                        WsSecCanonicalizationKind::Inclusive.uri()
+                    ),
+                    ErrorContext::new("wssec_parse_references").with_message_id(uri.to_string()),
+                ));
+            }
         }
         // Stated explicitly rather than left to the initializer: the default
         // for a reference that declares no transform is *inclusive*, so
@@ -515,47 +603,84 @@ pub fn verify_signature_references_strict(
     verify_signature_references_with_profile(xml, references, &profile, &[])
 }
 
+/// A sender rule over the signer certificate (DER).
+pub(crate) type SignerCheck = dyn Fn(&[u8]) -> Result<()> + Send + Sync;
+
 /// Options for WS-Security signature verification.
 ///
 /// Construct via `WsSecVerifyOptions::new()`, optionally chaining builder
 /// methods before passing to [`verify_enveloped_signature`].
-#[derive(Debug)]
 pub struct WsSecVerifyOptions<'a> {
     /// Permitted signer fingerprints. Empty means "no pin configured";
     /// the AS4 receive path refuses before reaching here in that case.
     pub(crate) expected_cert_fingerprints: &'a [crate::crypto::CertFingerprint],
-    pub(crate) revocation_policy: RevocationPolicy<'a>,
+    /// A profile's sender rule over the signer certificate (DER), checked
+    /// with the pins — before the signature value (the
+    /// caller's revocation check comes after, so an unauthorized signer
+    /// triggers no fetch).
+    pub(crate) signer_check: Option<&'a SignerCheck>,
+    pub(crate) chain_policy: ChainPolicy<'a>,
     pub(crate) external_references: &'a [(&'a str, &'a [u8])],
+    /// When the verification happens (`wsu:Timestamp`): the session clock's
+    /// reading, the system clock by default.
+    pub(crate) now: std::time::SystemTime,
+    /// Leave the `cid:` references to the caller (returned in
+    /// [`VerifiedSignatureCoverage::deferred`]): the attachment bytes they
+    /// cover exist only after decryption.
+    pub(crate) defer_attachments: bool,
+}
+
+impl std::fmt::Debug for WsSecVerifyOptions<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WsSecVerifyOptions")
+            .field(
+                "expected_cert_fingerprints",
+                &self.expected_cert_fingerprints,
+            )
+            .field("signer_check", &self.signer_check.is_some())
+            .field("chain_policy", &self.chain_policy)
+            .field("external_references", &self.external_references.len())
+            .finish()
+    }
 }
 
 impl<'a> WsSecVerifyOptions<'a> {
     /// Create options with strict fail-closed defaults.
     ///
-    /// Callers should pass an explicit policy via `with_revocation(...)`
+    /// Callers should pass an explicit policy via `with_chain_policy(...)`
     /// sourced from session trust material before using in production receive
     /// paths.
     pub fn new() -> Self {
         Self {
             expected_cert_fingerprints: &[],
-            revocation_policy: RevocationPolicy {
-                trust_anchor_pems: &[],
-                revocation_crl_pems: &[],
-                ocsp_mode: OcspMode::Disabled,
-                ocsp_failure_mode: OcspFailureMode::HardFail,
-                stapled_ocsp_responses_der: &[],
-                responder_ocsp_responses_der: &[],
-                // OCSP is disabled in the default; the namespace is not used for cache
-                // operations.  Use `with_revocation(revocation_policy)` to supply a
-                // session-scoped namespace and enable actual revocation checking.
-                ocsp_cache_namespace: "default-ocsp-disabled",
-                // Default: pure cryptographic verification only.  Callers that need
-                // PKIX chain validation must supply trust anchors via `with_revocation`.
-                require_chain_validation: false,
-                pre_parsed_trust_anchors: None,
-                pre_built_x509_store: None,
-            },
+            signer_check: None,
+            // Pure cryptographic verification by default: callers that need
+            // PKIX chain validation supply anchors via `with_chain_policy`.
+            chain_policy: ChainPolicy::default(),
             external_references: &[],
+            now: crate::clock::system().now(),
+            defer_attachments: false,
         }
+    }
+
+    /// Verify `SignatureValue`, signer and the same-document references only;
+    /// the `cid:` references are returned for the caller.
+    #[cfg(feature = "as4")]
+    pub(crate) fn deferring_attachments(mut self) -> Self {
+        self.defer_attachments = true;
+        self
+    }
+
+    /// Judge every time-dependent check at `now` (the session clock).
+    pub(crate) fn at(mut self, now: std::time::SystemTime) -> Self {
+        self.now = now;
+        self
+    }
+
+    /// Apply a sender rule to the signing certificate (DER).
+    pub(crate) fn with_signer_check(mut self, check: Option<&'a SignerCheck>) -> Self {
+        self.signer_check = check;
+        self
     }
 
     /// Require the signing certificate to match one of these fingerprints.
@@ -570,9 +695,10 @@ impl<'a> WsSecVerifyOptions<'a> {
         self
     }
 
-    /// Apply PKIX chain validation and revocation checks.
-    pub fn with_revocation(mut self, policy: RevocationPolicy<'a>) -> Self {
-        self.revocation_policy = policy;
+    /// Validate the signer's certification path against `policy` (offline;
+    /// revocation is the caller's).
+    pub fn with_chain_policy(mut self, policy: ChainPolicy<'a>) -> Self {
+        self.chain_policy = policy;
         self
     }
 
@@ -592,25 +718,24 @@ impl<'a> Default for WsSecVerifyOptions<'a> {
 /// Verify an enveloped WS-Security XMLDSig signature.
 ///
 /// Returns `Ok(())` when strict verification passes.
-#[cfg_attr(
-    feature = "trace",
-    tracing::instrument(skip_all, name = "wssec_verify_enveloped_signature")
-)]
 pub fn verify_enveloped_signature(xml: &str, opts: WsSecVerifyOptions<'_>) -> Result<()> {
     let doc = parse_wssec_document(
         xml,
+        crate::xml::XmlLimits::ENVELOPE,
         "wssec_verify",
         "failed to parse XML for wssec verification",
     )?;
 
-    let parsed = parse_signature_envelope_from_doc_optional_borrowed(&doc)?.ok_or_else(|| {
-        AsxError::new(
-            ErrorCode::ParseFailed,
-            "no ds:Signature elements found",
-            ErrorContext::new("wssec_parse_references"),
-        )
-    })?;
-    verify_enveloped_signature_with_parsed_signature_borrowed(&doc, xml, parsed, opts)
+    let parsed =
+        parse_signature_envelope_from_doc_optional_borrowed(&doc, SignedDocClass::UserMessage)?
+            .ok_or_else(|| {
+                AsxError::new(
+                    ErrorCode::ParseFailed,
+                    "no ds:Signature elements found",
+                    ErrorContext::new("wssec_parse_references"),
+                )
+            })?;
+    verify_enveloped_signature_with_parsed_signature_borrowed(&doc, xml, parsed, opts).map(|_| ())
 }
 
 /// Outcome of a successful WS-Security signature verification: everything the
@@ -635,22 +760,124 @@ pub(crate) struct VerifiedSignatureCoverage {
     /// Normalized Content-IDs of `cid:` references that verified (no `cid:`
     /// scheme prefix, no angle brackets).
     pub signed_cid_references: Vec<String>,
+    /// The signer certificate the signature verified against (audit evidence).
+    pub signer_certificate_der: Option<Vec<u8>>,
+    /// `(URI, DigestMethod URI, base64 DigestValue)` of every verified
+    /// `ds:Reference`, in document order (audit evidence).
+    pub references: Vec<(String, String, String)>,
+    /// What [`WsSecVerifyOptions::deferring_attachments`] left to the caller.
+    pub deferred: Option<std::sync::Arc<Deferred>>,
+    /// The validated certification path, signer first, trust anchor last
+    /// (empty without chain validation): what the caller checks for
+    /// revocation.
+    pub(crate) signer_path: Vec<openssl::x509::X509>,
+}
+
+/// The verification step left open by
+/// [`WsSecVerifyOptions::deferring_attachments`]: the `cid:` references, to
+/// be digested over the decrypted parts ([`verify_cid_references`]).
+#[cfg(feature = "as4")]
+#[derive(Debug)]
+pub(crate) struct Deferred {
+    pub(crate) cid_references: Vec<PendingCidReference>,
+}
+
+/// One `cid:` `ds:Reference` whose digest is still to be checked.
+#[cfg(feature = "as4")]
+#[derive(Debug, Clone)]
+pub(crate) struct PendingCidReference {
+    pub(crate) uri: String,
+    /// The Content-ID, normalized.
+    pub(crate) cid: String,
+    pub(crate) digest_method: WsSecDigestMethod,
+    pub(crate) digest_value_base64: String,
+}
+
+/// The second half of verification step 4: every pending `cid:`
+/// reference digested over its part's digest input (`parts`: normalized
+/// Content-ID, bytes after the SwA content transform). A reference without
+/// its part fails.
+#[cfg(feature = "as4")]
+pub(crate) fn verify_cid_references(
+    pending: &[PendingCidReference],
+    parts: &[(&str, &[u8])],
+) -> Result<()> {
+    for reference in pending {
+        #[cfg(test)]
+        order_probe::cid_digested();
+        let payload = parts
+            .iter()
+            .find(|(cid, _)| normalize_cid_uri(cid) == reference.cid)
+            .map(|(_, bytes)| *bytes)
+            .ok_or_else(|| {
+                AsxError::new(
+                    ErrorCode::SecurityVerificationFailed,
+                    format!(
+                        "missing external reference bytes required for URI {}",
+                        reference.uri
+                    ),
+                    ErrorContext::new("wssec_verify_references")
+                        .with_message_id(reference.uri.clone()),
+                )
+            })?;
+        let computed = openssl::hash::hash(reference.digest_method.message_digest(), payload)
+            .map_err(|_| {
+                AsxError::new(
+                    ErrorCode::SecurityVerificationFailed,
+                    "failed to digest external reference payload",
+                    ErrorContext::new("wssec_verify_references")
+                        .with_message_id(reference.uri.clone()),
+                )
+            })?;
+        let expected = decode_reference_digest_value(
+            &reference.uri,
+            reference.digest_method,
+            &reference.digest_value_base64,
+        )?;
+        verify_reference_digest_matches(
+            &reference.uri,
+            &expected,
+            &reference.digest_value_base64,
+            &computed,
+        )?;
+    }
+    Ok(())
+}
+
+/// What a signed document is, for the reference caps: a user
+/// message signs `eb:Messaging`, the Body, an optional `wsu:Timestamp` and one
+/// reference per attachment; a signal or pull request signs its header block,
+/// the Body and an optional timestamp; an SMP document signs itself once.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SignedDocClass {
+    UserMessage,
+    Signal,
+    Smp,
+}
+
+impl SignedDocClass {
+    /// At most this many `ds:Reference`s.
+    pub(crate) const fn max_references(self) -> usize {
+        match self {
+            // eb:Messaging, soap:Body, wsu:Timestamp, MAX_INBOUND_PAYLOADS (16).
+            Self::UserMessage => 3 + 16,
+            Self::Signal => 3,
+            Self::Smp => 1,
+        }
+    }
+
+    /// At most this many transforms per reference.
+    pub(crate) const MAX_TRANSFORMS: usize = 2;
 }
 
 #[cfg(feature = "as4")]
 pub(crate) fn verify_enveloped_signature_optional_with_doc(
     doc: &Document<'_>,
     xml: &str,
+    class: SignedDocClass,
     opts: WsSecVerifyOptions<'_>,
 ) -> Result<Option<VerifiedSignatureCoverage>> {
-    enforce_wssec_document_limits(
-        xml,
-        doc,
-        "wssec_verify",
-        "failed to parse XML for wssec verification",
-    )?;
-
-    let Some(parsed) = parse_signature_envelope_from_doc_optional_borrowed(doc)? else {
+    let Some(parsed) = parse_signature_envelope_from_doc_optional_borrowed(doc, class)? else {
         return Ok(None);
     };
 
@@ -669,116 +896,226 @@ pub(crate) fn verify_enveloped_signature_optional_with_doc(
         }
     }
 
-    verify_enveloped_signature_with_parsed_signature_borrowed(doc, xml, parsed, opts)?;
+    let signer_certificate_der = parsed
+        .signature_material
+        .x509_certificates_der
+        .first()
+        .cloned();
+    let span = crate::telemetry::verify_span(
+        &parsed.signature_material.signature_method_algorithm,
+        signer_certificate_der.as_deref(),
+    );
+    let references = parsed
+        .references
+        .iter()
+        .map(|r| {
+            (
+                r.uri.to_owned(),
+                r.digest_method.algorithm_uri().to_owned(),
+                r.digest_value_base64.to_owned(),
+            )
+        })
+        .collect();
+
+    let pending: Vec<PendingCidReference> = if opts.defer_attachments {
+        parsed
+            .references
+            .iter()
+            .filter_map(|r| match r.parsed_uri {
+                ParsedReferenceUri::Cid { normalized } => Some(PendingCidReference {
+                    uri: r.uri.to_owned(),
+                    cid: normalized.to_owned(),
+                    digest_method: r.digest_method,
+                    digest_value_base64: r.digest_value_base64.to_owned(),
+                }),
+                ParsedReferenceUri::SameDocument { .. } => None,
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let defer = opts.defer_attachments;
+    let verified = span.in_scope(|| {
+        verify_enveloped_signature_with_parsed_signature_borrowed(doc, xml, parsed, opts)
+    });
+    crate::telemetry::child_outcome(&span, &verified);
+    let chain = verified?;
     Ok(Some(VerifiedSignatureCoverage {
         signed_same_document_ids,
         signed_cid_references,
+        signer_certificate_der,
+        references,
+        deferred: defer.then(|| {
+            std::sync::Arc::new(Deferred {
+                cid_references: pending,
+            })
+        }),
+        signer_path: chain.map(|c| c.path).unwrap_or_default(),
     }))
 }
 
+/// The one verification pipeline — each step only after the
+/// previous succeeded (W3C XMLDSig Best Practices BP 1, 2):
+///
+/// 1. `SignedInfo`/`KeyInfo` parsed, reference and transform caps and the
+///    signature location enforced (done while parsing `parsed`);
+/// 2. signer identity: the pin, then the offline certification path;
+/// 3. key family, then the `SignatureValue` over the canonical `SignedInfo`;
+/// 4. reference digests — the expensive, attacker-sized work: same-document
+///    references first, then `cid:` references (when deferring, the `cid:`
+///    ones are the caller's, after decryption);
+/// 5. the `wsu:Timestamp`.
+///
+/// The validated path is returned: revocation (which may fetch) is the
+/// caller's, after the sender rule.
 fn verify_enveloped_signature_with_parsed_signature_borrowed(
     doc: &Document<'_>,
     xml: &str,
     parsed: ParsedWsSecSignatureEnvelopeBorrowed<'_>,
     opts: WsSecVerifyOptions<'_>,
-) -> Result<()> {
+) -> Result<Option<ValidatedChain>> {
     let c14n_profile = WsSecCanonicalizationProfile::default();
+    let ParsedWsSecSignatureEnvelopeBorrowed {
+        references,
+        signature_material,
+        security_header,
+    } = parsed;
 
+    let chain = verify_signature_value_with_components(
+        signature_material,
+        c14n_profile.clone(),
+        opts.expected_cert_fingerprints,
+        opts.signer_check,
+        &opts.chain_policy,
+    )?;
+
+    let references: Vec<WsSecSignatureReferenceBorrowed<'_>> = if opts.defer_attachments {
+        references
+            .into_iter()
+            .filter(|r| matches!(r.parsed_uri, ParsedReferenceUri::SameDocument { .. }))
+            .collect()
+    } else {
+        references
+    };
     verify_signature_references_borrowed_with_profile(
         xml,
-        &parsed.references,
+        &references,
         &c14n_profile,
         opts.external_references,
         Some(doc),
     )?;
 
-    verify_signature_value_with_components(
-        parsed.signature_material,
-        c14n_profile,
-        opts.expected_cert_fingerprints,
-        &opts.revocation_policy,
-    )
+    if let Some(security) = security_header {
+        check_wsu_timestamp(security, opts.now)?;
+    }
+
+    Ok(chain)
 }
 
-/// Maximum byte length accepted for WS-Security DOM parse.
-///
-/// This is an independent guard on the `roxmltree` DOM stage.  The streaming
-/// pre-parse in `parser.rs` already limits to `MAX_XML_ELEMENTS = 10_000` but
-/// does not constrain the raw byte size; a deeply nested document with few but
-/// very large attribute values can still consume significant heap before the
-/// element count is checked.  2 MiB is ≈ 200× a typical Peppol AS4 envelope.
-const MAX_WSSEC_DOM_BYTES: usize = 2 * 1024 * 1024;
+/// Clock skew tolerated on an inbound `wsu:Timestamp` (WSS 1.1.1 §10).
+const WSU_TIMESTAMP_SKEW: std::time::Duration = std::time::Duration::from_secs(300);
 
-/// Maximum XML elements allowed in the WS-Security DOM tree.
+/// Validate a present `wsu:Timestamp` in the processed `wsse:Security` header
+/// (WSS SOAP Message Security 1.1.1 §10).
 ///
-/// Matches `MAX_XML_ELEMENTS` used in the quick-xml streaming pre-parse so
-/// that both parse stages enforce a consistent limit.
-const MAX_WSSEC_DOM_ELEMENTS: usize = 10_000;
+/// An absent timestamp is accepted: WSS makes the element optional and the
+/// AS4 peers this crate interoperates with send none. A present one must be
+/// unambiguous and current — at most one `wsu:Timestamp`, at most one
+/// `wsu:Created` and `wsu:Expires`, both UTC `xsd:dateTime` values, `Expires`
+/// not before `Created`, `Expires ≥ now − skew` and `Created ≤ now + skew`.
+/// Whether the timestamp is signed does not matter: it can only cause
+/// rejection.
+fn check_wsu_timestamp(
+    security: roxmltree::Node<'_, '_>,
+    now: std::time::SystemTime,
+) -> Result<()> {
+    let reject = |detail: String| {
+        AsxError::new(
+            ErrorCode::SecurityVerificationFailed,
+            format!("wsu:Timestamp rejected: {detail}"),
+            ErrorContext::new("wssec_verify_timestamp"),
+        )
+    };
+    let is_wsu = |n: &roxmltree::Node<'_, '_>, local: &str| {
+        n.is_element() && n.tag_name().namespace() == Some(WSU_NS) && n.tag_name().name() == local
+    };
 
+    let mut timestamps = security.children().filter(|n| is_wsu(n, "Timestamp"));
+    let Some(timestamp) = timestamps.next() else {
+        return Ok(());
+    };
+    if timestamps.next().is_some() {
+        return Err(reject(
+            "more than one wsu:Timestamp in the wsse:Security header".to_string(),
+        ));
+    }
+
+    let single = |local: &str| -> Result<Option<i64>> {
+        let mut values = timestamp.children().filter(|n| is_wsu(n, local));
+        let Some(node) = values.next() else {
+            return Ok(None);
+        };
+        if values.next().is_some() {
+            return Err(reject(format!("more than one wsu:{local}")));
+        }
+        let text = node.text().unwrap_or("").trim();
+        let secs = text
+            .ends_with('Z')
+            .then(|| crate::time_utils::parse_rfc3339_to_unix_secs(text))
+            .flatten()
+            .ok_or_else(|| reject(format!("wsu:{local} '{text}' is not a UTC xsd:dateTime")))?;
+        Ok(Some(secs))
+    };
+    let created = single("Created")?;
+    let expires = single("Expires")?;
+
+    let now_secs = now
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let skew = WSU_TIMESTAMP_SKEW.as_secs() as i64;
+
+    if let (Some(created), Some(expires)) = (created, expires)
+        && expires < created
+    {
+        return Err(reject(
+            "wsu:Expires is earlier than wsu:Created".to_string(),
+        ));
+    }
+    if let Some(expires) = expires
+        && expires < now_secs - skew
+    {
+        return Err(reject(format!(
+            "message expired {} s ago (skew {skew} s)",
+            now_secs - expires
+        )));
+    }
+    if let Some(created) = created
+        && created > now_secs + skew
+    {
+        return Err(reject(format!(
+            "wsu:Created is {} s in the future (skew {skew} s)",
+            created - now_secs
+        )));
+    }
+    Ok(())
+}
+
+/// Parse a WS-Security document with the envelope limits (`xml::parse`),
+/// prefixing a failure with what was being parsed.
 fn parse_wssec_document<'a>(
     xml: &'a str,
+    limits: crate::xml::XmlLimits,
     context: &'static str,
     message: &str,
 ) -> Result<Document<'a>> {
-    if xml.len() > MAX_WSSEC_DOM_BYTES {
-        return Err(AsxError::new(
-            ErrorCode::ParseFailed,
-            format!(
-                "{message}: XML input exceeds {} byte limit ({} bytes)",
-                MAX_WSSEC_DOM_BYTES,
-                xml.len()
-            ),
-            ErrorContext::new(context),
-        ));
-    }
-    let doc = Document::parse(xml).map_err(|e| {
+    crate::xml::parse(xml, limits, context).map_err(|err| {
         AsxError::new(
             ErrorCode::ParseFailed,
-            format!("{message}: {e}"),
+            format!("{message}: {}", err.message),
             ErrorContext::new(context),
         )
-    })?;
-    enforce_wssec_document_limits(xml, &doc, context, message)?;
-    Ok(doc)
-}
-
-fn enforce_wssec_document_limits(
-    xml: &str,
-    doc: &Document<'_>,
-    context: &'static str,
-    message: &str,
-) -> Result<()> {
-    if xml.len() > MAX_WSSEC_DOM_BYTES {
-        return Err(AsxError::new(
-            ErrorCode::ParseFailed,
-            format!(
-                "{message}: XML input exceeds {} byte limit ({} bytes)",
-                MAX_WSSEC_DOM_BYTES,
-                xml.len()
-            ),
-            ErrorContext::new(context),
-        ));
-    }
-
-    // Bound counting to MAX+1 so oversized envelopes fail fast without a full
-    // descendant walk just to compute an exact count above the threshold.
-    let element_count = doc
-        .root()
-        .descendants()
-        .filter(|n| n.is_element())
-        .take(MAX_WSSEC_DOM_ELEMENTS + 1)
-        .count();
-    if element_count > MAX_WSSEC_DOM_ELEMENTS {
-        return Err(AsxError::new(
-            ErrorCode::ParseFailed,
-            format!(
-                "{message}: XML element count {element_count} exceeds limit {MAX_WSSEC_DOM_ELEMENTS}"
-            ),
-            ErrorContext::new(context),
-        ));
-    }
-
-    Ok(())
+    })
 }
 
 fn verify_signature_references_with_profile(
@@ -836,6 +1173,7 @@ fn verify_signature_references_borrowed_with_profile(
     if pre_parsed_doc.is_none() && !same_doc_target_ids.is_empty() {
         owned_parsed_doc = Some(parse_wssec_document(
             xml,
+            crate::xml::XmlLimits::ENVELOPE,
             "wssec_verify_references",
             "failed to parse XML for wssec reference verification",
         )?);
@@ -850,7 +1188,17 @@ fn verify_signature_references_borrowed_with_profile(
         .find_map(|r| (r.c14n_kind != profile.kind).then_some(r.c14n_kind))
         .map(|kind| profile_with_c14n_kind(profile, kind));
 
-    for reference in references {
+    // Same-document references first: a forged header stops before any
+    // attachment-sized digest.
+    let ordered = references
+        .iter()
+        .filter(|r| matches!(r.parsed_uri, ParsedReferenceUri::SameDocument { .. }))
+        .chain(
+            references
+                .iter()
+                .filter(|r| matches!(r.parsed_uri, ParsedReferenceUri::Cid { .. })),
+        );
+    for reference in ordered {
         let per_ref_profile = if reference.c14n_kind == profile.kind {
             profile
         } else {
@@ -931,7 +1279,11 @@ fn compute_reference_digest<'a>(
     ctx: &ReferenceDigestCtx<'a>,
     digest_method: WsSecDigestMethod,
 ) -> Result<Vec<u8>> {
+    #[cfg(test)]
+    order_probe::digested();
     if let ParsedReferenceUri::Cid { normalized } = parsed_uri {
+        #[cfg(test)]
+        order_probe::cid_digested();
         let payload = ctx
             .external_reference_cid_index
             .and_then(|idx| idx.get(*normalized).copied())
@@ -942,18 +1294,14 @@ fn compute_reference_digest<'a>(
                     ErrorContext::new("wssec_verify_references").with_message_id(uri.to_string()),
                 )
             })?;
-        let md = match digest_method {
-            WsSecDigestMethod::Sha256 => MessageDigest::sha256(),
-            WsSecDigestMethod::Sha384 => MessageDigest::sha384(),
-            WsSecDigestMethod::Sha512 => MessageDigest::sha512(),
-        };
-        let digest = openssl::hash::hash(md, payload).map_err(|_err| {
-            AsxError::new(
-                ErrorCode::SecurityVerificationFailed,
-                "failed to digest external reference payload",
-                ErrorContext::new("wssec_verify_references").with_message_id(uri.to_string()),
-            )
-        })?;
+        let digest =
+            openssl::hash::hash(digest_method.message_digest(), payload).map_err(|_err| {
+                AsxError::new(
+                    ErrorCode::SecurityVerificationFailed,
+                    "failed to digest external reference payload",
+                    ErrorContext::new("wssec_verify_references").with_message_id(uri.to_string()),
+                )
+            })?;
         return Ok(digest.to_vec());
     }
     let target_id = match parsed_uri {
@@ -974,6 +1322,19 @@ fn compute_reference_digest<'a>(
     } else {
         Some(inclusive_ns_prefixes)
     };
+    // An unresolvable target is a verification failure here,
+    // whatever the shared resolver calls it for a signer.
+    let unresolved = |err: AsxError| {
+        if err.code == ErrorCode::InvalidInput {
+            AsxError::new(
+                ErrorCode::SecurityVerificationFailed,
+                err.message,
+                ErrorContext::new("wssec_verify_references").with_message_id(uri.to_string()),
+            )
+        } else {
+            err
+        }
+    };
     if let Some(index) = ctx.parsed_index {
         canonicalize_reference_digest_from_doc_with_inclusive_ns_and_index(
             index,
@@ -982,6 +1343,7 @@ fn compute_reference_digest<'a>(
             inclusive_override,
             digest_method,
         )
+        .map_err(unresolved)
     } else if let Some(doc) = ctx.parsed_doc {
         canonicalize_reference_digest_from_same_document_target_id_with_inclusive_ns(
             doc,
@@ -991,6 +1353,7 @@ fn compute_reference_digest<'a>(
             inclusive_override,
             digest_method,
         )
+        .map_err(unresolved)
     } else {
         Err(AsxError::new(
             ErrorCode::InteropViolation,
@@ -1142,12 +1505,49 @@ fn validate_cid_reference_uri(uri: &str) -> Result<&str> {
     Ok(normalized)
 }
 
+/// The signature method's key family must match the signer certificate's
+/// key, named in the error.
+fn check_key_family(
+    algorithm: SignatureAlgorithm,
+    signer_cert: &openssl::x509::X509Ref,
+) -> Result<()> {
+    let key_id = signer_cert.public_key().map(|k| k.id()).map_err(|err| {
+        AsxError::new(
+            ErrorCode::SecurityVerificationFailed,
+            format!("signer certificate does not contain a usable public key: {err}"),
+            ErrorContext::new("wssec_verify_signature_value"),
+        )
+    })?;
+    let cert_family = match key_id {
+        openssl::pkey::Id::RSA | openssl::pkey::Id::RSA_PSS => Some(KeyFamily::Rsa),
+        openssl::pkey::Id::EC => Some(KeyFamily::Ec),
+        _ => None,
+    };
+    if cert_family == Some(algorithm.key_family()) {
+        return Ok(());
+    }
+    let key_type = match cert_family {
+        Some(KeyFamily::Rsa) => "an RSA".to_string(),
+        Some(KeyFamily::Ec) => "an EC".to_string(),
+        None => format!("a {key_id:?}"),
+    };
+    Err(AsxError::new(
+        ErrorCode::SecurityVerificationFailed,
+        format!(
+            "SignatureMethod {} does not match the signer certificate, which carries {key_type} key",
+            algorithm.algorithm_uri()
+        ),
+        ErrorContext::new("wssec_verify_signature_value"),
+    ))
+}
+
 fn verify_signature_value_with_components(
     mat: ParsedWsSecSignatureMaterialBorrowed<'_>,
     profile: WsSecCanonicalizationProfile,
     expected_cert_fingerprints: &[crate::crypto::CertFingerprint],
-    revocation_policy: &RevocationPolicy<'_>,
-) -> Result<()> {
+    signer_check: Option<&SignerCheck>,
+    chain_policy: &ChainPolicy<'_>,
+) -> Result<Option<ValidatedChain>> {
     let ParsedWsSecSignatureMaterialBorrowed {
         signed_info,
         signed_info_c14n_kind,
@@ -1167,15 +1567,8 @@ fn verify_signature_value_with_components(
     profile.kind = signed_info_c14n_kind;
     profile.inclusive_ns_prefixes = signed_info_inclusive_ns_prefixes;
     let profile = profile;
-    let is_rsa = signature_method_algorithm == RSA_SHA256_URI
-        || signature_method_algorithm == RSA_SHA384_URI
-        || signature_method_algorithm == RSA_SHA512_URI;
-    let is_ecdsa = signature_method_algorithm == ECDSA_SHA256_URI
-        || signature_method_algorithm == ECDSA_SHA384_URI
-        || signature_method_algorithm == ECDSA_SHA512_URI;
-
-    if !is_rsa && !is_ecdsa {
-        return Err(AsxError::new(
+    let algorithm = SignatureAlgorithm::from_uri(&signature_method_algorithm).map_err(|_| {
+        AsxError::new(
             ErrorCode::InteropViolation,
             format!(
                 "unsupported SignatureMethod algorithm: {} \
@@ -1183,8 +1576,10 @@ fn verify_signature_value_with_components(
                 signature_method_algorithm
             ),
             ErrorContext::new("wssec_verify_signature_value"),
-        ));
-    }
+        )
+    })?;
+    let is_rsa = algorithm.key_family() == KeyFamily::Rsa;
+    let is_ecdsa = algorithm.key_family() == KeyFamily::Ec;
 
     // A signature is only evidence of *identity* if the verifying key is bound
     // to a certificate. A bare `ds:KeyValue/ds:RSAKeyValue` is attacker-supplied
@@ -1218,6 +1613,9 @@ fn verify_signature_value_with_components(
             ));
         }
     }
+    if let Some(check) = signer_check {
+        check(signer_cert_der)?;
+    }
 
     // An inline ds:RSAKeyValue is redundant with the certificate. It is not
     // trusted as a key source, but if a partner sends one it must agree with the
@@ -1229,9 +1627,30 @@ fn verify_signature_value_with_components(
         validate_cert_public_key_matches_rsa_keyvalue(signer_cert_der, modulus, exponent)?;
     }
 
-    if revocation_policy.require_chain_validation {
-        validate_pkix_chain_and_revocation(&x509_certificates_der, revocation_policy)?;
-    }
+    // Trust in the key before any expensive work: the offline path only.
+    // Revocation (which may fetch) is the caller's, after the sender rule.
+    let chain = if chain_policy.require_chain_validation {
+        Some(validate_chain_offline(
+            &x509_certificates_der,
+            chain_policy,
+        )?)
+    } else {
+        None
+    };
+
+    // The method's key family must be the certificate's,
+    // before any signature operation.
+    let signer_cert = openssl::x509::X509::from_der(signer_cert_der).map_err(|err| {
+        AsxError::new(
+            ErrorCode::ParseFailed,
+            format!("failed to parse X509 certificate for signature verification: {err}"),
+            ErrorContext::new("wssec_verify_signature_value"),
+        )
+    })?;
+    check_key_family(algorithm, &signer_cert)?;
+    // An ECDSA value is exactly `2·l` octets (`r ‖ s`); any other
+    // length is refused here, naming both lengths. DER is never parsed.
+    let signature_value = algorithm.from_wire(&signature_value, &signer_cert)?;
 
     // The verifying key always comes from the certificate — the same object the
     // fingerprint pin and PKIX chain validation above were applied to. Deriving
@@ -1259,12 +1678,7 @@ fn verify_signature_value_with_components(
         pkey_from_rsa_components(&modulus, &exponent)?
     };
 
-    let digest = match signature_method_algorithm.as_str() {
-        s if s == RSA_SHA384_URI || s == ECDSA_SHA384_URI => MessageDigest::sha384(),
-        s if s == RSA_SHA512_URI || s == ECDSA_SHA512_URI => MessageDigest::sha512(),
-        _ => MessageDigest::sha256(),
-    };
-    let mut verifier = OsslVerifier::new(digest, &pkey).map_err(|err| {
+    let mut verifier = OsslVerifier::new(algorithm.message_digest(), &pkey).map_err(|err| {
         AsxError::new(
             ErrorCode::SecurityVerificationFailed,
             format!("failed to initialize XMLDSig verifier: {err}"),
@@ -1302,7 +1716,7 @@ fn verify_signature_value_with_components(
         ));
     }
 
-    Ok(())
+    Ok(chain)
 }
 
 #[cfg(all(test, feature = "as4"))]
@@ -1351,7 +1765,7 @@ fn parse_signature_material_from_doc(
     let mut profile = profile;
     // As in `verify_signature_value_with_components`: the signature was
     // computed over whatever `ds:CanonicalizationMethod` declares, so that is
-    // what SignedInfo must be serialized with (D68).
+    // what SignedInfo must be serialized with.
     profile.kind = signed_info_c14n_kind;
     profile.inclusive_ns_prefixes = signed_info_inclusive_ns_prefixes;
     let mut signed_info_xml = String::new();
@@ -1398,10 +1812,6 @@ fn parse_signature_material_components_from_signature<'a>(
     parse_signature_material_components_from_signature_with_signed_info(doc, signature, signed_info)
 }
 
-/// Exclusive XML Canonicalization 1.0, with and without comments.
-const EXC_C14N_URI: &str = "http://www.w3.org/2001/10/xml-exc-c14n#";
-const EXC_C14N_WITH_COMMENTS_URI: &str = "http://www.w3.org/2001/10/xml-exc-c14n#WithComments";
-
 /// Require `ds:SignedInfo/ds:CanonicalizationMethod` to declare Exclusive C14N,
 /// and return the `InclusiveNamespaces/@PrefixList` it carries (if any).
 ///
@@ -1426,14 +1836,6 @@ const EXC_C14N_WITH_COMMENTS_URI: &str = "http://www.w3.org/2001/10/xml-exc-c14n
 fn parse_signed_info_canonicalization_method(
     signed_info: roxmltree::Node<'_, '_>,
 ) -> Result<(WsSecCanonicalizationKind, Vec<String>)> {
-    const EXC_C14N_NS: &str = "http://www.w3.org/2001/10/xml-exc-c14n#";
-    /// Inclusive Canonical XML 1.0. Mandated for Peppol SMP `ds:Signature`
-    /// (SMP 1.4.0 §5.5.1, which changed it *from* exclusive in that release),
-    /// and the XMLDSig default for a reference that declares no transform (D49).
-    const INCLUSIVE_C14N_URI: &str = "http://www.w3.org/TR/2001/REC-xml-c14n-20010315";
-    const INCLUSIVE_C14N_WITH_COMMENTS_URI: &str =
-        "http://www.w3.org/TR/2001/REC-xml-c14n-20010315#WithComments";
-
     let method = signed_info
         .children()
         .find(|n| n.is_element() && is_ds_element(*n, "CanonicalizationMethod"))
@@ -1460,15 +1862,15 @@ fn parse_signed_info_canonicalization_method(
     // Which canonicalization the signer declared decides how SignedInfo is
     // serialized before the signature is checked. Both W3C algorithms are
     // legitimate here and the networks disagree: AS4 WS-Security profiles
-    // require exclusive, Peppol SMP requires inclusive. Forcing one rejected
-    // every conformant SMP response (D68).
-    let kind = match algorithm {
-        EXC_C14N_URI => WsSecCanonicalizationKind::Exclusive,
-        INCLUSIVE_C14N_URI => WsSecCanonicalizationKind::Inclusive,
-        _ => {
-            let detail = if algorithm == EXC_C14N_WITH_COMMENTS_URI
-                || algorithm == INCLUSIVE_C14N_WITH_COMMENTS_URI
-            {
+    // require exclusive, Peppol SMP requires inclusive. Forcing one would
+    // reject every conformant SMP response.
+    // Inclusive Canonical XML 1.0 is mandated for Peppol SMP `ds:Signature`
+    // (SMP 1.4.0 §5.5.1, which changed it *from* exclusive in that release),
+    // and is the XMLDSig default for a reference that declares no transform.
+    let kind = match WsSecCanonicalizationKind::from_uri(algorithm) {
+        Ok(kind) => kind,
+        Err(_) => {
+            let detail = if algorithm.ends_with("#WithComments") {
                 "comment-preserving canonicalization is not supported"
             } else {
                 "only Canonical XML 1.0 (inclusive) and Exclusive XML Canonicalization 1.0 \
@@ -1479,8 +1881,9 @@ fn parse_signed_info_canonicalization_method(
                 ErrorCode::InteropViolation,
                 format!(
                     "unsupported ds:CanonicalizationMethod Algorithm \"{algorithm}\": {detail} \
-                     (expected \"{EXC_C14N_URI}\" for AS4 WS-Security, or \
-                     \"{INCLUSIVE_C14N_URI}\" for Peppol SMP)"
+                     (expected \"{}\" for AS4 WS-Security, or \"{}\" for Peppol SMP)",
+                    WsSecCanonicalizationKind::Exclusive.uri(),
+                    WsSecCanonicalizationKind::Inclusive.uri()
                 ),
                 ErrorContext::new("wssec_signature_material")
                     .with_message_id(algorithm.to_string()),
@@ -1679,7 +2082,9 @@ fn parse_signature_material_components_from_signature_with_signed_info<'a>(
 ///
 /// - **`#X509v3`** — a single DER certificate. This is the default KeyInfo
 ///   shape of WSS4J-based stacks (phase4, Domibus, Oxalis).
-/// - **`#X509PKIPathv1`** — a DER `SEQUENCE` of certificates (leaf first).
+/// - **`#X509PKIPathv1`** — a DER `SEQUENCE` of certificates, issuer first
+///   and the signer last (WSS X.509 Token Profile 1.1 §3.1); returned signer
+///   first.
 ///
 /// Key-identifier styles that require out-of-document lookup
 /// (`wsse:KeyIdentifier` with SKI/thumbprint, `ds:X509IssuerSerial`) are not
@@ -1810,7 +2215,13 @@ fn extract_x509_certificates_from_security_token_reference(
         return Ok(Some(vec![token_der]));
     }
 
-    split_x509_pkipath_der_certificates(&token_der).map(Some)
+    // WSS X.509 Token Profile 1.1 §3.1: a PkiPath is ordered from the trust
+    // anchor side to the end entity, so the signer is the *last* certificate.
+    // Everything downstream (pin, path validation, SignatureValue) takes the
+    // signer first and the rest as the chain, so reverse once here.
+    let mut path = split_x509_pkipath_der_certificates(&token_der)?;
+    path.reverse();
+    Ok(Some(path))
 }
 
 fn split_x509_pkipath_der_certificates(pkipath_der: &[u8]) -> Result<Vec<Vec<u8>>> {
@@ -1931,6 +2342,39 @@ fn parse_der_header(input: &[u8], stage: &'static str) -> Result<(usize, usize)>
 
 pub(crate) use crate::core::constant_time_eq as secure_eq;
 
+/// Instrumentation for the verification-order tests: how many
+/// reference digests ran on this thread.
+#[cfg(test)]
+pub(crate) mod order_probe {
+    use std::cell::Cell;
+
+    thread_local! {
+        pub(crate) static DIGESTS: Cell<usize> = const { Cell::new(0) };
+        pub(crate) static CID_DIGESTS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(crate) fn cid_digested() {
+        CID_DIGESTS.with(|c| c.set(c.get() + 1));
+    }
+
+    pub(crate) fn cid_digests() -> usize {
+        CID_DIGESTS.with(Cell::get)
+    }
+
+    pub(crate) fn reset() {
+        CID_DIGESTS.with(|c| c.set(0));
+        DIGESTS.with(|c| c.set(0));
+    }
+
+    pub(crate) fn digested() {
+        DIGESTS.with(|c| c.set(c.get() + 1));
+    }
+
+    pub(crate) fn digests() -> usize {
+        DIGESTS.with(Cell::get)
+    }
+}
+
 #[cfg(test)]
 #[path = "verify_tests.rs"]
 mod tests;
@@ -1940,7 +2384,7 @@ mod tests;
 // ---------------------------------------------------------------------------
 
 /// XMLDSig enveloped-signature transform.
-pub const ENVELOPED_SIGNATURE_URI: &str = "http://www.w3.org/2000/09/xmldsig#enveloped-signature";
+pub const ENVELOPED_SIGNATURE_URI: &str = crate::crypto::alg::ENVELOPED_SIGNATURE;
 
 /// Outcome of a successful [`verify_enveloped_document_signature`].
 #[derive(Debug, Clone)]
@@ -1949,6 +2393,10 @@ pub struct VerifiedEnvelopedSignature {
     pub signer_fingerprint_sha256: String,
     /// DER of the signing certificate, as carried in `ds:KeyInfo/ds:X509Data`.
     pub signer_certificate_der: Vec<u8>,
+    /// The validated certification path, signer first (the caller checks
+    /// its revocation; the SMP client, feature `peppol`).
+    #[cfg_attr(not(feature = "peppol"), allow(dead_code))]
+    pub(crate) signer_path: Vec<openssl::x509::X509>,
 }
 
 /// Verify an **enveloped, whole-document** XML signature.
@@ -1962,7 +2410,7 @@ pub struct VerifiedEnvelopedSignature {
 /// `wsu:Id` — which is why it lives beside, rather than inside,
 /// [`verify_enveloped_signature`].
 ///
-/// The signing certificate is chain-validated against `revocation_policy`, so
+/// The signing certificate is chain-validated against `chain_policy`, so
 /// callers must supply the network's SMP CA as a trust anchor. Passing an empty
 /// anchor set with `require_chain_validation` fails closed.
 ///
@@ -1975,22 +2423,45 @@ pub struct VerifiedEnvelopedSignature {
 pub fn verify_enveloped_document_signature(
     xml: &str,
     expected_cert_fingerprints: &[crate::crypto::CertFingerprint],
-    revocation_policy: &RevocationPolicy<'_>,
+    chain_policy: &ChainPolicy<'_>,
 ) -> Result<VerifiedEnvelopedSignature> {
     let doc = parse_wssec_document(
         xml,
+        crate::xml::XmlLimits::SMP,
         "wssec_verify_enveloped",
         "failed to parse XML for enveloped signature verification",
     )?;
-    enforce_wssec_document_limits(
-        xml,
-        &doc,
-        "wssec_verify_enveloped",
-        "failed to parse XML for enveloped signature verification",
-    )?;
+    verify_enveloped_document_signature_with_doc(&doc, expected_cert_fingerprints, chain_policy)
+}
 
+/// [`verify_enveloped_document_signature`] on a document already parsed with
+/// `xml::parse(XmlLimits::SMP)` — the SMP client verifies and consumes one DOM.
+pub(crate) fn verify_enveloped_document_signature_with_doc(
+    doc: &Document<'_>,
+    expected_cert_fingerprints: &[crate::crypto::CertFingerprint],
+    chain_policy: &ChainPolicy<'_>,
+) -> Result<VerifiedEnvelopedSignature> {
+    let span = crate::telemetry::verify_span("xmldsig-enveloped-document", None);
+    let result = span.in_scope(|| {
+        verify_enveloped_document_signature_inner(doc, expected_cert_fingerprints, chain_policy)
+    });
+    if let Ok(verified) = &result {
+        span.record(
+            "signer.fingerprint",
+            verified.signer_fingerprint_sha256.as_str(),
+        );
+    }
+    crate::telemetry::child_outcome(&span, &result);
+    result
+}
+
+fn verify_enveloped_document_signature_inner(
+    doc: &Document<'_>,
+    expected_cert_fingerprints: &[crate::crypto::CertFingerprint],
+    chain_policy: &ChainPolicy<'_>,
+) -> Result<VerifiedEnvelopedSignature> {
     let signature =
-        find_single_signature_node(&doc, "wssec_verify_enveloped")?.ok_or_else(|| {
+        find_single_signature_node(doc, "wssec_verify_enveloped")?.ok_or_else(|| {
             AsxError::new(
                 ErrorCode::SecurityVerificationFailed,
                 "document carries no ds:Signature",
@@ -2009,30 +2480,33 @@ pub fn verify_enveloped_document_signature(
             )
         })?;
 
-    let material = parse_signature_material_components_from_signature_with_signed_info(
-        &doc,
-        signature,
-        signed_info,
-    )?;
-
-    // Digest every reference before touching the signature value.
-    let mut reference_count = 0usize;
-    for reference in signed_info
+    // Verification step 1: the cap (one URI="" reference) and at most two
+    // transforms, before anything is trusted or digested.
+    enforce_reference_cap(signed_info, SignedDocClass::Smp)?;
+    let references: Vec<_> = signed_info
         .children()
         .filter(|n| n.is_element() && is_ds_element(*n, "Reference"))
-    {
-        reference_count += 1;
-        verify_enveloped_reference(&doc, signature, reference)?;
-    }
-
-    if reference_count == 0 {
+        .collect();
+    if references.is_empty() {
         return Err(AsxError::new(
             ErrorCode::ParseFailed,
             "ds:SignedInfo contains no ds:Reference",
             ErrorContext::new("wssec_verify_enveloped"),
         ));
     }
+    let references = references
+        .into_iter()
+        .map(|reference| {
+            enforce_transform_cap(reference, reference.attribute("URI").unwrap_or(""))?;
+            parse_enveloped_reference(reference)
+        })
+        .collect::<Result<Vec<_>>>()?;
 
+    let material = parse_signature_material_components_from_signature_with_signed_info(
+        doc,
+        signature,
+        signed_info,
+    )?;
     let signer_certificate_der =
         material
             .x509_certificates_der
@@ -2047,25 +2521,40 @@ pub fn verify_enveloped_document_signature(
                 )
             })?;
 
-    verify_signature_value_with_components(
+    // Steps 2–3: signer identity (pin, offline path), then the SignatureValue.
+    let chain = verify_signature_value_with_components(
         material,
         WsSecCanonicalizationProfile::default(),
         expected_cert_fingerprints,
-        revocation_policy,
+        None,
+        chain_policy,
     )?;
 
+    // Step 4: the whole-document digest, only for an authenticated signer.
+    for reference in &references {
+        digest_enveloped_reference(doc, signature, reference)?;
+    }
+
+    // Revocation (may fetch) is the caller's, on the returned path.
     Ok(VerifiedEnvelopedSignature {
         signer_fingerprint_sha256: super::x509::sha256_hex_lower(&signer_certificate_der),
         signer_certificate_der,
+        signer_path: chain.map(|c| c.path).unwrap_or_default(),
     })
 }
 
-/// Check one `URI=""` + enveloped-signature reference.
-fn verify_enveloped_reference(
-    doc: &Document<'_>,
-    signature: roxmltree::Node<'_, '_>,
-    reference: roxmltree::Node<'_, '_>,
-) -> Result<()> {
+/// A structurally valid `URI=""` + enveloped-signature reference: its
+/// canonicalization and declared digest. Decided from the document alone
+/// (verification step 1), before the signer is trusted.
+struct EnvelopedReference<'a> {
+    c14n_kind: WsSecCanonicalizationKind,
+    expected_digest: &'a str,
+}
+
+/// Check one `URI=""` + enveloped-signature reference's shape.
+fn parse_enveloped_reference<'a>(
+    reference: roxmltree::Node<'a, '_>,
+) -> Result<EnvelopedReference<'a>> {
     let uri = reference.attribute("URI").unwrap_or("");
     if !uri.is_empty() {
         return Err(AsxError::new(
@@ -2091,11 +2580,12 @@ fn verify_enveloped_reference(
             .children()
             .filter(|n| n.is_element() && is_ds_element(*n, "Transform"))
         {
-            match transform.attribute("Algorithm").unwrap_or("") {
-                ENVELOPED_SIGNATURE_URI => saw_enveloped = true,
-                XML_EXC_C14N_URI => c14n_kind = WsSecCanonicalizationKind::Exclusive,
-                XML_INC_C14N_URI => c14n_kind = WsSecCanonicalizationKind::Inclusive,
-                other => {
+            let algorithm = transform.attribute("Algorithm").unwrap_or("");
+            match TransformAlg::from_uri(algorithm) {
+                Ok(TransformAlg::EnvelopedSignature) => saw_enveloped = true,
+                Ok(TransformAlg::C14n(kind)) => c14n_kind = kind,
+                _ => {
+                    let other = algorithm;
                     return Err(AsxError::new(
                         ErrorCode::InteropViolation,
                         format!(
@@ -2117,15 +2607,30 @@ fn verify_enveloped_reference(
         ));
     }
 
-    let expected = reference
+    let expected_digest = reference
         .children()
         .find(|n| n.is_element() && is_ds_element(*n, "DigestValue"))
         .and_then(|n| n.text())
         .map(str::trim)
         .unwrap_or_default();
+    Ok(EnvelopedReference {
+        c14n_kind,
+        expected_digest,
+    })
+}
 
+/// The whole-document digest of a parsed enveloped reference (verification
+/// step 4).
+fn digest_enveloped_reference(
+    doc: &Document<'_>,
+    signature: roxmltree::Node<'_, '_>,
+    reference: &EnvelopedReference<'_>,
+) -> Result<()> {
+    #[cfg(test)]
+    order_probe::digested();
+    let expected = reference.expected_digest;
     let profile = WsSecCanonicalizationProfile {
-        kind: c14n_kind,
+        kind: reference.c14n_kind,
         ..WsSecCanonicalizationProfile::default()
     };
     let actual = super::canonicalize::canonicalize_enveloped_document(doc, &profile, signature)?;

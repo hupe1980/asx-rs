@@ -1,250 +1,25 @@
-use super::super::large_message::{As4FragmentJoiner, As4JoinProgress, parse_fragment_envelope};
-use super::super::services::{DedupDecision, claim_push_sync, emit_receive_push_signed_encrypted};
-use super::super::stream::MultipartAs4Payload;
-use super::super::types::{
-    As4PushPolicy, As4ReceivePushOutput, As4ReceivePushProgress, As4ReceivedPayload,
-    FragmentScopePolicy,
-};
-use super::{As4PushReceiveCtx, metadata, payload, receipt};
-use crate::core::{AsxError, ErrorCode, ErrorContext, PayloadInput, Result, SessionContext};
-use crate::lifecycle::DomainReady;
-use crate::observability::{AsxIngressStage, EventBus};
-use crate::sbdh::SbdhHeader;
-use crate::storage::DedupClaim;
-use memchr::memmem;
-use std::sync::Arc;
-
-/// Return type for verified payload + optional SBDH header.
-/// `(primary payload, primary Content-ID, additional payloads, SBDH header)`
-type VerifiedPayloadWithSbdh = (
-    DomainReady<Arc<[u8]>>,
-    String,
-    Vec<As4ReceivedPayload>,
-    Option<SbdhHeader>,
-);
-
-pub(super) fn maybe_handle_fragment_message(
-    ctx: &As4PushReceiveCtx<'_>,
-    payload_bytes: &[u8],
-    receipt_payload: Option<&[u8]>,
-    http_content_type: &str,
-    fragment_joiner: Option<&mut As4FragmentJoiner>,
-    authenticated_sender_scope: Option<&str>,
-) -> Result<Option<As4ReceivePushProgress>> {
-    // Fragment messages are always multipart/related (ebMS3 Part 2 §5).
-    // Plain application/soap+xml envelopes cannot carry mf:MessageFragment,
-    // so skip the full-payload memmem scan for the common non-fragment path.
-    if !http_content_type
-        .split(';')
-        .next()
-        .unwrap_or("")
-        .trim()
-        .eq_ignore_ascii_case("multipart/related")
-    {
-        return Ok(None);
-    }
-    if memmem::find(payload_bytes, b"MessageFragment").is_none() {
-        return Ok(None);
-    }
-
-    let parsed_fragment = parse_fragment_envelope(http_content_type, payload_bytes)?;
-    let Some(joiner) = fragment_joiner else {
-        return Err(AsxError::new(
-            ErrorCode::PolicyViolation,
-            "AS4 message contains mf:MessageFragment; use fragment-aware receive API",
-            ErrorContext::for_session("as4_receive_push", ctx.session),
-        ));
-    };
-
-    // Enforce fragment scope policy.  RequireAuthenticatedScope (the default) prevents
-    // cross-sender fragment injection by keying groups on the transport-layer identity
-    // rather than the unauthenticated SOAP <eb:From> party ID.
-    let join_progress = match ctx.policy.fragment_scope_policy {
-        FragmentScopePolicy::RequireAuthenticatedScope => {
-            let scope = authenticated_sender_scope.ok_or_else(|| {
-                AsxError::new(
-                    ErrorCode::PolicyViolation,
-                    "As4PushPolicy::fragment_scope_policy is RequireAuthenticatedScope \
-                     but As4ReceivePushRequest::authenticated_sender_scope is None; \
-                     supply the transport-layer identity (e.g., mTLS client cert CN) \
-                     or set fragment_scope_policy to UseSoapSenderId for trusted networks",
-                    ErrorContext::for_session("as4_receive_push", ctx.session),
-                )
-            })?;
-            joiner.ingest_parsed_fragment_with_authenticated_scope(scope, parsed_fragment)
-        }
-        FragmentScopePolicy::UseSoapSenderId => joiner.ingest_parsed_fragment(parsed_fragment),
-    }?;
-
-    match join_progress {
-        As4JoinProgress::Pending {
-            group_id,
-            received_fragments,
-            expected_fragments,
-        } => Ok(Some(As4ReceivePushProgress::PendingFragment {
-            group_id,
-            received_fragments,
-            expected_fragments,
-        })),
-        As4JoinProgress::Complete(joined) => {
-            complete_fragment_joined_message(ctx, receipt_payload, joined)
-        }
-    }
-}
-
-fn complete_fragment_joined_message(
-    ctx: &As4PushReceiveCtx<'_>,
-    receipt_payload: Option<&[u8]>,
-    joined: super::super::large_message::As4JoinedLargeMessage,
-) -> Result<Option<As4ReceivePushProgress>> {
-    let progress = super::receive_push_inner(
-        ctx,
-        PayloadInput::Owned(joined.body),
-        receipt_payload,
-        joined.http_content_type.as_str(),
-        None, // fragment_joiner: joined message is processed as a regular push
-        None, // authenticated_sender_scope: not applicable for reassembled messages
-    )?;
-    Ok(Some(progress))
-}
-
-pub(super) fn process_non_fragment_push(
-    ctx: &As4PushReceiveCtx<'_>,
-    payload_bytes: &[u8],
-    receipt_payload: Option<&[u8]>,
-    http_content_type: &str,
-) -> Result<As4ReceivePushProgress> {
-    let (multipart, soap_bytes, parsed, gate) = metadata::parse_and_verify_receive_push_metadata(
-        ctx.session,
-        ctx.event_bus,
-        payload_bytes,
-        http_content_type,
-        ctx.policy,
-        ctx.verifier,
-        ctx.signer_pins,
-    )?;
-
-    // Claim only once the signature has been verified, so an unauthenticated
-    // peer cannot burn a partner's eb:MessageId.
-    let claim = match claim_push_sync(
-        ctx.session,
-        ctx.event_bus,
-        ctx.dedup_backend,
-        &parsed.message_id,
-        AsxIngressStage::As4ReceivePush,
-        ctx.policy.fail_closed_audit_events,
-    )? {
-        DedupDecision::Claimed(claim) => claim,
-        DedupDecision::Duplicate => {
-            return Ok(As4ReceivePushProgress::Duplicate {
-                message_id: parsed.message_id,
-            });
-        }
-        DedupDecision::InFlight => {
-            return Ok(As4ReceivePushProgress::InFlight {
-                message_id: parsed.message_id,
-            });
-        }
-    };
-
-    // Everything below can fail, and every one of those failures means the
-    // message was *not* received. Releasing the claim is what lets the
-    // sender's ReceptionAwareness retransmission be processed instead of being
-    // answered as a duplicate (D59).
-    finish_non_fragment_push(
-        ctx,
-        receipt_payload,
-        multipart,
-        soap_bytes,
-        parsed,
-        gate,
-        claim,
-    )
-}
-
-/// The fallible tail of a claimed push, with the claim released on failure.
-#[allow(clippy::too_many_arguments)]
-fn finish_non_fragment_push<'a>(
-    ctx: &As4PushReceiveCtx<'_>,
-    receipt_payload: Option<&[u8]>,
-    multipart: Option<MultipartAs4Payload<'a>>,
-    soap_bytes: &'a [u8],
-    parsed: super::super::ParsedAs4UserMessage,
-    gate: payload::WsSecVerifiedGate,
-    mut claim: DedupClaim,
-) -> Result<As4ReceivePushProgress> {
-    let run = || -> Result<As4ReceivePushOutput> {
-        enforce_non_fragment_timestamp_freshness(ctx.session, ctx.policy, &parsed)?;
-
-        let (payload, payload_content_id, additional_payloads, sbdh_header) =
-            materialize_non_fragment_payload(
-                ctx.session,
-                ctx.event_bus,
-                ctx.policy,
-                &parsed,
-                multipart,
-                soap_bytes,
-                gate,
-            )?;
-
-        let receipt = verify_non_fragment_receipt(
-            ctx.session,
-            ctx.event_bus,
-            receipt_payload,
-            ctx.policy,
-            &parsed,
-        )?;
-
-        Ok(assemble_non_fragment_output(
-            payload,
-            payload_content_id,
-            additional_payloads,
-            sbdh_header,
-            parsed,
-            receipt,
-        ))
-    };
-
-    match run() {
-        Ok(output) => Ok(As4ReceivePushProgress::Complete {
-            output: Box::new(output),
-            claim,
-        }),
-        Err(err) => {
-            // A failure to release is not allowed to mask the real error: the
-            // claim lease expires on its own, so the original rejection is the
-            // one the caller needs to see.
-            if let Err(release_err) = claim.abandon_in_place() {
-                tracing::error!(
-                    error = %release_err,
-                    "failed to release AS4 dedup claim after a rejected message; \
-                     the key stays claimed until its lease expires"
-                );
-            }
-            Err(err)
-        }
-    }
-}
+use super::super::types::As4PushPolicy;
+use super::{metadata, payload};
+use crate::core::{AsxError, ErrorCode, ErrorContext, Result, SessionContext};
 
 fn enforce_non_fragment_timestamp_freshness(
-    #[cfg_attr(not(feature = "trace"), allow(unused_variables))] session: &SessionContext,
+    session: &SessionContext,
     policy: &As4PushPolicy,
     parsed: &super::super::ParsedAs4UserMessage,
 ) -> Result<()> {
-    // Enforce eb:Timestamp freshness per eDelivery AS4 v1.15 §5.1.3.
-    // This is a secondary replay defence on top of the dedup store: the dedup
-    // TTL protects against replays while the dedup window is hot, but a
-    // timestamp freshness gate rejects replays whose message_id was evicted
-    // from the dedup store after TTL expiry.
-    if let Some(window) = policy.timestamp_freshness_window {
+    // eb:Timestamp: at most the clock skew ahead (eDelivery AS4 1.15
+    // §5.1.3), at most the dedup retention behind — a secondary replay
+    // defence for message ids the dedup store has evicted; a retry within
+    // the retention is a duplicate, not a replay.
+    if let Some(window) = policy.timestamp_window {
         parsed
-            .check_timestamp_freshness(window)
+            .check_timestamp_freshness(window, session.clock().now())
             .inspect_err(|_err| {
-                #[cfg(feature = "trace")]
-                tracing::warn!(
+                tracing::debug!(
+                    target: "asx",
                     message_id = %parsed.message_id,
-                    partner_id = %session.partner_id(),
-                    "AS4 inbound message rejected: eb:Timestamp outside freshness window"
+                    partner = %session.partner_id(),
+                    "eb:Timestamp outside the freshness window"
                 );
             })?;
     }
@@ -252,115 +27,336 @@ fn enforce_non_fragment_timestamp_freshness(
     Ok(())
 }
 
-fn materialize_non_fragment_payload<'a>(
+// ── The inbound path ────────────────────────────────────────────────────────
+
+/// What `Inbound` needs of one verified, decrypted message. No dedup claim
+/// has been taken: the caller claims after this returns.
+pub(crate) struct VerifiedInbound {
+    pub(crate) parsed: super::super::ParsedAs4UserMessage,
+    /// `(content id, decrypted and decompressed bytes, declared MimeType)`,
+    /// primary first; a part without a `MimeType` is `application/octet-stream`.
+    pub(crate) payloads: Vec<(String, Vec<u8>, String)>,
+    /// The verified signer (DER).
+    pub(crate) signer_der: Vec<u8>,
+    /// The verified references, for the record.
+    pub(crate) references: Vec<(String, String, String)>,
+    /// The references a receipt echoes as NonRepudiationInformation.
+    pub(crate) nri: Vec<super::super::types::As4NriReference>,
+}
+
+/// The stage name of an `eb:To` refusal (mapped to EBMS:0004).
+pub(crate) const TO_PARTY_STAGE: &str = "as4_inbound_to_party";
+
+/// An inbound push whose signature, signer authorization, same-document
+/// digests and `eb:To` verified: what the revocation check (async and
+/// outside the crypto pool) and then [`open_inbound`] need. Owned, so it crosses the `await`.
+pub(crate) struct AuthenticatedInbound {
+    pub(crate) parsed: super::super::ParsedAs4UserMessage,
+    declared: Vec<String>,
+    part_properties: super::payload::PartProperties,
+    deferred: std::sync::Arc<crate::crypto::wssec::verify::Deferred>,
+    signer_der: Vec<u8>,
+    references: Vec<(String, String, String)>,
+    nri: Vec<super::super::types::As4NriReference>,
+    /// The validated signer path, signer first, anchor last.
+    pub(crate) signer_path: Vec<openssl::x509::X509>,
+}
+
+/// Inbound verification up to the revocation check: bounded parse →
+/// signer authorization, `SignatureValue` and same-document digests →
+/// `eb:To` = `local`. No key is used and nothing is fetched.
+pub(crate) fn authenticate_inbound(
     session: &SessionContext,
-    event_bus: &EventBus,
     policy: &As4PushPolicy,
-    parsed: &super::super::ParsedAs4UserMessage,
-    multipart: Option<MultipartAs4Payload<'a>>,
-    soap_bytes: &'a [u8],
-    gate: payload::WsSecVerifiedGate,
-) -> Result<VerifiedPayloadWithSbdh> {
-    let resolved = payload::resolve_verified_payloads(
+    body: &[u8],
+    content_type: &str,
+    authorizer: &dyn super::SenderAuthorizer,
+    local: (&str, Option<&str>),
+) -> Result<AuthenticatedInbound> {
+    let metadata::VerifiedHeader {
+        soap_xml,
+        parsed,
+        declared,
+        part_properties,
+        signature,
+        ..
+    } = metadata::parse_and_verify_receive_push_metadata(
         session,
+        body,
+        content_type,
         policy,
-        &parsed.message_id,
-        multipart,
-        soap_bytes,
+        &super::As4WsSecVerifier,
+        Some(authorizer),
     )?;
-
-    // The gate is a zero-sized proof that WS-Security verification covered this
-    // message; every attachment was checked against it, so each promotion
-    // presents its own copy.
-    let _ = &gate;
-
-    // Compression is declared in the signed eb:Messaging header, so this map is
-    // integrity-protected along with the rest of the ebMS3 metadata.
-    let compression_types = payload::compression_types_by_content_id(soap_bytes);
-
-    let mut promoted: Vec<(String, DomainReady<Arc<[u8]>>)> = Vec::with_capacity(resolved.len());
-    let mut sbdh_header = None;
-    for (index, named) in resolved.into_iter().enumerate() {
-        // Decompress before anything inspects the bytes: SBDH detection and the
-        // application both need the business document, not the gzip stream.
-        let named_payload = payload::decompress_payload_if_declared(
-            session,
-            &named.content_id,
-            &compression_types,
-            named.payload,
-        )?;
-
-        // SBDH wrapping applies to the business document, i.e. the primary
-        // attachment. Additional parts travel as-is.
-        let payload_bytes = if index == 0 {
-            let (unwrapped, header) =
-                payload::maybe_unwrap_sbdh_payload(session, &parsed.message_id, named_payload)?;
-            sbdh_header = header;
-            unwrapped
-        } else {
-            named_payload
-        };
-
-        let verified =
-            payload::WsSecVerifiedPayload::new(payload_bytes, payload::WsSecVerifiedGate);
-        promoted.push((
-            named.content_id,
-            payload::promote_payload_to_domain_ready(session, verified)?,
+    let message_id = parsed.message_id.clone();
+    let refused = |code: ErrorCode, detail: String| {
+        AsxError::new(
+            code,
+            detail,
+            ErrorContext::for_session_with_message("as4_receive_push", session, &message_id),
+        )
+    };
+    let Some(signature) = signature else {
+        return Err(refused(
+            ErrorCode::SecurityVerificationFailed,
+            "AS4 push message signature is required but not present".to_string(),
+        ));
+    };
+    let (local_id, local_type) = local;
+    let type_mismatch = matches!(
+        (parsed.to_party_type.as_deref(), local_type),
+        (Some(theirs), Some(ours)) if theirs != ours
+    );
+    if parsed.to_party_id() != local_id || type_mismatch {
+        return Err(AsxError::new(
+            ErrorCode::InteropViolation,
+            format!(
+                "eb:To/eb:PartyId {:?} is not this party ({local_id:?})",
+                parsed.to_party_id()
+            ),
+            ErrorContext::for_session_with_message(TO_PARTY_STAGE, session, &parsed.message_id),
         ));
     }
+    let deferred = signature.deferred.clone().ok_or_else(|| {
+        refused(
+            ErrorCode::SecurityVerificationFailed,
+            "the attachment references were not deferred".to_string(),
+        )
+    })?;
+    let nri = crate::crypto::wssec::parse_signature_references(soap_xml)?
+        .into_iter()
+        .map(super::super::types::As4NriReference::from)
+        .collect();
+    let signer_der = signature.signer_certificate_der.clone().ok_or_else(|| {
+        refused(
+            ErrorCode::SecurityVerificationFailed,
+            "the verified signature names no signer certificate".to_string(),
+        )
+    })?;
+    Ok(AuthenticatedInbound {
+        parsed,
+        declared,
+        part_properties,
+        deferred,
+        signer_der,
+        references: signature.references.clone(),
+        nri,
+        signer_path: signature.signer_path,
+    })
+}
 
-    emit_receive_push_signed_encrypted(
+/// Inbound verification after the revocation check: freshness → (test
+/// service answered here) → payload set = `eb:PartInfo` → envelope structure
+/// and restored types → algorithm suite → encryption coverage → decryption (`keys`) → `cid:` digests over the decrypted bytes →
+/// decompression. The envelope is parsed again from the same bytes (no
+/// signature is verified twice); no key is used before the envelope is
+/// resolved; no claim is taken here.
+pub(crate) fn open_inbound(
+    session: &SessionContext,
+    policy: &As4PushPolicy,
+    body: &[u8],
+    content_type: &str,
+    authenticated: &AuthenticatedInbound,
+    keys: &dyn crate::crypto::wssec::xmlenc::RecipientKeys,
+    suite: &crate::crypto::wssec::xmlenc::Suite,
+) -> Result<VerifiedInbound> {
+    let AuthenticatedInbound {
+        parsed,
+        declared,
+        part_properties,
+        deferred,
+        signer_der,
+        references,
+        nri,
+        ..
+    } = authenticated;
+    let (parsed, signer_der, references, nri) = (
+        parsed.clone(),
+        signer_der.clone(),
+        references.clone(),
+        nri.clone(),
+    );
+    let message_id = parsed.message_id.clone();
+    let refused = |code: ErrorCode, detail: String| {
+        AsxError::new(
+            code,
+            detail,
+            ErrorContext::for_session_with_message("as4_receive_push", session, &message_id),
+        )
+    };
+    enforce_non_fragment_timestamp_freshness(session, policy, &parsed)?;
+    let multipart = super::super::stream::extract_multipart_related_payload_if_present(
+        body,
+        content_type,
         session,
-        event_bus,
-        &parsed.message_id,
-        policy.fail_closed_audit_events,
+        "as4_receive_push",
     )?;
+    let soap_bytes = multipart.as_ref().map(|m| m.soap_xml).unwrap_or(body);
+    let xml = crate::core::bytes_to_utf8_str(soap_bytes, "as4_receive_push", session)?;
+    let doc = super::super::parser::parse_as4_user_message_document(xml, session)?;
 
-    let mut promoted = promoted.into_iter();
-    let (primary_cid, primary) = promoted
-        .next()
-        .expect("resolve_verified_payloads returns at least one payload");
-    let additional = promoted
-        .map(|(content_id, payload)| As4ReceivedPayload {
-            content_id,
-            payload,
+    // The test service is answered here; its parts are never opened.
+    if parsed.service.as_deref() == Some(crate::profile::TEST_SERVICE)
+        && parsed.action == crate::profile::TEST_ACTION
+    {
+        return Ok(VerifiedInbound {
+            parsed,
+            payloads: Vec::new(),
+            signer_der,
+            references,
+            nri,
+        });
+    }
+
+    // A payload-less BDEW path-switch message (B §2.2.8, §2.3.7),
+    // classified from the verified header after signer authorization, eb:To,
+    // revocation and freshness. Every other payload-less message falls
+    // through to the part match and is refused there.
+    if declared.is_empty()
+        && policy.accept_path_switch
+        && crate::as4::classify_path_switch(
+            parsed.service.as_deref().unwrap_or_default(),
+            &parsed.action,
+        )
+        .is_some()
+    {
+        payload::check_payload_less(session, &message_id, &doc, multipart.as_ref())?;
+        return Ok(VerifiedInbound {
+            parsed,
+            payloads: Vec::new(),
+            signer_der,
+            references,
+            nri,
+        });
+    }
+
+    // The MIME parts are exactly the declared parts.
+    let parts = payload::match_parts(session, &message_id, declared, multipart.as_ref())?;
+
+    // Envelope structure and algorithm suite, without a key.
+    let security = doc
+        .descendants()
+        .find(|n| {
+            n.is_element()
+                && n.tag_name().namespace() == Some(crate::xml::ns::DS)
+                && n.tag_name().name() == "Signature"
+        })
+        .and_then(|n| n.parent())
+        .ok_or_else(|| {
+            refused(
+                ErrorCode::SecurityVerificationFailed,
+                "the verified signature has no wsse:Security header".to_string(),
+            )
+        })?;
+    let envelope = crate::crypto::wssec::xmlenc::resolve_envelope(
+        &doc,
+        security,
+        declared,
+        Some(suite),
+        super::super::stream::MAX_INBOUND_PAYLOADS,
+    )
+    .map_err(|err| err.with_message_id(message_id.clone()))?;
+    // Every declared part is encrypted (every AS4 preset).
+    let Some(envelope) = envelope.filter(|_| policy.require_encrypted_inbound) else {
+        return Err(refused(
+            ErrorCode::PolicyViolation,
+            format!(
+                "inbound AS4 payload cid:{} is not encrypted; the profile requires every \
+                 payload part to be encrypted",
+                declared.first().map(String::as_str).unwrap_or_default()
+            ),
+        ));
+    };
+    if let Some(plain) = declared
+        .iter()
+        .find(|cid| !envelope.data.iter().any(|d| &d.cid == *cid))
+    {
+        return Err(refused(
+            ErrorCode::PolicyViolation,
+            format!(
+                "inbound AS4 payload cid:{plain} is not encrypted; the profile requires every \
+                 payload part to be encrypted"
+            ),
+        ));
+    }
+    // Restored part types, before any key is used.
+    let mut restored = Vec::with_capacity(envelope.data.len());
+    for data in &envelope.data {
+        restored.push(payload::restored_type(
+            session,
+            &message_id,
+            &data.cid,
+            data.mime_type.as_deref(),
+            part_properties.compression.contains_key(&data.cid),
+        )?);
+    }
+
+    // Select the decrypter, one key operation, decrypt every part.
+    let bodies: Vec<&[u8]> = envelope
+        .data
+        .iter()
+        .map(|d| {
+            parts
+                .iter()
+                .find(|p| p.content_id == d.cid)
+                .map(|p| p.bytes)
+                .unwrap_or_default()
         })
         .collect();
+    let plaintexts = crate::crypto::wssec::xmlenc::decrypt_attachments(&envelope, &bodies, keys)
+        .map_err(|err| err.with_message_id(message_id.clone()))?;
 
-    Ok((primary, primary_cid, additional, sbdh_header))
-}
+    // The `cid:` digests over the decrypted bytes, input by restored type.
+    let inputs = plaintexts
+        .iter()
+        .zip(&restored)
+        .map(|(bytes, kind)| {
+            crate::crypto::wssec::swa_attachment_digest_input(kind.as_deref(), bytes)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let digest_parts: Vec<(&str, &[u8])> = envelope
+        .data
+        .iter()
+        .zip(&inputs)
+        .map(|(d, input)| (d.cid.as_str(), input.as_ref()))
+        .collect();
+    crate::crypto::wssec::verify::verify_cid_references(&deferred.cid_references, &digest_parts)
+        .map_err(|err| err.with_message_id(message_id.clone()))?;
+    drop(inputs);
 
-fn verify_non_fragment_receipt(
-    session: &SessionContext,
-    event_bus: &EventBus,
-    receipt_payload: Option<&[u8]>,
-    policy: &As4PushPolicy,
-    parsed: &super::super::ParsedAs4UserMessage,
-) -> Result<Option<super::super::ParsedAs4Receipt>> {
-    receipt::parse_and_verify_receipt_if_present(
-        session,
-        event_bus,
-        receipt_payload,
-        policy,
-        &parsed.message_id,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn assemble_non_fragment_output(
-    payload: DomainReady<Arc<[u8]>>,
-    payload_content_id: String,
-    additional_payloads: Vec<As4ReceivedPayload>,
-    sbdh_header: Option<SbdhHeader>,
-    parsed: super::super::ParsedAs4UserMessage,
-    receipt: Option<super::super::ParsedAs4Receipt>,
-) -> As4ReceivePushOutput {
-    As4ReceivePushOutput {
-        payload,
-        payload_content_id,
-        additional_payloads,
-        sbdh_header,
-        user_message: parsed,
-        receipt,
+    // Decompress, in declared order.
+    let mut by_cid: Vec<(String, Vec<u8>)> = envelope
+        .data
+        .iter()
+        .map(|d| d.cid.clone())
+        .zip(plaintexts)
+        .collect();
+    let mut payloads = Vec::with_capacity(declared.len());
+    for cid in declared {
+        let at = by_cid
+            .iter()
+            .position(|(c, _)| c == cid)
+            .expect("coverage checked above");
+        let (cid, bytes) = by_cid.swap_remove(at);
+        let bytes = payload::decompress_payload_if_declared(
+            session,
+            &cid,
+            &part_properties.compression,
+            bytes,
+        )?;
+        let mime_type = part_properties
+            .mime_types
+            .get(&cid)
+            .cloned()
+            .unwrap_or_else(|| "application/octet-stream".to_string());
+        payloads.push((cid, bytes, mime_type));
     }
+
+    Ok(VerifiedInbound {
+        parsed,
+        payloads,
+        signer_der,
+        references,
+        nri,
+    })
 }

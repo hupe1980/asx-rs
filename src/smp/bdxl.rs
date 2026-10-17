@@ -34,11 +34,11 @@
 //! implement it over whatever already resolves names in your process.
 
 use std::collections::HashMap;
-#[cfg(feature = "dns")]
+#[cfg(feature = "peppol")]
 use std::sync::Arc;
 
 use crate::core::{AsxError, ErrorCode, ErrorContext, Result};
-use crate::storage::BoxFuture;
+use crate::error::BoxFuture;
 
 /// How the SMP base URL is located for a participant.
 #[derive(Debug, Clone)]
@@ -107,8 +107,8 @@ fn hex_lower(input: &[u8]) -> String {
 /// Only the identifier **value** is hashed. Folding the scheme into the hash
 /// input is a plausible reading that produces a name nothing publishes.
 ///
-/// ```
-/// # use asx_rs::smp::bdxl_dns_name;
+/// ```text
+/// # use asx::smp::bdxl_dns_name;
 /// assert_eq!(
 ///     bdxl_dns_name("iso6523-actorid-upis", "0088:5790002590993", "participant.sml.prod.tech.peppol.org"),
 ///     "2M2UFGZNGSS25JOOMOV2S4VGG7PW64KIVYNONDSVZSRT4EAZVCLQ\
@@ -131,8 +131,8 @@ pub fn bdxl_dns_name(scheme: &str, participant_id: &str, sml_zone: &str) -> Stri
 ///
 /// As with [`bdxl_dns_name`], only the identifier **value** is hashed.
 ///
-/// ```
-/// # use asx_rs::smp::legacy_cname_host;
+/// ```text
+/// # use asx::smp::legacy_cname_host;
 /// // Peppol "Policy for use of Identifiers" worked example.
 /// assert_eq!(
 ///     legacy_cname_host("iso6523-actorid-upis", "0088:123abc", "edelivery.tech.ec.europa.eu"),
@@ -348,13 +348,13 @@ impl BdxlResolver for StaticBdxlResolver {
 /// Available under the `dns` feature. A deployment that needs DNSSEC
 /// validation, a specific resolver, or a mesh-aware client should implement
 /// [`BdxlResolver`] itself instead — that choice is the reason this is a trait.
-#[cfg(feature = "dns")]
+#[cfg(feature = "peppol")]
 #[derive(Debug, Clone)]
 pub struct HickoryBdxlResolver {
     resolver: Arc<hickory_resolver::TokioResolver>,
 }
 
-#[cfg(feature = "dns")]
+#[cfg(feature = "peppol")]
 impl HickoryBdxlResolver {
     /// Build a resolver from the system configuration.
     ///
@@ -387,7 +387,7 @@ impl HickoryBdxlResolver {
     }
 }
 
-#[cfg(feature = "dns")]
+#[cfg(feature = "peppol")]
 impl BdxlResolver for HickoryBdxlResolver {
     fn lookup_naptr<'a>(&'a self, name: &'a str) -> BoxFuture<'a, Result<Vec<NaptrRecord>>> {
         Box::pin(async move {

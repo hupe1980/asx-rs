@@ -1,6 +1,6 @@
 base_url = "https://hupe1980.github.io/asx-rs"
 title = "asx-rs"
-description = "Async-native AS2 and AS4 (ebMS3) B2B messaging for Rust. S/MIME, WS-Security, MDN and verified receipts, with fail-closed defaults."
+description = "AS2 and AS4 (ebMS3) B2B messaging for Rust: network profiles for BDEW, Peppol, eDelivery and ENTSOG, verified receipts and MDNs, strict by default."
 default_language = "en"
 compile_sass = true
 minify_html = true
@@ -30,7 +30,7 @@ repo = "https://github.com/hupe1980/asx-rs"
 crate = "https://crates.io/crates/asx-rs"
 api_docs = "https://docs.rs/asx-rs"
 # Shown in the page footer and the JSON-LD `softwareVersion`.
-version = "0.14.0"
+version = "0.16.0"
 # Fallback social-card text when a page sets no description.
 default_description = "Async-native AS2 and AS4 (ebMS3) B2B messaging for Rust."
 
@@ -43,43 +43,41 @@ title = "Start here"
 title = "Getting started"
 path = "/docs/getting-started/"
 [[extra.nav.items]]
-title = "Architecture"
-path = "/docs/architecture/"
+title = "Profiles"
+path = "/docs/profiles/"
+[[extra.nav.items]]
+title = "Migrating from 0.15"
+path = "/docs/migration/"
 
 [[extra.nav]]
 title = "Protocols"
 [[extra.nav.items]]
-title = "AS2"
-path = "/docs/as2/"
-[[extra.nav.items]]
 title = "AS4"
 path = "/docs/as4/"
 [[extra.nav.items]]
-title = "Interoperability"
-path = "/docs/interop/"
-[[extra.nav.items]]
-title = "Conformance"
-path = "/docs/conformance/"
+title = "AS2"
+path = "/docs/as2/"
 
 [[extra.nav]]
 title = "Operating it"
 [[extra.nav.items]]
-title = "Security model"
-path = "/docs/security/"
+title = "Keys and certificates"
+path = "/docs/keys/"
 [[extra.nav.items]]
-title = "Transport"
-path = "/docs/transport/"
-[[extra.nav.items]]
-title = "Reliability"
-path = "/docs/reliability/"
+title = "Persistence"
+path = "/docs/persistence/"
 [[extra.nav.items]]
 title = "Observability"
 path = "/docs/observability/"
 [[extra.nav.items]]
-title = "Persistence"
-path = "/docs/persistence/"
+title = "Security model"
+path = "/docs/security/"
+
 [[extra.nav]]
-title = "Contributing"
+title = "Evidence"
 [[extra.nav.items]]
 title = "Testing"
 path = "/docs/testing/"
+[[extra.nav.items]]
+title = "Conformance"
+path = "/docs/conformance/"

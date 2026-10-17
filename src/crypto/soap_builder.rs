@@ -1,55 +1,13 @@
-/// SOAP envelope and ebMS3 message builder for AS4
+/// SOAP envelope and ebMS3 message builder for AS4.
 ///
-/// Implements RFC 5751 (S/MIME) with OASIS ebMS 3.0 messaging format and WS-Security
-/// for AS4 push/pull message construction.
-use crate::core::Result;
-
-/// Splice a finished `wsse:Security` header into the slot
-/// [`WSSE_HEADER_PLACEHOLDER`] reserved, replacing it exactly once.
-///
-/// Fails if the placeholder is absent or appears more than once, so the
-/// "brittle string-marker insertion" this replaces cannot fail silently — which
-/// is the property the rebuild it replaces was chosen for, without the race the
-/// rebuild introduced (D42).
-///
-/// # Errors
-///
-/// [`ErrorCode::InvalidInput`](crate::ErrorCode::InvalidInput) when the
-/// envelope does not contain exactly one placeholder.
-pub fn splice_ws_security_header(envelope: &str, header_xml: &str) -> Result<String> {
-    let occurrences = envelope.matches(WSSE_HEADER_PLACEHOLDER).count();
-    if occurrences != 1 {
-        return Err(crate::core::AsxError::new(
-            crate::core::ErrorCode::InvalidInput,
-            format!(
-                "SOAP envelope must contain exactly one wsse:Security placeholder to splice \
-                 into, found {occurrences}; build it with \
-                 SoapEnvelopeBuilder::with_ws_security_placeholder()"
-            ),
-            crate::core::ErrorContext::new("as4_soap_builder"),
-        ));
-    }
-    Ok(envelope.replacen(WSSE_HEADER_PLACEHOLDER, header_xml, 1))
-}
-
-/// Marker reserving the position of the `wsse:Security` header inside
-/// `soap:Header`, emitted by
-/// [`SoapEnvelopeBuilder::with_ws_security_placeholder`].
-///
-/// It exists so the envelope is built **once**. Building it a second time to
-/// add the security header is what let `eb:Timestamp` change between the bytes
-/// that were digested and the bytes that shipped (D42) — a defect that only
-/// appeared when the two builds straddled a whole second.
-pub const WSSE_HEADER_PLACEHOLDER: &str = "<!--asx:wsse-security-header-->";
+/// Every element is written with the crate's one XML writer:
+/// caller values are escaped, a character XML 1.0 cannot carry is refused with
+/// `InvalidInput` naming the field, and the `wsse:Security` position of a
+/// signed message is a slot reserved by the writer — not a textual placeholder.
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 
-const SOAP12_NAMESPACE: &str = "http://www.w3.org/2003/05/soap-envelope";
-const EBMS_NAMESPACE: &str = "http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/";
-const WSSE_NAMESPACE: &str =
-    "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd";
-const WSSEC_UTILITY_NAMESPACE: &str =
-    "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd";
-const WSA_NAMESPACE: &str = "http://www.w3.org/2005/08/addressing";
+use crate::core::{AsxError, ErrorCode, ErrorContext, Result};
+use crate::xml::{Slot, XmlDoc, XmlFragment, XmlLimits, XmlOut, ns};
 
 // ── WS-Addressing ────────────────────────────────────────────────────────────
 
@@ -62,7 +20,7 @@ const WSA_NAMESPACE: &str = "http://www.w3.org/2005/08/addressing";
 /// Set on the builder via [`SoapEnvelopeBuilder::with_ws_addressing`].
 ///
 /// If no WS-Addressing configuration is supplied, **no** `wsa:*` headers are
-/// emitted (the default for backward-compatible deployments).
+/// emitted (the default).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WsAddressingHeaders {
     /// Absolute URI uniquely identifying this message instance.
@@ -93,12 +51,6 @@ impl WsAddressingHeaders {
             reply_to: None,
         }
     }
-
-    /// Add an explicit `ReplyTo` endpoint reference.
-    pub fn with_reply_to(mut self, reply_to: impl Into<String>) -> Self {
-        self.reply_to = Some(reply_to.into());
-        self
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -124,11 +76,12 @@ pub struct SoapEnvelopeBuilder {
     action: String,
     service: String,
     service_type: String,
-    mpc: Option<String>,
     conversation_id: Option<String>,
     /// Two-Way MEP correlation: emits `<eb:RefToMessageId>` in MessageInfo.
     ref_to_message_id: Option<String>,
     original_sender: String,
+    /// Emit `eb:MessageProperties` (the four-corner properties).
+    message_properties: bool,
     final_recipient: String,
     tracking_identifier: String,
     payload: Vec<u8>,
@@ -145,14 +98,10 @@ pub struct SoapEnvelopeBuilder {
     /// Additional `eb:PartInfo` entries for a multi-payload UserMessage:
     /// `(content_id, mime_type, compression_type)`.
     extra_part_infos: Vec<(String, String, Option<String>)>,
-    ws_security_header: Option<String>,
-    /// Emit [`WSSE_HEADER_PLACEHOLDER`] where the security header will go.
-    ws_security_placeholder: bool,
     /// Optional WS-Addressing headers to include in the SOAP Header.
     ws_addressing: Option<WsAddressingHeaders>,
 }
 
-pub(crate) const MESSAGE_ID_WSU_ID: &str = "as4-message-id";
 pub(crate) const SOAP_BODY_WSU_ID: &str = "as4-body";
 /// `wsu:Id` placed on the `<ebms:Messaging>` header block so the **entire**
 /// ebMS3 UserMessage (party info, service/action, message properties, payload
@@ -170,6 +119,29 @@ pub const EBMS_DEFAULT_ROLE: &str =
 /// conformance setups use for party identifiers outside a registered scheme.
 pub const EBCORE_PARTY_ID_TYPE_UNREGISTERED: &str =
     "urn:oasis:names:tc:ebcore:partyid-type:unregistered";
+
+/// An envelope whose `wsse:Security` position is reserved and still empty:
+/// sign [`Self::text`] (the slot lies outside every signed subtree), then
+/// [`Self::seal`] it with the finished header.
+#[derive(Debug)]
+pub(crate) struct UnsignedEnvelope {
+    doc: XmlDoc,
+    slot: Slot,
+    text: String,
+}
+
+impl UnsignedEnvelope {
+    /// The envelope as signed: the security slot empty.
+    pub(crate) fn text(&self) -> &str {
+        &self.text
+    }
+
+    /// The envelope with `header` in the reserved slot.
+    pub(crate) fn seal(mut self, header: XmlFragment) -> Result<String> {
+        self.doc.fill(self.slot, header)?;
+        self.doc.into_string()
+    }
+}
 
 impl SoapEnvelopeBuilder {
     /// Create a new builder.
@@ -195,10 +167,10 @@ impl SoapEnvelopeBuilder {
             action: "http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/action".into(),
             service: "http://example.org/example".into(),
             service_type: "example".into(),
-            mpc: None,
             conversation_id: None,
             ref_to_message_id: None,
             original_sender: String::new(),
+            message_properties: true,
             final_recipient: String::new(),
             tracking_identifier: String::new(),
             payload: Vec::new(),
@@ -207,11 +179,16 @@ impl SoapEnvelopeBuilder {
             payload_compression_type: None,
             payload_content_id: "payload@example.org".into(),
             extra_part_infos: Vec::new(),
-            ws_security_header: None,
-            ws_security_placeholder: false,
             ws_addressing: None,
         }
         .with_default_four_corner_properties()
+    }
+
+    /// Omit `eb:MessageProperties`: a profile without message properties
+    /// (BDEW).
+    pub(crate) fn without_message_properties(mut self) -> Self {
+        self.message_properties = false;
+        self
     }
 
     fn with_default_four_corner_properties(mut self) -> Self {
@@ -254,7 +231,7 @@ impl SoapEnvelopeBuilder {
     /// Set Four Corner topology MessageProperties.
     ///
     /// Emits `originalSender`, `finalRecipient`, and `trackingIdentifier`
-    /// under `<ebms:MessageProperties>`.
+    /// under `<ebms:MessageProperties>`, each value as element text.
     pub fn with_four_corner_properties(
         mut self,
         original_sender: impl Into<String>,
@@ -279,11 +256,6 @@ impl SoapEnvelopeBuilder {
     /// `(content_id, mime_type, compression_type)` per part.
     pub fn with_extra_part_infos(mut self, parts: Vec<(String, String, Option<String>)>) -> Self {
         self.extra_part_infos = parts;
-        self
-    }
-
-    pub fn with_mpc(mut self, mpc: impl Into<String>) -> Self {
-        self.mpc = Some(mpc.into());
         self
     }
 
@@ -330,16 +302,10 @@ impl SoapEnvelopeBuilder {
     /// Pin `eb:MessageInfo/eb:Timestamp`. **Required** — [`build`](Self::build)
     /// fails without it.
     ///
-    /// `eb:Timestamp` is inside the signed `eb:Messaging` block, and the AS4
-    /// send path builds the envelope twice for one message: once unsigned, to
-    /// digest that block, and once with the `wsse:Security` header. If each
-    /// build read the clock, the two would disagree whenever they straddled a
-    /// second — roughly one send in a thousand — and the envelope that shipped
-    /// would not be the one that was signed. Nobody could verify it, and it
-    /// would look like a flaky partner.
-    ///
-    /// Making this an input rather than an ambient read is what turns that from
-    /// unlikely into impossible.
+    /// `eb:Timestamp` is inside the signed `eb:Messaging` block. Making it an
+    /// input rather than an ambient clock read keeps every build of one
+    /// message byte-identical, so the envelope that ships is the one that was
+    /// signed.
     #[must_use]
     pub fn with_message_timestamp(mut self, timestamp: impl Into<String>) -> Self {
         self.message_timestamp = Some(timestamp.into());
@@ -379,25 +345,6 @@ impl SoapEnvelopeBuilder {
         self
     }
 
-    /// Reserve the `wsse:Security` slot with [`WSSE_HEADER_PLACEHOLDER`] instead
-    /// of supplying the header now.
-    ///
-    /// Sign the resulting envelope, then splice the finished header in with
-    /// [`splice_ws_security_header`]. The signature covers the `eb:Messaging`
-    /// and `soap:Body` subtrees, and the placeholder sits in neither, so the
-    /// splice cannot change a digest — whereas rebuilding the envelope can, and
-    /// did.
-    #[must_use]
-    pub fn with_ws_security_placeholder(mut self) -> Self {
-        self.ws_security_placeholder = true;
-        self
-    }
-
-    pub fn with_ws_security_header(mut self, header_xml: impl Into<String>) -> Self {
-        self.ws_security_header = Some(header_xml.into());
-        self
-    }
-
     /// Attach WS-Addressing 1.0 headers to the SOAP envelope.
     ///
     /// When set, the SOAP Header will include `<wsa:MessageID>`,
@@ -412,288 +359,213 @@ impl SoapEnvelopeBuilder {
         self
     }
 
-    /// Build a SOAP envelope with ebMS3 UserMessage
+    /// Build a SOAP envelope with an ebMS3 UserMessage.
     pub fn build(self) -> Result<Vec<u8>> {
-        let mut xml = String::new();
+        let (doc, _) = self.write(false)?;
+        Ok(doc.into_string()?.into_bytes())
+    }
 
-        // XML declaration
-        xml.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
+    /// Build the envelope with the `wsse:Security` position reserved.
+    pub(crate) fn build_with_security_slot(self) -> Result<UnsignedEnvelope> {
+        let (doc, slot) = self.write(true)?;
+        let slot = slot.expect("a slot was reserved");
+        let text = doc.text_with_empty_slots();
+        Ok(UnsignedEnvelope { doc, slot, text })
+    }
 
-        // SOAP Envelope — conditionally include WSA namespace declaration.
-        if self.ws_addressing.is_some() {
-            xml.push_str(&format!(
-                "<soap:Envelope xmlns:soap=\"{}\" xmlns:ebms=\"{}\" xmlns:wsse=\"{}\" xmlns:wsu=\"{}\" xmlns:wsa=\"{}\">\n",
-                SOAP12_NAMESPACE, EBMS_NAMESPACE, WSSE_NAMESPACE, WSSEC_UTILITY_NAMESPACE, WSA_NAMESPACE
-            ));
-        } else {
-            xml.push_str(&format!(
-                "<soap:Envelope xmlns:soap=\"{}\" xmlns:ebms=\"{}\" xmlns:wsse=\"{}\" xmlns:wsu=\"{}\">\n",
-                SOAP12_NAMESPACE, EBMS_NAMESPACE, WSSE_NAMESPACE, WSSEC_UTILITY_NAMESPACE
-            ));
-        }
-
-        // SOAP Header
-        xml.push_str("  <soap:Header>\n");
-
-        // WS-Addressing headers (optional, must appear before ebMS3 Messaging).
-        if let Some(wsa) = &self.ws_addressing {
-            xml.push_str(&format!(
-                "    <wsa:MessageID>{}</wsa:MessageID>\n",
-                escape_xml(&wsa.message_id)
-            ));
-            xml.push_str(&format!(
-                "    <wsa:Action soap:mustUnderstand=\"{}\">{}</wsa:Action>\n",
-                "true",
-                escape_xml(&wsa.action)
-            ));
-            xml.push_str(&format!("    <wsa:To>{}</wsa:To>\n", escape_xml(&wsa.to)));
-            if let Some(reply_to) = &wsa.reply_to {
-                xml.push_str(&format!(
-                    "    <wsa:ReplyTo><wsa:Address>{}</wsa:Address></wsa:ReplyTo>\n",
-                    escape_xml(reply_to)
-                ));
-            }
-        }
-
-        // ebMS3 Messaging/UserMessage is expected under SOAP Header.
-        // The wsu:Id makes the whole block referenceable so the signature covers
-        // all UserMessage routing/authorization metadata (eDelivery AS4 profile).
-        xml.push_str(&format!(
-            "    <ebms:Messaging soap:mustUnderstand=\"true\" wsu:Id=\"{MESSAGING_WSU_ID}\">\n"
-        ));
-        if let Some(mpc) = &self.mpc {
-            xml.push_str(&format!(
-                "      <ebms:UserMessage mpc=\"{}\">\n",
-                escape_xml(mpc)
-            ));
-        } else {
-            xml.push_str("      <ebms:UserMessage>\n");
-        }
-
-        // MessageInfo
-        xml.push_str("        <ebms:MessageInfo>\n");
-        // Required, not defaulted. `eb:Timestamp` sits inside the signed
-        // `eb:Messaging` block and the AS4 send path builds the envelope twice
-        // — reading the clock here made the two builds disagree whenever they
-        // straddled a second, shipping an envelope its own signature did not
-        // cover. Refusing is the only way to keep that unrepresentable rather
-        // than merely unlikely.
+    fn write(self, reserve_security: bool) -> Result<(XmlDoc, Option<Slot>)> {
+        // Required, not defaulted: `eb:Timestamp` sits inside the signed
+        // `eb:Messaging` block; reading the clock here would let two builds of
+        // one message disagree.
         let Some(message_timestamp) = self.message_timestamp.as_deref() else {
-            return Err(crate::core::AsxError::new(
-                crate::core::ErrorCode::InvalidInput,
+            return Err(AsxError::new(
+                ErrorCode::InvalidInput,
                 "SoapEnvelopeBuilder requires an eb:Timestamp pinned with \
                  with_message_timestamp(..); reading the clock inside build() lets two \
                  builds of the same message disagree and ship an envelope its own \
                  signature does not cover",
-                crate::core::ErrorContext::new("as4_soap_builder"),
+                ErrorContext::new("as4_soap_builder"),
             ));
         };
-        xml.push_str(&format!(
-            "          <ebms:Timestamp>{message_timestamp}</ebms:Timestamp>\n"
-        ));
-        xml.push_str(&format!(
-            "          <ebms:MessageId wsu:Id=\"{}\">{}</ebms:MessageId>\n",
-            MESSAGE_ID_WSU_ID,
-            escape_xml(&self.message_id)
-        ));
-        // Two-Way MEP: emit RefToMessageId when correlating a response to a request.
-        if let Some(ref_id) = &self.ref_to_message_id {
-            xml.push_str(&format!(
-                "          <ebms:RefToMessageId>{}</ebms:RefToMessageId>\n",
-                escape_xml(ref_id)
-            ));
-        }
-        xml.push_str("        </ebms:MessageInfo>\n");
 
-        // PartyInfo — From and To use independent party identifiers. Each
-        // party carries the schema-mandatory eb:Role (ebMS3 Core §5.2.2.3).
-        let party_id_xml = |id: &str, id_type: &Option<String>| -> String {
-            match id_type {
-                Some(t) => format!(
-                    "            <ebms:PartyId type=\"{}\">{}</ebms:PartyId>\n",
-                    escape_xml(t),
-                    escape_xml(id)
-                ),
-                None => format!(
-                    "            <ebms:PartyId>{}</ebms:PartyId>\n",
-                    escape_xml(id)
-                ),
+        let mut out = XmlOut::new();
+        out.declaration();
+        out.start("soap:Envelope")?
+            .ns("soap", ns::SOAP12)?
+            .ns("ebms", ns::EBMS3)?
+            .ns("wsse", ns::WSSE)?
+            .ns("wsu", ns::WSU)?;
+        if self.ws_addressing.is_some() {
+            out.ns("wsa", ns::WSA)?;
+        }
+        out.start("soap:Header")?;
+
+        // WS-Addressing headers (optional) precede ebMS3 Messaging.
+        if let Some(wsa) = &self.ws_addressing {
+            out.leaf("wsa:MessageID", &wsa.message_id, "wsa:MessageID")?;
+            out.start("wsa:Action")?
+                .attr("soap:mustUnderstand", "true", "soap:mustUnderstand")?
+                .text(&wsa.action, "wsa:Action")?
+                .end()?;
+            out.leaf("wsa:To", &wsa.to, "wsa:To")?;
+            if let Some(reply_to) = &wsa.reply_to {
+                out.start("wsa:ReplyTo")?;
+                out.leaf("wsa:Address", reply_to, "wsa:ReplyTo/wsa:Address")?;
+                out.end()?;
             }
-        };
-        xml.push_str("        <ebms:PartyInfo>\n");
-        xml.push_str("          <ebms:From>\n");
-        xml.push_str(&party_id_xml(&self.from_party_id, &self.from_party_id_type));
-        xml.push_str(&format!(
-            "            <ebms:Role>{}</ebms:Role>\n",
-            escape_xml(&self.from_role)
-        ));
-        xml.push_str("          </ebms:From>\n");
-        xml.push_str("          <ebms:To>\n");
-        xml.push_str(&party_id_xml(&self.to_party_id, &self.to_party_id_type));
-        xml.push_str(&format!(
-            "            <ebms:Role>{}</ebms:Role>\n",
-            escape_xml(&self.to_role)
-        ));
-        xml.push_str("          </ebms:To>\n");
-        xml.push_str("        </ebms:PartyInfo>\n");
+        }
+
+        // The wsu:Id makes the whole block referenceable so the signature
+        // covers all UserMessage routing/authorization metadata.
+        out.start("ebms:Messaging")?
+            .attr("soap:mustUnderstand", "true", "soap:mustUnderstand")?
+            .attr("wsu:Id", MESSAGING_WSU_ID, "wsu:Id")?;
+        out.start("ebms:UserMessage")?;
+
+        out.start("ebms:MessageInfo")?;
+        out.leaf("ebms:Timestamp", message_timestamp, "eb:Timestamp")?;
+        // The ebMS3 header schema gives eb:MessageId no attributes (phase4
+        // answers a wsu:Id there with EBMS:0009).
+        out.leaf("ebms:MessageId", &self.message_id, "eb:MessageId")?;
+        if let Some(ref_id) = &self.ref_to_message_id {
+            out.leaf("ebms:RefToMessageId", ref_id, "eb:RefToMessageId")?;
+        }
+        out.end()?;
+
+        // PartyInfo: each party carries the schema-mandatory eb:Role
+        // (ebMS3 Core §5.2.2.3).
+        out.start("ebms:PartyInfo")?;
+        for (element, id, id_type, role) in [
+            (
+                "ebms:From",
+                &self.from_party_id,
+                &self.from_party_id_type,
+                &self.from_role,
+            ),
+            (
+                "ebms:To",
+                &self.to_party_id,
+                &self.to_party_id_type,
+                &self.to_role,
+            ),
+        ] {
+            out.start(element)?;
+            out.start("ebms:PartyId")?;
+            if let Some(t) = id_type {
+                out.attr("type", t, "eb:PartyId/@type")?;
+            }
+            out.text(id, "eb:PartyId")?.end()?;
+            out.leaf("ebms:Role", role, "eb:Role")?;
+            out.end()?;
+        }
+        out.end()?;
 
         // CollaborationInfo — schema order: AgreementRef?, Service, Action,
         // ConversationId (ebMS3 Core §5.2.2.6).
-        xml.push_str("        <ebms:CollaborationInfo>\n");
+        out.start("ebms:CollaborationInfo")?;
         if let Some(agreement) = &self.agreement_ref {
-            match &self.agreement_ref_type {
-                Some(t) => xml.push_str(&format!(
-                    "          <ebms:AgreementRef type=\"{}\">{}</ebms:AgreementRef>\n",
-                    escape_xml(t),
-                    escape_xml(agreement)
-                )),
-                None => xml.push_str(&format!(
-                    "          <ebms:AgreementRef>{}</ebms:AgreementRef>\n",
-                    escape_xml(agreement)
-                )),
+            out.start("ebms:AgreementRef")?;
+            if let Some(t) = &self.agreement_ref_type {
+                out.attr("type", t, "eb:AgreementRef/@type")?;
             }
+            out.text(agreement, "eb:AgreementRef")?.end()?;
         }
-        if self.service_type.is_empty() {
-            xml.push_str(&format!(
-                "          <ebms:Service>{}</ebms:Service>\n",
-                escape_xml(&self.service)
-            ));
-        } else {
-            xml.push_str(&format!(
-                "          <ebms:Service type=\"{}\">{}</ebms:Service>\n",
-                escape_xml(&self.service_type),
-                escape_xml(&self.service)
-            ));
+        out.start("ebms:Service")?;
+        if !self.service_type.is_empty() {
+            out.attr("type", &self.service_type, "eb:Service/@type")?;
         }
-        xml.push_str(&format!(
-            "          <ebms:Action>{}</ebms:Action>\n",
-            escape_xml(&self.action)
-        ));
-        // ConversationId is REQUIRED by the ebMS3 schema (minOccurs=1).
-        // Previously it was omitted when unset, producing a schema-invalid
-        // envelope. The Peppol AS4 profile's convention for "no conversation
-        // semantics" is the literal "1", which also avoids leaking a
-        // correlatable identifier.
-        let conversation_id = self.conversation_id.as_deref().unwrap_or("1");
-        xml.push_str(&format!(
-            "          <ebms:ConversationId>{}</ebms:ConversationId>\n",
-            escape_xml(conversation_id)
-        ));
-        xml.push_str("        </ebms:CollaborationInfo>\n");
+        out.text(&self.service, "eb:Service")?.end()?;
+        out.leaf("ebms:Action", &self.action, "eb:Action")?;
+        // ConversationId is REQUIRED by the ebMS3 schema (minOccurs=1); the
+        // Peppol convention for "no conversation semantics" is "1".
+        out.leaf(
+            "ebms:ConversationId",
+            self.conversation_id.as_deref().unwrap_or("1"),
+            "eb:ConversationId",
+        )?;
+        out.end()?;
 
-        // MessageProperties — Four Corner topology routing metadata.
-        xml.push_str("        <ebms:MessageProperties>\n");
-        xml.push_str(&format!(
-            "          <ebms:Property name=\"originalSender\" value=\"{}\"/>\n",
-            escape_xml(&self.original_sender)
-        ));
-        xml.push_str(&format!(
-            "          <ebms:Property name=\"finalRecipient\" value=\"{}\"/>\n",
-            escape_xml(&self.final_recipient)
-        ));
-        xml.push_str(&format!(
-            "          <ebms:Property name=\"trackingIdentifier\" value=\"{}\"/>\n",
-            escape_xml(&self.tracking_identifier)
-        ));
-        xml.push_str("        </ebms:MessageProperties>\n");
+        // MessageProperties — Four Corner topology routing metadata; ebMS3
+        // Property values are element text.
+        if self.message_properties {
+            out.start("ebms:MessageProperties")?;
+            for (name, value) in [
+                ("originalSender", &self.original_sender),
+                ("finalRecipient", &self.final_recipient),
+                ("trackingIdentifier", &self.tracking_identifier),
+            ] {
+                write_property(&mut out, name, value)?;
+            }
+            out.end()?;
+        }
 
         if !self.payload.is_empty() || self.detached_payload_reference {
-            xml.push_str("        <ebms:PayloadInfo>\n");
-            xml.push_str(&format!(
-                "          <ebms:PartInfo href=\"cid:{}\">\n",
-                escape_xml(&self.payload_content_id)
-            ));
-            xml.push_str("            <ebms:Properties>\n");
-            xml.push_str(&format!(
-                "              <ebms:Property name=\"MimeType\" value=\"{}\"/>\n",
-                escape_xml(&self.payload_mime_type)
-            ));
-            // AS4 profile §3.1 (Compression): a compressed payload MUST be
-            // advertised with a `CompressionType` part property, and `MimeType`
-            // MUST describe the payload *before* compression. Without this the
-            // receiver has no conformant way to know it should decompress, and
-            // the original media type is lost entirely.
-            if let Some(compression_type) = &self.payload_compression_type {
-                xml.push_str(&format!(
-                    "              <ebms:Property name=\"CompressionType\" value=\"{}\"/>\n",
-                    escape_xml(compression_type)
-                ));
-            }
-            xml.push_str("            </ebms:Properties>\n");
-            xml.push_str("          </ebms:PartInfo>\n");
+            out.start("ebms:PayloadInfo")?;
+            // AS4 profile §3.1 (Compression): a compressed payload MUST carry
+            // a `CompressionType` part property, and `MimeType` MUST describe
+            // the payload *before* compression.
+            write_part_info(
+                &mut out,
+                &self.payload_content_id,
+                &self.payload_mime_type,
+                self.payload_compression_type.as_deref(),
+            )?;
             for (content_id, mime_type, compression_type) in &self.extra_part_infos {
-                xml.push_str(&format!(
-                    "          <ebms:PartInfo href=\"cid:{}\">\n",
-                    escape_xml(content_id)
-                ));
-                xml.push_str("            <ebms:Properties>\n");
-                xml.push_str(&format!(
-                    "              <ebms:Property name=\"MimeType\" value=\"{}\"/>\n",
-                    escape_xml(mime_type)
-                ));
-                if let Some(compression_type) = compression_type {
-                    xml.push_str(&format!(
-                        "              <ebms:Property name=\"CompressionType\" value=\"{}\"/>\n",
-                        escape_xml(compression_type)
-                    ));
-                }
-                xml.push_str("            </ebms:Properties>\n");
-                xml.push_str("          </ebms:PartInfo>\n");
+                write_part_info(&mut out, content_id, mime_type, compression_type.as_deref())?;
             }
-            xml.push_str("        </ebms:PayloadInfo>\n");
+            out.end()?;
         }
 
-        xml.push_str("      </ebms:UserMessage>\n");
-        xml.push_str("    </ebms:Messaging>\n");
+        out.end()?; // UserMessage
+        out.end()?; // Messaging
 
-        if let Some(wsse) = &self.ws_security_header {
-            xml.push_str(wsse);
-        } else if self.ws_security_placeholder {
-            xml.push_str(WSSE_HEADER_PLACEHOLDER);
-            xml.push('\n');
-        }
+        let slot = reserve_security.then(|| out.slot());
 
-        xml.push_str("  </soap:Header>\n");
+        out.end()?; // Header
 
-        // SOAP Body. With SwA packaging (`detached_payload_reference`) the Body
-        // is EMPTY per the AS4 profile — payloads travel as MIME parts
-        // referenced from the signed `eb:PartInfo` header. An MTOM-style
-        // `xop:Include` in the Body is exactly what makes WSS4J-based
-        // receivers (Holodeck B2B, phase4, Domibus) fail DOM conversion.
-        xml.push_str(&format!("  <soap:Body wsu:Id=\"{}\">\n", SOAP_BODY_WSU_ID));
-
-        // Payload bytes are carried in SOAP body as base64 to keep XML valid
-        // (non-MIME test mode only).
+        // SOAP Body. With SwA packaging the Body is EMPTY per the AS4 profile
+        // — payloads travel as MIME parts referenced from the signed
+        // `eb:PartInfo`.
+        out.start("soap:Body")?
+            .attr("wsu:Id", SOAP_BODY_WSU_ID, "wsu:Id")?;
         if !self.payload.is_empty() && !self.detached_payload_reference {
-            xml.push_str("    <asx:Payload xmlns:asx=\"urn:asx:payload\">\n");
-            xml.push_str(&format!(
-                "      <asx:MimeType>{}</asx:MimeType>\n",
-                escape_xml(&self.payload_mime_type)
-            ));
-            xml.push_str(&format!(
-                "      <asx:Base64>{}</asx:Base64>\n",
-                STANDARD.encode(&self.payload)
-            ));
-            xml.push_str("    </asx:Payload>\n");
+            // Payload bytes carried in the Body as base64 (non-MIME test mode).
+            out.start("asx:Payload")?.ns("asx", "urn:asx:payload")?;
+            out.leaf("asx:MimeType", &self.payload_mime_type, "MimeType")?;
+            out.leaf("asx:Base64", &STANDARD.encode(&self.payload), "payload")?;
+            out.end()?;
         }
-        xml.push_str("  </soap:Body>\n");
-        xml.push_str("</soap:Envelope>\n");
+        out.end()?;
+        out.end()?;
 
-        Ok(xml.into_bytes())
+        Ok((out.finish()?, slot))
     }
 }
 
-fn escape_xml(s: &str) -> String {
-    s.chars()
-        .map(|c| match c {
-            '<' => "&lt;".to_string(),
-            '>' => "&gt;".to_string(),
-            '&' => "&amp;".to_string(),
-            '"' => "&quot;".to_string(),
-            '\'' => "&apos;".to_string(),
-            c => c.to_string(),
-        })
-        .collect()
+fn write_property(out: &mut XmlOut, name: &'static str, value: &str) -> Result<()> {
+    out.start("ebms:Property")?
+        .attr("name", name, "eb:Property/@name")?
+        .text(value, name)?
+        .end()?;
+    Ok(())
+}
+
+fn write_part_info(
+    out: &mut XmlOut,
+    content_id: &str,
+    mime_type: &str,
+    compression_type: Option<&str>,
+) -> Result<()> {
+    out.start("ebms:PartInfo")?
+        .attr("href", &format!("cid:{content_id}"), "eb:PartInfo/@href")?;
+    out.start("ebms:PartProperties")?;
+    write_property(out, "MimeType", mime_type)?;
+    if let Some(compression_type) = compression_type {
+        write_property(out, "CompressionType", compression_type)?;
+    }
+    out.end()?;
+    out.end()?;
+    Ok(())
 }
 
 /// Encode `cert_der` as a minimal DER `SEQUENCE { Certificate }` suitable for
@@ -718,6 +590,58 @@ pub fn build_pkipath_der(cert_der: &[u8]) -> Vec<u8> {
     result
 }
 
+/// A PKIPath (RFC 3820 `SEQUENCE OF Certificate`) of `root_first`: the
+/// issuer before the subject, the signer last. One certificate gives exactly
+/// [`build_pkipath_der`]'s output.
+pub(crate) fn build_pkipath_chain_der(root_first: &[&[u8]]) -> Vec<u8> {
+    let content: Vec<u8> = root_first.concat();
+    build_pkipath_der(&content)
+}
+
+/// The `wsse:Security` header for a prepared signature: `ds:Signature` from
+/// `raw_signature` (DER for ECDSA; converted to `r‖s`) and the signer chain
+/// (leaf first, DER) as the token `key_info` names — a PKIPath (root first)
+/// for `X509PKIPathv1`, the leaf as X509v3 otherwise.
+pub(crate) fn security_header(
+    prepared: crate::crypto::wssec::sign::PreparedSignature,
+    raw_signature: Vec<u8>,
+    chain_der: &[Vec<u8>],
+    key_info: crate::crypto::wssec::WsSecOutboundKeyInfoProfile,
+    now: std::time::SystemTime,
+    encryption: Option<XmlFragment>,
+) -> Result<XmlFragment> {
+    let leaf_der = chain_der.first().ok_or_else(|| {
+        AsxError::new(
+            ErrorCode::PolicyViolation,
+            "the signer has no certificate",
+            ErrorContext::new("wssec_sign"),
+        )
+    })?;
+    let signature_xml =
+        crate::crypto::wssec::sign::finish_signature(prepared, raw_signature, leaf_der, key_info)?
+            .into_string();
+    let mut builder = WsSecurityHeaderBuilder::new()
+        .at(now)
+        .with_signature_xml(signature_xml);
+    builder.encryption = encryption;
+    let builder = if key_info == crate::crypto::wssec::WsSecOutboundKeyInfoProfile::X509PKIPathv1 {
+        let root_first: Vec<&[u8]> = chain_der.iter().rev().map(Vec::as_slice).collect();
+        builder.with_signing_cert_pkipath_der(build_pkipath_chain_der(&root_first))
+    } else {
+        let pem = openssl::x509::X509::from_der(leaf_der)
+            .and_then(|cert| cert.to_pem())
+            .map_err(|_err| {
+                AsxError::new(
+                    ErrorCode::ParseFailed,
+                    "failed to serialize the signing certificate to PEM",
+                    ErrorContext::new("wssec_sign"),
+                )
+            })?;
+        builder.with_signing_cert(pem)
+    };
+    builder.build_fragment()
+}
+
 /// WS-Security header builder for X.509 certificate-based signing
 #[derive(Debug, Clone)]
 pub struct WsSecurityHeaderBuilder {
@@ -726,8 +650,12 @@ pub struct WsSecurityHeaderBuilder {
     /// `ValueType="...#X509PKIPathv1"` instead of `#X509v3`.
     /// The value is the base64-encoded DER-encoded PKIPath (SEQUENCE OF Certificate).
     signing_cert_pkipath_der: Option<Vec<u8>>,
-    include_signature_placeholder: bool,
     signature_xml: Option<String>,
+    /// `wsu:Created`; `wsu:Expires` is five minutes later.
+    now: std::time::SystemTime,
+    /// The SwA encryption envelope (recipient BST, `EncryptedKey`,
+    /// `EncryptedData`s), placed before the signer's token.
+    encryption: Option<XmlFragment>,
 }
 
 impl Default for WsSecurityHeaderBuilder {
@@ -741,9 +669,16 @@ impl WsSecurityHeaderBuilder {
         Self {
             signing_cert_pem: None,
             signing_cert_pkipath_der: None,
-            include_signature_placeholder: false,
             signature_xml: None,
+            now: crate::clock::system().now(),
+            encryption: None,
         }
+    }
+
+    /// Stamp the `wsu:Timestamp` at `now` (the session clock).
+    pub(crate) fn at(mut self, now: std::time::SystemTime) -> Self {
+        self.now = now;
+        self
     }
 
     pub fn with_signing_cert(mut self, cert_pem: Vec<u8>) -> Self {
@@ -760,7 +695,7 @@ impl WsSecurityHeaderBuilder {
     /// references this BST by `wsu:Id="X509PKIPathToken"`.
     ///
     /// Build the PKIPath bytes from a single DER certificate:
-    /// ```ignore
+    /// ```text
     /// let cert_der = signing_cert_ref.to_der()?;
     /// let pkipath = build_pkipath_der(&cert_der);
     /// builder = builder.with_signing_cert_pkipath_der(pkipath);
@@ -770,80 +705,101 @@ impl WsSecurityHeaderBuilder {
         self
     }
 
-    pub fn with_signature_placeholder(mut self, enabled: bool) -> Self {
-        self.include_signature_placeholder = enabled;
-        self
-    }
-
+    /// The `ds:Signature` element to place in the header. It must be one
+    /// well-formed element (it is parsed with the envelope limits and inserted
+    /// as that element).
     pub fn with_signature_xml(mut self, signature_xml: impl Into<String>) -> Self {
         self.signature_xml = Some(signature_xml.into());
         self
     }
 
-    /// Build WS-Security header XML.
-    /// Includes a `wsu:Timestamp` (5-minute window) as required by WS-Security 1.1.1 and
-    /// the eDelivery AS4 profile.
+    /// Build WS-Security header XML: a standalone `wsse:Security` element that
+    /// declares the namespaces it uses.
+    /// Includes a `wsu:Timestamp` with a 5-minute window. WS-Security 1.1.1 §10
+    /// makes the element optional; it is emitted so a receiver can bound the
+    /// message lifetime, and inbound timestamps are validated when present.
     pub fn build(self) -> Result<Vec<u8>> {
-        let now = std::time::SystemTime::now();
+        Ok(self.build_fragment()?.into_string().into_bytes())
+    }
+
+    /// [`Self::build`] as a writer fragment, for a writer slot.
+    pub(crate) fn build_fragment(self) -> Result<XmlFragment> {
+        let now = self.now;
         let created = crate::time_utils::format_rfc3339_secs(now);
         let expires =
             crate::time_utils::format_rfc3339_secs(now + std::time::Duration::from_secs(300));
 
-        let mut xml = String::new();
+        let mut out = XmlOut::new();
+        out.start("wsse:Security")?
+            .ns("wsse", ns::WSSE)?
+            .ns("wsu", ns::WSU)?
+            .ns("soap", ns::SOAP12)?
+            .attr("soap:mustUnderstand", "true", "soap:mustUnderstand")?;
 
-        xml.push_str("    <wsse:Security soap:mustUnderstand=\"true\" xmlns:soap=\"http://www.w3.org/2003/05/soap-envelope\">\n");
+        out.start("wsu:Timestamp")?
+            .attr("wsu:Id", "Timestamp", "wsu:Id")?;
+        out.leaf("wsu:Created", &created, "wsu:Created")?;
+        out.leaf("wsu:Expires", &expires, "wsu:Expires")?;
+        out.end()?;
 
-        // wsu:Timestamp is REQUIRED by WS-Security 1.1.1 and eDelivery AS4 v1.15 §5.1.7
-        xml.push_str(&format!(
-            "      <wsu:Timestamp wsu:Id=\"Timestamp\">\n        <wsu:Created>{created}</wsu:Created>\n        <wsu:Expires>{expires}</wsu:Expires>\n      </wsu:Timestamp>\n"
-        ));
+        if let Some(encryption) = &self.encryption {
+            out.fragment(encryption)?;
+        }
 
         if let Some(cert_pem) = self.signing_cert_pem {
-            // The BST carries base64(DER). Encoding the PEM text instead
-            // produces a token no consumer can parse — invisible while KeyInfo
-            // embedded the certificate inline, and an immediate
-            // UNSUPPORTED_SECURITY_TOKEN once KeyInfo references the BST.
+            // The BST carries base64(DER), never base64(PEM).
             let cert_der = openssl::x509::X509::from_pem(&cert_pem)
                 .and_then(|cert| cert.to_der())
                 .map_err(|err| {
-                    crate::core::AsxError::new(
-                        crate::core::ErrorCode::ParseFailed,
+                    AsxError::new(
+                        ErrorCode::ParseFailed,
                         format!("signing certificate PEM could not be converted to DER: {err}"),
-                        crate::core::ErrorContext::new("wssec_header_builder"),
+                        ErrorContext::new("wssec_header_builder"),
                     )
                 })?;
-            xml.push_str("      <wsse:BinarySecurityToken wsu:Id=\"X509Token\" EncodingType=\"http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-soap-message-security-1.0#Base64Binary\" ValueType=\"http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-x509-token-profile-1.0#X509v3\">\n");
-            xml.push_str("        ");
-            xml.push_str(&STANDARD.encode(cert_der));
-            xml.push('\n');
-            xml.push_str("      </wsse:BinarySecurityToken>\n");
+            write_binary_security_token(
+                &mut out,
+                "X509Token",
+                ns::WSSE_X509V3_VALUE_TYPE,
+                &cert_der,
+            )?;
         }
 
         if let Some(pkipath_der) = self.signing_cert_pkipath_der {
-            xml.push_str("      <wsse:BinarySecurityToken wsu:Id=\"X509PKIPathToken\" \
-                EncodingType=\"http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-soap-message-security-1.0#Base64Binary\" \
-                ValueType=\"http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-x509-token-profile-1.0#X509PKIPathv1\">\n");
-            xml.push_str("        ");
-            xml.push_str(&STANDARD.encode(pkipath_der));
-            xml.push('\n');
-            xml.push_str("      </wsse:BinarySecurityToken>\n");
+            write_binary_security_token(
+                &mut out,
+                "X509PKIPathToken",
+                ns::WSSE_X509_PKIPATH_VALUE_TYPE,
+                &pkipath_der,
+            )?;
         }
 
-        if let Some(signature_xml) = self.signature_xml {
-            xml.push_str(&signature_xml);
-            if !signature_xml.ends_with('\n') {
-                xml.push('\n');
-            }
-        } else if self.include_signature_placeholder {
-            xml.push_str("      <ds:Signature xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\">\n");
-            xml.push_str("        <!-- XMLDSig signature will be inserted here -->\n");
-            xml.push_str("      </ds:Signature>\n");
+        if let Some(signature_xml) = &self.signature_xml {
+            out.document_element(
+                signature_xml,
+                XmlLimits::ENVELOPE,
+                "WsSecurityHeaderBuilder signature",
+            )?;
         }
 
-        xml.push_str("    </wsse:Security>\n");
-
-        Ok(xml.into_bytes())
+        out.end()?;
+        out.finish()?.into_fragment()
     }
+}
+
+fn write_binary_security_token(
+    out: &mut XmlOut,
+    id: &str,
+    value_type: &'static str,
+    der: &[u8],
+) -> Result<()> {
+    out.start("wsse:BinarySecurityToken")?
+        .attr("wsu:Id", id, "wsu:Id")?
+        .attr("EncodingType", ns::WSSE_BASE64_ENCODING, "EncodingType")?
+        .attr("ValueType", value_type, "ValueType")?
+        .text(&STANDARD.encode(der), "BinarySecurityToken")?
+        .end()?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -869,7 +825,7 @@ mod tests {
         assert!(envelope_str.contains("sender@example.org"));
         assert!(envelope_str.contains("receiver@example.com"));
         assert!(envelope_str.contains("conv-456"));
-        assert!(envelope_str.contains("name=\"trackingIdentifier\" value=\"msg-123\""));
+        assert!(envelope_str.contains("name=\"trackingIdentifier\">msg-123</"));
         // From and To must differ
         assert_ne!(
             envelope_str.find("sender@example.org"),
@@ -941,9 +897,9 @@ mod tests {
         let envelope = builder.build().expect("build");
         let envelope_str = String::from_utf8(envelope).expect("utf8");
 
-        assert!(envelope_str.contains("name=\"originalSender\" value=\"participant-a\""));
-        assert!(envelope_str.contains("name=\"finalRecipient\" value=\"participant-b\""));
-        assert!(envelope_str.contains("name=\"trackingIdentifier\" value=\"track-789\""));
+        assert!(envelope_str.contains("name=\"originalSender\">participant-a</"));
+        assert!(envelope_str.contains("name=\"finalRecipient\">participant-b</"));
+        assert!(envelope_str.contains("name=\"trackingIdentifier\">track-789</"));
     }
 
     #[test]
@@ -975,7 +931,7 @@ mod tests {
     #[test]
     fn wssecurity_header_includes_certificate_structure_when_provided() {
         // A real certificate is required: the BST carries base64(DER), so the
-        // builder converts the PEM — garbage input is now a build error
+        // builder converts the PEM — garbage input is a build error
         // instead of a silently unparseable token.
         let rsa = openssl::rsa::Rsa::generate(2048).expect("rsa");
         let pkey = openssl::pkey::PKey::from_rsa(rsa).expect("pkey");
@@ -998,7 +954,7 @@ mod tests {
 
         let builder = WsSecurityHeaderBuilder::new()
             .with_signing_cert(cert_pem)
-            .with_signature_placeholder(true);
+            .with_signature_xml(r#"<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#"/>"#);
         let header = builder.build().expect("build");
         let header_str = String::from_utf8(header).expect("utf8");
 
@@ -1020,8 +976,7 @@ mod tests {
 mod timestamp_pinning_tests {
     use super::*;
 
-    /// `eb:Timestamp` sits inside the signed `eb:Messaging` block, and the AS4
-    /// A `build()` that read the clock itself would disagree with an earlier
+    /// `eb:Timestamp` sits inside the signed `eb:Messaging` block. A `build()` that read the clock itself would disagree with an earlier
     /// build of the same message whenever the two straddled a second, shipping
     /// an envelope that is not the one that was signed. Making the timestamp a
     /// *required input* turns that race into an error at the first build.
@@ -1059,21 +1014,23 @@ mod timestamp_pinning_tests {
         );
     }
 
-    /// The placeholder must sit outside both signed subtrees, so splicing the
-    /// security header into it cannot change `eb:Messaging` or `soap:Body` —
-    /// which is what makes one build plus a splice safe where two builds were
-    /// not.
+    /// The reserved `wsse:Security` slot sits outside both signed subtrees, so
+    /// sealing the header into it cannot change `eb:Messaging` or `soap:Body`
+    /// — which is what makes one build plus a fill safe where two builds were
+    /// not. There is no textual placeholder to search for.
     #[test]
-    fn splicing_the_security_header_leaves_the_signed_subtrees_untouched() {
-        let envelope = SoapEnvelopeBuilder::new("msg-1", "from", "to")
+    fn sealing_the_security_header_leaves_the_signed_subtrees_untouched() {
+        let unsigned = SoapEnvelopeBuilder::new("msg-1", "from", "to")
             .with_action("urn:example:action")
             .with_message_timestamp("2026-09-06T12:00:00Z")
-            .with_ws_security_placeholder()
-            .build()
+            .build_with_security_slot()
             .expect("build");
-        let envelope = String::from_utf8(envelope).expect("utf8");
-
-        let spliced = splice_ws_security_header(&envelope, "<wsse:Security/>").expect("splice");
+        let before = unsigned.text().to_string();
+        assert!(!before.contains("wsse:Security"));
+        let header = WsSecurityHeaderBuilder::new()
+            .build_fragment()
+            .expect("header");
+        let sealed = unsigned.seal(header).expect("seal");
 
         let messaging = |xml: &str| {
             let start = xml.find("<ebms:Messaging").expect("messaging");
@@ -1082,34 +1039,13 @@ mod timestamp_pinning_tests {
         };
         let body = |xml: &str| {
             let start = xml.find("<soap:Body").expect("body");
-            let end = xml.find("</soap:Body>").expect("body end");
-            xml[start..end].to_string()
+            xml[start..].to_string()
         };
 
-        assert_eq!(messaging(&envelope), messaging(&spliced));
-        assert_eq!(body(&envelope), body(&spliced));
-        assert!(spliced.contains("<wsse:Security/>"));
-        assert!(!spliced.contains(WSSE_HEADER_PLACEHOLDER));
-    }
-
-    /// The splice replaces a marker in generated XML, which is only safe if a
-    /// miss is loud. Zero placeholders and two placeholders are both errors.
-    #[test]
-    fn splicing_requires_exactly_one_placeholder() {
-        let without = SoapEnvelopeBuilder::new("msg-1", "from", "to")
-            .with_action("urn:example:action")
-            .with_message_timestamp("2026-09-06T12:00:00Z")
-            .build()
-            .expect("build");
-        let without = String::from_utf8(without).expect("utf8");
-
-        let err = splice_ws_security_header(&without, "<wsse:Security/>")
-            .expect_err("no placeholder must be an error, not a no-op");
-        assert_eq!(err.code, crate::core::ErrorCode::InvalidInput);
-
-        let doubled = format!("{WSSE_HEADER_PLACEHOLDER}{WSSE_HEADER_PLACEHOLDER}");
-        splice_ws_security_header(&doubled, "<wsse:Security/>")
-            .expect_err("two placeholders are ambiguous");
+        assert_eq!(messaging(&before), messaging(&sealed));
+        assert_eq!(body(&before), body(&sealed));
+        assert!(sealed.contains("<wsse:Security"));
+        roxmltree::Document::parse(&sealed).expect("sealed envelope is well-formed");
     }
 
     /// The negative half: one second's difference changes the signed bytes,

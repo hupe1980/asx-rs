@@ -5,15 +5,13 @@
 //   sign          — XMLDSig signature generation
 //   verify        — Signature + reference verification
 //   x509          — X.509 certificate validation + PKIX chain
-//   ocsp          — OCSP / CRL revocation
 //   xmlenc        — XML Encryption (AES-128/256-GCM + RSA-OAEP)
 
-// These sub-modules depend on roxmltree / quick-xml which are as4-only deps.
+// These sub-modules depend on roxmltree, an as4-only dep.
 #[cfg(feature = "as4")]
 pub(crate) mod canonicalize;
 #[cfg(feature = "as4")]
 pub(crate) use canonicalize::swa_attachment_digest_input;
-pub(crate) mod ocsp;
 #[cfg(feature = "as4")]
 pub(crate) mod sign;
 #[cfg(feature = "as4")]
@@ -28,194 +26,68 @@ pub mod xmlenc;
 // ---------------------------------------------------------------------------
 
 #[cfg(feature = "as4")]
-pub(crate) const DS_NS: &str = "http://www.w3.org/2000/09/xmldsig#";
+pub(crate) const DS_NS: &str = crate::xml::ns::DS;
 #[cfg(feature = "as4")]
-pub(crate) const XML_NS: &str = "http://www.w3.org/XML/1998/namespace";
-pub(crate) const XML_EXC_C14N_URI: &str = "http://www.w3.org/2001/10/xml-exc-c14n#";
-/// W3C Canonical XML 1.0 (Inclusive C14N) transform algorithm URI.
-/// Used by legacy AS4 gateways (IBM DataPower default, older SAP PI/PO,
-/// some eDelivery v1.x stacks) that do not support Exclusive C14N.
-pub(crate) const XML_INC_C14N_URI: &str = "http://www.w3.org/TR/2001/REC-xml-c14n-20010315";
-pub(crate) const SHA256_URI: &str = "http://www.w3.org/2001/04/xmlenc#sha256";
-pub(crate) const SHA384_URI: &str = "http://www.w3.org/2001/04/xmldsig-more#sha384";
-pub(crate) const SHA512_URI: &str = "http://www.w3.org/2001/04/xmlenc#sha512";
-pub(crate) const RSA_SHA256_URI: &str = "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256";
-pub(crate) const RSA_SHA384_URI: &str = "http://www.w3.org/2001/04/xmldsig-more#rsa-sha384";
-pub(crate) const RSA_SHA512_URI: &str = "http://www.w3.org/2001/04/xmldsig-more#rsa-sha512";
-pub(crate) const ECDSA_SHA256_URI: &str = "http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha256";
-pub(crate) const ECDSA_SHA384_URI: &str = "http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha384";
-pub(crate) const ECDSA_SHA512_URI: &str = "http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha512";
-/// WSS SOAP-with-Attachments profile 1.1: digest covers the attachment
-/// **content octets** only. Mandated by the AS4 profile for `cid:` payload
-/// references; emitted by asx on sign and accepted on verify.
-#[cfg(feature = "as4")]
-pub(crate) const SWA_ATTACHMENT_CONTENT_TRANSFORM_URI: &str = "http://docs.oasis-open.org/wss/oasis-wss-SwAProfile-1.1#Attachment-Content-Signature-Transform";
-
+pub(crate) const XML_NS: &str = crate::xml::ns::XML;
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
 
-use crate::core::{OcspFailureMode, OcspMode};
 use serde::{Deserialize, Serialize};
 
+/// The trust material a signature's certification path is validated
+/// against (offline PKIX: no CRL, no OCSP, nothing fetched). Revocation is
+/// the caller's, after the signature and the sender rule
+/// (`crate::revocation`).
 #[derive(Clone, Default)]
-pub struct RevocationPolicy<'a> {
+pub struct ChainPolicy<'a> {
     pub trust_anchor_pems: &'a [String],
-    pub revocation_crl_pems: &'a [String],
-    pub ocsp_mode: OcspMode,
-    pub ocsp_failure_mode: OcspFailureMode,
-    pub stapled_ocsp_responses_der: &'a [Vec<u8>],
-    pub responder_ocsp_responses_der: &'a [Vec<u8>],
-    /// Namespace used to scope OCSP responder cache entries (e.g. tenant,
-    /// partner, or session domain) to reduce cross-tenant cache coupling.
-    pub ocsp_cache_namespace: &'a str,
     /// When `true`, PKIX chain validation is always performed and fails if
-    /// `trust_anchor_pems` is empty (fail-closed).  When `false`, chain
-    /// validation is skipped entirely and should only be used in controlled
-    /// test harnesses.
+    /// `trust_anchor_pems` is empty (fail-closed). When `false`, chain
+    /// validation is skipped entirely (vector suites only).
     pub require_chain_validation: bool,
-    /// Pre-parsed trust-anchor X.509 certificates.  When `Some`, these are
-    /// used directly instead of re-parsing `trust_anchor_pems` on every
-    /// verification call.  Obtain via `CertHandle::trust_anchors_x509`,
-    /// which caches the result via an internal `OnceLock`.
+    /// Pre-parsed trust-anchor X.509 certificates; when `Some`, used instead
+    /// of re-parsing `trust_anchor_pems` on every call.
     pub pre_parsed_trust_anchors: Option<Vec<openssl::x509::X509>>,
-    /// Pre-built `X509Store` derived from `trust_anchor_pems`.  When `Some`,
-    /// the verification pipeline uses this directly instead of constructing a
-    /// new store on every call.  Obtain via `CertHandle::trust_anchor_x509_store`,
-    /// which caches the result across all clones of the same `CertHandle`.
+    /// A pre-built `X509Store` of the anchors (cached per session).
     pub pre_built_x509_store: Option<std::sync::Arc<openssl::x509::store::X509Store>>,
 }
 
-impl std::fmt::Debug for RevocationPolicy<'_> {
+impl std::fmt::Debug for ChainPolicy<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RevocationPolicy")
+        f.debug_struct("ChainPolicy")
             .field("require_chain_validation", &self.require_chain_validation)
-            .field("ocsp_mode", &self.ocsp_mode)
-            .field("ocsp_failure_mode", &self.ocsp_failure_mode)
+            .field("trust_anchors", &self.trust_anchor_pems.len())
             .field(
                 "pre_parsed_trust_anchors",
                 &self.pre_parsed_trust_anchors.as_ref().map(|v| v.len()),
             )
             .field("pre_built_x509_store", &self.pre_built_x509_store.is_some())
-            .finish_non_exhaustive()
+            .finish()
     }
 }
 
-/// Owned counterpart to [`RevocationPolicy`] for configurations that must
-/// outlive a single call scope or be stored in a `struct` without lifetime
-/// annotation friction.
-///
-/// Convert to [`RevocationPolicy`] via the `From<&'_ OwnedRevocationPolicy>`
-/// implementation, which borrows all fields from `self`.
-///
-/// # Example
-/// ```rust
-/// # use asx_rs::crypto::wssec::{OwnedRevocationPolicy, RevocationPolicy};
-/// # use asx_rs::core::{OcspMode, OcspFailureMode};
-/// let owned = OwnedRevocationPolicy {
-///     trust_anchor_pems: vec![],
-///     revocation_crl_pems: vec![],
-///     ocsp_mode: OcspMode::Disabled,
-///     ocsp_failure_mode: OcspFailureMode::SoftFail,
-///     stapled_ocsp_responses_der: vec![],
-///     responder_ocsp_responses_der: vec![],
-///     ocsp_cache_namespace: "my-tenant".to_string(),
-///     require_chain_validation: false,
-/// };
-/// let policy: RevocationPolicy<'_> = RevocationPolicy::from(&owned);
-/// let _ = policy;
-/// ```
-///
-/// # ⚠ Security
-/// Setting `require_chain_validation: false` disables PKIX chain building.
-/// Any signer certificate will be accepted regardless of its trust chain.
-/// This setting is intended **only** for local integration tests with
-/// synthetic certificates.  Production deployments **must** supply at least
-/// one trust-anchor PEM and set `require_chain_validation: true`.
+/// Owned counterpart to [`ChainPolicy`]; borrow it with `From`.
 #[derive(Debug, Clone)]
-pub struct OwnedRevocationPolicy {
+pub struct OwnedChainPolicy {
     pub trust_anchor_pems: Vec<String>,
-    pub revocation_crl_pems: Vec<String>,
-    pub ocsp_mode: OcspMode,
-    pub ocsp_failure_mode: OcspFailureMode,
-    pub stapled_ocsp_responses_der: Vec<Vec<u8>>,
-    pub responder_ocsp_responses_der: Vec<Vec<u8>>,
-    pub ocsp_cache_namespace: String,
     pub require_chain_validation: bool,
 }
 
-impl OwnedRevocationPolicy {
-    /// Create a production-safe revocation policy with the supplied trust
-    /// anchors, OCSP enabled in responder-only mode, and PKIX chain validation
-    /// **required** (`require_chain_validation = true`).
-    ///
-    /// Use this constructor in all production deployments.  Adjust individual
-    /// fields via struct-update syntax if needed:
-    ///
-    /// ```rust,ignore
-    /// let policy = OwnedRevocationPolicy::production(vec![ca_pem])
-    ///     .with_ocsp_mode(OcspMode::Required);
-    /// ```
+impl OwnedChainPolicy {
+    /// The supplied anchors, PKIX chain validation required.
     pub fn production(trust_anchor_pems: Vec<String>) -> Self {
         Self {
             trust_anchor_pems,
-            revocation_crl_pems: Vec::new(),
-            ocsp_mode: OcspMode::ResponderOnly,
-            ocsp_failure_mode: OcspFailureMode::SoftFail,
-            stapled_ocsp_responses_der: Vec::new(),
-            responder_ocsp_responses_der: Vec::new(),
-            ocsp_cache_namespace: String::new(),
             require_chain_validation: true,
         }
     }
-
-    /// Create a revocation policy with **PKIX chain validation disabled**.
-    ///
-    /// # ⚠ Security: Testing and local integration only
-    ///
-    /// With this policy **any** signer certificate is accepted regardless of
-    /// its trust chain.  This is intentionally named to be obviously unsafe so
-    /// it stands out during code review.
-    ///
-    /// **Never use this in production binaries.**  Supply at least one trust
-    /// anchor PEM and use [`production`](Self::production) instead.
-    pub fn test_unsafe_no_chain_validation() -> Self {
-        Self {
-            trust_anchor_pems: Vec::new(),
-            revocation_crl_pems: Vec::new(),
-            ocsp_mode: OcspMode::Disabled,
-            ocsp_failure_mode: OcspFailureMode::SoftFail,
-            stapled_ocsp_responses_der: Vec::new(),
-            responder_ocsp_responses_der: Vec::new(),
-            ocsp_cache_namespace: String::new(),
-            require_chain_validation: false,
-        }
-    }
-
-    /// Override the OCSP mode, returning `self` for chaining.
-    pub fn with_ocsp_mode(mut self, mode: OcspMode) -> Self {
-        self.ocsp_mode = mode;
-        self
-    }
-
-    /// Override the cache namespace (e.g. tenant or partner identifier),
-    /// returning `self` for chaining.
-    pub fn with_cache_namespace(mut self, namespace: impl Into<String>) -> Self {
-        self.ocsp_cache_namespace = namespace.into();
-        self
-    }
 }
 
-impl<'a> From<&'a OwnedRevocationPolicy> for RevocationPolicy<'a> {
-    fn from(owned: &'a OwnedRevocationPolicy) -> Self {
+impl<'a> From<&'a OwnedChainPolicy> for ChainPolicy<'a> {
+    fn from(owned: &'a OwnedChainPolicy) -> Self {
         Self {
             trust_anchor_pems: &owned.trust_anchor_pems,
-            revocation_crl_pems: &owned.revocation_crl_pems,
-            ocsp_mode: owned.ocsp_mode,
-            ocsp_failure_mode: owned.ocsp_failure_mode,
-            stapled_ocsp_responses_der: &owned.stapled_ocsp_responses_der,
-            responder_ocsp_responses_der: &owned.responder_ocsp_responses_der,
-            ocsp_cache_namespace: &owned.ocsp_cache_namespace,
             require_chain_validation: owned.require_chain_validation,
             pre_parsed_trust_anchors: None,
             pre_built_x509_store: None,
@@ -253,20 +125,8 @@ pub enum WsSecOutboundKeyInfoProfile {
     X509PKIPathv1,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[non_exhaustive]
-pub enum WsSecCanonicalizationKind {
-    /// W3C Exclusive XML Canonicalization (Exc-C14N, RFC 3741).
-    /// Only visibly-utilized namespace declarations are rendered.
-    /// Required by WS-Security 1.0 and all modern AS4 profiles.
-    #[default]
-    Exclusive,
-    /// W3C Canonical XML 1.0 (Inclusive C14N).
-    /// ALL in-scope namespace declarations are rendered, regardless of
-    /// whether they are visibly utilized at the element.  Used by some
-    /// legacy AS4 gateways (IBM DataPower ≤ v7.5, SAP PI/PO ≤ 7.31).
-    Inclusive,
-}
+/// Defined in the algorithm registry (`crypto::alg`).
+pub use crate::crypto::alg::{WsSecCanonicalizationKind, WsSecDigestMethod};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WsSecCanonicalizationProfile {
@@ -295,10 +155,7 @@ impl Default for WsSecCanonicalizationProfile {
 impl WsSecCanonicalizationProfile {
     /// Returns the W3C transform algorithm URI for this profile's C14N kind.
     pub fn algorithm_uri(&self) -> &'static str {
-        match self.kind {
-            WsSecCanonicalizationKind::Exclusive => XML_EXC_C14N_URI,
-            WsSecCanonicalizationKind::Inclusive => XML_INC_C14N_URI,
-        }
+        self.kind.uri()
     }
 
     /// Construct a profile for Inclusive C14N.
@@ -307,55 +164,6 @@ impl WsSecCanonicalizationProfile {
             kind: WsSecCanonicalizationKind::Inclusive,
             include_comments: false,
             inclusive_ns_prefixes: Vec::new(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum WsSecDigestMethod {
-    Sha256,
-    /// SHA-384 reference digest — rare but accepted by some regulated-sector
-    /// gateways (e.g. BDEW, financial-sector AS4 variants).  Not required by
-    /// PEPPOL or CEF eDelivery; supported for broad inbound interoperability.
-    Sha384,
-    /// SHA-512 reference digest — uncommon but present in some IBM DataPower
-    /// and Axway configurations.  Supported for inbound decryption/verification.
-    Sha512,
-}
-
-impl WsSecDigestMethod {
-    pub fn from_algorithm_uri(uri: &str) -> crate::core::Result<Self> {
-        match uri {
-            SHA256_URI => Ok(Self::Sha256),
-            SHA384_URI => Ok(Self::Sha384),
-            SHA512_URI => Ok(Self::Sha512),
-            _ => Err(crate::core::AsxError::new(
-                crate::core::ErrorCode::InteropViolation,
-                format!(
-                    "unsupported digest algorithm URI: {uri} (supported: sha256, sha384, sha512)"
-                ),
-                crate::core::ErrorContext::new("wssec_digest_method"),
-            )),
-        }
-    }
-
-    /// Returns the canonical algorithm URI for this digest method.
-    pub fn algorithm_uri(self) -> &'static str {
-        match self {
-            Self::Sha256 => SHA256_URI,
-            Self::Sha384 => SHA384_URI,
-            Self::Sha512 => SHA512_URI,
-        }
-    }
-
-    /// Output byte length for this digest method.
-    #[cfg(feature = "as4")]
-    pub(crate) fn output_len(self) -> usize {
-        match self {
-            Self::Sha256 => 32,
-            Self::Sha384 => 48,
-            Self::Sha512 => 64,
         }
     }
 }
@@ -402,10 +210,7 @@ pub(crate) struct WsSecSignatureMaterial {
 // ---------------------------------------------------------------------------
 
 #[cfg(feature = "as4")]
-pub use xmlenc::{
-    XmlEncPayloadAlgorithm, decrypt_payload_xmlenc, encrypt_payload_xmlenc,
-    encrypt_payload_xmlenc_preparsed, encrypt_soap_header_xmlenc_preparsed,
-};
+pub use xmlenc::{XmlEncPayloadAlgorithm, decrypt_swa, encrypt_swa};
 
 #[cfg(feature = "as4")]
 pub use canonicalize::{
@@ -413,7 +218,6 @@ pub use canonicalize::{
     canonicalize_reference, canonicalize_reference_digest_from_doc_with_inclusive_ns_and_index,
     canonicalize_reference_from_doc, canonicalize_reference_from_doc_with_inclusive_ns,
 };
-pub use ocsp::CertOcspOutcome;
 #[cfg(feature = "as4")]
 pub use sign::{
     generate_xmlsig_signature, generate_xmlsig_signature_with_external_references,
@@ -425,7 +229,7 @@ pub use verify::{
     parse_signature_references, verify_enveloped_document_signature, verify_enveloped_signature,
     verify_signature_references_strict,
 };
-pub use x509::validate_certificate_chain as validate_certificate_chain_with_revocation_vectors;
+pub use x509::validate_certificate_chain;
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -434,6 +238,7 @@ pub use x509::validate_certificate_chain as validate_certificate_chain_with_revo
 #[cfg(all(test, feature = "as4"))]
 mod tests {
     use super::*;
+    use crate::crypto::signing::SignatureAlgorithm;
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
     use openssl::asn1::Asn1Time;
@@ -524,7 +329,7 @@ mod tests {
     ///
     /// A same-document reference must state the exclusive algorithm, because
     /// XMLDSig §4.3.3.2 makes *inclusive* C14N the default for one that states
-    /// nothing (D2). A `cid:` reference dereferences to an octet stream and
+    /// nothing. A `cid:` reference dereferences to an octet stream and
     /// correctly carries no C14N transform at all.
     fn reference_transforms(reference_uri: &str) -> &'static str {
         if reference_uri.starts_with("cid:") {
@@ -544,6 +349,8 @@ mod tests {
         modulus_base64: &str,
         exponent_base64: &str,
     ) -> String {
+        let rsa_sha256_uri = SignatureAlgorithm::RsaSha256.algorithm_uri();
+        let sha256_uri = WsSecDigestMethod::Sha256.algorithm_uri();
         let transforms = reference_transforms(reference_uri);
         format!(
             r#"<soap:Envelope xmlns:soap="http://www.w3.org/2003/05/soap-envelope"
@@ -551,12 +358,13 @@ mod tests {
         xmlns:ds="http://www.w3.org/2000/09/xmldsig#"
         xmlns:eb="urn:example:eb">
     <soap:Header>
+        <wsse:Security xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd">
         <ds:Signature>
             <ds:SignedInfo>
                 <ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>
-                <ds:SignatureMethod Algorithm="{RSA_SHA256_URI}"/>
+                <ds:SignatureMethod Algorithm="{rsa_sha256_uri}"/>
                 <ds:Reference URI="{reference_uri}">{transforms}
-                    <ds:DigestMethod Algorithm="{SHA256_URI}"/>
+                    <ds:DigestMethod Algorithm="{sha256_uri}"/>
                     <ds:DigestValue>{digest_base64}</ds:DigestValue>
                 </ds:Reference>
             </ds:SignedInfo>
@@ -570,6 +378,7 @@ mod tests {
                 </ds:KeyValue>
             </ds:KeyInfo>
         </ds:Signature>
+        </wsse:Security>
     </soap:Header>
     <soap:Body>
 {payload_xml}
@@ -587,6 +396,8 @@ mod tests {
         exponent_base64: &str,
         x509_certificate_base64: &str,
     ) -> String {
+        let rsa_sha256_uri = SignatureAlgorithm::RsaSha256.algorithm_uri();
+        let sha256_uri = WsSecDigestMethod::Sha256.algorithm_uri();
         let transforms = reference_transforms(reference_uri);
         format!(
             r#"<soap:Envelope xmlns:soap="http://www.w3.org/2003/05/soap-envelope"
@@ -594,12 +405,13 @@ mod tests {
         xmlns:ds="http://www.w3.org/2000/09/xmldsig#"
         xmlns:eb="urn:example:eb">
     <soap:Header>
+        <wsse:Security xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd">
         <ds:Signature>
             <ds:SignedInfo>
                 <ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>
-                <ds:SignatureMethod Algorithm="{RSA_SHA256_URI}"/>
+                <ds:SignatureMethod Algorithm="{rsa_sha256_uri}"/>
                 <ds:Reference URI="{reference_uri}">{transforms}
-                    <ds:DigestMethod Algorithm="{SHA256_URI}"/>
+                    <ds:DigestMethod Algorithm="{sha256_uri}"/>
                     <ds:DigestValue>{digest_base64}</ds:DigestValue>
                 </ds:Reference>
             </ds:SignedInfo>
@@ -616,6 +428,7 @@ mod tests {
                 </ds:X509Data>
             </ds:KeyInfo>
         </ds:Signature>
+        </wsse:Security>
     </soap:Header>
     <soap:Body>
 {payload_xml}
@@ -631,6 +444,8 @@ mod tests {
         signature_value_base64: &str,
         x509_certificate_base64: &str,
     ) -> String {
+        let rsa_sha256_uri = SignatureAlgorithm::RsaSha256.algorithm_uri();
+        let sha256_uri = WsSecDigestMethod::Sha256.algorithm_uri();
         let transforms = reference_transforms(reference_uri);
         format!(
             r#"<soap:Envelope xmlns:soap="http://www.w3.org/2003/05/soap-envelope"
@@ -638,12 +453,13 @@ mod tests {
         xmlns:ds="http://www.w3.org/2000/09/xmldsig#"
         xmlns:eb="urn:example:eb">
     <soap:Header>
+        <wsse:Security xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd">
         <ds:Signature>
             <ds:SignedInfo>
                 <ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>
-                <ds:SignatureMethod Algorithm="{RSA_SHA256_URI}"/>
+                <ds:SignatureMethod Algorithm="{rsa_sha256_uri}"/>
                 <ds:Reference URI="{reference_uri}">{transforms}
-                    <ds:DigestMethod Algorithm="{SHA256_URI}"/>
+                    <ds:DigestMethod Algorithm="{sha256_uri}"/>
                     <ds:DigestValue>{digest_base64}</ds:DigestValue>
                 </ds:Reference>
             </ds:SignedInfo>
@@ -654,6 +470,7 @@ mod tests {
                 </ds:X509Data>
             </ds:KeyInfo>
         </ds:Signature>
+        </wsse:Security>
     </soap:Header>
     <soap:Body>
 {payload_xml}
@@ -1066,44 +883,6 @@ mod tests {
             "error must name the cause: {}",
             err.message
         );
-    }
-
-    #[test]
-    fn xmlenc_encrypt_decrypt_roundtrip() {
-        let rsa = openssl::rsa::Rsa::generate(2048).expect("rsa");
-        let pkey = PKey::from_rsa(rsa).expect("pkey");
-
-        let mut name = openssl::x509::X509NameBuilder::new().expect("name builder");
-        name.append_entry_by_nid(openssl::nid::Nid::COMMONNAME, "asx-xmlenc-test")
-            .expect("cn");
-        let name = name.build();
-
-        let mut cert_builder = X509::builder().expect("x509 builder");
-        cert_builder.set_version(2).expect("version");
-        let mut serial = openssl::bn::BigNum::new().expect("serial");
-        serial
-            .pseudo_rand(64, openssl::bn::MsbOption::MAYBE_ZERO, false)
-            .expect("serial rand");
-        let serial = serial.to_asn1_integer().expect("serial asn1");
-        cert_builder.set_serial_number(&serial).expect("serial");
-        cert_builder.set_subject_name(&name).expect("subject");
-        cert_builder.set_issuer_name(&name).expect("issuer");
-        cert_builder.set_pubkey(&pkey).expect("pubkey");
-        let not_before = Asn1Time::days_from_now(0).expect("not_before");
-        let not_after = Asn1Time::days_from_now(365).expect("not_after");
-        cert_builder.set_not_before(&not_before).expect("nb");
-        cert_builder.set_not_after(&not_after).expect("na");
-        cert_builder
-            .sign(&pkey, MessageDigest::sha256())
-            .expect("cert sign");
-        let cert_pem = cert_builder.build().to_pem().expect("cert pem");
-        let key_pem = pkey.private_key_to_pem_pkcs8().expect("key pem");
-
-        let ciphertext =
-            encrypt_payload_xmlenc(b"payload", &cert_pem, XmlEncPayloadAlgorithm::Aes128Gcm)
-                .expect("encrypt");
-        let plaintext = decrypt_payload_xmlenc(&ciphertext, &key_pem).expect("decrypt");
-        assert_eq!(plaintext, b"payload");
     }
 
     #[test]

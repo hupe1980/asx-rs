@@ -4,12 +4,12 @@
 <section class="hero">
   <div class="wrap">
     <p class="eyebrow">AS2 &amp; AS4 · ebMS3 · Rust</p>
-    <h1>AS2 and AS4 messaging for Rust that fails closed by default.</h1>
+    <h1>AS2 and AS4 messaging for Rust, strict by default.</h1>
     <p class="lede">
-      <strong>asx-rs</strong> is an async-native Rust library for the AS2 (RFC 4130) and
-      AS4 (OASIS ebMS3 / eDelivery) protocols. S/MIME and WS-Security, MDN and
-      cryptographically verified receipts — as an embeddable crate, not a gateway
-      you have to operate.
+      <strong>asx-rs</strong> is an async Rust library for AS2 (RFC 4130) and
+      AS4 (OASIS ebMS3 / eDelivery). Pick a network profile — BDEW, Peppol, eDelivery, ENTSOG or AS2 —
+      and the client signs, encrypts and verifies as that network requires.
+      A crate you embed, not a gateway you operate.
     </p>
 
     <div class="cta">
@@ -18,37 +18,36 @@
     </div>
 
     <div class="install">
-      <code>cargo add asx-rs --features as4,client,server</code>
+      <code>cargo add asx-rs</code>
     </div>
   </div>
 </section>
 
 <section class="wrap section">
-  <h2>Why another AS2/AS4 stack?</h2>
+  <h2>Design</h2>
   <div class="grid grid-3">
     <article class="card">
-      <h3>The type system enforces trust</h3>
+      <h3>A profile, not knobs</h3>
       <p>
-        Payloads move through <code>UntrustedBytes → StructurallyParsed →
-        CryptographicallyVerified → ContentDecrypted → DomainReady</code>. Application
-        code cannot receive bytes that skipped a gate, because the state that would
-        let it does not exist.
+        <code>Profile::bdew()</code>, <code>peppol()</code>, <code>edelivery_1_15()</code>,
+        <code>entsog()</code> and <code>as2()</code> fix every algorithm, token form and
+        header rule. Nothing loosens a profile; misconfiguration is refused at
+        <code>build()</code>.
       </p>
     </article>
     <article class="card">
-      <h3>Insecure configurations are unreachable</h3>
+      <h3>Verification is a type</h3>
       <p>
-        Signatures are required, pull is denied, SMP results are not trusted, and
-        encrypted-spool profiles refuse to run without a key — until you say
-        otherwise. There is no unsafe setting you reach by forgetting a field.
+        <code>send</code> returns <code>Verified&lt;Receipt&gt;</code>, and your inbound
+        handler receives <code>Verified&lt;UserMessage&gt;</code>. Only the library
+        constructs one, so nothing unchecked reaches your code.
       </p>
     </article>
     <article class="card">
       <h3>A library, not a platform</h3>
       <p>
-        No container, no database requirement, no JVM. Dedup, reconciliation, audit
-        sinks and key management are traits you implement against your own
-        infrastructure.
+        No container, database or JVM. Deduplication, the audit trail, HTTP and
+        private keys (HSM/KMS) are traits; the testkit checks your implementation.
       </p>
     </article>
   </div>
@@ -61,111 +60,96 @@
       <h3>AS2 — RFC 4130</h3>
       <ul>
         <li>CMS/S/MIME signing and encryption (RSA, ECDSA)</li>
-        <li>Synchronous and asynchronous MDN</li>
-        <li>RFC 4130 §7.3.1 MIC over the signed MIME entity</li>
-        <li>RFC 5402 compression as CMS <code>CompressedData</code></li>
-        <li>Streaming receive with a bounded, encrypted spool</li>
+        <li>Signed MDN with the MIC verified, synchronous or asynchronous</li>
+        <li>Duplicate detection on receive</li>
+        <li>RFC 5402 compression accepted on receive</li>
       </ul>
-      <a class="more" href="{{ get_url(path='@/docs/as2.md') | safe }}">AS2 reference →</a>
+      <a class="more" href="{{ get_url(path='@/docs/as2.md') | safe }}">AS2 guide →</a>
     </article>
     <article class="card">
       <h3>AS4 — OASIS ebMS3</h3>
       <ul>
-        <li>WS-Security XMLDSig with XML Signature Wrapping defences</li>
-        <li>XML Encryption: AES-GCM, RSA-OAEP, ECDH-ES</li>
-        <li>Verified receipts with Non-Repudiation Information</li>
-        <li>One-Way/Push and One-Way/Pull with MPC authorization</li>
-        <li>Large-message splitting and joining</li>
-            <li>Peppol/CEF dynamic discovery (BDXL, SMP)</li>
+        <li>WS-Security signatures with XML Signature Wrapping defences; ECDSA as XMLDSig 1.1 <code>r ‖ s</code></li>
+        <li>WSS SwA encryption: RSA-OAEP or ECDH-ES + ConcatKDF, AES-GCM</li>
+        <li>Signed receipts verified as non-repudiation evidence</li>
+        <li>One-Way/Push, the ebMS3 test service, the BDEW path switch</li>
+        <li>Peppol dynamic discovery (BDXL, SMP)</li>
       </ul>
-      <a class="more" href="{{ get_url(path='@/docs/as4.md') | safe }}">AS4 reference →</a>
+      <a class="more" href="{{ get_url(path='@/docs/as4.md') | safe }}">AS4 guide →</a>
     </article>
   </div>
 </section>
 
 <section class="wrap section">
-  <h2>Send a signed AS4 message</h2>
-  <pre><code class="language-rust">use asx_rs::as4::{send_async, As4ReceiptPolicy, As4SendPolicyBuilder, As4SendRequest};
-use asx_rs::transport::egress::{As4HttpTransport, TransportConfig};
+  <h2>Send a BDEW AS4 message</h2>
+  <pre><code class="language-rust">use asx::{as4::{As4, Message}, Certificate, KeyPair, LocalParty, Partner, Payload, Profile};
 
-let (policy, credentials) = As4SendPolicyBuilder::new()
-    .action("urn:example:action")
-    .service("urn:example:service", "")
-    .signing_cert_pem(cert)
-    .signing_key_pem(key)
-    .build()?;
-
-let sent = send_async(&amp;session, &amp;bus, As4SendRequest {
-    message_id: message_id.clone(),
-    payload,
-    policy,
-    credentials: Some(credentials),
-    payload_filename: None,
-}).await?;
-
-// Send, then verify the counterparty's receipt — signature and
-// non-repudiation digests — in one call.
-let outcome = As4HttpTransport::new(TransportConfig::default())?
-    .send_and_verify(&amp;url, &amp;session, &amp;bus, &amp;sent, &amp;As4ReceiptPolicy::regulated())
-    .await?;</code></pre>
+async fn send(partner: Partner, sig: KeyPair, enc: KeyPair, root: Certificate, edi: Vec&lt;u8&gt;) -&gt; asx::Result&lt;()&gt; {
+    let as4 = As4::builder(Profile::bdew())
+        .local(LocalParty::new("9900000000001")
+            .party_type("urn:oasis:names:tc:ebcore:partyid-type:unregistered:BDEW")
+            .signer(sig)
+            .decrypter(enc))
+        .trust_anchor(root)
+        .partner(partner.clone())
+        .build()?;
+    let receipt = as4
+        .send(Message::to(&amp;partner)
+            .service("https://www.bdew.de/as4/communication/services/MP")
+            .payload(Payload::new(edi, "application/octet-stream")))
+        .await?;
+    println!("delivered, receipt record {}", receipt.evidence().record_id());
+    Ok(())
+}</code></pre>
   <p class="note">
-    A receipt is only evidence of delivery once its signature and digests are checked
-    against the message you sent. <code>send_and_verify</code> does both, so that step
-    cannot be skipped by accident.
+    <code>send</code> returns only a receipt signed by the partner's pinned
+    certificate that echoes the digests of what you sent. Full program:
+    <a href="{{ config.extra.repo }}/blob/main/examples/as4_send.rs" rel="noopener">examples/as4_send.rs</a>.
   </p>
 </section>
 
 <section class="wrap section" id="faq">
-  <h2>Questions people arrive with</h2>
+  <h2>FAQ</h2>
   <div class="faq">
     <details>
       <summary>Is this a gateway I have to run?</summary>
       <p>
-        No. It is a crate you link into a service you already run. There is no
-        container, no database requirement and no JVM. Dedup, reconciliation,
-        audit sinks and key management are traits you implement against your own
-        infrastructure — and a
+        No. It is a crate you link into your own service. Deduplication, the
+        audit sink and keys are traits you implement; a
         <a href="{{ get_url(path='@/docs/persistence.md') | safe }}">conformance suite</a>
-        ships so your backend can demonstrate durability rather than declare it.
+        tests your backend.
       </p>
     </details>
     <details>
       <summary>Which networks use AS4?</summary>
       <p>
-        Peppol (e-invoicing across some 40 countries), CEF eDelivery (EU sector
-        networks such as customs and e-Justice), the German energy market's BDEW
-        MaKo profile — where AS4 has been mandatory for electricity since April
-        2024 and gas since April 2025 — and ENTSOG for gas transmission. Each is
-        a different profile of the same protocol; see
-        <a href="{{ get_url(path='@/docs/interop.md') | safe }}">interoperability</a>.
+        Peppol (e-invoicing), eDelivery (EU sector networks), the German energy
+        market (BDEW; mandatory for electricity and gas) and ENTSOG (gas
+        transmission). Each is a preset; see
+        <a href="{{ get_url(path='@/docs/profiles.md') | safe }}">profiles</a>.
       </p>
     </details>
     <details>
       <summary>Does it do AS2 as well?</summary>
       <p>
-        Yes — RFC 4130 in full: S/MIME signing and encryption, RFC 5402 CMS
-        compression, synchronous and asynchronous MDN, and the MIC computed over
-        exactly the octets RFC 4130 §7.3.1 specifies. AS2 remains the backbone of
-        North American retail and logistics EDI and is not going anywhere.
+        Yes — RFC 4130: S/MIME signing and encryption, signed MDNs (synchronous,
+        or asynchronous on send), duplicate detection.
       </p>
     </details>
     <details>
       <summary>Is it conformance-certified?</summary>
       <p>
-        Not yet, and the <a href="{{ get_url(path='@/docs/conformance.md') | safe }}">conformance page</a>
-        says exactly what is missing: a runnable access point and a SUT
-        Controller, neither of which is a library concern. What does exist is
-        continuous third-party evidence — every signature is checked against
-        xmlsec1, AS2 against the <code>openssl</code> CLI, and a full signed
-        exchange against Holodeck B2B in a container.
+        No. It is tested against independent implementations — phase4 (BDEW,
+        both directions), xmlsec1, the <code>openssl</code> CLI and Holodeck B2B;
+        see the <a href="{{ get_url(path='@/docs/conformance.md') | safe }}">conformance page</a>.
       </p>
     </details>
     <details>
       <summary>What does it need to build?</summary>
       <p>
-        Rust 1.88 or newer and a working OpenSSL. <code>as2</code> and
-        <code>as4</code> are not default features — enable the protocols you
-        need. The library contains no <code>unsafe</code> and cannot gain any.
+        Rust 1.88 or newer and a working OpenSSL. <code>as2</code>,
+        <code>as4</code> and <code>http-client</code> are default features;
+        <code>peppol</code> and <code>metrics</code> are opt-in. No <code>unsafe</code>.
       </p>
     </details>
   </div>
@@ -176,15 +160,15 @@ let outcome = As4HttpTransport::new(TransportConfig::default())?
   <div class="grid grid-3">
     <a class="tile" href="{{ get_url(path='@/docs/getting-started.md') | safe }}">
       <h3>Getting started</h3>
-      <p>Feature flags, a session, and your first message in either protocol.</p>
+      <p>Features, a client, and your first message in either protocol.</p>
     </a>
     <a class="tile" href="{{ get_url(path='@/docs/security.md') | safe }}">
       <h3>Security model</h3>
       <p>Trust boundaries, defaults, and what the library does and does not promise.</p>
     </a>
-    <a class="tile" href="{{ get_url(path='@/docs/interop.md') | safe }}">
-      <h3>Interoperability</h3>
-      <p>Strict and relaxed modes, partner profiles, and known deviations.</p>
+    <a class="tile" href="{{ get_url(path='@/docs/profiles.md') | safe }}">
+      <h3>Profiles</h3>
+      <p>What each network preset fixes, with the section it comes from.</p>
     </a>
   </div>
 </section>

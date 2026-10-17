@@ -1,14 +1,11 @@
-//! AS4 signal generation: Receipt, Error, and PullRequest signals.
+//! AS4 signal generation: Receipt and Error signals.
 
-use super::stream::{extract_multipart_related_payload_if_present, normalize_mpc};
-use super::types::{
-    As4ErrorCode, As4ErrorSeverity, As4GeneratePullRequestPolicy, As4NriReference,
-    As4ReceiptCredentials, As4ReceivePushOutput,
-};
+use super::types::{As4ErrorCode, As4ErrorSeverity, As4NriReference, As4ReceiptCredentials};
 use crate::core::{AsxError, ErrorCode, ErrorContext, Result, SessionContext};
 #[cfg(feature = "as4")]
 use crate::crypto::soap_builder::WsSecurityHeaderBuilder;
 use crate::crypto::wssec::generate_xmlsig_signature;
+use crate::xml::{Slot, XmlDoc, XmlOut, ns};
 
 /// Generate an AS4 `eb:Receipt` SignalMessage per ebMS3 §5.2.2.1 and §5.1.3.
 ///
@@ -53,7 +50,6 @@ pub fn generate_receipt(
 /// The receipt is unsigned; for a receipt carrying a WS-Security XML
 /// Signature (Non-Repudiation of Receipt), use
 /// [`generate_signed_receipt_with_nri`].
-#[cfg_attr(feature = "trace", tracing::instrument(skip_all, fields(message_id = %message_id, partner_id = %session.partner_id())))]
 pub fn generate_receipt_with_nri(
     session: &SessionContext,
     message_id: &str,
@@ -67,40 +63,103 @@ pub fn generate_receipt_with_nri(
         ref_to_message_id,
     )?;
 
-    let timestamp = crate::time_utils::format_rfc3339_secs(std::time::SystemTime::now());
-    // SECURITY: Escape caller-supplied values to prevent XML injection.
-    let message_id_escaped = crate::wire::escape_xml(message_id);
-    let ref_to_message_id_escaped = crate::wire::escape_xml(ref_to_message_id);
-
-    let nri_xml = build_receipt_nri_xml(nri_refs);
-    let ds_ns_attr = if nri_refs.is_empty() {
-        ""
+    let timestamp = crate::time_utils::format_rfc3339_secs(session.clock().now());
+    let namespaces: &[(&'static str, &'static str)] = if nri_refs.is_empty() {
+        &[("ebbpsig", ns::EBBP_SIGNALS)]
     } else {
-        " xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\""
+        &[("ebbpsig", ns::EBBP_SIGNALS), ("ds", ns::DS)]
     };
+    let (doc, _) = write_signal(
+        &SignalEnvelope {
+            namespaces,
+            reserve_security: false,
+            messaging_id: None,
+            body_id: None,
+            timestamp: &timestamp,
+            message_id,
+            ref_to_message_id: Some(ref_to_message_id),
+        },
+        |out| write_receipt(out, nri_refs),
+    )?;
+    Ok(doc.into_string()?.into_bytes())
+}
 
-    let xml = format!(
-        "<S12:Envelope \
- xmlns:S12=\"http://www.w3.org/2003/05/soap-envelope\" \
- xmlns:eb=\"http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/\" \
- xmlns:ebbpsig=\"http://docs.oasis-open.org/ebxml-bp/ebbp-signals-2.0\"{ds_ns}>\
-<S12:Header>\
-<eb:Messaging S12:mustUnderstand=\"true\">\
-<eb:SignalMessage>\
-<eb:MessageInfo>\
-<eb:Timestamp>{timestamp}</eb:Timestamp>\
-<eb:MessageId>{message_id_escaped}</eb:MessageId>\
-<eb:RefToMessageId>{ref_to_message_id_escaped}</eb:RefToMessageId>\
-</eb:MessageInfo>\
-<eb:Receipt>{nri_xml}</eb:Receipt>\
-</eb:SignalMessage>\
-</eb:Messaging>\
-</S12:Header>\
-<S12:Body/>\
-</S12:Envelope>",
-        ds_ns = ds_ns_attr,
-    );
-    Ok(xml.into_bytes())
+/// The fixed frame of every signal this crate emits.
+struct SignalEnvelope<'a> {
+    /// Namespaces beyond `S12` and `eb`, declared on the envelope.
+    namespaces: &'a [(&'static str, &'static str)],
+    /// Reserve the `wsse:Security` position (before `eb:Messaging`).
+    reserve_security: bool,
+    messaging_id: Option<&'static str>,
+    body_id: Option<&'static str>,
+    timestamp: &'a str,
+    message_id: &'a str,
+    ref_to_message_id: Option<&'a str>,
+}
+
+/// Write `S12:Envelope/S12:Header/eb:Messaging/eb:SignalMessage` with its
+/// `eb:MessageInfo`; `body` writes the signal itself.
+fn write_signal(
+    spec: &SignalEnvelope<'_>,
+    body: impl FnOnce(&mut XmlOut) -> Result<()>,
+) -> Result<(XmlDoc, Option<Slot>)> {
+    let mut out = XmlOut::new();
+    out.start("S12:Envelope")?
+        .ns("S12", ns::SOAP12)?
+        .ns("eb", ns::EBMS3)?;
+    for (prefix, uri) in spec.namespaces {
+        out.ns(prefix, uri)?;
+    }
+    out.start("S12:Header")?;
+    let slot = spec.reserve_security.then(|| out.slot());
+    out.start("eb:Messaging")?
+        .attr("S12:mustUnderstand", "true", "S12:mustUnderstand")?;
+    if let Some(id) = spec.messaging_id {
+        out.attr("wsu:Id", id, "wsu:Id")?;
+    }
+    out.start("eb:SignalMessage")?;
+    out.start("eb:MessageInfo")?;
+    out.leaf("eb:Timestamp", spec.timestamp, "eb:Timestamp")?;
+    out.leaf("eb:MessageId", spec.message_id, "eb:MessageId")?;
+    if let Some(ref_to) = spec.ref_to_message_id {
+        out.leaf("eb:RefToMessageId", ref_to, "eb:RefToMessageId")?;
+    }
+    out.end()?;
+    body(&mut out)?;
+    out.end()?; // SignalMessage
+    out.end()?; // Messaging
+    out.end()?; // Header
+    out.start("S12:Body")?;
+    if let Some(id) = spec.body_id {
+        out.attr("wsu:Id", id, "wsu:Id")?;
+    }
+    out.end()?;
+    out.end()?;
+    Ok((out.finish()?, slot))
+}
+
+/// `eb:Receipt` with its `ebbpsig:NonRepudiationInformation`: one
+/// `MessagePartNRInformation/ds:Reference` per echoed reference (eDelivery
+/// AS4 §5.1.3 Non-Repudiation of Origin), or an empty block.
+fn write_receipt(out: &mut XmlOut, nri_refs: &[As4NriReference]) -> Result<()> {
+    out.start("eb:Receipt")?
+        .start("ebbpsig:NonRepudiationInformation")?;
+    for r in nri_refs {
+        out.start("ebbpsig:MessagePartNRInformation")?
+            .start("ds:Reference")?
+            .attr("URI", &r.uri, "ds:Reference/@URI")?;
+        out.start("ds:DigestMethod")?
+            .attr(
+                "Algorithm",
+                &r.digest_method_uri,
+                "ds:DigestMethod/@Algorithm",
+            )?
+            .end()?;
+        out.leaf("ds:DigestValue", &r.digest_value_b64, "ds:DigestValue")?;
+        out.end()?.end()?;
+    }
+    out.end()?.end()?;
+    Ok(())
 }
 
 /// Validate the message-ID pair shared by all receipt generators.
@@ -125,38 +184,6 @@ fn validate_receipt_signal_ids(
         ));
     }
     Ok(())
-}
-
-/// Build the `<ebbpsig:NonRepudiationInformation>` block for a receipt.
-///
-/// When NRI references are provided, each becomes a MessagePartNRInformation
-/// entry that echoes the original message's ds:Reference — conformant with
-/// eDelivery AS4 §5.1.3 Non-Repudiation of Origin.
-fn build_receipt_nri_xml(nri_refs: &[As4NriReference]) -> String {
-    if nri_refs.is_empty() {
-        return "<ebbpsig:NonRepudiationInformation/>".to_string();
-    }
-    let mut nri = "<ebbpsig:NonRepudiationInformation>".to_string();
-    for r in nri_refs {
-        // SECURITY: escape all caller-controlled fields.
-        let uri_esc = crate::wire::escape_xml(&r.uri);
-        let dig_method_esc = crate::wire::escape_xml(&r.digest_method_uri);
-        let dig_value_esc = crate::wire::escape_xml(&r.digest_value_b64);
-        nri.push_str(&format!(
-            "<ebbpsig:MessagePartNRInformation>\
-<ds:Reference URI=\"{uri}\">\
-<ds:DigestMethod Algorithm=\"{dig_method}\"\
-></ds:DigestMethod\
-><ds:DigestValue>{dig_value}</ds:DigestValue>\
-</ds:Reference>\
-</ebbpsig:MessagePartNRInformation>",
-            uri = uri_esc,
-            dig_method = dig_method_esc,
-            dig_value = dig_value_esc,
-        ));
-    }
-    nri.push_str("</ebbpsig:NonRepudiationInformation>");
-    nri
 }
 
 /// Validate that a PEM signing key and certificate parse and match each other.
@@ -217,9 +244,7 @@ const RECEIPT_BODY_WSU_ID: &str = "as4-receipt-body";
 /// counterparties enforcing `require_signed_receipt = true`.
 ///
 /// Obtain `nri_refs` from the inbound signed message via
-/// [`crate::crypto::wssec::parse_signature_references`], or use
-/// [`generate_signed_receipt_for_output`] which extracts them for you.
-#[cfg_attr(feature = "trace", tracing::instrument(skip_all, fields(message_id = %message_id, partner_id = %session.partner_id())))]
+/// [`crate::crypto::wssec::parse_signature_references`].
 pub fn generate_signed_receipt_with_nri(
     session: &SessionContext,
     message_id: &str,
@@ -237,68 +262,82 @@ pub fn generate_signed_receipt_with_nri(
         &credentials.signing_cert_pem,
     )?;
 
-    let timestamp = crate::time_utils::format_rfc3339_secs(std::time::SystemTime::now());
-    // SECURITY: Escape caller-supplied values to prevent XML injection.
-    let message_id_escaped = crate::wire::escape_xml(message_id);
-    let ref_to_message_id_escaped = crate::wire::escape_xml(ref_to_message_id);
-    let nri_xml = build_receipt_nri_xml(nri_refs);
-
-    let envelope = format!(
-        "<S12:Envelope \
- xmlns:S12=\"http://www.w3.org/2003/05/soap-envelope\" \
- xmlns:eb=\"http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/\" \
- xmlns:ebbpsig=\"http://docs.oasis-open.org/ebxml-bp/ebbp-signals-2.0\" \
- xmlns:wsse=\"http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd\" \
- xmlns:wsu=\"http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd\" \
- xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\">\
-<S12:Header>\
-<!-- wsse-placeholder -->\
-<eb:Messaging S12:mustUnderstand=\"true\" wsu:Id=\"{RECEIPT_MESSAGING_WSU_ID}\">\
-<eb:SignalMessage>\
-<eb:MessageInfo>\
-<eb:Timestamp>{timestamp}</eb:Timestamp>\
-<eb:MessageId>{message_id_escaped}</eb:MessageId>\
-<eb:RefToMessageId>{ref_to_message_id_escaped}</eb:RefToMessageId>\
-</eb:MessageInfo>\
-<eb:Receipt>{nri_xml}</eb:Receipt>\
-</eb:SignalMessage>\
-</eb:Messaging>\
-</S12:Header>\
-<S12:Body wsu:Id=\"{RECEIPT_BODY_WSU_ID}\"/>\
-</S12:Envelope>",
-    );
+    let timestamp = crate::time_utils::format_rfc3339_secs(session.clock().now());
+    let (doc, slot) = write_signal(
+        &SignalEnvelope {
+            namespaces: &[
+                ("ebbpsig", ns::EBBP_SIGNALS),
+                ("wsse", ns::WSSE),
+                ("wsu", ns::WSU),
+                ("ds", ns::DS),
+            ],
+            reserve_security: true,
+            messaging_id: Some(RECEIPT_MESSAGING_WSU_ID),
+            body_id: Some(RECEIPT_BODY_WSU_ID),
+            timestamp: &timestamp,
+            message_id,
+            ref_to_message_id: Some(ref_to_message_id),
+        },
+        |out| write_receipt(out, nri_refs),
+    )?;
 
     let messaging_ref = format!("#{RECEIPT_MESSAGING_WSU_ID}");
     let body_ref = format!("#{RECEIPT_BODY_WSU_ID}");
-    let reference_uris = [messaging_ref.as_str(), body_ref.as_str()];
-    let signature_xml = generate_xmlsig_signature(
-        &envelope,
-        &reference_uris,
+    seal_signed_signal(
+        doc,
+        slot,
+        &[messaging_ref.as_str(), body_ref.as_str()],
         &credentials.signing_key_pem,
         &credentials.signing_cert_pem,
         credentials.key_info_profile,
-    )?;
-    let wsse_header = WsSecurityHeaderBuilder::new()
-        .with_signing_cert(credentials.signing_cert_pem.clone())
-        .with_signature_xml(signature_xml)
-        .build()
-        .map_err(|err| {
-            AsxError::new(
-                ErrorCode::ParseFailed,
-                format!("failed to build WS-Security header for receipt: {err:?}"),
-                ErrorContext::for_session(stage, session),
-            )
-        })?;
-    let wsse_str = String::from_utf8(wsse_header).map_err(|_| {
+        stage,
+        session,
+    )
+}
+
+/// Sign the signal's envelope (its security slot still empty — it lies
+/// outside every signed subtree) and fill the slot with the `wsse:Security`
+/// header carrying the signature.
+#[allow(clippy::too_many_arguments)]
+fn seal_signed_signal(
+    mut doc: XmlDoc,
+    slot: Option<Slot>,
+    reference_uris: &[&str],
+    signing_key_pem: &[u8],
+    signing_cert_pem: &[u8],
+    key_info_profile: crate::crypto::wssec::WsSecOutboundKeyInfoProfile,
+    stage: &'static str,
+    session: &SessionContext,
+) -> Result<Vec<u8>> {
+    let slot = slot.ok_or_else(|| {
         AsxError::new(
-            ErrorCode::ParseFailed,
-            "WS-Security header for receipt is not valid UTF-8",
+            ErrorCode::InvalidInput,
+            "a signed signal needs a reserved wsse:Security slot",
             ErrorContext::for_session(stage, session),
         )
     })?;
-
-    let signed_envelope = envelope.replace("<!-- wsse-placeholder -->", &wsse_str);
-    Ok(signed_envelope.into_bytes())
+    let envelope = doc.text_with_empty_slots();
+    let signature_xml = generate_xmlsig_signature(
+        &envelope,
+        reference_uris,
+        signing_key_pem,
+        signing_cert_pem,
+        key_info_profile,
+    )?;
+    let header = WsSecurityHeaderBuilder::new()
+        .at(session.clock().now())
+        .with_signing_cert(signing_cert_pem.to_vec())
+        .with_signature_xml(signature_xml)
+        .build_fragment()
+        .map_err(|err| {
+            AsxError::new(
+                err.code,
+                format!("failed to build the WS-Security header: {}", err.message),
+                ErrorContext::for_session(stage, session),
+            )
+        })?;
+    doc.fill(slot, header)?;
+    Ok(doc.into_string()?.into_bytes())
 }
 
 /// Generate an AS4 `eb:Error` SignalMessage per ebMS3 §6.7.3.
@@ -324,298 +363,184 @@ pub fn generate_error_signal(
         ));
     }
 
-    let timestamp = crate::time_utils::format_rfc3339_secs(std::time::SystemTime::now());
-    let message_id_escaped = crate::wire::escape_xml(message_id);
-    let ref_id_escaped = crate::wire::escape_xml(ref_to_message_id);
-    let description_escaped = crate::wire::escape_xml(description);
-
-    let xml = format!(
-        "<S12:Envelope \
-              xmlns:S12=\"http://www.w3.org/2003/05/soap-envelope\" \
-              xmlns:eb=\"http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/\">\
-              <S12:Header>\
-                <eb:Messaging S12:mustUnderstand=\"true\">\
-                  <eb:SignalMessage>\
-                    <eb:MessageInfo>\
-                      <eb:Timestamp>{timestamp}</eb:Timestamp>\
-                      <eb:MessageId>{message_id_escaped}</eb:MessageId>\
-                      <eb:RefToMessageId>{ref_id_escaped}</eb:RefToMessageId>\
-                    </eb:MessageInfo>\
-                    <eb:Error errorCode=\"{error_code}\" severity=\"{severity}\" \
-                              category=\"CONTENT\" origin=\"ebMS\">\
-                      <eb:Description xml:lang=\"en\">{description_escaped}</eb:Description>\
-                    </eb:Error>\
-                  </eb:SignalMessage>\
-                </eb:Messaging>\
-              </S12:Header>\
-              <S12:Body/>\
-            </S12:Envelope>",
-        timestamp = timestamp,
-        message_id_escaped = message_id_escaped,
-        ref_id_escaped = ref_id_escaped,
-        error_code = error_code.ebms_code(),
-        severity = severity.as_str(),
-        description_escaped = description_escaped,
-    );
-    Ok(xml.into_bytes())
+    let timestamp = crate::time_utils::format_rfc3339_secs(session.clock().now());
+    let (doc, _) = write_signal(
+        &SignalEnvelope {
+            namespaces: &[],
+            reserve_security: false,
+            messaging_id: None,
+            body_id: None,
+            timestamp: &timestamp,
+            message_id,
+            ref_to_message_id: Some(ref_to_message_id),
+        },
+        |out| {
+            out.start("eb:Error")?
+                .attr("errorCode", error_code.ebms_code(), "eb:Error/@errorCode")?
+                .attr("severity", severity.as_str(), "eb:Error/@severity")?
+                .attr("category", "CONTENT", "eb:Error/@category")?
+                .attr("origin", "ebMS", "eb:Error/@origin")?;
+            out.start("eb:Description")?
+                .attr("xml:lang", "en", "xml:lang")?
+                .text(description, "eb:Description")?
+                .end()?;
+            out.end()?;
+            Ok(())
+        },
+    )?;
+    Ok(doc.into_string()?.into_bytes())
 }
 
-/// Generate an AS4 `eb:PullRequest` signal message, optionally signed.
-///
-/// Per eDelivery AS4 v1.15 §4.5.5, pull requests sent by the Receiver MSH
-/// MUST carry a WS-Security XML Signature when credentials are supplied.
-#[cfg_attr(feature = "trace", tracing::instrument(skip_all, fields(message_id = %policy.message_id, partner_id = %session.partner_id())))]
-pub fn generate_pull_request(
-    session: &SessionContext,
-    policy: &As4GeneratePullRequestPolicy,
-) -> Result<Vec<u8>> {
-    let stage = "as4_generate_pull_request";
+// ── Draft/finish signals ────────────────────────────────────────────────────
 
-    let mpc = normalize_mpc(&policy.mpc);
-    if mpc.is_empty() {
-        return Err(AsxError::new(
-            ErrorCode::InvalidInput,
-            "AS4 PullRequest MPC must not be empty",
-            ErrorContext::for_session(stage, session),
-        ));
-    }
-    if policy.message_id.trim().is_empty() {
-        return Err(AsxError::new(
-            ErrorCode::InvalidInput,
-            "AS4 PullRequest message_id must not be empty",
-            ErrorContext::for_session(stage, session),
-        ));
-    }
+/// A signal built up to its signature: sign
+/// [`SignalDraft::to_sign`], then [`finish_signal`].
+pub(crate) struct SignalDraft {
+    doc: XmlDoc,
+    slot: Slot,
+    prepared: crate::crypto::wssec::sign::PreparedSignature,
+    /// The draft's clock reading, reused for the `wsu:Timestamp`.
+    now: std::time::SystemTime,
+}
 
-    if let Some(ref auth) = policy.authorization_info
-        && auth.trim().is_empty()
-    {
-        return Err(AsxError::new(
-            ErrorCode::InvalidInput,
-            "AS4 PullRequest authorization_info must not be empty when set",
-            ErrorContext::for_session(stage, session),
-        ));
-    }
-
-    if let Some(creds) = &policy.credentials {
-        validate_signal_signing_credentials(
-            session,
-            stage,
-            "PullRequest",
-            &creds.signing_key_pem,
-            &creds.signing_cert_pem,
-        )?;
-    }
-
-    let timestamp = crate::time_utils::format_rfc3339_secs(std::time::SystemTime::now());
-    let mpc_escaped = crate::wire::escape_xml(mpc);
-    let message_id_escaped = crate::wire::escape_xml(&policy.message_id);
-
-    const PULL_REQUEST_WSU_ID: &str = "as4-pull-request";
-
-    let auth_info_xml = policy
-        .authorization_info
-        .as_deref()
-        .map(|v| {
-            format!(
-                "\n        <eb:AuthorizationInfo>{}</eb:AuthorizationInfo>",
-                crate::wire::escape_xml(v)
-            )
-        })
-        .unwrap_or_default();
-
-    let messaging_header = format!(
-        r#"<!-- wsse-placeholder -->
-    <eb:Messaging S12:mustUnderstand="true">
-      <eb:SignalMessage>
-        <eb:MessageInfo>
-          <eb:Timestamp>{timestamp}</eb:Timestamp>
-          <eb:MessageId>{message_id_escaped}</eb:MessageId>
-        </eb:MessageInfo>
-        <eb:PullRequest wsu:Id="{PULL_REQUEST_WSU_ID}" eb:mpc="{mpc_escaped}">{auth_info}</eb:PullRequest>
-      </eb:SignalMessage>
-    </eb:Messaging>"#,
-        timestamp = timestamp,
-        message_id_escaped = message_id_escaped,
-        mpc_escaped = mpc_escaped,
-        auth_info = auth_info_xml,
-    );
-
-    let envelope = format!(
-        r#"<S12:Envelope xmlns:S12="http://www.w3.org/2003/05/soap-envelope"
-  xmlns:eb="http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/"
-  xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd"
-  xmlns:wsu="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd"
-  xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
-  <S12:Header>
-    {messaging_header}
-  </S12:Header>
-  <S12:Body/>
-</S12:Envelope>"#,
-        messaging_header = messaging_header,
-    );
-
-    if let Some(creds) = &policy.credentials {
-        let reference_uri = format!("#{PULL_REQUEST_WSU_ID}");
-        let reference_uris = [reference_uri.as_str()];
-        let signature_xml = generate_xmlsig_signature(
-            &envelope,
-            &reference_uris,
-            &creds.signing_key_pem,
-            &creds.signing_cert_pem,
-            creds.key_info_profile,
-        )?;
-        let wsse_header = WsSecurityHeaderBuilder::new()
-            .with_signing_cert(creds.signing_cert_pem.clone())
-            .with_signature_xml(signature_xml)
-            .build()
-            .map_err(|err| {
-                AsxError::new(
-                    ErrorCode::ParseFailed,
-                    format!("failed to build WS-Security header for pull request: {err:?}"),
-                    ErrorContext::for_session(stage, session),
-                )
-            })?;
-        let wsse_str = String::from_utf8(wsse_header).map_err(|_| {
-            AsxError::new(
-                ErrorCode::ParseFailed,
-                "WS-Security header for pull request is not valid UTF-8",
-                ErrorContext::for_session(stage, session),
-            )
-        })?;
-
-        let signed_envelope = envelope.replace("<!-- wsse-placeholder -->", &wsse_str);
-        Ok(signed_envelope.into_bytes())
-    } else {
-        let unsigned_envelope = envelope.replace("<!-- wsse-placeholder -->\n    ", "");
-        Ok(unsigned_envelope.into_bytes())
+impl SignalDraft {
+    pub(crate) fn to_sign(&self) -> (crate::crypto::alg::SignatureAlgorithm, &[u8]) {
+        (
+            self.prepared.algorithm,
+            &self.prepared.canonical_signed_info,
+        )
     }
 }
 
-/// Convenience wrapper: generate a receipt for a completed receive output.
-///
-/// Equivalent to calling [`generate_receipt_with_nri`] with
-/// `ref_to_message_id = output.user_message.message_id` and an empty NRI
-/// slice.  For NRO-profile receipts (with `<NonRepudiationInformation>`),
-/// use [`generate_receipt_with_nri`] directly with refs extracted from the
-/// raw inbound bytes.
-///
-/// The result is **unsigned**; production deployments that must satisfy
-/// Non-Repudiation of Receipt (e.g. BDEW AS4-Profil §2.2.4) should use
-/// [`generate_signed_receipt_for_output`] instead.
-///
-/// # Example
-/// ```no_run
-/// use asx_rs::as4::{generate_receipt_for_output, As4ReceiveOutcome};
-/// use asx_rs::core::SessionContext;
-///
-/// # fn example(
-/// #     session: &SessionContext,
-/// #     outcome: As4ReceiveOutcome,
-/// # ) -> asx_rs::Result<()> {
-/// if let As4ReceiveOutcome::FirstSeen { output, claim } = outcome {
-///     // A ping is acknowledged but never delivered (ebMS3 §5.2.2).
-///     let receipt_id = format!("receipt@{}", uuid::Uuid::new_v4());
-///     let receipt_bytes = generate_receipt_for_output(session, &receipt_id, &output)?;
-///     let _ = receipt_bytes;
-///     // Acknowledged, so a replay must not be delivered again.
-///     claim.accept_blocking()?;
-/// }
-/// # Ok(())
-/// # }
-/// ```
-pub fn generate_receipt_for_output(
-    session: &SessionContext,
-    receipt_message_id: &str,
-    output: &As4ReceivePushOutput,
-) -> Result<Vec<u8>> {
-    generate_receipt_with_nri(
-        session,
-        receipt_message_id,
-        &output.user_message.message_id,
-        &[],
-    )
-}
-
-/// Generate a **signed** receipt for a completed receive output, echoing the
-/// inbound message's `ds:Reference` digests as Non-Repudiation Information.
-///
-/// `inbound_http_body` / `inbound_http_content_type` are the raw HTTP request
-/// body and `Content-Type` of the inbound push exactly as passed to the
-/// receive pipeline (MIME multipart or bare SOAP).  The NRI references are
-/// extracted from the inbound WS-Security signature via
-/// [`crate::crypto::wssec::parse_signature_references`], then the receipt is
-/// built and signed with [`generate_signed_receipt_with_nri`].
-///
-/// Returns [`ErrorCode::InvalidInput`] when the inbound message carries no
-/// `ds:Signature` — an NRR receipt cannot echo digests that do not exist.
-/// For unsigned inbound messages (test setups only), fall back to
-/// [`generate_receipt_for_output`].
-///
-/// # Example
-/// ```no_run
-/// use asx_rs::as4::{
-///     generate_signed_receipt_for_output, As4ReceiptCredentials, As4ReceiveOutcome,
-/// };
-/// use asx_rs::core::SessionContext;
-///
-/// # fn example(
-/// #     session: &SessionContext,
-/// #     outcome: As4ReceiveOutcome,
-/// #     raw_body: &[u8],
-/// #     content_type: &str,
-/// #     credentials: &As4ReceiptCredentials,
-/// # ) -> asx_rs::Result<()> {
-/// if let As4ReceiveOutcome::FirstSeen { output, claim } = outcome {
-///     let receipt_id = format!("receipt@{}", uuid::Uuid::new_v4());
-///     let receipt_bytes = generate_signed_receipt_for_output(
-///         session, &receipt_id, &output, raw_body, content_type, credentials,
-///     )?;
-///     let _ = receipt_bytes;
-///     // The receipt is an NRR commitment: settle before it goes on the wire.
-///     claim.accept_blocking()?;
-/// }
-/// # Ok(())
-/// # }
-/// ```
-#[cfg_attr(feature = "trace", tracing::instrument(skip_all, fields(message_id = %receipt_message_id, partner_id = %session.partner_id())))]
-pub fn generate_signed_receipt_for_output(
-    session: &SessionContext,
-    receipt_message_id: &str,
-    output: &As4ReceivePushOutput,
-    inbound_http_body: &[u8],
-    inbound_http_content_type: &str,
-    credentials: &As4ReceiptCredentials,
-) -> Result<Vec<u8>> {
-    let stage = "as4_generate_signed_receipt";
-    let soap_bytes = match extract_multipart_related_payload_if_present(
-        inbound_http_body,
-        inbound_http_content_type,
-        session,
-        stage,
-    )? {
-        Some(multipart) => multipart.soap_xml,
-        None => inbound_http_body,
-    };
-    let soap_xml = crate::core::bytes_to_utf8_str(soap_bytes, stage, session)?;
-    let sig_refs = crate::crypto::wssec::parse_signature_references(soap_xml).map_err(|err| {
+/// An NRR receipt for `ref_to_message_id`, echoing `nri_refs`, up to its
+/// signature.
+pub(crate) fn draft_receipt(
+    now: std::time::SystemTime,
+    message_id: &str,
+    ref_to_message_id: &str,
+    nri_refs: &[As4NriReference],
+    algorithm: crate::crypto::alg::SignatureAlgorithm,
+) -> Result<SignalDraft> {
+    let timestamp = crate::time_utils::format_rfc3339_secs(now);
+    let (doc, slot) = write_signal(
+        &SignalEnvelope {
+            namespaces: &[
+                ("ebbpsig", ns::EBBP_SIGNALS),
+                ("wsse", ns::WSSE),
+                ("wsu", ns::WSU),
+                ("ds", ns::DS),
+            ],
+            reserve_security: true,
+            messaging_id: Some(RECEIPT_MESSAGING_WSU_ID),
+            body_id: Some(RECEIPT_BODY_WSU_ID),
+            timestamp: &timestamp,
+            message_id,
+            ref_to_message_id: Some(ref_to_message_id),
+        },
+        |out| write_receipt(out, nri_refs),
+    )?;
+    let slot = slot.ok_or_else(|| {
         AsxError::new(
             ErrorCode::InvalidInput,
-            format!(
-                "cannot build NRR receipt: failed to extract ds:Reference digests \
-                 from the inbound message signature ({}); for unsigned inbound \
-                 messages use generate_receipt_for_output instead",
-                err.message
-            ),
-            ErrorContext::for_session(stage, session),
+            "a signed signal needs a reserved wsse:Security slot",
+            ErrorContext::new("as4_generate_signed_receipt"),
         )
     })?;
-    let nri_refs: Vec<As4NriReference> = sig_refs.into_iter().map(As4NriReference::from).collect();
-    generate_signed_receipt_with_nri(
-        session,
-        receipt_message_id,
-        &output.user_message.message_id,
-        &nri_refs,
-        credentials,
-    )
+    let messaging_ref = format!("#{RECEIPT_MESSAGING_WSU_ID}");
+    let body_ref = format!("#{RECEIPT_BODY_WSU_ID}");
+    let prepared = crate::crypto::wssec::sign::prepare_envelope_signature(
+        &doc.text_with_empty_slots(),
+        &[messaging_ref.as_str(), body_ref.as_str()],
+        &[],
+        algorithm,
+    )?;
+    Ok(SignalDraft {
+        doc,
+        slot,
+        prepared,
+        now,
+    })
+}
+
+/// Seal a signal with the key's `raw_signature` (DER for ECDSA) and the
+/// signer chain (leaf first, DER) in the profile's token form.
+pub(crate) fn finish_signal(
+    draft: SignalDraft,
+    raw_signature: Vec<u8>,
+    chain_der: &[Vec<u8>],
+    key_info: crate::crypto::wssec::WsSecOutboundKeyInfoProfile,
+) -> Result<Vec<u8>> {
+    let SignalDraft {
+        mut doc,
+        slot,
+        prepared,
+        now,
+    } = draft;
+    let header = crate::crypto::soap_builder::security_header(
+        prepared,
+        raw_signature,
+        chain_der,
+        key_info,
+        now,
+        None,
+    )?;
+    doc.fill(slot, header)?;
+    Ok(doc.into_string()?.into_bytes())
+}
+
+/// An `eb:Error` signal (ebMS3 §6.7) with a free-form code and an optional
+/// `eb:ErrorDetail`. `ref_to_message_id` is absent when the message could not
+/// be read.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn error_signal(
+    now: std::time::SystemTime,
+    message_id: &str,
+    ref_to_message_id: Option<&str>,
+    code: &str,
+    short_description: &str,
+    category: &str,
+    description: &str,
+    detail: Option<&str>,
+) -> Result<Vec<u8>> {
+    let timestamp = crate::time_utils::format_rfc3339_secs(now);
+    let (doc, _) = write_signal(
+        &SignalEnvelope {
+            namespaces: &[],
+            reserve_security: false,
+            messaging_id: None,
+            body_id: None,
+            timestamp: &timestamp,
+            message_id,
+            ref_to_message_id,
+        },
+        |out| {
+            out.start("eb:Error")?
+                .attr("errorCode", code, "eb:Error/@errorCode")?
+                .attr("severity", "failure", "eb:Error/@severity")?
+                .attr(
+                    "shortDescription",
+                    short_description,
+                    "eb:Error/@shortDescription",
+                )?
+                .attr("category", category, "eb:Error/@category")?
+                .attr("origin", "ebMS", "eb:Error/@origin")?;
+            if let Some(ref_to) = ref_to_message_id {
+                out.attr(
+                    "refToMessageInError",
+                    ref_to,
+                    "eb:Error/@refToMessageInError",
+                )?;
+            }
+            out.start("eb:Description")?
+                .attr("xml:lang", "en", "xml:lang")?
+                .text(description, "eb:Description")?
+                .end()?;
+            if let Some(detail) = detail {
+                out.leaf("eb:ErrorDetail", detail, "eb:ErrorDetail")?;
+            }
+            out.end()?;
+            Ok(())
+        },
+    )?;
+    Ok(doc.into_string()?.into_bytes())
 }

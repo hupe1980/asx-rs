@@ -1,58 +1,34 @@
-#![cfg(all(feature = "as4", feature = "testing"))]
-#[path = "common/as4_adversarial.rs"]
-mod common;
-// Adversarial SOAP/ebMS corpus for AS4 parser hardening.
-//
-// This suite covers structural, encoding, and semantic edge cases that
-// standards-compliant parsers should reject deterministically, based on
-// ebMS 3.0 §5, SOAP 1.2, and XML 1.0 processing rules.
+#![cfg(feature = "as4")]
+//! Adversarial SOAP/ebMS corpus against `As4::inbound`.
+//!
+//! Every envelope is posted to a real [`asx::Inbound`] and judged by the
+//! response table: the HTTP status, the `eb:Error`
+//! code and, where the case names one, the refusal reason, with the
+//! handler never called. Structural, encoding and semantic edge cases follow
+//! ebMS 3.0 §5, SOAP 1.2 and XML 1.0. The hand-crafted envelopes are unsigned
+//! and wrapped as SwA, so the parser judges them before any signature is
+//! looked at (`structurally_valid_unsigned_envelope_is_refused_as_unsigned`
+//! is the control). The *accepted* variants, and the signature-wrapping and
+//! ambiguity cases, mutate a genuine signed and encrypted message
+//! captured from `As4::send`; a mutation of signed content is re-signed with
+//! the sender's key, so the verdict is about the shape alone. Receipt cases
+//! are in `as4_receipt_verification.rs`.
 
-use crate::common::{as4_strict_push_policy, as4_unsigned_push_policy};
-use asx_rs::as4::{As4ReceivePushRequest, As4ReceivePushSync, receive_push_sync};
-use asx_rs::core::{ErrorCode, SessionContext};
-use asx_rs::observability::EventBus;
-use asx_rs::reliability::InMemoryDedupBackend;
+#[path = "common/inbound_harness.rs"]
+mod inbound_harness;
+#[path = "common/peers.rs"]
+mod peers;
 
-fn session() -> SessionContext {
-    SessionContext::new("s-adversarial", "p-adversarial", "strict").expect("session")
-}
-
-fn dedup() -> std::sync::Arc<dyn asx_rs::storage::DedupStorage> {
-    std::sync::Arc::new(InMemoryDedupBackend::default())
-}
-
-fn bus() -> EventBus {
-    EventBus::new(32).expect("bus")
-}
-
-fn content_type_for_payload(payload: &[u8]) -> String {
-    if let Some(boundary) = detect_multipart_boundary(payload) {
-        return format!(
-            "multipart/related; boundary=\"{boundary}\"; type=\"application/soap+xml\""
-        );
-    }
-
-    "application/soap+xml".to_string()
-}
+use inbound_harness::{Answer, Genuine, Receiver, genuine, header_first, messaging, request, swa};
+use peers::{Preset, pair};
 
 fn detect_multipart_boundary(payload: &[u8]) -> Option<String> {
     if !payload.starts_with(b"--") {
         return None;
     }
-
     let line_end = payload.windows(2).position(|window| window == b"\r\n")?;
-    let boundary = &payload[2..line_end];
-
-    if boundary.is_empty() {
-        return None;
-    }
-
-    let boundary = std::str::from_utf8(boundary).ok()?.trim();
-    if boundary.is_empty() {
-        return None;
-    }
-
-    Some(boundary.to_string())
+    let boundary = std::str::from_utf8(&payload[2..line_end]).ok()?.trim();
+    (!boundary.is_empty()).then(|| boundary.to_string())
 }
 
 fn ensure_required_strict_properties_in_xml(xml: &str) -> String {
@@ -81,68 +57,34 @@ fn ensure_required_strict_properties_in_xml(xml: &str) -> String {
     out
 }
 
-fn push(payload: &[u8]) -> asx_rs::core::Result<asx_rs::as4::As4ReceivePushOutput> {
-    let bus = bus();
-    let _events = bus.subscribe_scoped_events();
-    let normalized_payload = if detect_multipart_boundary(payload).is_none() {
-        String::from_utf8_lossy(payload).into_owned()
-    } else {
-        String::new()
+/// Post a crafted envelope (SwA-wrapped unless it already is multipart) to
+/// an eDelivery receiver. It must be refused with HTTP 400 and must not reach
+/// the handler; the caller checks the code and reason.
+async fn refused(payload: impl AsRef<[u8]>, why: &str) -> Answer {
+    let payload = payload.as_ref();
+    let request = match detect_multipart_boundary(payload) {
+        Some(boundary) => request(
+            &format!("multipart/related; boundary=\"{boundary}\"; type=\"application/soap+xml\""),
+            payload.to_vec(),
+        ),
+        None => {
+            let xml = match std::str::from_utf8(payload) {
+                Ok(xml) => ensure_required_strict_properties_in_xml(xml).into_bytes(),
+                Err(_) => payload.to_vec(),
+            };
+            swa(&xml)
+        }
     };
-    let payload_owned = if normalized_payload.is_empty() {
-        payload.to_vec()
-    } else {
-        ensure_required_strict_properties_in_xml(&normalized_payload).into_bytes()
-    };
-    let http_content_type = content_type_for_payload(&payload_owned);
-    receive_push_sync(
-        &session(),
-        &bus,
-        As4ReceivePushSync {
-            request: As4ReceivePushRequest {
-                http_content_type,
-                payload: payload_owned.into(),
-                receipt_payload: None,
-                policy: as4_unsigned_push_policy(),
-                authenticated_sender_scope: None,
-            },
-            dedup: dedup(),
-            signer_pins: None,
-        },
-    )
-    .map(|o| o.unwrap_output().0)
-}
-
-fn push_signed_required(payload: &[u8]) -> asx_rs::core::Result<asx_rs::as4::As4ReceivePushOutput> {
-    let bus = bus();
-    let _events = bus.subscribe_scoped_events();
-    let normalized_payload = if detect_multipart_boundary(payload).is_none() {
-        String::from_utf8_lossy(payload).into_owned()
-    } else {
-        String::new()
-    };
-    let payload_owned = if normalized_payload.is_empty() {
-        payload.to_vec()
-    } else {
-        ensure_required_strict_properties_in_xml(&normalized_payload).into_bytes()
-    };
-    let http_content_type = content_type_for_payload(&payload_owned);
-    receive_push_sync(
-        &session(),
-        &bus,
-        As4ReceivePushSync {
-            request: As4ReceivePushRequest {
-                http_content_type,
-                payload: payload_owned.into(),
-                receipt_payload: None,
-                policy: as4_strict_push_policy(),
-                authenticated_sender_scope: None,
-            },
-            dedup: dedup(),
-            signer_pins: None,
-        },
-    )
-    .map(|o| o.unwrap_output().0)
+    let p = pair(Preset::Edelivery);
+    let receiver = Receiver::of(&p);
+    let answer = receiver.post(request).await;
+    assert_eq!(
+        answer.status,
+        http::StatusCode::BAD_REQUEST,
+        "{why}: {answer:?}"
+    );
+    receiver.assert_not_delivered();
+    answer
 }
 
 fn multipart_payload_with_cid(soap_xml: &[u8], payload_cid: &str, payload: &[u8]) -> Vec<u8> {
@@ -185,35 +127,36 @@ fn multipart_payload_with_cid(soap_xml: &[u8], payload_cid: &str, payload: &[u8]
 
 // ── Structural completeness ──────────────────────────────────────────────────
 
-#[test]
-fn rejects_completely_malformed_xml() {
-    let err = push(b"not xml at all <<< >>>").expect_err("must reject");
-    assert_eq!(err.code, ErrorCode::ParseFailed);
+#[tokio::test]
+async fn rejects_completely_malformed_xml() {
+    let answer = refused(b"not xml at all <<< >>>", "must reject").await;
+    answer.assert_refused_because("EBMS:0004", "XML is not well-formed");
 }
 
-#[test]
-fn rejects_empty_xml_document() {
-    let err = push(b"").expect_err("empty must reject");
-    assert_eq!(err.code, ErrorCode::ParseFailed);
+#[tokio::test]
+async fn rejects_empty_xml_document() {
+    let answer = refused(b"", "empty must reject").await;
+    answer.assert_refused_because("EBMS:0004", "XML is not well-formed");
 }
 
-#[test]
-fn rejects_soap_envelope_without_header() {
+#[tokio::test]
+async fn rejects_soap_envelope_without_header() {
     // SOAP envelope with Body but no Header → missing required structure.
-    let err = push(
+    let answer = refused(
         br#"<S12:Envelope xmlns:S12="http://www.w3.org/2003/05/soap-envelope"
                 xmlns:eb="http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/"
                 xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd">
             <S12:Body/>
         </S12:Envelope>"#,
+    "no Header must reject",
     )
-    .expect_err("no Header must reject");
-    assert_eq!(err.code, ErrorCode::ParseFailed);
+    .await;
+    answer.assert_refused_because("EBMS:0004", "AS4 SOAP Envelope missing Header");
 }
 
-#[test]
-fn rejects_soap_envelope_without_body() {
-    let err = push(
+#[tokio::test]
+async fn rejects_soap_envelope_without_body() {
+    let answer = refused(
         br#"<S12:Envelope xmlns:S12="http://www.w3.org/2003/05/soap-envelope"
                 xmlns:eb="http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/"
                 xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd">
@@ -231,14 +174,15 @@ fn rejects_soap_envelope_without_body() {
                 <wsse:Security/>
             </S12:Header>
         </S12:Envelope>"#,
+    "no Body must reject",
     )
-    .expect_err("no Body must reject");
-    assert_eq!(err.code, ErrorCode::ParseFailed);
+    .await;
+    answer.assert_refused_because("EBMS:0004", "AS4 SOAP Envelope missing Body");
 }
 
-#[test]
-fn rejects_soap_envelope_without_messaging_element() {
-    let err = push(
+#[tokio::test]
+async fn rejects_soap_envelope_without_messaging_element() {
+    let answer = refused(
         br#"<S12:Envelope xmlns:S12="http://www.w3.org/2003/05/soap-envelope"
                 xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd">
             <S12:Header>
@@ -246,15 +190,16 @@ fn rejects_soap_envelope_without_messaging_element() {
             </S12:Header>
             <S12:Body/>
         </S12:Envelope>"#,
+    "no eb:Messaging must reject",
     )
-    .expect_err("no eb:Messaging must reject");
-    assert_eq!(err.code, ErrorCode::ParseFailed);
+    .await;
+    answer.assert_refused_because("EBMS:0004", "AS4 SOAP Header missing eb:Messaging");
 }
 
-#[test]
-fn rejects_messaging_without_user_message() {
+#[tokio::test]
+async fn rejects_messaging_without_user_message() {
     // eb:Messaging present but contains no eb:UserMessage.
-    let err = push(
+    let answer = refused(
         br#"<S12:Envelope xmlns:S12="http://www.w3.org/2003/05/soap-envelope"
                 xmlns:eb="http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/"
                 xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd">
@@ -268,16 +213,17 @@ fn rejects_messaging_without_user_message() {
             </S12:Header>
             <S12:Body/>
         </S12:Envelope>"#,
+    "no UserMessage must reject",
     )
-    .expect_err("no UserMessage must reject");
-    assert_eq!(err.code, ErrorCode::ParseFailed);
+    .await;
+    answer.assert_refused_because("EBMS:0004", "AS4 eb:Messaging missing UserMessage");
 }
 
 // ── Required field validation ────────────────────────────────────────────────
 
-#[test]
-fn rejects_user_message_without_message_id() {
-    let err = push(
+#[tokio::test]
+async fn rejects_user_message_without_message_id() {
+    let answer = refused(
         br#"<S12:Envelope xmlns:S12="http://www.w3.org/2003/05/soap-envelope"
                 xmlns:eb="http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/"
                 xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd">
@@ -295,14 +241,15 @@ fn rejects_user_message_without_message_id() {
             </S12:Header>
             <S12:Body/>
         </S12:Envelope>"#,
+    "missing MessageId must reject",
     )
-    .expect_err("missing MessageId must reject");
-    assert_eq!(err.code, ErrorCode::ParseFailed);
+    .await;
+    answer.assert_refused_because("EBMS:0004", "AS4 UserMessage missing MessageId");
 }
 
-#[test]
-fn rejects_user_message_without_action() {
-    let err = push(
+#[tokio::test]
+async fn rejects_user_message_without_action() {
+    let answer = refused(
         br#"<S12:Envelope xmlns:S12="http://www.w3.org/2003/05/soap-envelope"
                 xmlns:eb="http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/"
                 xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd">
@@ -321,14 +268,15 @@ fn rejects_user_message_without_action() {
             </S12:Header>
             <S12:Body/>
         </S12:Envelope>"#,
+    "missing Action must reject",
     )
-    .expect_err("missing Action must reject");
-    assert_eq!(err.code, ErrorCode::ParseFailed);
+    .await;
+    answer.assert_refused_because("EBMS:0004", "AS4 UserMessage missing Action");
 }
 
-#[test]
-fn rejects_user_message_without_from_party_id() {
-    let err = push(
+#[tokio::test]
+async fn rejects_user_message_without_from_party_id() {
+    let answer = refused(
         br#"<S12:Envelope xmlns:S12="http://www.w3.org/2003/05/soap-envelope"
                 xmlns:eb="http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/"
                 xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd">
@@ -346,14 +294,15 @@ fn rejects_user_message_without_from_party_id() {
             </S12:Header>
             <S12:Body/>
         </S12:Envelope>"#,
+    "missing From/PartyId must reject",
     )
-    .expect_err("missing From/PartyId must reject");
-    assert_eq!(err.code, ErrorCode::ParseFailed);
+    .await;
+    answer.assert_refused_because("EBMS:0004", "AS4 UserMessage missing From/PartyId");
 }
 
-#[test]
-fn rejects_user_message_without_to_party_id() {
-    let err = push(
+#[tokio::test]
+async fn rejects_user_message_without_to_party_id() {
+    let answer = refused(
         br#"<S12:Envelope xmlns:S12="http://www.w3.org/2003/05/soap-envelope"
                 xmlns:eb="http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/"
                 xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd">
@@ -371,111 +320,28 @@ fn rejects_user_message_without_to_party_id() {
             </S12:Header>
             <S12:Body/>
         </S12:Envelope>"#,
+    "missing To/PartyId must reject",
     )
-    .expect_err("missing To/PartyId must reject");
-    assert_eq!(err.code, ErrorCode::ParseFailed);
+    .await;
+    answer.assert_refused_because("EBMS:0004", "AS4 UserMessage missing To/PartyId");
 }
 
 // ── Encoding / injection resilience ─────────────────────────────────────────
 
-#[test]
-fn rejects_non_utf8_payload() {
+#[tokio::test]
+async fn rejects_non_utf8_payload() {
     // 0xFF bytes are invalid in UTF-8 and must not be silently decoded.
     let mut payload =
         br#"<S12:Envelope xmlns:S12="http://www.w3.org/2003/05/soap-envelope">"#.to_vec();
     payload.push(0xFF);
     payload.extend_from_slice(b"</S12:Envelope>");
-    let err = push(&payload).expect_err("non-UTF-8 must reject");
-    assert_eq!(err.code, ErrorCode::ParseFailed);
+    let answer = refused(&payload, "non-UTF-8 must reject").await;
+    answer.assert_refused_because("EBMS:0004", "as4_receive_push: payload is not valid UTF-8");
 }
 
-#[test]
-fn accepts_xml_entity_encoded_message_id() {
-    // XML entity encoding in MessageId must round-trip through the parser.
-    // The parser should decode &amp; entities without rejecting the document.
-    let out = push(&multipart_payload_with_cid(
-        br#"<S12:Envelope xmlns:S12="http://www.w3.org/2003/05/soap-envelope"
-                xmlns:eb="http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/"
-                xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd">
-            <S12:Header>
-                <eb:Messaging S12:mustUnderstand="true">
-                    <eb:UserMessage>
-                        <eb:MessageInfo><eb:MessageId>msg&amp;entity&lt;test&gt;</eb:MessageId></eb:MessageInfo>
-                        <eb:PartyInfo>
-                            <eb:From><eb:PartyId>A</eb:PartyId></eb:From>
-                            <eb:To><eb:PartyId>B</eb:PartyId></eb:To>
-                        </eb:PartyInfo>
-                        <eb:CollaborationInfo><eb:Action>Act</eb:Action></eb:CollaborationInfo>
-                        <eb:PayloadInfo>
-                            <eb:PartInfo href="cid:body@example.com"/>
-                        </eb:PayloadInfo>
-                    </eb:UserMessage>
-                </eb:Messaging>
-                <wsse:Security/>
-            </S12:Header>
-            <S12:Body/>
-        </S12:Envelope>"#,
-        "body@example.com",
-        b"entity-encoded-message-id-payload",
-    ))
-    .expect("entity-encoded MessageId must parse");
-    // quick-xml 0.38 emits separate Text events at entity boundaries; the
-    // parser must accumulate them so the full decoded value is preserved.
-    assert_eq!(out.user_message.message_id, "msg&entity<test>");
-}
-
-#[test]
-fn accepts_deeply_nested_but_valid_envelope() {
-    // A valid envelope with extra namespace declarations and nested empty elements
-    // inside the SOAP Body should be accepted.
-    let out = push(&multipart_payload_with_cid(
-        br#"<S12:Envelope xmlns:S12="http://www.w3.org/2003/05/soap-envelope"
-                xmlns:eb="http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/"
-                xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd"
-                xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
-            <S12:Header>
-                <eb:Messaging S12:mustUnderstand="true">
-                    <eb:UserMessage>
-                        <eb:MessageInfo>
-                            <eb:MessageId>msg-deep-1</eb:MessageId>
-                        </eb:MessageInfo>
-                        <eb:PartyInfo>
-                            <eb:From><eb:PartyId type="urn:oasis:names:tc:ebcore:partyid-type:iso6523:0088">A</eb:PartyId></eb:From>
-                            <eb:To><eb:PartyId>B</eb:PartyId></eb:To>
-                        </eb:PartyInfo>
-                        <eb:CollaborationInfo>
-                            <eb:Service type="urn:oasis:names:tc:ebcore:service:unregistered">TestService</eb:Service>
-                            <eb:Action>SubmitOrder</eb:Action>
-                            <eb:ConversationId>conv-deep-1</eb:ConversationId>
-                        </eb:CollaborationInfo>
-                        <eb:PayloadInfo>
-                            <eb:PartInfo href="cid:body@example.com"/>
-                        </eb:PayloadInfo>
-                    </eb:UserMessage>
-                </eb:Messaging>
-                <wsse:Security><wsse:Timestamp/></wsse:Security>
-            </S12:Header>
-            <S12:Body>
-                <app:Payload xmlns:app="urn:example:app"><app:Data/></app:Payload>
-            </S12:Body>
-        </S12:Envelope>"#,
-        "body@example.com",
-        b"deep-envelope-payload",
-    ))
-    .expect("deep valid envelope must parse");
-    assert_eq!(out.user_message.message_id, "msg-deep-1");
-    assert_eq!(out.user_message.action, "SubmitOrder");
-    assert_eq!(
-        out.user_message.conversation_id,
-        Some("conv-deep-1".to_string())
-    );
-}
-
-// ── First-element-wins / injection guard ────────────────────────────────────
-
-#[test]
-fn rejects_duplicate_message_id_in_strict_mode() {
-    let err = push(
+#[tokio::test]
+async fn rejects_duplicate_message_id_in_strict_mode() {
+    let answer = refused(
         br#"<S12:Envelope xmlns:S12="http://www.w3.org/2003/05/soap-envelope"
                 xmlns:eb="http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/"
                 xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd">
@@ -497,17 +363,14 @@ fn rejects_duplicate_message_id_in_strict_mode() {
             </S12:Header>
             <S12:Body/>
         </S12:Envelope>"#,
+    "strict mode must reject duplicate MessageId",
     )
-    .expect_err("strict mode must reject duplicate MessageId");
-    assert_eq!(err.code, ErrorCode::InteropViolation);
-    assert!(
-        err.to_string()
-            .contains("AS4 UserMessage contains duplicate MessageId")
-    );
+    .await;
+    answer.assert_refused_because("EBMS:0004", "AS4 UserMessage contains duplicate MessageId");
 }
 
-#[test]
-fn rejects_receipt_without_ref_to_message_id() {
+#[tokio::test]
+async fn rejects_receipt_without_ref_to_message_id() {
     let payload = br#"<S12:Envelope xmlns:S12="http://www.w3.org/2003/05/soap-envelope"
             xmlns:eb="http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/"
             xmlns:ds="http://www.w3.org/2000/09/xmldsig#"
@@ -528,13 +391,13 @@ fn rejects_receipt_without_ref_to_message_id() {
         <S12:Body/>
     </S12:Envelope>"#;
 
-    let err = push(payload).expect_err("receipt without RefToMessageId must reject");
-    assert_eq!(err.code, ErrorCode::ParseFailed);
+    let answer = refused(payload, "receipt without RefToMessageId must reject").await;
+    answer.assert_refused_because("EBMS:0004", "AS4 eb:Messaging missing UserMessage");
 }
 
-#[test]
-fn rejects_duplicate_action_in_strict_mode() {
-    let err = push(
+#[tokio::test]
+async fn rejects_duplicate_action_in_strict_mode() {
+    let answer = refused(
         br#"<S12:Envelope xmlns:S12="http://www.w3.org/2003/05/soap-envelope"
                 xmlns:eb="http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/"
                 xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd">
@@ -556,93 +419,18 @@ fn rejects_duplicate_action_in_strict_mode() {
             </S12:Header>
             <S12:Body/>
         </S12:Envelope>"#,
+    "strict mode must reject duplicate Action",
     )
-    .expect_err("strict mode must reject duplicate Action");
-    assert_eq!(err.code, ErrorCode::InteropViolation);
-    assert!(
-        err.to_string()
-            .contains("AS4 UserMessage contains duplicate Action")
-    );
+    .await;
+    answer.assert_refused_because("EBMS:0004", "AS4 UserMessage contains duplicate Action");
 }
 
 /// ebMS3 §5.2.2.4 allows multiple <eb:PartyId> per party for multi-scheme identifiers.
 /// Strict mode MUST accept them; rejection was a conformance bug.
-#[test]
-fn accepts_multiple_from_party_ids_in_strict_mode() {
-    let out = push(&multipart_payload_with_cid(
-        br#"<S12:Envelope xmlns:S12="http://www.w3.org/2003/05/soap-envelope"
-                xmlns:eb="http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/"
-                xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd">
-            <S12:Header>
-                <eb:Messaging S12:mustUnderstand="true">
-                    <eb:UserMessage>
-                        <eb:MessageInfo><eb:MessageId>msg-from-multi</eb:MessageId></eb:MessageInfo>
-                        <eb:PartyInfo>
-                            <eb:From>
-                                <eb:PartyId>GLN:1234567890</eb:PartyId>
-                                <eb:PartyId>DUNS:987654321</eb:PartyId>
-                            </eb:From>
-                            <eb:To><eb:PartyId>B</eb:PartyId></eb:To>
-                        </eb:PartyInfo>
-                        <eb:CollaborationInfo><eb:Action>Act</eb:Action></eb:CollaborationInfo>
-                        <eb:PayloadInfo>
-                            <eb:PartInfo href="cid:body@example.com"/>
-                        </eb:PayloadInfo>
-                    </eb:UserMessage>
-                </eb:Messaging>
-                <wsse:Security/>
-            </S12:Header>
-            <S12:Body/>
-        </S12:Envelope>"#,
-        "body@example.com",
-        b"multiple-from-party-id-payload",
-    ))
-    .expect("ebMS3 §5.2.2.4: multiple From/PartyId must be accepted in strict mode");
-    assert_eq!(out.user_message.from_party_id(), "GLN:1234567890");
-    assert_eq!(out.user_message.from_party_ids.len(), 2);
-    assert_eq!(out.user_message.from_party_ids[1], "DUNS:987654321");
-}
-
 /// ebMS3 §5.2.2.4 allows multiple <eb:PartyId> per party for multi-scheme identifiers.
-#[test]
-fn accepts_multiple_to_party_ids_in_strict_mode() {
-    let out = push(&multipart_payload_with_cid(
-        br#"<S12:Envelope xmlns:S12="http://www.w3.org/2003/05/soap-envelope"
-                xmlns:eb="http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/"
-                xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd">
-            <S12:Header>
-                <eb:Messaging S12:mustUnderstand="true">
-                    <eb:UserMessage>
-                        <eb:MessageInfo><eb:MessageId>msg-to-multi</eb:MessageId></eb:MessageInfo>
-                        <eb:PartyInfo>
-                            <eb:From><eb:PartyId>A</eb:PartyId></eb:From>
-                            <eb:To>
-                                <eb:PartyId>GLN:9876543210</eb:PartyId>
-                                <eb:PartyId>DUNS:123456789</eb:PartyId>
-                            </eb:To>
-                        </eb:PartyInfo>
-                        <eb:CollaborationInfo><eb:Action>Act</eb:Action></eb:CollaborationInfo>
-                        <eb:PayloadInfo>
-                            <eb:PartInfo href="cid:body@example.com"/>
-                        </eb:PayloadInfo>
-                    </eb:UserMessage>
-                </eb:Messaging>
-                <wsse:Security/>
-            </S12:Header>
-            <S12:Body/>
-        </S12:Envelope>"#,
-        "body@example.com",
-        b"multiple-to-party-id-payload",
-    ))
-    .expect("ebMS3 §5.2.2.4: multiple To/PartyId must be accepted in strict mode");
-    assert_eq!(out.user_message.to_party_id(), "GLN:9876543210");
-    assert_eq!(out.user_message.to_party_ids.len(), 2);
-    assert_eq!(out.user_message.to_party_ids[1], "DUNS:123456789");
-}
-
-#[test]
-fn rejects_messaging_must_understand_false_in_strict_mode() {
-    let err = push(
+#[tokio::test]
+async fn rejects_messaging_must_understand_false_in_strict_mode() {
+    let answer = refused(
         br#"<S12:Envelope xmlns:S12="http://www.w3.org/2003/05/soap-envelope"
                 xmlns:eb="http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/"
                 xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd">
@@ -661,14 +449,18 @@ fn rejects_messaging_must_understand_false_in_strict_mode() {
             </S12:Header>
             <S12:Body/>
         </S12:Envelope>"#,
+    "strict mode must reject mustUnderstand=false",
     )
-    .expect_err("strict mode must reject mustUnderstand=false");
-    assert_eq!(err.code, ErrorCode::InteropViolation);
+    .await;
+    answer.assert_refused_because(
+        "EBMS:0004",
+        "AS4 eb:Messaging must set SOAP mustUnderstand=true",
+    );
 }
 
-#[test]
-fn rejects_duplicate_top_level_messaging_headers_in_strict_mode() {
-    let err = push(
+#[tokio::test]
+async fn rejects_duplicate_top_level_messaging_headers_in_strict_mode() {
+    let answer = refused(
         br#"<S12:Envelope xmlns:S12="http://www.w3.org/2003/05/soap-envelope"
                 xmlns:eb="http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/"
                 xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd">
@@ -697,15 +489,19 @@ fn rejects_duplicate_top_level_messaging_headers_in_strict_mode() {
             </S12:Header>
             <S12:Body/>
         </S12:Envelope>"#,
+    "strict mode must reject duplicate top-level Messaging headers",
     )
-    .expect_err("strict mode must reject duplicate top-level Messaging headers");
+    .await;
 
-    assert_eq!(err.code, ErrorCode::InteropViolation);
+    answer.assert_refused_because(
+        "EBMS:0004",
+        "AS4 SOAP Header contains duplicate eb:Messaging blocks",
+    );
 }
 
-#[test]
-fn rejects_duplicate_top_level_security_headers_in_strict_mode() {
-    let err = push(
+#[tokio::test]
+async fn rejects_duplicate_top_level_security_headers_in_strict_mode() {
+    let answer = refused(
         br#"<S12:Envelope xmlns:S12="http://www.w3.org/2003/05/soap-envelope"
                 xmlns:eb="http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/"
                 xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd">
@@ -725,15 +521,19 @@ fn rejects_duplicate_top_level_security_headers_in_strict_mode() {
             </S12:Header>
             <S12:Body/>
         </S12:Envelope>"#,
+    "strict mode must reject duplicate top-level Security headers",
     )
-    .expect_err("strict mode must reject duplicate top-level Security headers");
+    .await;
 
-    assert_eq!(err.code, ErrorCode::InteropViolation);
+    answer.assert_refused_because(
+        "EBMS:0004",
+        "AS4 SOAP Header contains duplicate receiver-targeted wsse:Security blocks",
+    );
 }
 
-#[test]
-fn rejects_messaging_with_soap12_next_role_in_strict_mode() {
-    let err = push(
+#[tokio::test]
+async fn rejects_messaging_with_soap12_next_role_in_strict_mode() {
+    let answer = refused(
         br#"<S12:Envelope xmlns:S12="http://www.w3.org/2003/05/soap-envelope"
                 xmlns:eb="http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/"
                 xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd">
@@ -752,15 +552,19 @@ fn rejects_messaging_with_soap12_next_role_in_strict_mode() {
             </S12:Header>
             <S12:Body/>
         </S12:Envelope>"#,
+    "strict mode must reject intermediary-targeted SOAP role",
     )
-    .expect_err("strict mode must reject intermediary-targeted SOAP role");
+    .await;
 
-    assert_eq!(err.code, ErrorCode::InteropViolation);
+    answer.assert_refused_because(
+        "EBMS:0004",
+        "AS4 eb:Messaging SOAP targeting must resolve to receiver role",
+    );
 }
 
-#[test]
-fn rejects_non_targeted_security_header_with_soap12_next_role_in_strict_mode() {
-    let err = push(&multipart_payload_with_cid(
+#[tokio::test]
+async fn rejects_non_targeted_security_header_with_soap12_next_role_in_strict_mode() {
+    let answer = refused(&multipart_payload_with_cid(
         br#"<S12:Envelope xmlns:S12="http://www.w3.org/2003/05/soap-envelope"
                 xmlns:eb="http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/"
                 xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd">
@@ -784,19 +588,14 @@ fn rejects_non_targeted_security_header_with_soap12_next_role_in_strict_mode() {
         </S12:Envelope>"#,
         "body@example.com",
         b"security-next-role-payload",
-    ))
-    .expect_err("strict mode must reject when wsse:Security is not targeted to this receiver");
+    ), "strict mode must reject when wsse:Security is not targeted to this receiver").await;
 
-    assert_eq!(err.code, ErrorCode::ParseFailed);
-    assert!(
-        err.to_string()
-            .contains("AS4 SOAP Header missing wsse:Security")
-    );
+    answer.assert_refused_because("EBMS:0004", "AS4 SOAP Header missing wsse:Security");
 }
 
-#[test]
-fn rejects_non_targeted_security_header_with_custom_soap12_role_in_strict_mode() {
-    let err = push(
+#[tokio::test]
+async fn rejects_non_targeted_security_header_with_custom_soap12_role_in_strict_mode() {
+    let answer = refused(
         br#"<S12:Envelope xmlns:S12="http://www.w3.org/2003/05/soap-envelope"
                 xmlns:eb="http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/"
                 xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd">
@@ -815,52 +614,16 @@ fn rejects_non_targeted_security_header_with_custom_soap12_role_in_strict_mode()
             </S12:Header>
             <S12:Body/>
         </S12:Envelope>"#,
+    "strict mode must reject when SOAP 1.2 wsse:Security is targeted away from this receiver via custom role",
     )
-    .expect_err("strict mode must reject when SOAP 1.2 wsse:Security is targeted away from this receiver via custom role");
+    .await;
 
-    assert_eq!(err.code, ErrorCode::ParseFailed);
-    assert!(
-        err.to_string()
-            .contains("AS4 SOAP Header missing wsse:Security")
-    );
+    answer.assert_refused_because("EBMS:0004", "AS4 SOAP Header missing wsse:Security");
 }
 
-#[test]
-fn accepts_targeted_security_when_non_targeted_security_header_is_also_present_in_strict_mode() {
-    let out = push(&multipart_payload_with_cid(
-        br#"<S12:Envelope xmlns:S12="http://www.w3.org/2003/05/soap-envelope"
-                xmlns:eb="http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/"
-                xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd">
-            <S12:Header>
-                <eb:Messaging S12:mustUnderstand="true">
-                    <eb:UserMessage>
-                        <eb:MessageInfo><eb:MessageId>msg-security-mixed-targets</eb:MessageId></eb:MessageInfo>
-                        <eb:PartyInfo>
-                            <eb:From><eb:PartyId>A</eb:PartyId></eb:From>
-                            <eb:To><eb:PartyId>B</eb:PartyId></eb:To>
-                        </eb:PartyInfo>
-                        <eb:CollaborationInfo><eb:Action>Act</eb:Action></eb:CollaborationInfo>
-                        <eb:PayloadInfo>
-                            <eb:PartInfo href="cid:body@example.com"/>
-                        </eb:PayloadInfo>
-                    </eb:UserMessage>
-                </eb:Messaging>
-                <wsse:Security S12:role="http://www.w3.org/2003/05/soap-envelope/role/next"/>
-                <wsse:Security/>
-            </S12:Header>
-            <S12:Body/>
-        </S12:Envelope>"#,
-        "body@example.com",
-        b"security-mixed-targets-payload",
-    ))
-    .expect("strict mode should accept a receiver-targeted wsse:Security even when a non-targeted wsse:Security header is present");
-
-    assert_eq!(out.user_message.message_id, "msg-security-mixed-targets");
-}
-
-#[test]
-fn rejects_non_targeted_security_header_with_soap11_next_actor_in_strict_mode() {
-    let err = push(
+#[tokio::test]
+async fn rejects_non_targeted_security_header_with_soap11_next_actor_in_strict_mode() {
+    let answer = refused(
         br#"<S11:Envelope xmlns:S11="http://schemas.xmlsoap.org/soap/envelope/"
                 xmlns:eb="http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/"
                 xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd">
@@ -879,15 +642,19 @@ fn rejects_non_targeted_security_header_with_soap11_next_actor_in_strict_mode() 
             </S11:Header>
             <S11:Body/>
         </S11:Envelope>"#,
+    "strict mode must reject when SOAP 1.1 wsse:Security is not targeted to this receiver",
     )
-    .expect_err("strict mode must reject when SOAP 1.1 wsse:Security is not targeted to this receiver");
+    .await;
 
-    assert_eq!(err.code, ErrorCode::InteropViolation);
+    answer.assert_refused_because(
+        "EBMS:0004",
+        "AS4 policy requires SOAP 1.2 envelope namespace",
+    );
 }
 
-#[test]
-fn rejects_non_targeted_security_header_with_custom_soap11_actor_in_strict_mode() {
-    let err = push(
+#[tokio::test]
+async fn rejects_non_targeted_security_header_with_custom_soap11_actor_in_strict_mode() {
+    let answer = refused(
         br#"<S11:Envelope xmlns:S11="http://schemas.xmlsoap.org/soap/envelope/"
                 xmlns:eb="http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/"
                 xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd">
@@ -906,15 +673,19 @@ fn rejects_non_targeted_security_header_with_custom_soap11_actor_in_strict_mode(
             </S11:Header>
             <S11:Body/>
         </S11:Envelope>"#,
+    "strict mode must reject when SOAP 1.1 wsse:Security is targeted away from this receiver via custom actor",
     )
-    .expect_err("strict mode must reject when SOAP 1.1 wsse:Security is targeted away from this receiver via custom actor");
+    .await;
 
-    assert_eq!(err.code, ErrorCode::InteropViolation);
+    answer.assert_refused_because(
+        "EBMS:0004",
+        "AS4 policy requires SOAP 1.2 envelope namespace",
+    );
 }
 
-#[test]
-fn rejects_soap11_mixed_security_targets_in_strict_mode() {
-    let err = push(&multipart_payload_with_cid(
+#[tokio::test]
+async fn rejects_soap11_mixed_security_targets_in_strict_mode() {
+    let answer = refused(&multipart_payload_with_cid(
         br#"<S11:Envelope xmlns:S11="http://schemas.xmlsoap.org/soap/envelope/"
                 xmlns:eb="http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/"
                 xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd">
@@ -939,15 +710,17 @@ fn rejects_soap11_mixed_security_targets_in_strict_mode() {
         </S11:Envelope>"#,
         "body@example.com",
         b"security-soap11-mixed-targets-payload",
-    ))
-    .expect_err("strict mode must reject SOAP 1.1 envelopes");
+    ), "strict mode must reject SOAP 1.1 envelopes").await;
 
-    assert_eq!(err.code, ErrorCode::InteropViolation);
+    answer.assert_refused_because(
+        "EBMS:0004",
+        "AS4 policy requires SOAP 1.2 envelope namespace",
+    );
 }
 
-#[test]
-fn rejects_messaging_with_soap11_actor_in_strict_mode() {
-    let err = push(
+#[tokio::test]
+async fn rejects_messaging_with_soap11_actor_in_strict_mode() {
+    let answer = refused(
         br#"<S11:Envelope xmlns:S11="http://schemas.xmlsoap.org/soap/envelope/"
                 xmlns:eb="http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/"
                 xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd">
@@ -966,47 +739,19 @@ fn rejects_messaging_with_soap11_actor_in_strict_mode() {
             </S11:Header>
             <S11:Body/>
         </S11:Envelope>"#,
+    "strict mode must reject intermediary-targeted SOAP actor",
     )
-    .expect_err("strict mode must reject intermediary-targeted SOAP actor");
+    .await;
 
-    assert_eq!(err.code, ErrorCode::InteropViolation);
+    answer.assert_refused_because(
+        "EBMS:0004",
+        "AS4 policy requires SOAP 1.2 envelope namespace",
+    );
 }
 
-#[test]
-fn accepts_messaging_with_soap12_ultimate_receiver_role_in_strict_mode() {
-    let out = push(&multipart_payload_with_cid(
-        br#"<S12:Envelope xmlns:S12="http://www.w3.org/2003/05/soap-envelope"
-                xmlns:eb="http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/"
-                xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd">
-            <S12:Header>
-                <eb:Messaging S12:mustUnderstand="true" S12:role="http://www.w3.org/2003/05/soap-envelope/role/ultimateReceiver">
-                    <eb:UserMessage>
-                        <eb:MessageInfo><eb:MessageId>msg-role-ultimate</eb:MessageId></eb:MessageInfo>
-                        <eb:PartyInfo>
-                            <eb:From><eb:PartyId>A</eb:PartyId></eb:From>
-                            <eb:To><eb:PartyId>B</eb:PartyId></eb:To>
-                        </eb:PartyInfo>
-                        <eb:CollaborationInfo><eb:Action>Act</eb:Action></eb:CollaborationInfo>
-                        <eb:PayloadInfo>
-                            <eb:PartInfo href="cid:body@example.com"/>
-                        </eb:PayloadInfo>
-                    </eb:UserMessage>
-                </eb:Messaging>
-                <wsse:Security/>
-            </S12:Header>
-            <S12:Body/>
-        </S12:Envelope>"#,
-        "body@example.com",
-        b"role-ultimate-payload",
-    ))
-    .expect("strict mode should accept ultimateReceiver role targeting");
-
-    assert_eq!(out.user_message.message_id, "msg-role-ultimate");
-}
-
-#[test]
-fn rejects_unknown_mandatory_top_level_header_in_strict_mode() {
-    let err = push(
+#[tokio::test]
+async fn rejects_unknown_mandatory_top_level_header_in_strict_mode() {
+    let answer = refused(
         br#"<S12:Envelope xmlns:S12="http://www.w3.org/2003/05/soap-envelope"
                 xmlns:eb="http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/"
                 xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd"
@@ -1027,159 +772,19 @@ fn rejects_unknown_mandatory_top_level_header_in_strict_mode() {
             </S12:Header>
             <S12:Body/>
         </S12:Envelope>"#,
+    "strict mode must reject unknown mandatory SOAP header blocks",
     )
-    .expect_err("strict mode must reject unknown mandatory SOAP header blocks");
+    .await;
 
-    assert_eq!(err.code, ErrorCode::InteropViolation);
-    assert!(
-        err.to_string()
-            .contains("AS4 SOAP Header contains unknown mandatory receiver-targeted block")
+    answer.assert_refused_because(
+        "EBMS:0004",
+        "AS4 SOAP Header contains unknown mandatory receiver-targeted block",
     );
 }
 
-#[test]
-fn accepts_unknown_non_mandatory_top_level_header_in_strict_mode() {
-    let out = push(&multipart_payload_with_cid(
-        br#"<S12:Envelope xmlns:S12="http://www.w3.org/2003/05/soap-envelope"
-                xmlns:eb="http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/"
-                xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd"
-                xmlns:ext="urn:partner:ext:v1">
-            <S12:Header>
-                <ext:PartnerRoutingHint S12:mustUnderstand="false">route-a</ext:PartnerRoutingHint>
-                <eb:Messaging S12:mustUnderstand="true">
-                    <eb:UserMessage>
-                        <eb:MessageInfo><eb:MessageId>msg-unknown-optional</eb:MessageId></eb:MessageInfo>
-                        <eb:PartyInfo>
-                            <eb:From><eb:PartyId>A</eb:PartyId></eb:From>
-                            <eb:To><eb:PartyId>B</eb:PartyId></eb:To>
-                        </eb:PartyInfo>
-                        <eb:CollaborationInfo><eb:Action>Act</eb:Action></eb:CollaborationInfo>
-                        <eb:PayloadInfo>
-                            <eb:PartInfo href="cid:body@example.com"/>
-                        </eb:PayloadInfo>
-                    </eb:UserMessage>
-                </eb:Messaging>
-                <wsse:Security/>
-            </S12:Header>
-            <S12:Body/>
-        </S12:Envelope>"#,
-        "body@example.com",
-        b"unknown-optional-header-payload",
-    ))
-    .expect("strict mode should allow unknown non-mandatory SOAP headers");
-
-    assert_eq!(out.user_message.message_id, "msg-unknown-optional");
-}
-
-#[test]
-fn accepts_unknown_mandatory_header_targeted_to_soap12_next_in_strict_mode() {
-    let out = push(&multipart_payload_with_cid(
-        br#"<S12:Envelope xmlns:S12="http://www.w3.org/2003/05/soap-envelope"
-                xmlns:eb="http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/"
-                xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd"
-                xmlns:ext="urn:partner:ext:v1">
-            <S12:Header>
-                <ext:PartnerRoutingHint S12:mustUnderstand="true" S12:role="http://www.w3.org/2003/05/soap-envelope/role/next">route-a</ext:PartnerRoutingHint>
-                <eb:Messaging S12:mustUnderstand="true">
-                    <eb:UserMessage>
-                        <eb:MessageInfo><eb:MessageId>msg-unknown-next-role</eb:MessageId></eb:MessageInfo>
-                        <eb:PartyInfo>
-                            <eb:From><eb:PartyId>A</eb:PartyId></eb:From>
-                            <eb:To><eb:PartyId>B</eb:PartyId></eb:To>
-                        </eb:PartyInfo>
-                        <eb:CollaborationInfo><eb:Action>Act</eb:Action></eb:CollaborationInfo>
-                        <eb:PayloadInfo>
-                            <eb:PartInfo href="cid:body@example.com"/>
-                        </eb:PayloadInfo>
-                    </eb:UserMessage>
-                </eb:Messaging>
-                <wsse:Security/>
-            </S12:Header>
-            <S12:Body/>
-        </S12:Envelope>"#,
-        "body@example.com",
-        b"unknown-mandatory-next-role-payload",
-    ))
-    .expect("strict mode should allow unknown mandatory headers targeted to SOAP next role");
-
-    assert_eq!(out.user_message.message_id, "msg-unknown-next-role");
-}
-
-#[test]
-fn accepts_unknown_mandatory_header_targeted_to_soap12_none_role_in_strict_mode() {
-    let out = push(&multipart_payload_with_cid(
-        br#"<S12:Envelope xmlns:S12="http://www.w3.org/2003/05/soap-envelope"
-                xmlns:eb="http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/"
-                xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd"
-                xmlns:ext="urn:partner:ext:v1">
-            <S12:Header>
-                <ext:PartnerRoutingHint
-                    S12:mustUnderstand="true"
-                    S12:role="http://www.w3.org/2003/05/soap-envelope/role/none">route-a</ext:PartnerRoutingHint>
-                <eb:Messaging S12:mustUnderstand="true">
-                    <eb:UserMessage>
-                        <eb:MessageInfo><eb:MessageId>msg-unknown-none-role</eb:MessageId></eb:MessageInfo>
-                        <eb:PartyInfo>
-                            <eb:From><eb:PartyId>A</eb:PartyId></eb:From>
-                            <eb:To><eb:PartyId>B</eb:PartyId></eb:To>
-                        </eb:PartyInfo>
-                        <eb:CollaborationInfo><eb:Action>Act</eb:Action></eb:CollaborationInfo>
-                        <eb:PayloadInfo>
-                            <eb:PartInfo href="cid:body@example.com"/>
-                        </eb:PayloadInfo>
-                    </eb:UserMessage>
-                </eb:Messaging>
-                <wsse:Security/>
-            </S12:Header>
-            <S12:Body/>
-        </S12:Envelope>"#,
-        "body@example.com",
-        b"unknown-none-role-payload",
-    ))
-    .expect("strict mode should accept unknown mandatory headers targeted to SOAP 1.2 role/none");
-
-    assert_eq!(out.user_message.message_id, "msg-unknown-none-role");
-}
-
-#[test]
-fn accepts_unknown_mandatory_header_targeted_to_custom_soap12_role_in_strict_mode() {
-    let out = push(&multipart_payload_with_cid(
-        br#"<S12:Envelope xmlns:S12="http://www.w3.org/2003/05/soap-envelope"
-                xmlns:eb="http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/"
-                xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd"
-                xmlns:ext="urn:partner:ext:v1">
-            <S12:Header>
-                <ext:PartnerRoutingHint
-                    S12:mustUnderstand="true"
-                    S12:role="urn:partner:role:custom-hop">route-a</ext:PartnerRoutingHint>
-                <eb:Messaging S12:mustUnderstand="true">
-                    <eb:UserMessage>
-                        <eb:MessageInfo><eb:MessageId>msg-unknown-custom-role</eb:MessageId></eb:MessageInfo>
-                        <eb:PartyInfo>
-                            <eb:From><eb:PartyId>A</eb:PartyId></eb:From>
-                            <eb:To><eb:PartyId>B</eb:PartyId></eb:To>
-                        </eb:PartyInfo>
-                        <eb:CollaborationInfo><eb:Action>Act</eb:Action></eb:CollaborationInfo>
-                        <eb:PayloadInfo>
-                            <eb:PartInfo href="cid:body@example.com"/>
-                        </eb:PayloadInfo>
-                    </eb:UserMessage>
-                </eb:Messaging>
-                <wsse:Security/>
-            </S12:Header>
-            <S12:Body/>
-        </S12:Envelope>"#,
-        "body@example.com",
-        b"unknown-custom-role-payload",
-    ))
-    .expect("strict mode should accept unknown mandatory headers with user-defined SOAP 1.2 role targets");
-
-    assert_eq!(out.user_message.message_id, "msg-unknown-custom-role");
-}
-
-#[test]
-fn rejects_soap11_unknown_mandatory_header_targeted_to_next_actor_in_strict_mode() {
-    let err = push(&multipart_payload_with_cid(
+#[tokio::test]
+async fn rejects_soap11_unknown_mandatory_header_targeted_to_next_actor_in_strict_mode() {
+    let answer = refused(&multipart_payload_with_cid(
         br#"<S11:Envelope xmlns:S11="http://schemas.xmlsoap.org/soap/envelope/"
                 xmlns:eb="http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/"
                 xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd"
@@ -1205,15 +810,17 @@ fn rejects_soap11_unknown_mandatory_header_targeted_to_next_actor_in_strict_mode
         </S11:Envelope>"#,
         "body@example.com",
         b"unknown-mandatory-next-actor-payload",
-    ))
-    .expect_err("strict mode must reject SOAP 1.1 envelopes");
+    ), "strict mode must reject SOAP 1.1 envelopes").await;
 
-    assert_eq!(err.code, ErrorCode::InteropViolation);
+    answer.assert_refused_because(
+        "EBMS:0004",
+        "AS4 policy requires SOAP 1.2 envelope namespace",
+    );
 }
 
-#[test]
-fn rejects_soap11_unknown_mandatory_header_targeted_to_custom_actor_in_strict_mode() {
-    let err = push(&multipart_payload_with_cid(
+#[tokio::test]
+async fn rejects_soap11_unknown_mandatory_header_targeted_to_custom_actor_in_strict_mode() {
+    let answer = refused(&multipart_payload_with_cid(
         br#"<S11:Envelope xmlns:S11="http://schemas.xmlsoap.org/soap/envelope/"
                 xmlns:eb="http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/"
                 xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd"
@@ -1241,15 +848,17 @@ fn rejects_soap11_unknown_mandatory_header_targeted_to_custom_actor_in_strict_mo
         </S11:Envelope>"#,
         "body@example.com",
         b"unknown-custom-actor-payload",
-    ))
-    .expect_err("strict mode must reject SOAP 1.1 envelopes");
+    ), "strict mode must reject SOAP 1.1 envelopes").await;
 
-    assert_eq!(err.code, ErrorCode::InteropViolation);
+    answer.assert_refused_because(
+        "EBMS:0004",
+        "AS4 policy requires SOAP 1.2 envelope namespace",
+    );
 }
 
-#[test]
-fn rejects_unknown_mandatory_header_targeted_to_soap12_ultimate_receiver_in_strict_mode() {
-    let err = push(
+#[tokio::test]
+async fn rejects_unknown_mandatory_header_targeted_to_soap12_ultimate_receiver_in_strict_mode() {
+    let answer = refused(
         br#"<S12:Envelope xmlns:S12="http://www.w3.org/2003/05/soap-envelope"
                 xmlns:eb="http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/"
                 xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd"
@@ -1272,15 +881,19 @@ fn rejects_unknown_mandatory_header_targeted_to_soap12_ultimate_receiver_in_stri
             </S12:Header>
             <S12:Body/>
         </S12:Envelope>"#,
+    "strict mode must reject unknown mandatory headers targeted at ultimateReceiver",
     )
-    .expect_err("strict mode must reject unknown mandatory headers targeted at ultimateReceiver");
+    .await;
 
-    assert_eq!(err.code, ErrorCode::InteropViolation);
+    answer.assert_refused_because(
+        "EBMS:0004",
+        "AS4 SOAP Header contains unknown mandatory receiver-targeted block",
+    );
 }
 
-#[test]
-fn rejects_unknown_mandatory_header_with_empty_soap11_actor_in_strict_mode() {
-    let err = push(
+#[tokio::test]
+async fn rejects_unknown_mandatory_header_with_empty_soap11_actor_in_strict_mode() {
+    let answer = refused(
         br#"<S11:Envelope xmlns:S11="http://schemas.xmlsoap.org/soap/envelope/"
                 xmlns:eb="http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/"
                 xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd"
@@ -1303,15 +916,19 @@ fn rejects_unknown_mandatory_header_with_empty_soap11_actor_in_strict_mode() {
             </S11:Header>
             <S11:Body/>
         </S11:Envelope>"#,
+    "strict mode must reject unknown mandatory headers targeted to receiver via empty SOAP actor",
     )
-    .expect_err("strict mode must reject unknown mandatory headers targeted to receiver via empty SOAP actor");
+    .await;
 
-    assert_eq!(err.code, ErrorCode::InteropViolation);
+    answer.assert_refused_because(
+        "EBMS:0004",
+        "AS4 policy requires SOAP 1.2 envelope namespace",
+    );
 }
 
-#[test]
-fn rejects_unknown_mandatory_header_after_messaging_in_strict_mode() {
-    let err = push(
+#[tokio::test]
+async fn rejects_unknown_mandatory_header_after_messaging_in_strict_mode() {
+    let answer = refused(
         br#"<S12:Envelope xmlns:S12="http://www.w3.org/2003/05/soap-envelope"
                 xmlns:eb="http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/"
                 xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd"
@@ -1332,15 +949,19 @@ fn rejects_unknown_mandatory_header_after_messaging_in_strict_mode() {
             </S12:Header>
             <S12:Body/>
         </S12:Envelope>"#,
+    "strict mode must reject unknown mandatory headers regardless of top-level header order",
     )
-    .expect_err("strict mode must reject unknown mandatory headers regardless of top-level header order");
+    .await;
 
-    assert_eq!(err.code, ErrorCode::InteropViolation);
+    answer.assert_refused_because(
+        "EBMS:0004",
+        "AS4 SOAP Header contains unknown mandatory receiver-targeted block",
+    );
 }
 
-#[test]
-fn rejects_messaging_with_invalid_must_understand_token_in_strict_mode() {
-    let err = push(
+#[tokio::test]
+async fn rejects_messaging_with_invalid_must_understand_token_in_strict_mode() {
+    let answer = refused(
         br#"<S12:Envelope xmlns:S12="http://www.w3.org/2003/05/soap-envelope"
                 xmlns:eb="http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/"
                 xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd">
@@ -1359,19 +980,19 @@ fn rejects_messaging_with_invalid_must_understand_token_in_strict_mode() {
             </S12:Header>
             <S12:Body/>
         </S12:Envelope>"#,
+    "strict mode must reject invalid mustUnderstand token on Messaging",
     )
-    .expect_err("strict mode must reject invalid mustUnderstand token on Messaging");
+    .await;
 
-    assert_eq!(err.code, ErrorCode::InteropViolation);
-    assert!(
-        err.to_string()
-            .contains("AS4 eb:Messaging has invalid SOAP mustUnderstand token")
+    answer.assert_refused_because(
+        "EBMS:0004",
+        "AS4 eb:Messaging has invalid SOAP mustUnderstand token",
     );
 }
 
-#[test]
-fn rejects_unknown_header_with_invalid_must_understand_token_in_strict_mode() {
-    let err = push(
+#[tokio::test]
+async fn rejects_unknown_header_with_invalid_must_understand_token_in_strict_mode() {
+    let answer = refused(
         br#"<S12:Envelope xmlns:S12="http://www.w3.org/2003/05/soap-envelope"
                 xmlns:eb="http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/"
                 xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd"
@@ -1392,19 +1013,19 @@ fn rejects_unknown_header_with_invalid_must_understand_token_in_strict_mode() {
             </S12:Header>
             <S12:Body/>
         </S12:Envelope>"#,
+    "strict mode must reject invalid mustUnderstand token on top-level extension headers",
     )
-    .expect_err("strict mode must reject invalid mustUnderstand token on top-level extension headers");
+    .await;
 
-    assert_eq!(err.code, ErrorCode::InteropViolation);
-    assert!(
-        err.to_string()
-            .contains("AS4 SOAP Header block has invalid SOAP mustUnderstand token")
+    answer.assert_refused_because(
+        "EBMS:0004",
+        "AS4 SOAP Header block has invalid SOAP mustUnderstand token",
     );
 }
 
-#[test]
-fn rejects_messaging_with_unqualified_must_understand_in_strict_mode() {
-    let err = push(
+#[tokio::test]
+async fn rejects_messaging_with_unqualified_must_understand_in_strict_mode() {
+    let answer = refused(
         br#"<S12:Envelope xmlns:S12="http://www.w3.org/2003/05/soap-envelope"
                 xmlns:eb="http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/"
                 xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd">
@@ -1423,49 +1044,19 @@ fn rejects_messaging_with_unqualified_must_understand_in_strict_mode() {
             </S12:Header>
             <S12:Body/>
         </S12:Envelope>"#,
+    "strict mode must reject non-SOAP mustUnderstand on Messaging",
     )
-    .expect_err("strict mode must reject non-SOAP mustUnderstand on Messaging");
+    .await;
 
-    assert_eq!(err.code, ErrorCode::InteropViolation);
+    answer.assert_refused_because(
+        "EBMS:0004",
+        "AS4 eb:Messaging must set SOAP mustUnderstand=true",
+    );
 }
 
-#[test]
-fn accepts_unknown_header_with_unqualified_must_understand_in_strict_mode() {
-    let out = push(&multipart_payload_with_cid(
-        br#"<S12:Envelope xmlns:S12="http://www.w3.org/2003/05/soap-envelope"
-                xmlns:eb="http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/"
-                xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd"
-                xmlns:ext="urn:partner:ext:v1">
-            <S12:Header>
-                <ext:PartnerRoutingHint mustUnderstand="true">route-unqualified</ext:PartnerRoutingHint>
-                <eb:Messaging S12:mustUnderstand="true">
-                    <eb:UserMessage>
-                        <eb:MessageInfo><eb:MessageId>msg-unknown-unqualified-mu</eb:MessageId></eb:MessageInfo>
-                        <eb:PartyInfo>
-                            <eb:From><eb:PartyId>A</eb:PartyId></eb:From>
-                            <eb:To><eb:PartyId>B</eb:PartyId></eb:To>
-                        </eb:PartyInfo>
-                        <eb:CollaborationInfo><eb:Action>Act</eb:Action></eb:CollaborationInfo>
-                        <eb:PayloadInfo>
-                            <eb:PartInfo href="cid:body@example.com"/>
-                        </eb:PayloadInfo>
-                    </eb:UserMessage>
-                </eb:Messaging>
-                <wsse:Security/>
-            </S12:Header>
-            <S12:Body/>
-        </S12:Envelope>"#,
-        "body@example.com",
-        b"unqualified-mu-on-extension-is-non-soap",
-    ))
-    .expect("strict mode should ignore non-SOAP mustUnderstand on unknown headers");
-
-    assert_eq!(out.user_message.message_id, "msg-unknown-unqualified-mu");
-}
-
-#[test]
-fn rejects_security_header_with_invalid_must_understand_token_in_strict_mode() {
-    let err = push(
+#[tokio::test]
+async fn rejects_security_header_with_invalid_must_understand_token_in_strict_mode() {
+    let answer = refused(
         br#"<S12:Envelope xmlns:S12="http://www.w3.org/2003/05/soap-envelope"
                 xmlns:eb="http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/"
                 xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd">
@@ -1484,83 +1075,19 @@ fn rejects_security_header_with_invalid_must_understand_token_in_strict_mode() {
             </S12:Header>
             <S12:Body/>
         </S12:Envelope>"#,
+    "strict mode must reject invalid SOAP mustUnderstand on wsse:Security",
     )
-    .expect_err("strict mode must reject invalid SOAP mustUnderstand on wsse:Security");
+    .await;
 
-    assert_eq!(err.code, ErrorCode::InteropViolation);
-    assert!(
-        err.to_string()
-            .contains("AS4 SOAP Header block has invalid SOAP mustUnderstand token")
+    answer.assert_refused_because(
+        "EBMS:0004",
+        "AS4 SOAP Header block has invalid SOAP mustUnderstand token",
     );
 }
 
-#[test]
-fn accepts_messaging_with_custom_soap_prefix_must_understand_in_strict_mode() {
-    let out = push(&multipart_payload_with_cid(
-        br#"<env:Envelope xmlns:env="http://www.w3.org/2003/05/soap-envelope"
-                xmlns:eb="http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/"
-                xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd">
-            <env:Header>
-                <eb:Messaging env:mustUnderstand="true">
-                    <eb:UserMessage>
-                        <eb:MessageInfo><eb:MessageId>msg-custom-soap-prefix</eb:MessageId></eb:MessageInfo>
-                        <eb:PartyInfo>
-                            <eb:From><eb:PartyId>A</eb:PartyId></eb:From>
-                            <eb:To><eb:PartyId>B</eb:PartyId></eb:To>
-                        </eb:PartyInfo>
-                        <eb:CollaborationInfo><eb:Action>Act</eb:Action></eb:CollaborationInfo>
-                        <eb:PayloadInfo>
-                            <eb:PartInfo href="cid:body@example.com"/>
-                        </eb:PayloadInfo>
-                    </eb:UserMessage>
-                </eb:Messaging>
-                <wsse:Security/>
-            </env:Header>
-            <env:Body/>
-        </env:Envelope>"#,
-        "body@example.com",
-        b"custom-soap-prefix-payload",
-    ))
-    .expect("strict mode should accept SOAP mustUnderstand with non-default SOAP prefix");
-
-    assert_eq!(out.user_message.message_id, "msg-custom-soap-prefix");
-}
-
-#[test]
-fn accepts_messaging_with_header_scoped_soap_prefix_in_strict_mode() {
-    let out = push(&multipart_payload_with_cid(
-        br#"<S12:Envelope xmlns:S12="http://www.w3.org/2003/05/soap-envelope"
-                xmlns:eb="http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/"
-                xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd">
-            <S12:Header xmlns:h12="http://www.w3.org/2003/05/soap-envelope">
-                <eb:Messaging h12:mustUnderstand="true">
-                    <eb:UserMessage>
-                        <eb:MessageInfo><eb:MessageId>msg-header-scope-prefix</eb:MessageId></eb:MessageInfo>
-                        <eb:PartyInfo>
-                            <eb:From><eb:PartyId>A</eb:PartyId></eb:From>
-                            <eb:To><eb:PartyId>B</eb:PartyId></eb:To>
-                        </eb:PartyInfo>
-                        <eb:CollaborationInfo><eb:Action>Act</eb:Action></eb:CollaborationInfo>
-                        <eb:PayloadInfo>
-                            <eb:PartInfo href="cid:body@example.com"/>
-                        </eb:PayloadInfo>
-                    </eb:UserMessage>
-                </eb:Messaging>
-                <wsse:Security/>
-            </S12:Header>
-            <S12:Body/>
-        </S12:Envelope>"#,
-        "body@example.com",
-        b"header-scoped-soap-prefix-payload",
-    ))
-    .expect("strict mode should accept SOAP mustUnderstand from header-scoped SOAP prefix");
-
-    assert_eq!(out.user_message.message_id, "msg-header-scope-prefix");
-}
-
-#[test]
-fn rejects_unknown_mandatory_receiver_header_among_multi_hop_extensions_in_strict_mode() {
-    let err = push(
+#[tokio::test]
+async fn rejects_unknown_mandatory_receiver_header_among_multi_hop_extensions_in_strict_mode() {
+    let answer = refused(
         br#"<S12:Envelope xmlns:S12="http://www.w3.org/2003/05/soap-envelope"
                 xmlns:eb="http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/"
                 xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd"
@@ -1583,87 +1110,20 @@ fn rejects_unknown_mandatory_receiver_header_among_multi_hop_extensions_in_stric
             </S12:Header>
             <S12:Body/>
         </S12:Envelope>"#,
+    "strict mode must reject any mandatory unknown receiver-targeted header even with intermediary-targeted neighbors",
     )
-    .expect_err("strict mode must reject any mandatory unknown receiver-targeted header even with intermediary-targeted neighbors");
+    .await;
 
-    assert_eq!(err.code, ErrorCode::InteropViolation);
+    answer.assert_refused_because(
+        "EBMS:0004",
+        "AS4 SOAP Header contains unknown mandatory receiver-targeted block",
+    );
 }
 
-#[test]
-fn accepts_multi_hop_intermediary_mandatory_headers_with_header_scoped_soap_prefix_in_strict_mode()
-{
-    let out = push(&multipart_payload_with_cid(
-        br#"<S12:Envelope xmlns:S12="http://www.w3.org/2003/05/soap-envelope"
-                xmlns:eb="http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/"
-                xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd"
-                xmlns:ext="urn:partner:ext:v2">
-            <S12:Header xmlns:h12="http://www.w3.org/2003/05/soap-envelope">
-                <ext:HopOneHint h12:mustUnderstand="true" h12:role="http://www.w3.org/2003/05/soap-envelope/role/next">hop1</ext:HopOneHint>
-                <ext:HopTwoHint h12:mustUnderstand="true" h12:role="http://www.w3.org/2003/05/soap-envelope/role/next">hop2</ext:HopTwoHint>
-                <eb:Messaging h12:mustUnderstand="true">
-                    <eb:UserMessage>
-                        <eb:MessageInfo><eb:MessageId>msg-multi-hop-next-only</eb:MessageId></eb:MessageInfo>
-                        <eb:PartyInfo>
-                            <eb:From><eb:PartyId>A</eb:PartyId></eb:From>
-                            <eb:To><eb:PartyId>B</eb:PartyId></eb:To>
-                        </eb:PartyInfo>
-                        <eb:CollaborationInfo><eb:Action>Act</eb:Action></eb:CollaborationInfo>
-                        <eb:PayloadInfo>
-                            <eb:PartInfo href="cid:body@example.com"/>
-                        </eb:PayloadInfo>
-                    </eb:UserMessage>
-                </eb:Messaging>
-                <wsse:Security/>
-            </S12:Header>
-            <S12:Body/>
-        </S12:Envelope>"#,
-        "body@example.com",
-        b"multi-hop-next-only-payload",
-    ))
-    .expect("strict mode should accept mandatory unknown headers that are all intermediary-targeted");
-
-    assert_eq!(out.user_message.message_id, "msg-multi-hop-next-only");
-}
-
-#[test]
-fn accepts_composite_multi_hop_extensions_and_mixed_wsse_targets_in_strict_mode() {
-    let out = push(&multipart_payload_with_cid(
-        br#"<S12:Envelope xmlns:S12="http://www.w3.org/2003/05/soap-envelope"
-                xmlns:eb="http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/"
-                xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd"
-                xmlns:ext="urn:partner:ext:v4">
-            <S12:Header xmlns:h12="http://www.w3.org/2003/05/soap-envelope">
-                <ext:HopHintOne h12:mustUnderstand="true" h12:role="http://www.w3.org/2003/05/soap-envelope/role/next">hop1</ext:HopHintOne>
-                <ext:HopHintTwo h12:mustUnderstand="true" h12:role="urn:partner:hop:security-gateway">hop2</ext:HopHintTwo>
-                <eb:Messaging h12:mustUnderstand="true">
-                    <eb:UserMessage>
-                        <eb:MessageInfo><eb:MessageId>msg-composite-multi-hop-wsse</eb:MessageId></eb:MessageInfo>
-                        <eb:PartyInfo>
-                            <eb:From><eb:PartyId>A</eb:PartyId></eb:From>
-                            <eb:To><eb:PartyId>B</eb:PartyId></eb:To>
-                        </eb:PartyInfo>
-                        <eb:CollaborationInfo><eb:Action>Act</eb:Action></eb:CollaborationInfo>
-                        <eb:PayloadInfo>
-                            <eb:PartInfo href="cid:body@example.com"/>
-                        </eb:PayloadInfo>
-                    </eb:UserMessage>
-                </eb:Messaging>
-                <wsse:Security h12:role="http://www.w3.org/2003/05/soap-envelope/role/next"/>
-                <wsse:Security/>
-            </S12:Header>
-            <S12:Body/>
-        </S12:Envelope>"#,
-        "body@example.com",
-        b"composite-multi-hop-wsse-payload",
-    ))
-    .expect("strict mode should accept intermediary-targeted mandatory extensions when a receiver-targeted wsse:Security is present");
-
-    assert_eq!(out.user_message.message_id, "msg-composite-multi-hop-wsse");
-}
-
-#[test]
-fn rejects_receiver_targeted_partner_extension_even_with_valid_mixed_wsse_targets_in_strict_mode() {
-    let err = push(&multipart_payload_with_cid(
+#[tokio::test]
+async fn rejects_receiver_targeted_partner_extension_even_with_valid_mixed_wsse_targets_in_strict_mode()
+ {
+    let answer = refused(&multipart_payload_with_cid(
         br#"<S12:Envelope xmlns:S12="http://www.w3.org/2003/05/soap-envelope"
                 xmlns:eb="http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/"
                 xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd"
@@ -1691,15 +1151,17 @@ fn rejects_receiver_targeted_partner_extension_even_with_valid_mixed_wsse_target
         </S12:Envelope>"#,
         "body@example.com",
         b"composite-receiver-extension-payload",
-    ))
-    .expect_err("strict mode must reject receiver-targeted mandatory unknown extension headers even when wsse targeting is otherwise valid");
+    ), "strict mode must reject receiver-targeted mandatory unknown extension headers even when wsse targeting is otherwise valid").await;
 
-    assert_eq!(err.code, ErrorCode::InteropViolation);
+    answer.assert_refused_because(
+        "EBMS:0004",
+        "AS4 SOAP Header contains unknown mandatory receiver-targeted block",
+    );
 }
 
-#[test]
-fn rejects_soap11_composite_intermediary_extensions_in_strict_mode() {
-    let err = push(&multipart_payload_with_cid(
+#[tokio::test]
+async fn rejects_soap11_composite_intermediary_extensions_in_strict_mode() {
+    let answer = refused(&multipart_payload_with_cid(
         br#"<S11:Envelope xmlns:S11="http://schemas.xmlsoap.org/soap/envelope/"
                 xmlns:eb="http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/"
                 xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd"
@@ -1727,15 +1189,17 @@ fn rejects_soap11_composite_intermediary_extensions_in_strict_mode() {
         </S11:Envelope>"#,
         "body@example.com",
         b"soap11-composite-multi-hop-wsse-payload",
-    ))
-    .expect_err("strict mode must reject SOAP 1.1 envelopes");
+    ), "strict mode must reject SOAP 1.1 envelopes").await;
 
-    assert_eq!(err.code, ErrorCode::InteropViolation);
+    answer.assert_refused_because(
+        "EBMS:0004",
+        "AS4 policy requires SOAP 1.2 envelope namespace",
+    );
 }
 
-#[test]
-fn rejects_messaging_with_element_local_shadowed_soap_prefix_in_strict_mode() {
-    let err = push(
+#[tokio::test]
+async fn rejects_messaging_with_element_local_shadowed_soap_prefix_in_strict_mode() {
+    let answer = refused(
         br#"<S12:Envelope xmlns:S12="http://www.w3.org/2003/05/soap-envelope"
                 xmlns:eb="http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/"
                 xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd">
@@ -1754,49 +1218,19 @@ fn rejects_messaging_with_element_local_shadowed_soap_prefix_in_strict_mode() {
             </S12:Header>
             <S12:Body/>
         </S12:Envelope>"#,
+    "strict mode must reject Messaging when mustUnderstand uses element-local non-SOAP shadowed prefix",
     )
-    .expect_err("strict mode must reject Messaging when mustUnderstand uses element-local non-SOAP shadowed prefix");
+    .await;
 
-    assert_eq!(err.code, ErrorCode::InteropViolation);
+    answer.assert_refused_because(
+        "EBMS:0004",
+        "AS4 eb:Messaging must set SOAP mustUnderstand=true",
+    );
 }
 
-#[test]
-fn accepts_unknown_header_with_element_local_shadowed_soap_prefix_in_strict_mode() {
-    let out = push(&multipart_payload_with_cid(
-        br#"<S12:Envelope xmlns:S12="http://www.w3.org/2003/05/soap-envelope"
-                xmlns:eb="http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/"
-                xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd"
-                xmlns:ext="urn:partner:ext:v3">
-            <S12:Header>
-                <ext:PartnerRoutingHint xmlns:S12="urn:attacker:shadow" S12:mustUnderstand="true">shadowed</ext:PartnerRoutingHint>
-                <eb:Messaging S12:mustUnderstand="true">
-                    <eb:UserMessage>
-                        <eb:MessageInfo><eb:MessageId>msg-shadowed-extension-prefix</eb:MessageId></eb:MessageInfo>
-                        <eb:PartyInfo>
-                            <eb:From><eb:PartyId>A</eb:PartyId></eb:From>
-                            <eb:To><eb:PartyId>B</eb:PartyId></eb:To>
-                        </eb:PartyInfo>
-                        <eb:CollaborationInfo><eb:Action>Act</eb:Action></eb:CollaborationInfo>
-                        <eb:PayloadInfo>
-                            <eb:PartInfo href="cid:body@example.com"/>
-                        </eb:PayloadInfo>
-                    </eb:UserMessage>
-                </eb:Messaging>
-                <wsse:Security/>
-            </S12:Header>
-            <S12:Body/>
-        </S12:Envelope>"#,
-        "body@example.com",
-        b"shadowed-extension-prefix-payload",
-    ))
-    .expect("strict mode should ignore non-SOAP shadowed mustUnderstand on unknown header");
-
-    assert_eq!(out.user_message.message_id, "msg-shadowed-extension-prefix");
-}
-
-#[test]
-fn rejects_peppol_profile_mandatory_receiver_extension_header_in_strict_mode() {
-    let err = push(
+#[tokio::test]
+async fn rejects_peppol_profile_mandatory_receiver_extension_header_in_strict_mode() {
+    let answer = refused(
         br#"<S12:Envelope xmlns:S12="http://www.w3.org/2003/05/soap-envelope"
                 xmlns:eb="http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/"
                 xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd"
@@ -1819,51 +1253,19 @@ fn rejects_peppol_profile_mandatory_receiver_extension_header_in_strict_mode() {
             </S12:Header>
             <S12:Body/>
         </S12:Envelope>"#,
+    "strict mode must reject unknown mandatory Peppol extension headers targeted to receiver",
     )
-    .expect_err("strict mode must reject unknown mandatory Peppol extension headers targeted to receiver");
+    .await;
 
-    assert_eq!(err.code, ErrorCode::InteropViolation);
+    answer.assert_refused_because(
+        "EBMS:0004",
+        "AS4 SOAP Header contains unknown mandatory receiver-targeted block",
+    );
 }
 
-#[test]
-fn accepts_peppol_profile_mandatory_intermediary_extension_header_in_strict_mode() {
-    let out = push(&multipart_payload_with_cid(
-        br#"<S12:Envelope xmlns:S12="http://www.w3.org/2003/05/soap-envelope"
-                xmlns:eb="http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/"
-                xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd"
-                xmlns:pp="urn:fdc:peppol.eu:transport:as4:profile:2.0">
-            <S12:Header>
-                <pp:PeppolRoutingHint
-                    S12:mustUnderstand="true"
-                    S12:role="http://www.w3.org/2003/05/soap-envelope/role/next">peppol-next</pp:PeppolRoutingHint>
-                <eb:Messaging S12:mustUnderstand="true">
-                    <eb:UserMessage>
-                        <eb:MessageInfo><eb:MessageId>msg-peppol-next-ext</eb:MessageId></eb:MessageInfo>
-                        <eb:PartyInfo>
-                            <eb:From><eb:PartyId>A</eb:PartyId></eb:From>
-                            <eb:To><eb:PartyId>B</eb:PartyId></eb:To>
-                        </eb:PartyInfo>
-                        <eb:CollaborationInfo><eb:Action>Act</eb:Action></eb:CollaborationInfo>
-                        <eb:PayloadInfo>
-                            <eb:PartInfo href="cid:body@example.com"/>
-                        </eb:PayloadInfo>
-                    </eb:UserMessage>
-                </eb:Messaging>
-                <wsse:Security/>
-            </S12:Header>
-            <S12:Body/>
-        </S12:Envelope>"#,
-        "body@example.com",
-        b"peppol-intermediary-extension-payload",
-    ))
-    .expect("strict mode should accept intermediary-targeted mandatory Peppol extension headers");
-
-    assert_eq!(out.user_message.message_id, "msg-peppol-next-ext");
-}
-
-#[test]
-fn rejects_edelivery_profile_mandatory_receiver_extension_header_in_strict_mode() {
-    let err = push(
+#[tokio::test]
+async fn rejects_edelivery_profile_mandatory_receiver_extension_header_in_strict_mode() {
+    let answer = refused(
         br#"<S12:Envelope xmlns:S12="http://www.w3.org/2003/05/soap-envelope"
                 xmlns:eb="http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/"
                 xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd"
@@ -1884,15 +1286,19 @@ fn rejects_edelivery_profile_mandatory_receiver_extension_header_in_strict_mode(
             </S12:Header>
             <S12:Body/>
         </S12:Envelope>"#,
+    "strict mode must reject unknown mandatory eDelivery extension headers when receiver-targeted by default",
     )
-    .expect_err("strict mode must reject unknown mandatory eDelivery extension headers when receiver-targeted by default");
+    .await;
 
-    assert_eq!(err.code, ErrorCode::InteropViolation);
+    answer.assert_refused_because(
+        "EBMS:0004",
+        "AS4 SOAP Header contains unknown mandatory receiver-targeted block",
+    );
 }
 
-#[test]
-fn rejects_peppol_profile_mandatory_soap11_next_actor_extension_header_in_strict_mode() {
-    let err = push(&multipart_payload_with_cid(
+#[tokio::test]
+async fn rejects_peppol_profile_mandatory_soap11_next_actor_extension_header_in_strict_mode() {
+    let answer = refused(&multipart_payload_with_cid(
         br#"<S11:Envelope xmlns:S11="http://schemas.xmlsoap.org/soap/envelope/"
                 xmlns:eb="http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/"
                 xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd"
@@ -1918,15 +1324,17 @@ fn rejects_peppol_profile_mandatory_soap11_next_actor_extension_header_in_strict
         </S11:Envelope>"#,
         "body@example.com",
         b"peppol-soap11-next-actor-payload",
-    ))
-    .expect_err("strict mode must reject SOAP 1.1 envelopes");
+    ), "strict mode must reject SOAP 1.1 envelopes").await;
 
-    assert_eq!(err.code, ErrorCode::InteropViolation);
+    answer.assert_refused_because(
+        "EBMS:0004",
+        "AS4 policy requires SOAP 1.2 envelope namespace",
+    );
 }
 
-#[test]
-fn rejects_peppol_profile_mandatory_soap11_empty_actor_extension_header_in_strict_mode() {
-    let err = push(
+#[tokio::test]
+async fn rejects_peppol_profile_mandatory_soap11_empty_actor_extension_header_in_strict_mode() {
+    let answer = refused(
         br#"<S11:Envelope xmlns:S11="http://schemas.xmlsoap.org/soap/envelope/"
                 xmlns:eb="http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/"
                 xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd"
@@ -1947,15 +1355,19 @@ fn rejects_peppol_profile_mandatory_soap11_empty_actor_extension_header_in_stric
             </S11:Header>
             <S11:Body/>
         </S11:Envelope>"#,
+    "strict mode must reject SOAP 1.1 receiver-targeted mandatory Peppol extension headers via empty actor",
     )
-    .expect_err("strict mode must reject SOAP 1.1 receiver-targeted mandatory Peppol extension headers via empty actor");
+    .await;
 
-    assert_eq!(err.code, ErrorCode::InteropViolation);
+    answer.assert_refused_because(
+        "EBMS:0004",
+        "AS4 policy requires SOAP 1.2 envelope namespace",
+    );
 }
 
-#[test]
-fn rejects_edelivery_profile_mandatory_soap11_empty_actor_extension_header_in_strict_mode() {
-    let err = push(
+#[tokio::test]
+async fn rejects_edelivery_profile_mandatory_soap11_empty_actor_extension_header_in_strict_mode() {
+    let answer = refused(
         br#"<S11:Envelope xmlns:S11="http://schemas.xmlsoap.org/soap/envelope/"
                 xmlns:eb="http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/"
                 xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd"
@@ -1976,15 +1388,19 @@ fn rejects_edelivery_profile_mandatory_soap11_empty_actor_extension_header_in_st
             </S11:Header>
             <S11:Body/>
         </S11:Envelope>"#,
+    "strict mode must reject SOAP 1.1 receiver-targeted mandatory eDelivery extension headers via empty actor",
     )
-    .expect_err("strict mode must reject SOAP 1.1 receiver-targeted mandatory eDelivery extension headers via empty actor");
+    .await;
 
-    assert_eq!(err.code, ErrorCode::InteropViolation);
+    answer.assert_refused_because(
+        "EBMS:0004",
+        "AS4 policy requires SOAP 1.2 envelope namespace",
+    );
 }
 
-#[test]
-fn rejects_soap11_unknown_mandatory_header_with_header_scoped_prefix_in_strict_mode() {
-    let err = push(&multipart_payload_with_cid(
+#[tokio::test]
+async fn rejects_soap11_unknown_mandatory_header_with_header_scoped_prefix_in_strict_mode() {
+    let answer = refused(&multipart_payload_with_cid(
         br#"<S11:Envelope xmlns:S11="http://schemas.xmlsoap.org/soap/envelope/"
                 xmlns:eb="http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/"
                 xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd"
@@ -2010,16 +1426,18 @@ fn rejects_soap11_unknown_mandatory_header_with_header_scoped_prefix_in_strict_m
         </S11:Envelope>"#,
         "body@example.com",
         b"soap11-header-scope-next-actor-payload",
-    ))
-    .expect_err("strict mode must reject SOAP 1.1 envelopes");
+    ), "strict mode must reject SOAP 1.1 envelopes").await;
 
-    assert_eq!(err.code, ErrorCode::InteropViolation);
+    answer.assert_refused_because(
+        "EBMS:0004",
+        "AS4 policy requires SOAP 1.2 envelope namespace",
+    );
 }
 
-#[test]
-fn rejects_unknown_mandatory_header_targeted_to_soap11_receiver_with_header_scoped_prefix_in_strict_mode()
+#[tokio::test]
+async fn rejects_unknown_mandatory_header_targeted_to_soap11_receiver_with_header_scoped_prefix_in_strict_mode()
  {
-    let err = push(
+    let answer = refused(
         br#"<S11:Envelope xmlns:S11="http://schemas.xmlsoap.org/soap/envelope/"
                 xmlns:eb="http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/"
                 xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd"
@@ -2040,15 +1458,19 @@ fn rejects_unknown_mandatory_header_targeted_to_soap11_receiver_with_header_scop
             </S11:Header>
             <S11:Body/>
         </S11:Envelope>"#,
+    "strict mode must reject SOAP 1.1 receiver-targeted unknown mandatory header with header-scoped SOAP prefix",
     )
-    .expect_err("strict mode must reject SOAP 1.1 receiver-targeted unknown mandatory header with header-scoped SOAP prefix");
+    .await;
 
-    assert_eq!(err.code, ErrorCode::InteropViolation);
+    answer.assert_refused_because(
+        "EBMS:0004",
+        "AS4 policy requires SOAP 1.2 envelope namespace",
+    );
 }
 
-#[test]
-fn rejects_messaging_with_shadowed_soap11_prefix_must_understand_in_strict_mode() {
-    let err = push(
+#[tokio::test]
+async fn rejects_messaging_with_shadowed_soap11_prefix_must_understand_in_strict_mode() {
+    let answer = refused(
         br#"<S11:Envelope xmlns:S11="http://schemas.xmlsoap.org/soap/envelope/"
                 xmlns:eb="http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/"
                 xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd">
@@ -2067,47 +1489,19 @@ fn rejects_messaging_with_shadowed_soap11_prefix_must_understand_in_strict_mode(
             </S11:Header>
             <S11:Body/>
         </S11:Envelope>"#,
+    "strict mode must reject Messaging when SOAP 1.1 mustUnderstand uses element-local shadowed prefix",
     )
-    .expect_err("strict mode must reject Messaging when SOAP 1.1 mustUnderstand uses element-local shadowed prefix");
+    .await;
 
-    assert_eq!(err.code, ErrorCode::InteropViolation);
+    answer.assert_refused_because(
+        "EBMS:0004",
+        "AS4 policy requires SOAP 1.2 envelope namespace",
+    );
 }
 
-#[test]
-fn accepts_messaging_must_understand_numeric_one_in_strict_mode() {
-    let out = push(&multipart_payload_with_cid(
-        br#"<S12:Envelope xmlns:S12="http://www.w3.org/2003/05/soap-envelope"
-                xmlns:eb="http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/"
-                xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd">
-            <S12:Header>
-                <eb:Messaging S12:mustUnderstand="1">
-                    <eb:UserMessage>
-                        <eb:MessageInfo><eb:MessageId>msg-mu-one</eb:MessageId></eb:MessageInfo>
-                        <eb:PartyInfo>
-                            <eb:From><eb:PartyId>A</eb:PartyId></eb:From>
-                            <eb:To><eb:PartyId>B</eb:PartyId></eb:To>
-                        </eb:PartyInfo>
-                        <eb:CollaborationInfo><eb:Action>Act</eb:Action></eb:CollaborationInfo>
-                        <eb:PayloadInfo>
-                            <eb:PartInfo href="cid:body@example.com"/>
-                        </eb:PayloadInfo>
-                    </eb:UserMessage>
-                </eb:Messaging>
-                <wsse:Security/>
-            </S12:Header>
-            <S12:Body/>
-        </S12:Envelope>"#,
-        "body@example.com",
-        b"must-understand-one-payload",
-    ))
-    .expect("strict mode should accept mustUnderstand=1");
-
-    assert_eq!(out.user_message.message_id, "msg-mu-one");
-}
-
-#[test]
-fn rejects_soap11_envelope_wire_shape() {
-    let err = push(&multipart_payload_with_cid(
+#[tokio::test]
+async fn rejects_soap11_envelope_wire_shape() {
+    let answer = refused(&multipart_payload_with_cid(
         br#"<S11:Envelope xmlns:S11="http://schemas.xmlsoap.org/soap/envelope/"
                 xmlns:eb="http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/"
                 xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd">
@@ -2131,14 +1525,16 @@ fn rejects_soap11_envelope_wire_shape() {
         </S11:Envelope>"#,
         "body@example.com",
         b"soap11-wire-shape-payload",
-    ))
-    .expect_err("SOAP 1.1 envelope wire-shape must be rejected");
+    ), "SOAP 1.1 envelope wire-shape must be rejected").await;
 
-    assert_eq!(err.code, ErrorCode::InteropViolation);
+    answer.assert_refused_because(
+        "EBMS:0004",
+        "AS4 policy requires SOAP 1.2 envelope namespace",
+    );
 }
 
-#[test]
-fn rejects_unsigned_receipt_when_signed_receipt_required() {
+#[tokio::test]
+async fn rejects_unsigned_receipt_when_signed_receipt_required() {
     let payload = br#"<S12:Envelope xmlns:S12="http://www.w3.org/2003/05/soap-envelope"
             xmlns:eb="http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/"
             xmlns:ebbpsig="http://docs.oasis-open.org/ebxml-bp/ebbp-signals-2.0">
@@ -2158,13 +1554,13 @@ fn rejects_unsigned_receipt_when_signed_receipt_required() {
         <S12:Body/>
     </S12:Envelope>"#;
 
-    let err = push(payload).expect_err("unsigned receipt must reject");
-    assert_eq!(err.code, ErrorCode::ParseFailed);
+    let answer = refused(payload, "unsigned receipt must reject").await;
+    answer.assert_refused_because("EBMS:0004", "AS4 eb:Messaging missing UserMessage");
 }
 
-#[test]
-fn rejects_security_element_outside_soap_header() {
-    let err = push(
+#[tokio::test]
+async fn rejects_security_element_outside_soap_header() {
+    let answer = refused(
         br#"<S12:Envelope xmlns:S12="http://www.w3.org/2003/05/soap-envelope"
                 xmlns:eb="http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/"
                 xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd">
@@ -2184,18 +1580,15 @@ fn rejects_security_element_outside_soap_header() {
                 <wsse:Security/>
             </S12:Body>
         </S12:Envelope>"#,
+    "security in body must not satisfy strict header requirement",
     )
-    .expect_err("security in body must not satisfy strict header requirement");
-    assert_eq!(err.code, ErrorCode::ParseFailed);
-    assert!(
-        err.to_string()
-            .contains("AS4 SOAP Header missing wsse:Security")
-    );
+    .await;
+    answer.assert_refused_because("EBMS:0004", "AS4 SOAP Header missing wsse:Security");
 }
 
-#[test]
-fn rejects_messaging_usermessage_outside_soap_header() {
-    let err = push(
+#[tokio::test]
+async fn rejects_messaging_usermessage_outside_soap_header() {
+    let answer = refused(
         br#"<S12:Envelope xmlns:S12="http://www.w3.org/2003/05/soap-envelope"
                 xmlns:eb="http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/"
                 xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd">
@@ -2215,14 +1608,15 @@ fn rejects_messaging_usermessage_outside_soap_header() {
                 </eb:Messaging>
             </S12:Body>
         </S12:Envelope>"#,
+    "messaging in body must not satisfy required header structure",
     )
-    .expect_err("messaging in body must not satisfy required header structure");
-    assert_eq!(err.code, ErrorCode::ParseFailed);
+    .await;
+    answer.assert_refused_because("EBMS:0004", "AS4 SOAP Header missing eb:Messaging");
 }
 
-#[test]
-fn rejects_fake_namespace_messaging_in_soap_header() {
-    let err = push(
+#[tokio::test]
+async fn rejects_fake_namespace_messaging_in_soap_header() {
+    let answer = refused(
         br#"<S12:Envelope xmlns:S12="http://www.w3.org/2003/05/soap-envelope"
                 xmlns:x="urn:attacker:fake"
                 xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd">
@@ -2241,14 +1635,18 @@ fn rejects_fake_namespace_messaging_in_soap_header() {
             </S12:Header>
             <S12:Body/>
         </S12:Envelope>"#,
+    "fake namespace messaging must not satisfy ebMS structure",
     )
-    .expect_err("fake namespace messaging must not satisfy ebMS structure");
-    assert_eq!(err.code, ErrorCode::InteropViolation);
+    .await;
+    answer.assert_refused_because(
+        "EBMS:0004",
+        "AS4 SOAP Header contains unknown mandatory receiver-targeted block",
+    );
 }
 
-#[test]
-fn rejects_fake_namespace_security_header() {
-    let err = push(
+#[tokio::test]
+async fn rejects_fake_namespace_security_header() {
+    let answer = refused(
         br#"<S12:Envelope xmlns:S12="http://www.w3.org/2003/05/soap-envelope"
                 xmlns:eb="http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/"
                 xmlns:x="urn:attacker:fake">
@@ -2267,18 +1665,15 @@ fn rejects_fake_namespace_security_header() {
             </S12:Header>
             <S12:Body/>
         </S12:Envelope>"#,
+    "fake namespace security header must not satisfy wsse requirement",
     )
-    .expect_err("fake namespace security header must not satisfy wsse requirement");
-    assert_eq!(err.code, ErrorCode::ParseFailed);
-    assert!(
-        err.to_string()
-            .contains("AS4 SOAP Header missing wsse:Security")
-    );
+    .await;
+    answer.assert_refused_because("EBMS:0004", "AS4 SOAP Header missing wsse:Security");
 }
 
-#[test]
-fn rejects_usermessage_with_mpc_missing_uri_scheme() {
-    let err = push(
+#[tokio::test]
+async fn rejects_usermessage_with_mpc_missing_uri_scheme() {
+    let answer = refused(
         br#"<S12:Envelope xmlns:S12="http://www.w3.org/2003/05/soap-envelope"
                 xmlns:eb="http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/"
                 xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd">
@@ -2297,18 +1692,15 @@ fn rejects_usermessage_with_mpc_missing_uri_scheme() {
             </S12:Header>
             <S12:Body/>
         </S12:Envelope>"#,
+    "strict mode must reject mpc without URI scheme",
     )
-    .expect_err("strict mode must reject mpc without URI scheme");
-    assert_eq!(err.code, ErrorCode::InteropViolation);
-    assert!(
-        err.to_string()
-            .contains("AS4 UserMessage mpc must be a valid URI")
-    );
+    .await;
+    answer.assert_refused_because("EBMS:0004", "AS4 UserMessage mpc must be a valid URI");
 }
 
-#[test]
-fn rejects_usermessage_with_mpc_containing_whitespace() {
-    let err = push(
+#[tokio::test]
+async fn rejects_usermessage_with_mpc_containing_whitespace() {
+    let answer = refused(
         br#"<S12:Envelope xmlns:S12="http://www.w3.org/2003/05/soap-envelope"
                 xmlns:eb="http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/"
                 xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd">
@@ -2327,17 +1719,14 @@ fn rejects_usermessage_with_mpc_containing_whitespace() {
             </S12:Header>
             <S12:Body/>
         </S12:Envelope>"#,
+    "strict mode must reject mpc with whitespace",
     )
-    .expect_err("strict mode must reject mpc with whitespace");
-    assert_eq!(err.code, ErrorCode::InteropViolation);
-    assert!(
-        err.to_string()
-            .contains("AS4 UserMessage mpc must be a valid URI")
-    );
+    .await;
+    answer.assert_refused_because("EBMS:0004", "AS4 UserMessage mpc must be a valid URI");
 }
 
-#[test]
-fn rejects_push_with_tampered_ds_signature_structure() {
+#[tokio::test]
+async fn rejects_push_with_tampered_ds_signature_structure() {
     let payload = br#"<S12:Envelope xmlns:S12="http://www.w3.org/2003/05/soap-envelope"
             xmlns:eb="http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/"
             xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd"
@@ -2347,8 +1736,8 @@ fn rejects_push_with_tampered_ds_signature_structure() {
                 <eb:UserMessage>
                     <eb:MessageInfo><eb:MessageId>msg-bad-ds</eb:MessageId></eb:MessageInfo>
                     <eb:PartyInfo>
-                        <eb:From><eb:PartyId>A</eb:PartyId></eb:From>
-                        <eb:To><eb:PartyId>B</eb:PartyId></eb:To>
+                        <eb:From><eb:PartyId>party-a</eb:PartyId></eb:From>
+                        <eb:To><eb:PartyId>party-b</eb:PartyId></eb:To>
                     </eb:PartyInfo>
                     <eb:CollaborationInfo><eb:Action>Act</eb:Action></eb:CollaborationInfo>
                 </eb:UserMessage>
@@ -2362,83 +1751,500 @@ fn rejects_push_with_tampered_ds_signature_structure() {
         <S12:Body/>
     </S12:Envelope>"#;
 
-    let err = push_signed_required(payload)
-        .expect_err("tampered ds:Signature structure must fail cryptographic verification");
-    assert_eq!(err.code, ErrorCode::ParseFailed);
+    // A configured sender, so the signature structure is what gets judged.
+    let answer = refused(
+        payload,
+        "tampered ds:Signature structure must fail cryptographic verification",
+    )
+    .await;
+    answer.assert_refused_because("EBMS:0004", "ds:Signature missing ds:SignedInfo");
 }
 
-#[test]
-fn rejects_receipt_namespace_confusion_with_fake_receipt_element() {
-    let bus = bus();
-    let _events = bus.subscribe_scoped_events();
-    let payload = multipart_payload_with_cid(
+// ── Control: the structural verdicts above are about structure ──────────────
+
+/// A structurally complete crafted envelope is refused for its missing
+/// signature (EBMS:0101), not as malformed: the EBMS:0004 verdicts above come
+/// from the parser, before any signature is looked at.
+#[tokio::test]
+async fn structurally_valid_unsigned_envelope_is_refused_as_unsigned() {
+    let answer = refused(
         br#"<S12:Envelope xmlns:S12="http://www.w3.org/2003/05/soap-envelope"
                 xmlns:eb="http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/"
                 xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd">
             <S12:Header>
                 <eb:Messaging S12:mustUnderstand="true">
                     <eb:UserMessage>
-                        <eb:MessageInfo><eb:MessageId>msg-push-1</eb:MessageId></eb:MessageInfo>
+                        <eb:MessageInfo><eb:MessageId>msg-control</eb:MessageId></eb:MessageInfo>
                         <eb:PartyInfo>
-                            <eb:From><eb:PartyId>sender-a</eb:PartyId></eb:From>
-                            <eb:To><eb:PartyId>receiver-b</eb:PartyId></eb:To>
+                            <eb:From><eb:PartyId>party-a</eb:PartyId></eb:From>
+                            <eb:To><eb:PartyId>party-b</eb:PartyId></eb:To>
                         </eb:PartyInfo>
-                        <eb:CollaborationInfo>
-                            <eb:Action>SubmitOrder</eb:Action>
-                            <eb:ConversationId>conv-44</eb:ConversationId>
-                        </eb:CollaborationInfo>
-                        <eb:PayloadInfo>
-                            <eb:PartInfo href="cid:body@example.com"/>
-                        </eb:PayloadInfo>
+                        <eb:CollaborationInfo><eb:Action>Act</eb:Action></eb:CollaborationInfo>
+                        <eb:PayloadInfo><eb:PartInfo href="cid:body@example.com"/></eb:PayloadInfo>
                     </eb:UserMessage>
                 </eb:Messaging>
-                <wsse:Security>
-                    <wsse:BinarySecurityToken>stub</wsse:BinarySecurityToken>
-                </wsse:Security>
+                <wsse:Security/>
             </S12:Header>
             <S12:Body/>
         </S12:Envelope>"#,
-        "body@example.com",
-        b"receipt-namespace-confusion-payload",
-    );
-    let fake_ns_receipt = br#"<S12:Envelope xmlns:S12="http://www.w3.org/2003/05/soap-envelope"
-            xmlns:eb="http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/"
-            xmlns:x="urn:attacker:fake"
-            xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
-        <S12:Header>
-            <eb:Messaging>
-                <eb:SignalMessage>
-                    <eb:MessageInfo>
-                        <eb:RefToMessageId>msg-push-1</eb:RefToMessageId>
-                    </eb:MessageInfo>
-                    <x:Receipt>
-                        <x:NonRepudiationInformation/>
-                    </x:Receipt>
-                </eb:SignalMessage>
-            </eb:Messaging>
-            <ds:Signature>
-                <ds:SignatureValue>AAAA</ds:SignatureValue>
-            </ds:Signature>
-        </S12:Header>
-        <S12:Body/>
-    </S12:Envelope>"#;
-
-    let err = receive_push_sync(
-        &session(),
-        &bus,
-        As4ReceivePushSync {
-            request: As4ReceivePushRequest {
-                http_content_type: content_type_for_payload(&payload),
-                payload: payload.into(),
-                receipt_payload: Some(fake_ns_receipt.to_vec()),
-                policy: as4_unsigned_push_policy(),
-                authenticated_sender_scope: None,
-            },
-            dedup: dedup(),
-            signer_pins: None,
-        },
+        "an unsigned message is refused",
     )
-    .expect_err("namespace-confused receipt must be rejected");
+    .await;
+    // Unsigned where the profile requires a signature is EBMS:0103.
+    answer.assert_refused_because("EBMS:0103", "signature is required but not present");
+}
 
-    assert_eq!(err.code, ErrorCode::ParseFailed);
+// ── Accepted variants of a genuine message ──────────────────────────────────
+
+const NEXT: &str = "http://www.w3.org/2003/05/soap-envelope/role/next";
+
+async fn edelivery() -> (Genuine, Receiver) {
+    let g = genuine(Preset::Edelivery).await;
+    let r = g.receiver();
+    (g, r)
+}
+
+/// The genuine message id.
+fn message_id(soap: &str) -> String {
+    let start = soap.find("<ebms:MessageId").unwrap();
+    let start = start + soap[start..].find('>').unwrap() + 1;
+    soap[start..start + soap[start..].find('<').unwrap()].to_string()
+}
+
+#[tokio::test]
+async fn accepts_xml_entity_encoded_message_id() {
+    // Entity references in MessageId decode into one contiguous text value.
+    let (g, r) = edelivery().await;
+    let soap = g.soap();
+    let id = message_id(&soap);
+    let delivered = r
+        .accepted(g.resigned(|s| s.replace(&format!(">{id}<"), ">msg&amp;entity@asx.test<")))
+        .await;
+    assert_eq!(delivered.message_id, "msg&entity@asx.test");
+}
+
+#[tokio::test]
+async fn accepts_deeply_nested_but_valid_envelope() {
+    // Extra namespace declarations and nested elements in the (signed) Body.
+    let (g, r) = edelivery().await;
+    let delivered = r
+        .accepted(g.resigned(|s| {
+            s.replacen(
+                "<soap:Envelope ",
+                "<soap:Envelope xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" ",
+                1,
+            )
+            .replace(
+                "<soap:Body wsu:Id=\"as4-body\"/>",
+                "<soap:Body wsu:Id=\"as4-body\"><app:Payload xmlns:app=\"urn:example:app\">\
+                 <app:Data/></app:Payload></soap:Body>",
+            )
+            .replace(
+                "<ebms:ConversationId>1</ebms:ConversationId>",
+                "<ebms:ConversationId>conv-deep-1</ebms:ConversationId>",
+            )
+        }))
+        .await;
+    assert_eq!(delivered.action, "urn:example:action");
+    assert_eq!(delivered.conversation_id, "conv-deep-1");
+}
+
+/// ebMS3 §5.2.2.4 allows multiple <eb:PartyId> per party for multi-scheme
+/// identifiers. Strict mode MUST accept them; the first one is the party.
+#[tokio::test]
+async fn accepts_multiple_from_party_ids_in_strict_mode() {
+    let (g, r) = edelivery().await;
+    let delivered = r
+        .accepted(g.resigned(|s| {
+            s.replacen(
+                "party-a</ebms:PartyId>",
+                "party-a</ebms:PartyId><ebms:PartyId type=\"urn:oasis:names:tc:ebcore:partyid-type:iso6523:0060\">987654321</ebms:PartyId>",
+                1,
+            )
+        }))
+        .await;
+    assert_eq!(delivered.from, "party-a");
+}
+
+#[tokio::test]
+async fn accepts_multiple_to_party_ids_in_strict_mode() {
+    let (g, r) = edelivery().await;
+    r.accepted(g.resigned(|s| {
+        s.replacen(
+            "party-b</ebms:PartyId>",
+            "party-b</ebms:PartyId><ebms:PartyId type=\"urn:oasis:names:tc:ebcore:partyid-type:iso6523:0060\">123456789</ebms:PartyId>",
+            1,
+        )
+    }))
+    .await;
+}
+
+#[tokio::test]
+async fn accepts_targeted_security_when_non_targeted_security_header_is_also_present_in_strict_mode()
+ {
+    // An unsigned header block: the genuine signature still holds.
+    let (g, r) = edelivery().await;
+    r.accepted(g.mutated(|s| header_first(&s, &format!("<wsse:Security soap:role=\"{NEXT}\"/>"))))
+        .await;
+}
+
+#[tokio::test]
+async fn accepts_messaging_with_soap12_ultimate_receiver_role_in_strict_mode() {
+    let (g, r) = edelivery().await;
+    r.accepted(g.resigned(|s| {
+        s.replacen(
+            "<ebms:Messaging soap:mustUnderstand=\"true\"",
+            "<ebms:Messaging soap:mustUnderstand=\"true\" \
+             soap:role=\"http://www.w3.org/2003/05/soap-envelope/role/ultimateReceiver\"",
+            1,
+        )
+    }))
+    .await;
+}
+
+/// Unknown header blocks the receiver does not have to process: accepted.
+#[tokio::test]
+async fn accepts_unknown_headers_it_need_not_understand() {
+    for (case, header) in [
+        (
+            "non-mandatory",
+            r#"<ext:PartnerRoutingHint xmlns:ext="urn:partner:ext:v1" soap:mustUnderstand="false">route-a</ext:PartnerRoutingHint>"#.to_string(),
+        ),
+        (
+            "mandatory, role next",
+            format!(r#"<ext:PartnerRoutingHint xmlns:ext="urn:partner:ext:v1" soap:mustUnderstand="true" soap:role="{NEXT}">route-a</ext:PartnerRoutingHint>"#),
+        ),
+        (
+            "mandatory, role none",
+            r#"<ext:PartnerRoutingHint xmlns:ext="urn:partner:ext:v1" soap:mustUnderstand="true" soap:role="http://www.w3.org/2003/05/soap-envelope/role/none">route-a</ext:PartnerRoutingHint>"#.to_string(),
+        ),
+        (
+            "mandatory, custom role",
+            r#"<ext:PartnerRoutingHint xmlns:ext="urn:partner:ext:v1" soap:mustUnderstand="true" soap:role="urn:partner:role:custom-hop">route-a</ext:PartnerRoutingHint>"#.to_string(),
+        ),
+        (
+            "unqualified mustUnderstand is not SOAP's",
+            r#"<ext:PartnerRoutingHint xmlns:ext="urn:partner:ext:v1" mustUnderstand="true">route-unqualified</ext:PartnerRoutingHint>"#.to_string(),
+        ),
+        (
+            "element-local shadowed SOAP prefix",
+            r#"<ext:PartnerRoutingHint xmlns:ext="urn:partner:ext:v3" xmlns:soap="urn:attacker:shadow" soap:mustUnderstand="true">shadowed</ext:PartnerRoutingHint>"#.to_string(),
+        ),
+        (
+            "intermediary-targeted Peppol extension",
+            format!(r#"<pp:PeppolRoutingHint xmlns:pp="urn:fdc:peppol.eu:transport:as4:profile:2.0" soap:mustUnderstand="true" soap:role="{NEXT}">peppol-next</pp:PeppolRoutingHint>"#),
+        ),
+    ] {
+        let (g, r) = edelivery().await;
+        let answer = r.post(g.mutated(|s| header_first(&s, &header))).await;
+        assert!(answer.is_receipt(), "{case}: {answer:?}");
+        assert_eq!(r.calls(), 1, "{case}");
+    }
+}
+
+#[tokio::test]
+async fn accepts_messaging_with_custom_soap_prefix_must_understand_in_strict_mode() {
+    let (g, r) = edelivery().await;
+    r.accepted(g.resigned(|s| {
+        s.replace("xmlns:soap=", "xmlns:env=")
+            .replace("soap:", "env:")
+    }))
+    .await;
+}
+
+#[tokio::test]
+async fn accepts_messaging_with_header_scoped_soap_prefix_in_strict_mode() {
+    let (g, r) = edelivery().await;
+    r.accepted(g.resigned(|s| {
+        s.replacen(
+            "<soap:Header>",
+            "<soap:Header xmlns:h12=\"http://www.w3.org/2003/05/soap-envelope\">",
+            1,
+        )
+        .replacen(
+            "<ebms:Messaging soap:mustUnderstand",
+            "<ebms:Messaging h12:mustUnderstand",
+            1,
+        )
+    }))
+    .await;
+}
+
+#[tokio::test]
+async fn accepts_multi_hop_intermediary_mandatory_headers_with_header_scoped_soap_prefix_in_strict_mode()
+ {
+    let (g, r) = edelivery().await;
+    r.accepted(g.resigned(|s| {
+        s.replacen(
+            "<soap:Header>",
+            &format!(
+                "<soap:Header xmlns:h12=\"http://www.w3.org/2003/05/soap-envelope\">\
+                 <ext:HopOneHint xmlns:ext=\"urn:partner:ext:v2\" h12:mustUnderstand=\"true\" h12:role=\"{NEXT}\">hop1</ext:HopOneHint>\
+                 <ext:HopTwoHint xmlns:ext=\"urn:partner:ext:v2\" h12:mustUnderstand=\"true\" h12:role=\"{NEXT}\">hop2</ext:HopTwoHint>"
+            ),
+            1,
+        )
+        .replacen(
+            "<ebms:Messaging soap:mustUnderstand",
+            "<ebms:Messaging h12:mustUnderstand",
+            1,
+        )
+    }))
+    .await;
+}
+
+#[tokio::test]
+async fn accepts_composite_multi_hop_extensions_and_mixed_wsse_targets_in_strict_mode() {
+    let (g, r) = edelivery().await;
+    r.accepted(g.resigned(|s| {
+        s.replacen(
+            "<soap:Header>",
+            &format!(
+                "<soap:Header xmlns:h12=\"http://www.w3.org/2003/05/soap-envelope\">\
+                 <ext:HopHintOne xmlns:ext=\"urn:partner:ext:v4\" h12:mustUnderstand=\"true\" h12:role=\"{NEXT}\">hop1</ext:HopHintOne>\
+                 <ext:HopHintTwo xmlns:ext=\"urn:partner:ext:v4\" h12:mustUnderstand=\"true\" h12:role=\"urn:partner:hop:security-gateway\">hop2</ext:HopHintTwo>\
+                 <wsse:Security h12:role=\"{NEXT}\"/>"
+            ),
+            1,
+        )
+        .replacen(
+            "<ebms:Messaging soap:mustUnderstand",
+            "<ebms:Messaging h12:mustUnderstand",
+            1,
+        )
+    }))
+    .await;
+}
+
+#[tokio::test]
+async fn accepts_messaging_must_understand_numeric_one_in_strict_mode() {
+    let (g, r) = edelivery().await;
+    r.accepted(g.resigned(|s| {
+        s.replacen(
+            "<ebms:Messaging soap:mustUnderstand=\"true\"",
+            "<ebms:Messaging soap:mustUnderstand=\"1\"",
+            1,
+        )
+    }))
+    .await;
+}
+
+/// The same mutations without re-signing break the `eb:Messaging` digest: the
+/// accepted verdicts above are not a verifier that skips the header.
+#[tokio::test]
+async fn messaging_mutation_without_resigning_is_refused() {
+    let (g, r) = edelivery().await;
+    r.refused(
+        g.mutated(|s| {
+            s.replacen(
+                "<ebms:Messaging soap:mustUnderstand=\"true\"",
+                "<ebms:Messaging soap:mustUnderstand=\"1\"",
+                1,
+            )
+        }),
+        "EBMS:0101",
+    )
+    .await;
+}
+
+// ── Signature wrapping and ambiguity ────────────────────────────────────────
+
+const FORGED_ACTION: &str = "urn:attacker:action";
+
+/// The genuine `eb:Messaging`, rewritten by an attacker: another action, no
+/// `wsu:Id` (or the genuine one, when `keep_id`).
+fn forged_messaging(soap: &str, keep_id: bool) -> String {
+    let forged = messaging(soap).replace("urn:example:action", FORGED_ACTION);
+    if keep_id {
+        forged
+    } else {
+        forged.replace(" wsu:Id=\"as4-messaging\"", "")
+    }
+}
+
+/// Two top-level `eb:Messaging` headers, the signed one first.
+#[tokio::test]
+async fn duplicate_messaging_after_the_signed_one_is_refused() {
+    let (g, r) = edelivery().await;
+    let answer = r
+        .refused(
+            g.mutated(|s| {
+                let forged = forged_messaging(&s, false);
+                let end = s.find("</ebms:Messaging>").unwrap() + "</ebms:Messaging>".len();
+                format!("{}{forged}{}", &s[..end], &s[end..])
+            }),
+            "EBMS:0004",
+        )
+        .await;
+    assert!(
+        answer.description().contains("duplicate eb:Messaging"),
+        "{answer:?}"
+    );
+}
+
+/// A forged `eb:Messaging` placed before the signed one.
+#[tokio::test]
+async fn duplicate_messaging_before_the_signed_one_is_refused() {
+    let (g, r) = edelivery().await;
+    r.refused(
+        g.mutated(|s| header_first(&s, &forged_messaging(&s, false))),
+        "EBMS:0004",
+    )
+    .await;
+}
+
+/// XSW: the signed `eb:Messaging` is moved into a wrapper header and a
+/// forged one takes its place. The signature still verifies over the moved
+/// element; the processed header is not the signed one.
+#[tokio::test]
+async fn signed_messaging_moved_into_a_wrapper_is_refused() {
+    let (g, r) = edelivery().await;
+    let answer = r
+        .post(g.mutated(|s| {
+            let genuine = messaging(&s).to_string();
+            let forged = forged_messaging(&s, false);
+            s.replacen(
+                &genuine,
+                &format!(
+                    "{forged}<ext:Wrapper xmlns:ext=\"urn:attacker:wrap\" \
+                     soap:mustUnderstand=\"false\">{genuine}</ext:Wrapper>"
+                ),
+                1,
+            )
+        }))
+        .await;
+    answer.assert_refused_because("EBMS:0101", "exactly one eb:Messaging");
+    r.assert_not_delivered();
+}
+
+/// ID ambiguity: the forged header carries the signed element's
+/// `wsu:Id`, the genuine one hides in a wrapper. Two elements with one Id
+/// must never resolve to "the first one".
+#[tokio::test]
+async fn duplicate_wsu_id_is_refused() {
+    let (g, r) = edelivery().await;
+    let answer = r
+        .post(g.mutated(|s| {
+            let genuine = messaging(&s).to_string();
+            let forged = forged_messaging(&s, true);
+            s.replacen(
+                &genuine,
+                &format!(
+                    "{forged}<ext:Wrapper xmlns:ext=\"urn:attacker:wrap\">{genuine}</ext:Wrapper>"
+                ),
+                1,
+            )
+        }))
+        .await;
+    answer.assert_refused_because("EBMS:0004", "multiple elements share ID as4-messaging");
+    r.assert_not_delivered();
+}
+
+/// ID ambiguity: the Body carries the Messaging header's `wsu:Id` as well.
+#[tokio::test]
+async fn body_reusing_the_messaging_id_is_refused() {
+    let (g, r) = edelivery().await;
+    let answer = r
+        .post(g.mutated(|s| {
+            s.replace(
+                "<soap:Body wsu:Id=\"as4-body\"/>",
+                "<soap:Body wsu:Id=\"as4-messaging\"/>",
+            )
+        }))
+        .await;
+    answer.assert_refused_because("EBMS:0004", "multiple elements share ID as4-messaging");
+    r.assert_not_delivered();
+}
+
+/// Two `ds:Signature` elements in the receiver's `wsse:Security`.
+#[tokio::test]
+async fn multiple_signatures_are_refused() {
+    let (g, r) = edelivery().await;
+    let answer = r
+        .post(g.mutated(|s| {
+            let start = s.find("<ds:Signature").unwrap();
+            let end = s.find("</ds:Signature>").unwrap() + "</ds:Signature>".len();
+            let signature = s[start..end].to_string();
+            format!("{}{signature}{}", &s[..end], &s[end..])
+        }))
+        .await;
+    answer.assert_refused_because("EBMS:0004", "multiple ds:Signature elements");
+    r.assert_not_delivered();
+}
+
+/// The genuine `wsse:Security` re-targeted at the next hop: no signature is
+/// addressed to this receiver.
+#[tokio::test]
+async fn security_header_targeted_at_another_role_is_refused() {
+    let (g, r) = edelivery().await;
+    let answer = r
+        .post(g.mutated(|s| {
+            s.replacen(
+                "<wsse:Security xmlns:wsse=",
+                &format!("<wsse:Security soap:role=\"{NEXT}\" xmlns:wsse="),
+                1,
+            )
+        }))
+        .await;
+    answer.assert_refused_because("EBMS:0004", "missing wsse:Security");
+    r.assert_not_delivered();
+}
+
+/// A forged header re-signed by a key that is not the token's.
+#[tokio::test]
+async fn messaging_resigned_by_another_key_is_refused() {
+    let (g, r) = edelivery().await;
+    let attacker =
+        asx_testkit::pki::TestCa::new("attacker root", asx_testkit::pki::KeyAlg::Rsa2048)
+            .rsa_party("party-a");
+    let attachments: Vec<(String, Vec<u8>)> = g.parts()[1..]
+        .iter()
+        .map(|p| (format!("cid:{}", p.content_id().unwrap()), p.body.clone()))
+        .collect();
+    let soap = g.soap().replace("urn:example:action", FORGED_ACTION);
+    let forged = inbound_harness::resign(&soap, &attachments, &attacker.signing);
+    r.refused(g.with_soap(&forged), "EBMS:0101").await;
+}
+
+/// The genuine signed `eb:Messaging` claiming another recipient after a
+/// valid re-signature by the real sender: the `eb:To` check (EBMS:0004).
+#[tokio::test]
+async fn message_for_another_recipient_is_refused() {
+    let (g, r) = edelivery().await;
+    r.refused(
+        g.resigned(|s| s.replacen("party-b</ebms:PartyId>", "party-c</ebms:PartyId>", 1)),
+        "EBMS:0004",
+    )
+    .await;
+}
+
+// ── Fragments (not supported) ───────────────────────────────────────────────
+
+/// A `mf:MessageFragment` whose `href` holds a multibyte character is
+/// refused, never a panic and never delivered.
+#[tokio::test]
+async fn fragment_message_is_refused() {
+    let boundary = "frag-adversarial-boundary";
+    let soap = "<S12:Envelope xmlns:S12=\"http://www.w3.org/2003/05/soap-envelope\" \
+         xmlns:eb=\"http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/\" \
+         xmlns:mf=\"http://docs.oasis-open.org/ebxml-msg/ns/v3.0/mf/2010/04/\">\
+         <S12:Header><eb:Messaging S12:mustUnderstand=\"true\"><eb:UserMessage><eb:PartyInfo><eb:From>\
+         <eb:PartyId>party-a</eb:PartyId></eb:From></eb:PartyInfo></eb:UserMessage>\
+         </eb:Messaging><mf:MessageFragment href=\"abc\u{e9}@x\"><mf:GroupId>g-1</mf:GroupId>\
+         <mf:FragmentCount>2</mf:FragmentCount><mf:FragmentNum>1</mf:FragmentNum>\
+         </mf:MessageFragment></S12:Header><S12:Body/></S12:Envelope>";
+    let mut body = Vec::new();
+    body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+    body.extend_from_slice(
+        b"Content-Type: application/soap+xml\r\nContent-ID: <soap@test>\r\n\r\n",
+    );
+    body.extend_from_slice(soap.as_bytes());
+    body.extend_from_slice(format!("\r\n--{boundary}\r\n").as_bytes());
+    body.extend_from_slice(
+        b"Content-Type: application/octet-stream\r\nContent-ID: <other@x>\r\n\r\n",
+    );
+    body.extend_from_slice(b"fragment-data");
+    body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+    let answer = refused(&body, "a fragment is refused").await;
+    answer.assert_refused("EBMS:0004");
 }

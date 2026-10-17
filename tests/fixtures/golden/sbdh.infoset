@@ -1,0 +1,24 @@
+{http://www.unece.org/cefact/namespaces/StandardBusinessDocumentHeader}StandardBusinessDocument
+  {http://www.unece.org/cefact/namespaces/StandardBusinessDocumentHeader}StandardBusinessDocumentHeader
+    {http://www.unece.org/cefact/namespaces/StandardBusinessDocumentHeader}HeaderVersion = "1.0"
+    {http://www.unece.org/cefact/namespaces/StandardBusinessDocumentHeader}Sender
+      {http://www.unece.org/cefact/namespaces/StandardBusinessDocumentHeader}Identifier @{}Authority="auth-a<b&c\"d'e>f" = "0088:a<b&c\"d'e>f"
+    {http://www.unece.org/cefact/namespaces/StandardBusinessDocumentHeader}Receiver
+      {http://www.unece.org/cefact/namespaces/StandardBusinessDocumentHeader}Identifier @{}Authority="iso6523-actorid-upis" = "0088:receiver"
+    {http://www.unece.org/cefact/namespaces/StandardBusinessDocumentHeader}DocumentIdentification
+      {http://www.unece.org/cefact/namespaces/StandardBusinessDocumentHeader}Standard = "urn:standard:a<b&c\"d'e>f"
+      {http://www.unece.org/cefact/namespaces/StandardBusinessDocumentHeader}TypeVersion = "2.1"
+      {http://www.unece.org/cefact/namespaces/StandardBusinessDocumentHeader}InstanceIdentifier = "instance-a<b&c\"d'e>f"
+      {http://www.unece.org/cefact/namespaces/StandardBusinessDocumentHeader}Type = "Invoice"
+      {http://www.unece.org/cefact/namespaces/StandardBusinessDocumentHeader}MultipleType = "false"
+      {http://www.unece.org/cefact/namespaces/StandardBusinessDocumentHeader}CreationDateAndTime = "2026-10-16T12:00:00Z"
+    {http://www.unece.org/cefact/namespaces/StandardBusinessDocumentHeader}BusinessScope
+      {http://www.unece.org/cefact/namespaces/StandardBusinessDocumentHeader}Scope
+        {http://www.unece.org/cefact/namespaces/StandardBusinessDocumentHeader}Type = "DOCUMENTID"
+        {http://www.unece.org/cefact/namespaces/StandardBusinessDocumentHeader}InstanceIdentifier = "doc-a<b&c\"d'e>f"
+        {http://www.unece.org/cefact/namespaces/StandardBusinessDocumentHeader}Identifier = "busdox-docid-qns"
+      {http://www.unece.org/cefact/namespaces/StandardBusinessDocumentHeader}Scope
+        {http://www.unece.org/cefact/namespaces/StandardBusinessDocumentHeader}Type = "MLS_TYPE"
+        {http://www.unece.org/cefact/namespaces/StandardBusinessDocumentHeader}InstanceIdentifier
+  {urn:oasis:names:specification:ubl:schema:xsd:Invoice-2}Invoice
+    {urn:oasis:names:specification:ubl:schema:xsd:Invoice-2}ID = "1 & 2"

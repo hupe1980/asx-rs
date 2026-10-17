@@ -16,20 +16,19 @@ const SHA256_HEX_LEN: usize = 64;
 /// The SHA-256 fingerprint of an X.509 certificate, over its **DER** encoding.
 ///
 /// This is the value [`SessionContextBuilder::with_fingerprint_sha256`] pins
-/// and the one an [`As4SignerPins`] resolver returns. Canonical form is
+/// and the form `Partner::signing_cert` pins are kept in. Canonical form is
 /// lower-case hex with no separators; [`parse`](Self::parse) accepts the
 /// colon-separated upper-case form that `openssl x509 -fingerprint` prints and
 /// normalizes it.
 ///
 /// [`SessionContextBuilder::with_fingerprint_sha256`]: crate::core::SessionContextBuilder::with_fingerprint_sha256
-/// [`As4SignerPins`]: crate::as4::As4SignerPins
 ///
 /// # Computing one
 ///
-/// ```no_run
-/// use asx_rs::crypto::CertFingerprint;
+/// ```text
+/// use asx::crypto::CertFingerprint;
 ///
-/// # fn example(partner_cert_pem: &[u8]) -> asx_rs::Result<()> {
+/// # fn example(partner_cert_pem: &[u8]) -> asx::Result<()> {
 /// let pin = CertFingerprint::from_cert_pem(partner_cert_pem)?;
 /// println!("{pin}"); // 64 lower-case hex characters
 /// # Ok(())
@@ -54,8 +53,8 @@ impl CertFingerprint {
     /// Requires the `crypto` feature, which supplies the X.509 parser. Without
     /// it, [`from_cert_der`](Self::from_cert_der) and [`parse`](Self::parse)
     /// are still available, since neither needs one.
-    #[cfg(feature = "crypto")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "crypto")))]
+    #[cfg(any(feature = "as2", feature = "as4"))]
+    #[cfg_attr(docsrs, doc(cfg(any(feature = "as2", feature = "as4"))))]
     pub fn from_cert_pem(cert_pem: &[u8]) -> Result<Self> {
         let cert = openssl::x509::X509::from_pem(cert_pem).map_err(|err| {
             AsxError::new(
@@ -95,9 +94,9 @@ impl CertFingerprint {
     /// Separators (`:`, spaces, `-`) are ignored and case is normalized, so
     /// all of these are the same value:
     ///
-    /// ```
-    /// use asx_rs::crypto::CertFingerprint;
-    /// # fn main() -> asx_rs::Result<()> {
+    /// ```text
+    /// use asx::crypto::CertFingerprint;
+    /// # fn main() -> asx::Result<()> {
     /// let a = CertFingerprint::parse(
     ///     "AB:CD:EF:01:23:45:67:89:AB:CD:EF:01:23:45:67:89:\
     ///      AB:CD:EF:01:23:45:67:89:AB:CD:EF:01:23:45:67:89",

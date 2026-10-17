@@ -1,541 +1,189 @@
 +++
 title = "Security model"
-description = "Trust boundaries, fail-closed defaults, certificate validation and revocation, XML Signature Wrapping defences, and what asx-rs does not protect against."
+description = "What asx checks, in which order, and the test that fails when a check is removed."
 +++
 
-## Design Principles
+Each claim names the test that fails when the check is removed (in `tests/`,
+run with `cargo test --all-features --test <file> <name>`) or the section it
+implements. Foreign-implementation evidence is on the
+[conformance page](@/docs/conformance.md).
 
-1. **Fail-closed by default** — absent configuration causes rejection, not acceptance.
-2. **Explicit trust transitions** — trust is not implicit; it must be established at each cryptographic stage.
-3. **No silent bypasses** — signature verification results are always propagated; `let _ = verify(...)` is forbidden.
-4. **Algorithm agility with compliance first** — AS4 WS-Security runtime verification is strict-only (no legacy inbound fallback paths); any non-default compatibility behavior must be explicit and scoped through interop policy outside WS-Security cryptographic verification.
-5. **Security invariants are floors, not defaults** — a safe default that any configuration layer can silently overwrite is not an invariant. Where a policy layer is publicly mutable, the safe value is additionally pinned by a floor that validation enforces; see [Profile security floor](#profile-security-floor).
+## Design principles
 
----
+- **The profile is the only source of security settings.** No public item
+  selects or relaxes an algorithm, a signature requirement or a trust rule
+  outside `Profile` and `Quirk` (`tests/source_gates.rs`:
+  `internal_policies_are_built_only_by_the_profile_views`). No test feature, no
+  interop mode (`no_testing_feature_and_no_interop_mode`).
+- **Verification is a type.** `Verified<T>` has no public constructor; exactly
+  four pipelines create one (`verified_new_has_exactly_four_call_sites`), and
+  a forged one does not compile (the `compile_fail` doctest on `Verified`).
+- **Algorithms come from the profile, never from the message.** Another
+  declared algorithm is refused, not negotiated.
 
-## Profile Security Floor
+## Configuration is validated once
 
-`ProfileStack.overrides` and `ProfileStack.partner_overrides` are public `Vec`
-fields, so a single overlay can rewrite `SecurityPolicy` for one partner.
-`BaseProfile::security_floor` is the invariant that survives that.
+`build()` refuses anything the profile does not allow with `ErrorKind::Config`
+naming the setting and section (`tests/build_rejections.rs`; [summary](@/docs/profiles.md#what-build-refuses)).
+`send` checks the message before anything is signed
+(`tests/as4_send.rs::invalid_message_is_config_and_nothing_is_sent`,
+`tests/as2_send.rs::invalid_messages_are_refused_before_sending`).
+Certificates are re-checked for validity at use.
 
-| Property | Behaviour |
-|---|---|
-| Default | `SecurityPolicy::SIGN_AND_ENCRYPT` — matches PEPPOL, CEF eDelivery and BDEW AS4-Profil v1.2 §2.2.6.2.2 |
-| Overridable by a layer | **No.** The floor lives on `BaseProfile` only, so no extension, global override, partner overlay, or regional pack can lower it |
-| Enforced by | `ProfileStack::validate()`, against the **resolved** policy of the deployment baseline and of every declared partner |
-| Enforced by a host mandate | `validate_with_floor(floor)` — takes the stronger of the host floor and the profile's, so it can only tighten |
-| Visible in audit | Recorded in `EffectivePolicySnapshot::security_floor`; `diff_effective_policy_snapshots` grades a **lowered** floor as `High` risk and blocks release even when the resolved policy is unchanged |
+## Verification order
 
-A layer that weakens security while still clearing the floor is reported as a
-`ProfileLintCode::SecurityRelaxation` lint at `ProfileLintSeverity::Critical`;
-`ProfileValidationOptions::forbid_security_relaxation` escalates it to an error.
+Inbound AS4, in order; a failing step stops the pipeline:
 
-**Interop mode is a separate axis.** Neither `InteropMode::Strict` nor the
-`interop-strict` feature implies a strict security policy — they govern header
-and ambiguity handling. Enforce the security axis with a floor.
+1. size limit (HTTP 413) and structure: one parser with per-class limits
+   (bytes, nodes, depth, attributes), `DOCTYPE` and every `<!` declaration
+   refused (`tests/xml_limits.rs`; ebMS header rules in
+   `tests/as4_ebms_adversarial.rs`);
+2. the signer chains to a trust anchor offline and is authorized for the
+   claimed sender (pinned certificate, or the profile's identity rule) (`tests/as4_receive.rs`:
+   `unpinned_signer_of_a_configured_partner_is_refused`,
+   `unconfigured_bdew_sender_with_matching_subject_is_accepted`,
+   `bdew_mp_id_must_be_in_the_ou`, `unconfigured_edelivery_sender_is_refused`);
+3. the `SignatureValue`, then the digests of `eb:Messaging` and the Body; the
+   signature must be a child of the targeted `wsse:Security`, references
+   resolve only through `wsu:Id`, `Id` or `xml:id`, at most 19 references and
+   two transforms each (`tests/wssec_strict_matrix.rs`,
+   `tests/as4_swa_encryption_inbound.rs::messaging_digest_failure_is_pre_key`);
+4. `eb:To` is the local party (`message_for_another_party_is_refused`);
+5. revocation (below);
+6. `eb:Timestamp`: at most 300 s in the future, at most 24 h in the past;
+7. the ebMS3 test service is receipted here and never delivered
+   (`ping_is_receipted_without_a_claim`);
+8. the payload set equals the signed `eb:PartInfo` set (a part property
+   repeated in one `eb:PartInfo` is refused; each payload carries its
+   `MimeType`), the encryption envelope is well-formed and uses the profile's
+   suite, and every part is encrypted (`tests/as4_swa_encryption_inbound.rs`,
+   `undeclared_mime_part_is_refused`, `declared_part_missing_is_refused`,
+   `suite_outside_partner_set_is_rejected_before_unwrap`);
+9. **one** private-key operation by the decrypter the reference selects, then
+   AES-GCM per part (`genuine_message_decrypts_with_one_key_operation`,
+   `unauthenticated_message_makes_no_key_operation`,
+   `second_decrypter_selected_by_reference`, `ambiguous_reference_refused`);
+10. the `cid:` digests over the decrypted bytes, then decompression
+    (`cid_digest_mismatch_over_the_decrypted_bytes`,
+    `tampered_payload_is_refused_without_a_claim`);
+11. the dedup claim, the handler, the audit record, `accept`
+    (`accepted_message_is_delivered_once_and_receipted`,
+    `in_flight_is_503_and_a_stale_holder_cannot_settle`).
 
----
+An unauthenticated sender never causes a key operation, a dedup write or an
+audit record. AS2 follows the same order with S/MIME
+(`tests/as2_receive.rs::unknown_sender_is_refused_before_any_private_key_operation`);
+its payload carries the Content-Type of the signed entity, or of the inner MIME
+entity when RFC 5402-compressed.
 
-## Certificate and Trust Configuration
+## What is refused
 
-All certificate and trust material is carried in `CertHandle`, which is set on `SessionContext` via `.with_cert_handle(handle)`.
-
-```rust
-pub struct CertHandle {
-    pub signing_key_pem: String,          // PEM private key for signing (AS2 S/MIME or AS4 WS-Security)
-    pub signing_cert_pem: String,         // PEM certificate corresponding to signing_key_pem
-    pub encryption_cert_pem: String,      // PEM certificate for encrypting to this party
-    pub trust_anchor_pems: Vec<String>,   // PEM CA certificates for PKIX chain validation
-    pub fingerprint_sha256: String,       // Partner's signing cert, SHA-256. REQUIRED for signed AS4 inbound;
-                                          // use As4ReceivePush::signer_pins for more than one partner
-    pub ocsp_config: OcspConfig,          // OCSP mode and responder override
-}
-```
-
-### PKIX chain validation
-
-When `RevocationPolicy::require_chain_validation = true` (the default when at least one trust anchor is provided), all signer certificates are validated against `trust_anchor_pems` using PKIX chain building. An empty `trust_anchor_pems` with `require_chain_validation = true` **fails closed** — no certificate will pass validation.
-
-To explicitly allow any certificate (testing only):
-```rust
-RevocationPolicy {
-    require_chain_validation: false,
-    trust_anchor_pems: vec![],
-    ..Default::default()
-}
-```
-
-### Certificate fingerprint pinning — required, not optional
-
-**A signed AS4 message whose claimed sender resolves to no pin is refused.**
-
-Every access point on a network shares that network's trust anchors, so "the
-signature verifies and chains to an anchor" proves the sender is *on the
-network*, not that it is who it claims to be. The pin is what attributes a
-verified signature to the claimed `eb:From` party. A receiver that pins nothing
-accepts nothing.
-
-#### Computing the value
-
-Do not hash by hand. A mistyped or truncated pin is otherwise accepted at
-configuration time and fails at message time as "signature does not match":
-
-```rust
-use asx_rs::crypto::CertFingerprint;
-
-let pin = CertFingerprint::from_cert_pem(partner_cert_pem)?;
-```
-
-`CertFingerprint::parse` accepts the colon-separated form `openssl x509
--fingerprint -sha256` prints, and requires exactly 64 hex digits — so a SHA-1
-value or a truncated paste is a configuration error, not a delivery failure.
-
-#### One partner: pin on the session
-
-```rust
-CertHandle {
-    fingerprint_sha256: pin.to_string(),
-    ..
-}
-```
-
-#### Many partners: resolve per claimed sender
-
-A single fingerprint on the session means one partner per session. For a
-receiver with several counterparties, supply a resolver instead — it is keyed
-on the message's claimed `eb:From` and compared against the verified signer, so
-a match *is* the proof of identity:
-
-```rust
-use asx_rs::as4::{As4ReceivePush, As4SignerPinMap};
-use asx_rs::crypto::CertFingerprint;
-
-let pins = std::sync::Arc::new(
-    As4SignerPinMap::new()
-        .pin_cert_pem("9900000000001", partner_a_cert_pem)?
-        // Both certificates are valid during a rollover overlap.
-        .pin("9900000000002", CertFingerprint::parse(partner_b_pin)?)
-        .pin("9900000000002", CertFingerprint::parse(partner_b_next_pin)?),
-);
-
-let outcome = receive_push(&session, &bus, As4ReceivePush {
-    request,
-    dedup,
-    ordering: None,
-    signer_pins: Some(pins),
-})
-.await?
-.into_inner();
-```
-
-Implement `As4SignerPins` yourself to resolve against a partner table or an SMP
-cache. Returning **no** pin for a party refuses the message, so pinning B's
-certificate does nothing for a message claiming to be from A.
-
-### AS4 pull authorization
-
-A `PullRequest` asks the receiver to hand over queued messages, is not signed,
-and names an MPC that is not secret. `As4PullPolicy::authorization` therefore
-defaults to `As4PullAuthorization::Deny`: an MPC that was never explicitly opened
-serves nothing. Choose `SharedSecret` (constant-time comparison against
-`eb:AuthorizationInfo`) or `EnforcedByTransport` (mTLS or an API gateway
-authorizes the caller upstream). There is no "unauthenticated" setting reachable
-by leaving a field unset.
-
-WS-Security verification always requires an X.509 signer token, and the verifying key is taken from that certificate. A signature that verifies only against an inline `ds:KeyValue/ds:RSAKeyValue` is rejected: anyone can generate a key pair and inline its public half, so such a signature is cryptographically valid while authenticating nobody. An inline `RSAKeyValue` sent alongside a certificate is still checked for consistency with it.
-
-Three KeyInfo shapes resolve to the signer certificate:
-
-| KeyInfo shape | Notes |
-|---|---|
-| `ds:X509Data/ds:X509Certificate` inline | What ASX emits by default |
-| `wsse:SecurityTokenReference` → `wsse:BinarySecurityToken` `ValueType="...#X509v3"` | Single DER certificate — the default shape of WSS4J-based stacks (phase4, Domibus, Oxalis) |
-| `wsse:SecurityTokenReference` → `wsse:BinarySecurityToken` `ValueType="...#X509PKIPathv1"` | DER certificate path, leaf first (BDEW) |
-
-Key-identifier styles that need out-of-document lookup (`wsse:KeyIdentifier`
-with SKI or thumbprint, `ds:X509IssuerSerial`) are not resolvable from the
-message alone and fail with a named error.
-
-A document carrying **multiple `ds:Signature` elements** is resolved
-fail-closed: exactly one signature directly inside `wsse:Security` is used (a
-counter-signature elsewhere in the document is tolerated but not verified);
-two or more inside `wsse:Security`, or several with none inside
-`wsse:Security`, are rejected as ambiguous rather than resolved by document
-order — which would let an attacker prepend a signature-shaped element to
-steer which signature gets verified.
-
-For AS4 push receive, `As4PushPolicy` now controls trust mode explicitly:
-1. Pinned sender mode — required for signed inbound. See
-   [certificate fingerprint pinning](#certificate-fingerprint-pinning-required-not-optional).
-
----
-
-## OCSP (Online Certificate Status Protocol)
-
-OCSP is configured per session via `OcspConfig` in `CertHandle`:
-
-```rust
-pub struct OcspConfig {
-    pub mode: OcspMode,
-    pub responder_override: Option<String>,  // Optional URL override
-}
-
-pub enum OcspMode {
-    Disabled,
-    Required,
-    BestEffort,  // OCSP failure does not fail the receive
-}
-```
-
-OCSP responses are fetched via `reqwest` (`async-ocsp` feature, enabled by default). The async path (`fetch_ocsp_responses_with_cache_async*`) is the preferred entry point and runs entirely on the caller's Tokio runtime with no additional thread overhead. The sync compatibility wrapper (`fetch_ocsp_responses_with_cache_provider_scoped`) bridges into async by using `tokio::task::block_in_place` + `block_on` on the current runtime handle — no dedicated OS thread is spawned. Responses are cached (`ProcessLocalOcspResponseCache`, 5-minute TTL, max 512 entries with lazy eviction) to minimise live round-trips — in steady state, most certificate checks are served from cache.
-
-### Response freshness
-
-OCSP responses are validated for freshness:
-- `thisUpdate` must be within 300 seconds of the current time (clock skew tolerance).
-- `nextUpdate` must not be more than 86400 seconds (24 hours) in the past.
-
-Stale or expired OCSP responses are rejected.
-
----
-
-## Outbound requests are validated *and pinned*
-
-Three paths make an outbound HTTP request, and two take their target from
-something the counterparty influences:
-
-| Path | Target chosen by |
-|---|---|
-| AS2/AS4 egress | The deployment's own P-Mode or partner configuration |
-| **SMP lookup** | The SML zone (operator) plus a participant identifier (not) |
-| **OCSP** | The **certificate's AIA extension** — by whoever presented the certificate, *before* it is trusted |
-
-All three refuse private, loopback and link-local targets, refuse non-HTTP
-schemes, and never follow redirects: a `3xx` would reach a host nothing checked.
-
-Validating is not enough on its own. Resolving DNS to check the address and then
-letting the HTTP client resolve again is a time-of-check/time-of-use hole — the
-attacker answers the check with a public address and the connection with a
-private one. Every path therefore pins the connection to the addresses that were
-validated.
-
-Plain HTTP is refused everywhere **except** OCSP: RFC 6960 responses are signed
-by the responder, and public PKIs publish `http://` responder URLs, so requiring
-TLS there would break revocation checking rather than improve it.
-
----
-
-## Cryptographic Algorithms
-
-### AS2 (S/MIME)
-
-| Operation | Algorithm |
-|---|---|
-| Signing | S/MIME CMS — RSA + SHA-256 |
-| Encryption | S/MIME CMS — AES-256 CBC (or AES-128-GCM for newer partners) |
-| MIC computation | SHA-256 over the signed/decrypted MIME entity, or over content alone for unprotected messages (RFC 4130 §7.3.1 — see [as2.md](@/docs/as2.md#mic-computation)) |
-
-### AS4 (WS-Security / XML Encryption)
-
-| Operation | Algorithm | URI |
+| Check | Answer | Test |
 |---|---|---|
-| Payload encryption (outbound) | AES-256-GCM (XMLenc11) | `http://www.w3.org/2009/xmlenc11#aes256-gcm` |
-| Payload encryption (inbound) | AES-128-GCM or AES-256-GCM (XMLenc11) | `http://www.w3.org/2009/xmlenc11#aes128-gcm`, `http://www.w3.org/2009/xmlenc11#aes256-gcm` |
-| Key transport | RSA-OAEP (XMLenc11) | `http://www.w3.org/2009/xmlenc11#rsa-oaep` |
-| Key transport MGF | MGF1-SHA256 | `http://www.w3.org/2009/xmlenc11#mgf1sha256` |
-| Key transport digest | SHA-256 | `http://www.w3.org/2001/04/xmlenc#sha256` |
-| XML Signature | RSA-SHA256 | `http://www.w3.org/2001/04/xmldsig-more#rsa-sha256` |
-| Canonicalization | Exclusive C14N | `http://www.w3.org/2001/10/xml-exc-c14n#` |
+| Unsigned or unencrypted AS4 message under a profile that requires both | `EBMS:0103` | `tests/as4_swa_encryption_inbound.rs::plaintext_xml_mentioning_encrypted_data_is_refused`; phase4 `bdew_unencrypted_push_phase4_to_crate_is_refused` |
+| Unsigned or unencrypted AS2 message | `insufficient-message-security` | `tests/as2_receive.rs::unsigned_or_unencrypted_is_insufficient_message_security` |
+| Bad AS2 signature | `authentication-failed` | `bad_signature_is_authentication_failed` |
+| Any decryption failure (wrong key, bad padding, bad tag) | one indistinguishable answer: `EBMS:0102` / `decryption-failed` (RFC 3218 §2.3.2: a random content key is substituted) | `one_identical_decryption_failure`; `every_decryption_failure_is_the_same_decryption_failed`, `padding_and_content_failures_produce_identical_mdns` |
+| A receipt that is unsigned, from an unpinned signer, for another message, or with NRR digests that differ | `Indeterminate` | `tests/as4_send.rs`: `unsigned_receipt_is_indeterminate`, `receipt_from_an_unpinned_signer_is_indeterminate`, `receipt_for_another_message_is_indeterminate`, `tampered_receipt_digest_is_indeterminate`; `tests/as4_receipt_verification.rs::nrr_missing_a_reference_is_indeterminate` |
+| An MDN with a wrong MIC, a wrong `Original-Message-ID`, another signer, or no signature without the quirk | `Indeterminate` | `tests/as2_send.rs`: `wrong_mic_is_indeterminate`, `wrong_original_message_id_is_indeterminate`, `mdn_signed_by_another_certificate_is_indeterminate`, `unsigned_mdn_is_indeterminate_without_the_quirk`, `unsigned_mdn_quirk_still_refuses_a_failing_signature` |
+| ECDSA signature value that is DER or the wrong length | refused naming the lengths (XMLDSig 1.1 §6.4.3) | `tests/wssec_ecdsa_signature_value.rs::wrong_length_rejected`, `ecdsa_receipt_verifies_as_nrr_evidence_and_der_is_rejected` |
+| Encryption parameters outside the profile's suite (`rsa-1_5`, `rsa-oaep-mgf1p`, CBC, another KDF or curve) | refused before the key is used | `suite_outside_partner_set_is_rejected_before_unwrap`; `tests/wssec_key_transport_identifiers.rs` |
+| AS2 compressed content that is not a MIME entity | `decompression-failed` | `tests/as2_receive.rs::a_compressed_entity_without_mime_headers_is_decompression_failed` |
+| Body above the size limit | HTTP 413 before parsing | `oversized_body_is_413` (AS4 and AS2) |
 
-ASX uses **AES-256-GCM** (authenticated encryption) for outbound AS4 encryption and accepts only XMLenc11 AES-GCM inbound. Legacy AES-CBC and XMLenc 1.0 OAEP variants are rejected fail-closed to reduce downgrade and padding-oracle risk.
+## Algorithms
 
----
+Per preset ([profiles](@/docs/profiles.md#what-each-preset-fixes)): ECDSA-SHA256 on
+BrainpoolP256r1 with ECDH-ES + ConcatKDF + AES-KW and AES-128-GCM for BDEW;
+RSA-SHA256 with RSA-OAEP (SHA-256, MGF1-SHA-256) and AES-128-GCM for Peppol,
+eDelivery and ENTSOG; S/MIME with SHA-256 and AES-256-CBC for AS2. Reference
+digests are always SHA-256. Signer and verifier share one identifier
+registry.
 
-## WS-Security XML Signatures
+## Revocation
 
-### Canonicalization (C14N)
+Every non-anchor certificate of a verified signer's path is checked (AS4 and
+AS2 inbound, AS4 receipts, AS2 MDNs) after the signature and the sender rule,
+so an unauthenticated sender cannot make the client fetch anything (`tests/revocation.rs::an_unauthorized_signer_triggers_no_revocation_request`,
+`::a_broken_signature_triggers_no_revocation_request`). The check is async
+and runs outside the crypto pool.
 
-WS-Security signature computation uses XML Exclusive C14N (W3C `exc-c14n`).
+- **CRL-DP.** The CRL comes from the distribution point each certificate names
+  (RFC 5280 §4.2.1.13), over `http` or `https` only. A CRL counts only if its
+  signature verifies with the issuing key (or, for the indirect SM-PKI Root-CA
+  CRL, with a `Builder::crl_signer` certificate that chains to an anchor and
+  asserts `cRLSign`, TR-03109-4 §4.2.1), it is complete (no delta), its
+  `IssuingDistributionPoint` scope covers the certificate, it carries no
+  unknown critical extension and its `thisUpdate` is at most 300 s ahead.
+  `CertificateIssuer` entries of indirect CRLs are honoured. Decisions on static
+  vectors agree with `openssl verify -crl_check_all`
+  (`tests/revocation_openssl_oracle.rs`).
+- **The three-day rule (BDEW, RzÜ AS4 2.6 §5.4).** A CA whose newest valid CRL
+  is past its `nextUpdate`, or whose CRL could not be fetched for more than
+  72 h after the last successful fetch, is distrusted with everything below it
+  until a current CRL is obtained; the distrust is not stored. Boundaries are
+  tested at ± 1 s and at equality (`src/revocation/tests.rs`).
+- **OCSP** (every profile but BDEW, after the CRL): responder signature and
+  authorization (the issuer or a delegated `id-kp-OCSPSigning` responder),
+  `CertID`, `thisUpdate` within 300 s and at most 24 h old, `nextUpdate` not
+  passed — all judged at the client clock's instant.
+- **Fetching.** Through the client's `HttpClient`; the built-in client allows
+  plain `http` for these signed objects only, applies the private-address
+  filter and pinning, follows no redirect, presents no client certificate,
+  times out at 3 s / 10 s and reads at most 10 MiB (CRL) / 64 KiB (OCSP); a
+  larger body from any client is refused before parsing.
+- **Cache.** One bounded in-process cache per client (1 024 entries); every
+  entry is verified again on read and its unsigned fetch time clamped into
+  `[thisUpdate, now]`. Concurrent checks of one CA make one fetch.
 
-> **Whitespace is signed.** Exclusive and Inclusive C14N differ *only* in
-> namespace rendering; neither removes whitespace-only text nodes. ASX has no
-> option to strip them — a `strip_blank_text` knob existed through 0.12.0 and made
-> every signature non-interoperable. Conformance is
-> now checked against xmlsec1, the XMLDSig reference implementation, by
-> `tests/interop_xmlsec_oracle.rs`.
+## Outbound HTTP
 
-The implementation:
-- Correctly handles namespace propagation for visibly-utilized namespaces, including the `xmlns=""` undeclaration for a no-namespace element under an inherited non-empty default namespace (Exc-C14N §2.3).
-- Forwards processing instruction nodes (`<?target data?>`).
-- Implements `InclusiveNamespaces PrefixList` per W3C Exc-C14N §2.1 — ancestor namespace bindings for listed prefixes are rendered even when not directly utilized at the element. The list is honored both on per-reference `ds:Transform`s and on the `ds:SignedInfo` `CanonicalizationMethod` itself, where WSS4J-based signers declare their SOAP envelope prefix by default.
-- Strips comments in default mode; preserves them when `include_comments = true`.
-- Sorts attributes in lexicographic order (namespace URI, local name) as required by C14N.
+The built-in client (feature `http-client`):
 
-For `cid:` attachment references, the WSS SwA profile
-`Attachment-Content-Signature-Transform` is declared on send and accepted on
-verify — the AS4 profile mandates it, and its digest input for binary content
-is the raw attachment octets. The `Attachment-Complete-Signature-Transform`
-(MIME part headers folded into the digest) is not implemented and is rejected
-by name.
+- accepts only `https` endpoints without userinfo (`partner_endpoint_invalid`);
+- refuses private, loopback, link-local and transition-mechanism addresses,
+  and connects to the addresses it validated (no second DNS lookup);
+- follows no redirects; connects within 10 s, completes within 300 s;
+- reads at most 16 MiB of response (SMP 1 MiB, OCSP 64 KiB).
 
-Validated against W3C C14N test vectors (namespace propagation, attribute ordering, text/attribute escaping, PI forwarding, comment stripping, comment preservation).
+An error from an `HttpClient` you supply is `Indeterminate`: the request may
+have been written; resending is safe because receivers detect duplicates.
 
-### Payload attachment coverage
+## Limits
 
-The AS4 payload — the actual business document — travels as a detached MIME
-part, not inside the SOAP envelope. Signing `eb:Messaging` and the SOAP Body
-therefore proves nothing about it.
-
-On receive, when a signature is present, ASX requires the payload attachment to
-be covered by a verified `ds:Reference URI="cid:…"` matching the attachment's
-`Content-ID`. A message whose signature omits the attachment reference is
-rejected with `ErrorCode::SecurityVerificationFailed` — otherwise an
-intermediary could swap the payload without invalidating the signature.
-
-Two supporting rules make this enforceable:
-
-| Rule | Why |
+| Limit | Value |
 |---|---|
-| The envelope must reference the attachment by `href="cid:…"` — an `eb:PartInfo` in the **signed** `eb:Messaging` header (SwA, the AS4 packaging), or a legacy MTOM `xop:Include` in the Body | Without a Content-ID there is nothing to match a `cid:` reference against, so coverage could never be proven. A multipart message without one is rejected as having no payload attachment. |
-| `href` is matched in both XML quoting styles | `href='cid:…'` is legal XML; matching only the double-quoted form left the attachment unidentified. |
+| Message size, inbound and outbound | the preset ceiling (256 MiB), lowered by `Profile::max_message_bytes` |
+| SOAP envelope | 4 MiB, 20 000 nodes, depth 64, 64 attributes per element (`tests/xml_limits.rs`) |
+| SMP document | 2 MiB (XML), 1 MiB (HTTP) |
+| Canonicalization depth | 256 |
+| Signature references | 19 per user message, 3 per signal, 1 per SMP document |
+| Receipt and MDN freshness on send | 300 s |
 
-### Signed scope and XML Signature Wrapping defence
+## Secrets
 
-The AS4 push signature covers **three** references: the entire `eb:Messaging`
-header block (`wsu:Id="as4-messaging"` — all `UserMessage` routing/authorization
-metadata: From, To, Service, Action, MPC, MessageProperties, PartInfo), the SOAP
-Body, and a detached `cid:` reference for the MIME payload attachment. (Earlier
-revisions signed only `ebms:MessageId`, leaving the routing metadata tamperable.)
+`KeyPair` zeroizes its key on drop and prints only its certificate; builders,
+clients and endpoints redact keys in `Debug`, and key errors never echo the key
+(`tests/secret_debug_redaction.rs`). Telemetry carries no payload, key or
+certificate subject ([observability](@/docs/observability.md)), and observers
+cannot change an outcome
+(`tests/no_observer.rs::exchanges_succeed_unobserved_and_an_idle_observer_changes_nothing`).
 
-On receive, verification returns the set of verified same-document `wsu:Id`s and
-the AS4 layer requires that the document contains **exactly one** `eb:Messaging`
-block whose `wsu:Id` is in that set. This binds the block the pipeline routes on
-to the block the signature actually covered, defeating XML Signature Wrapping
-(relocating the signed element and injecting an unsigned replacement).
+## What the library does not protect against
 
-### Signature verification
-
-Signature verification uses:
-1. Digest verification over C14N-serialized referenced elements.
-2. RSA/ECDSA signature verification using `secure_eq` (constant-time comparison) for digest values.
-3. Minimum signing-key strength enforcement (RSA `< 2048` bits is rejected).
-4. PKIX chain validation of the signing certificate.
-5. OCSP status check (if configured).
-6. Binding of the consumed `eb:Messaging` block to the verified signature (above).
-
-Verification is fail-closed: any error at any step propagates immediately via `?`. The caller cannot ignore a failed verification.
-
-### `wsu:Timestamp` validation
-
-Inbound WS-Security timestamps are validated:
-- `wsu:Created` must be within 5 minutes of the current time.
-- `wsu:Expires` (if present) must not be in the past.
-
-Outbound timestamps include `wsu:Created` (now) and `wsu:Expires` (now + 5 minutes).
-
----
-
-## Non-Repudiation of Receipt (AS4 send path)
-
-A counterparty's `eb:Receipt` is only delivery evidence once it has been checked
-against the message that was actually sent. `asx_rs::as4::verify_sync_response`
-(and `As4HttpTransport::send_and_verify`) performs that check; nothing else in
-the send path does.
-
-Threat model for the receipt, and what defends against each:
-
-| Threat | Defence |
-|---|---|
-| Attacker or misconfigured MSH returns a receipt it did not sign | WS-Security signature verified against the pinned partner certificate (`cert_handle.fingerprint_sha256`), trust anchors and revocation policy |
-| **Signature wrapping** — leave a genuinely signed element in place so the signature verifies, and append an unsigned acknowledgement for another message | the `eb:SignalMessage` acted on must itself be covered by the verified signature, directly or via a signed ancestor; at most one `eb:Messaging` and one `eb:SignalMessage` are accepted |
-| Element injection — a duplicate `eb:RefToMessageId` / `eb:MessageId` / `eb:Timestamp` shadowing the real one | a repeated `eb:MessageInfo` child is rejected outright rather than resolved first-wins |
-| Digests parked outside the `eb:Receipt` to fake non-repudiation | `NonRepudiationInformation` is read only from inside the `eb:Receipt` of that SignalMessage |
-| Counterparty acknowledges a *different* message | `eb:RefToMessageId` compared to the sent `message_id` |
-| Counterparty acknowledges *different bytes* — the core NRR guarantee | every `ds:Reference` of the sent message's own signature must be echoed by a `MessagePartNRInformation` entry with a matching digest algorithm and digest value |
-| Receipt acknowledges only part of a multi-part message | a sent reference with no echoed entry is rejected; the MIME package is unwrapped so `cid:` attachment references are covered |
-| Padding a valid entry with a second, conflicting one for the same URI | duplicate `MessagePartNRInformation` URIs are rejected outright |
-| Entries for URIs the sender never signed | rejected under `reject_unexpected_references` (on in `regulated()`) |
-| Replay of an old receipt | `eb:Timestamp` freshness window, 5 minutes by default; a receipt with **no** timestamp is rejected rather than skipping the check |
-| A `ds:Signature` element that is not a verifiable enveloped signature | treated as a verification failure, never downgraded to "unsigned" |
-| An `eb:Error` for someone else's message causing a wrongful dead-letter | the error signal's correlation (`eb:MessageInfo/eb:RefToMessageId` or the `eb:Error/@refToMessageId` attribute) must match the sent message when present |
-| A signal that both acknowledges and rejects | rejected as ambiguous — neither confirmed delivered nor confirmed rejected |
-| Resource exhaustion from a hostile response | 256 KiB body cap, XML element-count cap, bounded NRI and error-entry counts |
-
-The same wrapping and ambiguity defences apply to the **inbound** receipt path
-(`receipt_payload` on `As4ReceivePushRequest`), which shares the parser and the
-signature-coverage binding.
-
-### Error signals are not authenticated
-
-`As4SyncSignal::Error` reports what the connection returned; it does not prove
-it. Error signals are typically unsigned, so treat one as a routing hint (retry
-vs dead-letter), never as evidence about the message's fate. Only
-`As4VerifiedReceipt::is_non_repudiation_evidence()` asserts a cryptographically
-proven outcome.
-
-A digest that is present and wrong is **always** an error
-(`SecurityVerificationFailed`) regardless of policy — `As4NonRepudiation` has no
-"mismatch" variant, so a mismatch cannot be returned as a value the caller might
-ignore. `As4ReceiptPolicy::require_non_repudiation = false` only tolerates the
-*absence* of digests, and the resulting `As4NonRepudiation::NotProvided` makes
-`As4VerifiedReceipt::is_non_repudiation_evidence()` return `false`.
-
-Do not detect receipts by scanning the response body for `<eb:Receipt`.
-Namespace prefixes are arbitrary and element text may be CDATA-wrapped, so a
-substring match yields false delivery failures against conformant partners — and
-it cannot verify non-repudiation at all.
-
----
-
-## `InsecureBypassTrustVerifier`
-
-```rust
-use asx_rs::lifecycle::InsecureBypassTrustVerifier;
-```
-
-**For testing only.** This verifier passes any payload as fully trusted and decryptable without performing any cryptographic checks. Its name is intentionally explicit.
-
-Never use `InsecureBypassTrustVerifier` in production. It bypasses:
-- Signature verification
-- PKIX chain validation
-- OCSP status checking
-- Fingerprint pinning
-
----
-
-## Payload Size Limits
-
-All inbound reads are bounded. The default limit is **256 MiB** (`DEFAULT_MAX_BODY_BYTES`). This applies to:
-- `asx_rs::as2::receive_with_mdn_with_reliability`
-- `asx_rs::as4::receive_push_sync`
-- `transport::server` layer (axum handlers)
-
-Override per-session:
-```rust
-As2PushPolicy::builder().max_body_bytes(64 * 1024 * 1024)  // 64 MiB
-```
-
-An over-limit body fails with `ErrorCode::PayloadTooLarge`, which maps to
-HTTP 413. (Before v0.11.0 `wire::enforce_payload_limit` returned
-`PolicyViolation` → HTTP 403, misreporting an oversize body as an authorization
-failure; ingress handlers matching on `PolicyViolation` for size must be
-updated.)
-
-AS4 synchronous receipts are bounded separately and much more tightly at
-**256 KiB** (`as4::DEFAULT_MAX_RECEIPT_BYTES`, tunable via
-`As4ReceiptPolicy::max_receipt_bytes`) — a SignalMessage carries no business
-payload, so anything larger is malformed or hostile.
-
----
-
-## Temp File Security
-
-Streaming receive operations that require on-disk spooling (e.g., for signature verification rewinding) use `tempfile::NamedTempFile` for atomic, exclusive temp file creation. This prevents symlink attacks on world-writable `/tmp`.
-
----
-
-## Operator Hardening Expectations (Core Dumps and Host Memory)
-
-ASX zeroizes owned private-key PEM buffers on drop where possible, and recent send-path refactors minimize transient key-buffer duplication. However, ASX is only a library and cannot enforce host OS process-dump policy, swap policy, or debugger attach policy.
-
-Production operators are expected to harden runtime environments accordingly:
-
-1. Disable process core dumps for ASX-hosting services (for example `ulimit -c 0`, systemd `LimitCORE=0`, container runtime equivalents).
-2. Restrict dumpability and ptrace/debug attachment to trusted operators only.
-3. Ensure swap/pagefile policy is encrypted or disabled for regulated deployments handling private keys.
-4. Keep crash-reporting pipelines from uploading raw process memory unless a formally approved secret-scrubbing policy is in place.
-
-These controls are mandatory complements to in-process zeroization when handling cryptographic private key material in production.
-
----
-
-## SMP Discovery Verification
-
-`smp::SmpClient` resolves the AS4 endpoint URL and the recipient's certificate.
-TLS authenticates the SMP *host*, not the metadata it serves, so a rogue or
-compromised SMP could otherwise redirect traffic and substitute its own
-recipient certificate. Verify the response signature with
-`SmpSignaturePolicy::Verify`.
-
-| Control | Status |
-|---|---|
-| SMP URL SSRF validation + DNS pinning + no redirects | ✅ enforced — the lookup validates and pins in one step, so the addresses that were checked are the ones connected to |
-| The NAPTR record naming the SMP may only yield an `https` URI, and may not use a backreference | ✅ enforced — the SMP URL is read out of DNS, so the record's contents are an input to where a message goes |
-| The result is usable at all | ⛔ **refused** by default (`SmpSignaturePolicy::Deny`) — a lookup whose authenticity was never established does not silently become a routing decision |
-| `ds:Signature` **present** on the response | ✅ with `SmpSignaturePolicy::RequireSignaturePresent` — catches an unsigned SMP and nothing else |
-| `ds:Signature` **verifies** | ✅ with `SmpSignaturePolicy::Verify` |
-| SMP certificate chains to the network SMP CA | ✅ with `SmpSignaturePolicy::Verify` |
-
-```rust
-let config = SmpConfig {
-    signature_policy: SmpSignaturePolicy::verify_with_trust_anchors(vec![smp_ca_pem]),
-    ..SmpConfig::peppol_production()
-};
-```
-
-`SmpEndpoint::verified_signer_fingerprint_sha256` is `Some` only when the
-signature was actually verified — check it rather than assuming, since the
-other two policies leave it `None`. `SmpEndpoint::signed_document` still
-returns the exact response bytes for callers that want to verify independently.
-
-**Assurance note.** The enveloped whole-document path is cross-validated
-against a foreign implementation: `tests/interop_peppol_smp_oracle.rs` verifies
-a `SignedServiceMetadata` captured from the live Peppol production network
-against the real Peppol PKI, with tamper cases. DNSSEC validation of the SML
-zone is the resolver's job — the Peppol zones are signed, and `BdxlResolver` is
-where a deployment supplies a validating client.
-
----
-
-## Known Limitations
-
-| Limitation | Mitigation |
-|---|---|
-| Custom XML Exclusive C14N implementation | Validated against W3C test vectors and interop compatibility matrix; not yet replaced by a vetted library |
-| In-memory dedup provides no replay protection across restarts | Use a durable `DedupStorage` backend for production; the recommended window is 48h per RFC 4130 §5.2.1 |
-| **Inbound** mTLS is not terminated by the library | The crate never owns a listener. Terminate at your reverse proxy and pass the authenticated identity in as `authenticated_sender_scope`. **Outbound** mTLS *is* supported — `TransportConfig::with_client_identity` ([transport](@/docs/transport.md#mutual-tls-on-egress)) |
-| OCSP `thisUpdate`/`nextUpdate` clock skew tolerance is fixed at ±300s / 86400s | Adjust via `OcspConfig` if partner OCSP responders have larger clock drift |
-| OCSP sync wrapper uses `block_in_place`/`block_on` (not a new OS thread) — must be called from a multi-thread Tokio runtime | Use the async `fetch_ocsp_responses_with_cache_async` entry point directly from async call sites; at very high message rates with many distinct certificates, consider a shared persistent OCSP cache backend |
-
----
+- **A compromised trust anchor.** The network CA can issue for any party; pin
+  partner certificates if you need more than network membership.
+- **Inbound TLS.** There is no listener: terminate TLS (and mTLS) in front of
+  the `Inbound`.
+- **Replay across a non-durable store.** Use a durable
+  [`DedupStore`](@/docs/persistence.md).
+- **Host memory.** Zeroization covers owned buffers only: disable core dumps
+  (`ulimit -c 0`, systemd `LimitCORE=0`), restrict ptrace, encrypt or disable
+  swap, or keep keys in an HSM/KMS ([keys](@/docs/keys.md)).
 
 ## Crypto backends
 
-`asx-rs` links two crypto ecosystems:
-
-| Subsystem | Current backend | Role |
-|---|---|---|
-| AS2 S/MIME signing / encryption | `openssl` (C FFI) | CMS `SignedData` / `EnvelopedData` |
-| AS4 WS-Security XML signing | `openssl` (C FFI) | RSA-SHA256 `ds:Signature`, RSA-OAEP key wrap |
-| AS4 payload symmetric encryption | `aes-gcm` (pure Rust) | AES-128/256-GCM `xenc:EncryptedData` |
-| X.509 certificate parsing | `openssl` (C FFI) | Trust-anchor validation, chain building, OCSP |
-
-This mixed model has several implications:
-
-- **Build system**: consumers must have a working OpenSSL installation (or
-  accept the `openssl-sys` vendored build). Cross-compilation (e.g., to
-  `x86_64-unknown-linux-musl` static binaries) requires extra care.
-- **FIPS compliance**: OpenSSL can be compiled in FIPS mode; the `aes-gcm`
-  crate is *not* FIPS 140-2 validated. Regulated deployments (US federal,
-  healthcare) requiring FIPS-validated crypto across **all** algorithms must
-  either replace `aes-gcm` with the OpenSSL AES-GCM primitives or wait for
-  the pure-Rust migration path below.
-- **Vulnerability management**: OpenSSL and `aes-gcm` have separate CVE
-  timelines and patch cadences. Both must be tracked independently.
-
-### FIPS deployments
-
-The supported configuration is:
-
-1. Compile OpenSSL in FIPS mode (OpenSSL 3.x with `OPENSSL_FIPS=1`).
-2. Do **not** enable AS4 payload encryption: the `aes-gcm` symmetric layer is
-   not FIPS 140-2 validated.
-
-That second point conflicts with every AS4 profile this crate targets, all of
-which mandate payload encryption — and with P-Mode materialization, which
-refuses `encrypt = false` outside test builds. FIPS and conformant AS4 are not
-simultaneously achievable here today; treat it as a documented limitation
-rather than a supported mode.
-
-
+OpenSSL (the `openssl` crate, system or vendored) performs RSA, ECDSA, ECDH,
+X.509 chain validation and CMS; AES-GCM and AES key wrap are RustCrypto
+`aes-gcm` and `aes-kw`. There is no FIPS-validated configuration. No `unsafe`
+code (`#![forbid(unsafe_code)]`).

@@ -1,0 +1,15 @@
+{http://www.w3.org/2003/05/soap-envelope}Envelope
+  {http://www.w3.org/2003/05/soap-envelope}Header
+    {http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/}Messaging @{http://www.w3.org/2003/05/soap-envelope}mustUnderstand="true"
+      {http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/}SignalMessage
+        {http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/}MessageInfo
+          {http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/}Timestamp = "*"
+          {http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/}MessageId = "rcpt-nri@asx.test"
+          {http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/}RefToMessageId = "ref@asx.test"
+        {http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/}Receipt
+          {http://docs.oasis-open.org/ebxml-bp/ebbp-signals-2.0}NonRepudiationInformation
+            {http://docs.oasis-open.org/ebxml-bp/ebbp-signals-2.0}MessagePartNRInformation
+              {http://www.w3.org/2000/09/xmldsig#}Reference @{}URI="cid:a<b&c\"d'e>f"
+                {http://www.w3.org/2000/09/xmldsig#}DigestMethod @{}Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"
+                {http://www.w3.org/2000/09/xmldsig#}DigestValue = "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU="
+  {http://www.w3.org/2003/05/soap-envelope}Body

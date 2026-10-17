@@ -21,13 +21,14 @@ pub fn canonicalize_reference(
     uri: &str,
     profile: WsSecCanonicalizationProfile,
 ) -> Result<WsSecCanonicalizedReference> {
-    let doc = Document::parse(xml).map_err(|e| {
-        AsxError::new(
-            ErrorCode::ParseFailed,
-            format!("failed to parse XML for canonicalization: {e}"),
-            ErrorContext::new("wssec_canonicalize").with_message_id(uri.to_string()),
-        )
-    })?;
+    let doc = crate::xml::parse(xml, crate::xml::XmlLimits::ENVELOPE, "wssec_canonicalize")
+        .map_err(|e| {
+            AsxError::new(
+                ErrorCode::ParseFailed,
+                format!("failed to parse XML for canonicalization: {}", e.message),
+                ErrorContext::new("wssec_canonicalize").with_message_id(uri.to_string()),
+            )
+        })?;
 
     canonicalize_reference_from_doc(&doc, uri, &profile)
 }
@@ -439,18 +440,26 @@ pub(crate) fn resolve_same_document_reference_target_with_index<'a>(
         )),
         None => Err(AsxError::new(
             ErrorCode::InvalidInput,
-            format!("could not resolve same-document reference target for URI {uri}"),
+            format!(
+                "could not resolve same-document reference target for URI {uri}: no element \
+                 carries wsu:Id, Id or xml:id = \"{target_id}\""
+            ),
             ErrorContext::new("wssec_canonicalize").with_message_id(uri.to_string()),
         )),
     }
 }
 
+/// Same-document reference IDs are `wsu:Id`, the unqualified `Id` and
+/// `xml:id` — nothing else. Any other attribute
+/// named like an ID (`ID`, `id`, `foo:id`) identifies nothing, so a signature
+/// cannot be steered to an element by a look-alike attribute.
 fn is_reference_id_attr(namespace: Option<&str>, name: &str) -> bool {
-    if namespace == Some(XML_NS) && name == "id" {
-        return true;
+    match namespace {
+        None => name == "Id",
+        Some(crate::xml::ns::WSU) => name == "Id",
+        Some(XML_NS) => name == "id",
+        Some(_) => false,
     }
-
-    name.eq_ignore_ascii_case("id")
 }
 
 pub(crate) fn is_ds_element(node: Node<'_, '_>, local_name: &str) -> bool {
@@ -483,20 +492,18 @@ pub(crate) fn swa_attachment_digest_input<'a>(
 
     let is_xml = media == "text/xml" || media == "application/xml" || media.ends_with("+xml");
     if is_xml {
-        let text = std::str::from_utf8(bytes).map_err(|err| {
-            AsxError::new(
-                ErrorCode::ParseFailed,
-                format!("XML-typed attachment is not valid UTF-8: {err}"),
-                ErrorContext::new("wssec_swa_attachment"),
-            )
-        })?;
-        let text = text.strip_prefix('\u{feff}').unwrap_or(text);
-        let doc = Document::parse(text).map_err(|err| {
+        let doc = crate::xml::parse_bytes(
+            bytes,
+            crate::xml::XmlLimits::payload(crate::core::DEFAULT_MAX_BODY_BYTES),
+            "wssec_swa_attachment",
+        )
+        .map_err(|err| {
             AsxError::new(
                 ErrorCode::ParseFailed,
                 format!(
                     "XML-typed attachment does not parse; the SwA transform requires \
-                     canonicalizing XML content: {err}"
+                     canonicalizing XML content: {}",
+                    err.message
                 ),
                 ErrorContext::new("wssec_swa_attachment"),
             )
@@ -732,16 +739,20 @@ pub(crate) fn try_serialize_node_omitting(
         parent_ns,
         inclusive_ns_prefixes_override,
         omit,
-        true,
+        0,
     )
 }
 
 /// Serialize one node of the subset.
 ///
-/// `apex` marks the node whose parent lies *outside* the node-set — the one
-/// element that Canonical XML 1.0 §2.3 gives the ancestors' in-scope `xml:*`
-/// attributes to. It is true only for the node the caller passed in, and false
-/// for everything reached by recursion.
+/// `depth` counts the element levels below the node the caller passed in.
+/// Depth 0 is the apex — the node whose parent lies *outside* the node-set,
+/// the one element that Canonical XML 1.0 §2.3 gives the ancestors' in-scope
+/// `xml:*` attributes to. An element at depth [`MAX_C14N_DEPTH`] or deeper
+/// fails serialization: the recursion is bounded by construction,
+/// not only by what the parser let through.
+///
+/// [`MAX_C14N_DEPTH`]: crate::xml::MAX_C14N_DEPTH
 fn serialize_subtree(
     node: Node<'_, '_>,
     out: &mut impl std::fmt::Write,
@@ -749,7 +760,7 @@ fn serialize_subtree(
     parent_ns: &BTreeMap<String, String>,
     inclusive_ns_prefixes_override: Option<&[String]>,
     omit: Option<Node<'_, '_>>,
-    apex: bool,
+    depth: u16,
 ) -> std::fmt::Result {
     if let Some(omit) = omit
         && node == omit
@@ -764,13 +775,13 @@ fn serialize_subtree(
             parent_ns,
             inclusive_ns_prefixes_override,
             omit,
-            apex,
+            depth,
         ),
         NodeType::Text => {
             // Every text node is emitted verbatim (modulo escaping), including
             // whitespace-only nodes. Neither Canonical XML 1.0 nor Exclusive
             // C14N removes whitespace — they differ only in namespace
-            // rendering. Stripping it here produced digests over an octet
+            // rendering. Stripping it would produce digests over an octet
             // stream no conformant implementation computes.
             if let Some(text) = node.text() {
                 escape_text(text, out)?;
@@ -813,7 +824,7 @@ fn serialize_subtree(
                     parent_ns,
                     inclusive_ns_prefixes_override,
                     omit,
-                    apex,
+                    depth,
                 )?;
             }
             Ok(())
@@ -899,8 +910,62 @@ fn serialize_element(
     parent_ns: &BTreeMap<String, String>,
     inclusive_ns_prefixes_override: Option<&[String]>,
     omit: Option<Node<'_, '_>>,
-    apex: bool,
+    depth: u16,
 ) -> std::fmt::Result {
+    if depth >= crate::xml::MAX_C14N_DEPTH {
+        return Err(std::fmt::Error);
+    }
+    // The start tag's working state lives in a separate frame that is gone
+    // before the recursion below: only the qualified name and the namespace
+    // context stay on the stack per level.
+    let (tag_qname, ns_emitted) = write_start_tag(
+        node,
+        out,
+        profile,
+        parent_ns,
+        inclusive_ns_prefixes_override,
+        depth == 0,
+    )?;
+
+    // Build child namespace context: when no declarations were emitted at this
+    // element, pass the parent context through without cloning.
+    let child_ns: Cow<'_, BTreeMap<String, String>> = if ns_emitted.is_empty() {
+        Cow::Borrowed(parent_ns)
+    } else {
+        let mut owned = parent_ns.clone();
+        owned.extend(ns_emitted);
+        Cow::Owned(owned)
+    };
+
+    for child in node.children() {
+        serialize_subtree(
+            child,
+            out,
+            profile,
+            child_ns.as_ref(),
+            inclusive_ns_prefixes_override,
+            omit,
+            depth + 1,
+        )?;
+    }
+
+    out.write_str("</")?;
+    out.write_str(&tag_qname)?;
+    out.write_char('>')?;
+    Ok(())
+}
+
+/// Write the canonical start tag of `node`; return its qualified name and the
+/// namespace declarations it emitted.
+#[inline(never)]
+fn write_start_tag<'a>(
+    node: Node<'a, '_>,
+    out: &mut impl std::fmt::Write,
+    profile: &WsSecCanonicalizationProfile,
+    parent_ns: &BTreeMap<String, String>,
+    inclusive_ns_prefixes_override: Option<&[String]>,
+    apex: bool,
+) -> std::result::Result<(Cow<'a, str>, BTreeMap<String, String>), std::fmt::Error> {
     let doc_text = node.document().input_text();
 
     let tag_ns = node.tag_name().namespace();
@@ -1085,33 +1150,7 @@ fn serialize_element(
     }
 
     out.write_char('>')?;
-
-    // Build child namespace context: when no declarations were emitted at this
-    // element, pass the parent context through without cloning.
-    let child_ns: Cow<'_, BTreeMap<String, String>> = if ns_emitted.is_empty() {
-        Cow::Borrowed(parent_ns)
-    } else {
-        let mut owned = parent_ns.clone();
-        owned.extend(ns_emitted);
-        Cow::Owned(owned)
-    };
-
-    for child in node.children() {
-        serialize_subtree(
-            child,
-            out,
-            profile,
-            child_ns.as_ref(),
-            inclusive_ns_prefixes_override,
-            omit,
-            false,
-        )?;
-    }
-
-    out.write_str("</")?;
-    out.write_str(&tag_qname)?;
-    out.write_char('>')?;
-    Ok(())
+    Ok((tag_qname, ns_emitted))
 }
 
 /// Escape text node content per Canonical XML 1.0 §2.2:
@@ -1867,6 +1906,82 @@ mod w3c_c14n_vectors {
             result,
             r#"<inner id="t" xml:lang="fr"><deep></deep></inner>"#
         );
+    }
+
+    // ── input limits and recursion bound ─────────────────────────────────
+
+    /// An XML-typed attachment digested for a
+    /// `cid:` reference goes through `xml::parse` with the payload limits.
+    #[test]
+    fn xml_attachment_digest_input_limits() {
+        let attrs: String = (0..1_000).map(|i| format!(" a{i}=\"v\"")).collect();
+        let probes = [
+            ("DOCTYPE", "<!DOCTYPE r><r/>".to_string()),
+            (
+                "depth limit",
+                format!("{}{}", "<x>".repeat(5_000), "</x>".repeat(5_000)),
+            ),
+            ("attribute limit", format!("<r{attrs}/>")),
+        ];
+        for (needle, probe) in probes {
+            let err = std::thread::Builder::new()
+                .stack_size(256 * 1024)
+                .spawn(move || {
+                    super::swa_attachment_digest_input(Some("application/xml"), probe.as_bytes())
+                        .map(|_| ())
+                })
+                .expect("spawn")
+                .join()
+                .expect("must not overflow a 256 KiB stack")
+                .expect_err("probe must be refused");
+            assert_eq!(err.code, crate::core::ErrorCode::ParseFailed, "{needle}");
+            assert!(err.message.contains(needle), "{needle}: {}", err.message);
+        }
+    }
+
+    /// The serializer bounds its own recursion. The input is parsed
+    /// with `roxmltree` directly (test code), bypassing `xml::parse`, so only
+    /// the serializer's own counter can refuse it.
+    ///
+    /// Release builds run it on a 2 MiB stack (Tokio's blocking-thread
+    /// default): `MAX_C14N_DEPTH` levels of parse + serialize must fit there.
+    /// Unoptimized builds use far larger frames (roxmltree alone overflows
+    /// 2 MiB at ~128 levels), so they get headroom.
+    #[test]
+    fn c14n_depth_bound_returns_error() {
+        let stack = if cfg!(debug_assertions) {
+            64 << 20
+        } else {
+            2 << 20
+        };
+        std::thread::Builder::new()
+            .stack_size(stack)
+            .spawn(|| {
+                let depth = usize::from(crate::xml::MAX_C14N_DEPTH);
+                let serialize = |levels: usize| {
+                    let xml = format!("{}{}", "<a>".repeat(levels), "</a>".repeat(levels));
+                    let doc = roxmltree::Document::parse(&xml).expect("parse");
+                    let mut out = String::new();
+                    super::try_serialize_node(
+                        doc.root_element(),
+                        &mut out,
+                        &exc_profile(),
+                        &std::collections::BTreeMap::new(),
+                    )
+                };
+                assert!(
+                    serialize(depth).is_ok(),
+                    "{depth} levels are within the bound"
+                );
+                assert!(
+                    serialize(depth + 1).is_err(),
+                    "{} levels exceed MAX_C14N_DEPTH",
+                    depth + 1
+                );
+            })
+            .expect("spawn")
+            .join()
+            .expect("the bounded serializer must fit its stack");
     }
 
     // ── C14N 1.0 §2.3 — processing instructions ──────────────────────────

@@ -1,230 +1,123 @@
 +++
-title = "AS2 reference"
-description = "AS2 (RFC 4130) in asx-rs: send and receive, S/MIME signing and encryption, MDN generation, and how the RFC 4130 section 7.3.1 MIC is computed."
+title = "AS2"
+description = "Send AS2 with a verified synchronous or asynchronous MDN, and receive with MDN dispositions."
 +++
 
-Requires feature flag: `as2`
+AS2 (RFC 4130) is S/MIME over HTTP with a Message Disposition Notification
+(MDN) as receipt. `Profile::as2()` fixes the security settings
+([profiles](@/docs/profiles.md#as2)).
 
-## Overview
+## Sending with a synchronous MDN
 
-AS2 (RFC 4130) support in `asx-rs` is exposed through free functions in `asx_rs::as2`.
-
-Primary flows:
-
-1. Outbound send with optional compression, signing, and encryption.
-2. Inbound receive with trust verification/decryption.
-3. MDN generation and parse/classification.
-4. Reliability and dedup integration for MDN-linked receive paths.
-
-## Public Entry Points
-
-### Send
+An AS2 [`Message`](https://docs.rs/asx-rs/latest/asx/as2/struct.Message.html)
+is one payload to one partner.
 
 ```rust
-pub fn send_sync(
-    session: &SessionContext,
-    event_bus: &EventBus,
-    request: As2SendRequest,
-) -> Result<As2SendOutput>
-```
+use asx::{as2::{As2, Message}, ErrorKind, Partner, Payload};
 
-Async-safe wrapper for Tokio services:
-
-```rust
-pub async fn send_async(
-    session: &SessionContext,
-    event_bus: &EventBus,
-    request: As2SendRequest,
-) -> Result<As2SendOutput>
-```
-
-Behavior notes:
-
-1. RFC 5402 order is enforced for compression-enabled messages: `compress -> sign -> encrypt`.
-2. Compression produces a CMS `CompressedData` structure (RFC 5402 / RFC 3274, ZLIB),
-   carried as `application/pkcs7-mime; smime-type=compressed-data` — not a bare gzip stream.
-3. Policy-controlled protocol events are emitted via `EventBus`.
-
-### MIC computation
-
-The `Received-Content-MIC` a receiver returns in the MDN must digest exactly the
-octets the sender digested, and RFC 4130 §7.3.1 makes that input depend on which
-protection was applied:
-
-| Message | MIC input |
-|---|---|
-| Signed (with or without encryption) | the **signed MIME entity** — headers, blank line, content |
-| Encrypted but unsigned | the **decrypted MIME entity** — headers and content |
-| Neither signed nor encrypted | the **content only**, with no MIME headers |
-
-The last row is deliberate: unprotected messages pass through intermediaries
-that reorder and rewrite headers, so including them would make the MIC
-unreproducible.
-
-Consequences worth knowing:
-
-- `As2SendPolicy::payload_content_type` appears on the wire as the signed
-  entity's `Content-Type`, so it is part of the MIC. Setting it to the payload's
-  real media type (`application/edi-x12`, `application/edifact`, …) is required
-  for the partner to compute the same value.
-- Binary content (compressed or encrypted payloads) is transfer-encoded with
-  `base64` before signing, per RFC 5751 §3.1.1 — MIME line-ending
-  canonicalization would otherwise rewrite bytes inside the blob and break the
-  signature. Text payloads keep `binary` transfer encoding.
-- Nothing is trimmed, re-folded, or normalized before hashing; the entity is
-  digested as transmitted.
-
-### Receive (owned payload)
-
-```rust
-pub fn receive_sync(
-    session: &SessionContext,
-    payload: Vec<u8>,
-    verifier: &dyn As2TrustVerifier,
-) -> Result<DomainReady<Arc<[u8]>>>
-```
-
-Async-safe wrapper for Tokio services:
-
-```rust
-pub async fn receive_async(
-    session: &SessionContext,
-    payload: Vec<u8>,
-    verifier: Arc<dyn As2TrustVerifier + Send + Sync>,
-) -> Result<DomainReady<Arc<[u8]>>>
-```
-
-### Token-enforced strict runtime sessions
-
-For regulated deployments that require explicit startup proof, bind validated
-session context once and then use standard AS2 entry points:
-
-```rust
-let strict_session = bootstrap_token.bind(&session);
-
-let received = asx_rs::as2::receive_sync(&strict_session, payload, verifier)?;
-```
-
-`bootstrap_token` comes from
-[`StrictRuntimeBootstrap::validate`](@/docs/getting-started.md#regulated-startup-gate-strict-production).
-In non-testing builds, strict-interop AS2 entry points refuse a session with no
-token binding, and there is no other way to set the marker.
-
-### Receive (streaming ingress)
-
-```rust
-pub async fn receive_stream<R: tokio::io::AsyncRead + Unpin>(
-    session: &SessionContext,
-    policy: &As2ReceivePolicy,
-    reader: R,
-    verifier: &dyn AsyncAs2TrustVerifier,
-    limits: StreamLimits,
-) -> Result<DomainReady<Arc<[u8]>>>
-```
-
-```rust
-pub async fn receive_stream_with_metrics<R: tokio::io::AsyncRead + Unpin>(
-    session: &SessionContext,
-    policy: &As2ReceivePolicy,
-    reader: R,
-    verifier: &dyn AsyncAs2TrustVerifier,
-    limits: StreamLimits,
-) -> Result<(DomainReady<Arc<[u8]>>, StreamReadMetrics)>
-```
-
-### Receive + MDN + reliability
-
-```rust
-pub fn receive_with_mdn_with_reliability(
-    session: &SessionContext,
-    event_bus: &EventBus,
-    request: As2ReceiveMdnRequest,
-    reconciliation_hook: &dyn ReconciliationStorage,
-    dedup_backend: Arc<dyn DedupStorage>,
-    verifier: &dyn As2TrustVerifier,
-) -> Result<As2ReceiveMdnOutput>
-```
-
-Borrowed variant:
-
-```rust
-pub fn receive_with_mdn_with_reliability_mdn_ref(
-    session: &SessionContext,
-    event_bus: &EventBus,
-    request: As2ReceiveMdnRefRequest<'_>,
-    reconciliation_hook: &dyn ReconciliationStorage,
-    dedup_backend: Arc<dyn DedupStorage>,
-    verifier: &dyn As2TrustVerifier,
-) -> Result<As2ReceiveMdnOutput>
-```
-
-`As2ReceiveMdnOutput::dedup` reports how the MDN's idempotency key resolved:
-
-```rust
-use asx_rs::as2::As2MdnDedup;
-
-match output.dedup {
-    // First sight. Settle the claim once the delivery outcome is durably
-    // recorded — `abandon()` instead if recording it failed, so the partner's
-    // retransmission is processed rather than swallowed.
-    As2MdnDedup::FirstSeen(claim) => claim.accept().await?,
-    // A previously accepted MDN for the same original message: the downstream
-    // side effects were deliberately skipped.
-    As2MdnDedup::Duplicate => {}
-    // A concurrent delivery holds the claim; this call caused no side effects.
-    As2MdnDedup::InFlight => {}
-    _ => {}
+async fn send_x12(as2: &As2, partner: &Partner, outbox_id: &str, x12: Vec<u8>) -> asx::Result<()> {
+    let msg = Message::to(partner, Payload::new(x12, "application/edi-x12"))
+        .message_id(format!("{outbox_id}@sender.example"));
+    match as2.send(msg).await {
+        Ok(mdn) => {
+            println!("processed; MDN record {}", mdn.evidence().record_id());
+            Ok(())
+        }
+        Err(e) if e.kind() == ErrorKind::PartnerError => {
+            println!("partner refused: {:?}", e.mdn_disposition());
+            Err(e)
+        }
+        Err(e) => Err(e),
+    }
 }
 ```
 
-### Which MDN part carries the verdict
+`send` returns `Ok(Verified<Receipt>)` only for an MDN that is signed by a
+pinned partner certificate (unsigned only with `Quirk::UnsignedMdn`), names
+the sent id in `Original-Message-ID`, echoes the MIC over the signed entity
+(RFC 4130 §7.3.1) and reports `processed` (warnings allowed). A
+`processed/error` or `failed` MDN is `ErrorKind::PartnerError` with
+`mdn_disposition()`. An MDN that fails any check is `ErrorKind::Indeterminate`:
+resend with the same message id.
 
-The machine-readable fields (`Disposition`, `Received-Content-MIC`,
-`Original-Message-ID`) live in a `message/disposition-notification` part, and
-that part is found by **media type** — RFC 3798 §3 places it second in a
-`multipart/report`, but position is a convention, not the identifier.
+`message_id` takes an RFC 2822 `id-left@id-right` value (sent as `<id>`);
+without it a fresh one is generated. `Payload::named` is refused.
 
-The same rules apply signed and unsigned, and the signed case is the one that
-matters because it is the non-repudiation evidence:
+## Asynchronous MDNs
 
-| Shape | Result |
-|---|---|
-| `multipart/report` with one `message/disposition-notification` part | that part |
-| Signed content that *is* a `message/disposition-notification` | that part |
-| Report with **no** machine-readable part | strict: rejected · relaxed: **no verdict** |
-| Signed content of any other media type | strict: rejected · relaxed: no verdict |
-| Report with **two** machine-readable parts | rejected in both modes |
-
-Relaxed mode widens only the absent case: it never produces a verdict read out
-of a human-readable part, which is where a counterparty would put a forged
-`Disposition:` line.
-
-### MDN generation
+`send_async_mdn(msg, receipt_url)` sends with
+`Receipt-Delivery-Option: receipt_url` and returns a
+[`PendingMdn`](https://docs.rs/asx-rs/latest/asx/as2/struct.PendingMdn.html),
+which holds no secret; persist its `serde` form (versioned JSON) with the
+outbox entry. When the MDN arrives on your receipt URL, look it up and verify:
 
 ```rust
-pub fn generate_mdn(
-    session: &SessionContext,
-    event_bus: &EventBus,
-    request: As2GenerateMdnRequest,
-) -> Result<As2MdnOutput>
+use asx::{as2::{As2, PendingMdn}, ErrorKind};
+use bytes::Bytes;
+
+async fn on_mdn(as2: &As2, request: http::Request<Bytes>, load: impl Fn(&str) -> Option<PendingMdn>) -> asx::Result<bool> {
+    // Unauthenticated: only a lookup key. verify_async_mdn checks it.
+    let Some(key) = PendingMdn::lookup_key(&request) else { return Ok(false) };
+    let Some(pending) = load(&key) else { return Ok(false) };
+    match as2.verify_async_mdn(request, &pending).await {
+        Ok(_mdn) => Ok(true),
+        Err(e) if e.kind() == ErrorKind::Rejected => Ok(false), // not an MDN for this message
+        Err(e) => Err(e),
+    }
+}
 ```
 
-## Core Types
+A request that is not an MDN for `pending` is `ErrorKind::Rejected`; one that
+fails verification is `ErrorKind::Indeterminate`. The audit record is written
+when the MDN is verified.
 
-1. `As2SendPolicy`: outbound cryptographic/interop behavior.
-2. `As2SendCredentials`: PEM signing/encryption material.
-3. `As2SendOutput`: transport headers/body/MIC for HTTP send.
-4. `As2ReceiveMdnRequest`: payload + MDN + policy input for reliability path.
-5. `ParsedAs2Mdn`: parsed disposition/MIC/signature metadata.
+## Receiving
 
-## Interop Notes
+`As2::inbound(dedup, handler)` returns the same `Inbound` tower `Service` as
+[AS4](@/docs/as4.md#receiving), with a handler over [`Received`](https://docs.rs/asx-rs/latest/asx/as2/struct.Received.html).
 
-1. Strict mode is the default profile.
-2. Relaxed mode remains feature-gated (`interop-relaxed`) and should be used only with scoped, audit-visible exception policies.
-3. Production deployments should keep strict mode unless exceptions are explicitly governed.
+```rust
+use asx::{as2::{As2, Received}, MemoryDedup, Reject, Verified};
 
-## Audit Events
+async fn deliver(msg: Verified<Received>) -> Result<(), Reject> {
+    let p = msg.payload();
+    println!("{} from {}: {} bytes of {}", msg.message_id(), msg.from(), p.bytes().len(), p.mime_type());
+    Ok(())
+}
 
-AS2 flows emit protocol events through `EventBus` (for example: outbound prepared, MIC computed, message signed/encrypted, MDN received, duplicate detected).
+fn router(as2: &As2) -> axum::Router {
+    axum::Router::new().route_service("/as2", as2.inbound(MemoryDedup::default(), deliver))
+}
+```
 
-`EventBus` is strict by default. Use `EventBus::new_regulated(..)` in regulated deployments; opt into best-effort explicitly via `EventBus::builder().emission_mode(EventEmissionMode::BestEffort)` only where transport progress must not depend on subscriber liveness.
+The payload is decrypted, verified and, if compressed (RFC 5402),
+decompressed. `mime_type()` is the signed entity's `Content-Type`; for a
+compressed entity, that of the MIME entity inside the CompressedData.
+`AS2-From` must be a configured partner whose pinned certificate signed.
+
+### MDN dispositions
+
+| Situation | Answer | Handler | Dedup |
+|---|---|---|---|
+| Body above `max_message_bytes` | HTTP 413 | no | — |
+| Unparseable | HTTP 400, with an MDN `processed/error: unexpected-processing-error` when one can be addressed | no | — |
+| Unknown sender, bad signature or unpinned signer | MDN `processed/error: authentication-failed` | no | — |
+| `AS2-To` is not the local party | MDN `processed/error: unexpected-processing-error` | no | — |
+| Unsigned or unencrypted | MDN `processed/error: insufficient-message-security` | no | — |
+| Decryption failed (one answer for every cause) | MDN `processed/error: decryption-failed` | no | — |
+| Decompression failed, or the compressed content is not a MIME entity | MDN `processed/error: decompression-failed` | no | — |
+| Duplicate `(AS2-From, Message-ID)` | MDN `processed/warning: duplicate-document` | no | unchanged |
+| In flight | HTTP 503 | no | unchanged |
+| `claim` failed | HTTP 500, no MDN | no | — |
+| Handler `Ok`, audit record and `accept` succeed | signed MDN `processed` with the MIC | yes | accepted |
+| Handler `Err`, or a panic | MDN `processed/error: unexpected-processing-error` | yes | abandoned |
+| Handler `Ok`, then the audit record or `accept` fails | HTTP 500, no MDN | yes | abandoned |
+
+Every MDN is signed and returned synchronously, even when the sender asked
+for an asynchronous one. An unknown sender never causes a private-key
+operation.
+
+## Not supported
+
+Sending asynchronous MDNs as receiver, streaming receive, outbound
+compression. See the [migration page](@/docs/migration.md) for 0.15 users.

@@ -1,4 +1,4 @@
-#![cfg(all(feature = "as4", feature = "client"))]
+#![cfg(all(feature = "peppol", feature = "http-client"))]
 //! Foreign-implementation oracle for the SMP enveloped-signature path.
 //!
 //! # Why this exists
@@ -37,11 +37,10 @@
 //! | Reference transforms | enveloped-signature **only** | enveloped + explicit C14N |
 //!
 //! The first pins prefix-agnostic parsing against a real signer. The second and
-//! third are the D49 path: a reference that declares no canonicalization
-//! transform is canonicalized **inclusively**, and the enclosing method is
-//! inclusive C14N over a document subset. That decision was made by reading the
-//! specification; this is the first time an independent implementation has
-//! confirmed it.
+//! third pin the canonicalization default: a reference that declares no
+//! canonicalization transform is canonicalized **inclusively**, and the
+//! enclosing method is inclusive C14N over a document subset, as confirmed by
+//! an independent implementation.
 //!
 //! # Fixture lifetime
 //!
@@ -50,10 +49,8 @@
 //! rather than leaving a maintainer to decode a chain error. Re-capture with
 //! the three steps above.
 
-use asx_rs::core::ErrorCode;
-use asx_rs::crypto::wssec::{
-    OwnedRevocationPolicy, RevocationPolicy, verify_enveloped_document_signature,
-};
+use asx::__fuzz::ErrorCode;
+use asx::__fuzz::wssec::{ChainPolicy, OwnedChainPolicy, verify_enveloped_document_signature};
 
 const SIGNED_SERVICE_METADATA: &str =
     include_str!("fixtures/smp/peppol_production_signed_service_metadata.xml");
@@ -71,14 +68,14 @@ const PEPPOL_ROOT_CA_PEM: &str = include_str!("fixtures/smp/peppol_root_ca_g3.ce
 /// This is the deployment configuration, not a shortcut — the signature is
 /// checked against the chain a Peppol access point would check it against.
 ///
-/// OCSP is disabled: the responder is a live third-party service, and whether
-/// DigiCert is reachable from CI is not what this test is about.
-fn the_real_peppol_pki() -> OwnedRevocationPolicy {
-    OwnedRevocationPolicy::production(vec![
+/// No revocation: the signature check is offline (the SMP signer's CRL/OCSP
+/// check is `Smp::lookup`'s), and whether DigiCert is reachable
+/// from CI is not what this test is about.
+fn the_real_peppol_pki() -> OwnedChainPolicy {
+    OwnedChainPolicy::production(vec![
         PEPPOL_ROOT_CA_PEM.to_string(),
         PEPPOL_SMP_CA_PEM.to_string(),
     ])
-    .with_ocsp_mode(asx_rs::core::OcspMode::Disabled)
 }
 
 /// **The oracle.** A real production Peppol SMP signature verifies.
@@ -88,7 +85,7 @@ fn a_real_peppol_smp_signature_verifies() {
     let verified = verify_enveloped_document_signature(
         SIGNED_SERVICE_METADATA,
         &[],
-        &RevocationPolicy::from(&owned),
+        &ChainPolicy::from(&owned),
     )
     .expect(
         "a signature produced by a live Peppol SMP must verify; if this fails, our \
@@ -97,7 +94,7 @@ fn a_real_peppol_smp_signature_verifies() {
 
     assert_eq!(
         verified.signer_fingerprint_sha256,
-        asx_rs::crypto::CertFingerprint::from_cert_pem(SIGNER_CERT_PEM.as_bytes())
+        asx::__fuzz::CertFingerprint::from_cert_pem(SIGNER_CERT_PEM.as_bytes())
             .expect("fixture signer PEM")
             .to_string(),
         "the verified signer must be the certificate the document carries"
@@ -119,7 +116,7 @@ fn a_tampered_endpoint_breaks_the_real_signature() {
     let tampered = SIGNED_SERVICE_METADATA.replacen(REAL_ENDPOINT_HOST, "ap.evil.example", 1);
 
     let owned = the_real_peppol_pki();
-    let err = verify_enveloped_document_signature(&tampered, &[], &RevocationPolicy::from(&owned))
+    let err = verify_enveloped_document_signature(&tampered, &[], &ChainPolicy::from(&owned))
         .expect_err("redirecting the endpoint must break the digest");
     assert_eq!(err.code, ErrorCode::SecurityVerificationFailed);
 }
@@ -136,7 +133,7 @@ fn a_truncated_signature_value_is_rejected() {
     tampered.replace_range(start..start + 8, "AAAAAAAA");
 
     let owned = the_real_peppol_pki();
-    let err = verify_enveloped_document_signature(&tampered, &[], &RevocationPolicy::from(&owned))
+    let err = verify_enveloped_document_signature(&tampered, &[], &ChainPolicy::from(&owned))
         .expect_err("a corrupted SignatureValue must not verify");
     assert_eq!(err.code, ErrorCode::SecurityVerificationFailed);
 }

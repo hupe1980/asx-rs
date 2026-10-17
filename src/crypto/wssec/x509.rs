@@ -7,207 +7,149 @@ use openssl::pkey::PKey;
 use openssl::rsa::Rsa;
 use openssl::stack::Stack;
 use openssl::x509::store::X509StoreBuilder;
-use openssl::x509::{X509, X509Crl, X509StoreContext, X509StoreContextRef};
+use openssl::x509::{X509, X509StoreContext};
 use sha2::{Digest, Sha256};
 use x509_parser::prelude::{FromDer, X509Certificate};
 use x509_parser::public_key::PublicKey;
 use x509_parser::time::ASN1Time;
 
-use super::RevocationPolicy;
-use super::ocsp::{CertOcspOutcome, is_revoked, validate_crls, validate_ocsp_status};
+use super::ChainPolicy;
 use crate::core::{AsxError, ErrorCode, ErrorContext, Result};
 
+/// Validate `x509_certificates_der` (signer first, then intermediates)
+/// offline against `policy` and return the certification path OpenSSL
+/// built, signer first and trust anchor last (DER). No CRL or OCSP is
+/// consulted: revocation is `crate::revocation`'s, after the signature.
 pub fn validate_certificate_chain(
     x509_certificates_der: &[Vec<u8>],
-    revocation_policy: &RevocationPolicy<'_>,
-) -> Result<CertOcspOutcome> {
-    validate_pkix_chain_and_revocation(x509_certificates_der, revocation_policy)
+    policy: &ChainPolicy<'_>,
+) -> Result<Vec<Vec<u8>>> {
+    let chain = validate_chain_offline(x509_certificates_der, policy)?;
+    chain
+        .path
+        .iter()
+        .map(|c| {
+            c.to_der()
+                .map_err(|e| pkix_error(format!("unencodable certificate: {e}")))
+        })
+        .collect()
 }
 
-pub(crate) fn validate_pkix_chain_and_revocation(
+/// A certification path that validated offline: signer first, trust anchor
+/// last, as OpenSSL built it. The caller checks its revocation after the
+/// signature and the sender rule.
+#[derive(Clone)]
+pub(crate) struct ValidatedChain {
+    pub(crate) path: Vec<X509>,
+}
+
+impl std::fmt::Debug for ValidatedChain {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ValidatedChain")
+            .field("path", &self.path.len())
+            .finish()
+    }
+}
+
+fn pkix_error(message: String) -> AsxError {
+    AsxError::new(
+        ErrorCode::SecurityVerificationFailed,
+        message,
+        ErrorContext::new("wssec_verify_signature_value"),
+    )
+}
+
+/// PKIX validation, offline: the signer (first certificate) must chain
+/// through the supplied intermediates to a configured trust anchor. No CRL
+/// or OCSP is consulted and nothing is fetched.
+pub(crate) fn validate_chain_offline(
     x509_certificates_der: &[Vec<u8>],
-    revocation_policy: &RevocationPolicy<'_>,
-) -> Result<CertOcspOutcome> {
-    if revocation_policy.trust_anchor_pems.is_empty() {
-        return Err(AsxError::new(
-            ErrorCode::SecurityVerificationFailed,
-            "PKIX validation requires at least one trust anchor",
-            ErrorContext::new("wssec_verify_signature_value"),
+    policy: &ChainPolicy<'_>,
+) -> Result<ValidatedChain> {
+    if policy.trust_anchor_pems.is_empty() {
+        return Err(pkix_error(
+            "PKIX validation requires at least one trust anchor".to_string(),
         ));
     }
 
     let leaf_der = x509_certificates_der.first().ok_or_else(|| {
-        AsxError::new(
-            ErrorCode::SecurityVerificationFailed,
-            "PKIX validation requires an X509 certificate in KeyInfo",
-            ErrorContext::new("wssec_verify_signature_value"),
-        )
+        pkix_error("PKIX validation requires an X509 certificate in KeyInfo".to_string())
     })?;
-
     let leaf = X509::from_der(leaf_der).map_err(|err| {
-        AsxError::new(
-            ErrorCode::SecurityVerificationFailed,
-            format!("failed to parse signer certificate for PKIX validation: {err}"),
-            ErrorContext::new("wssec_verify_signature_value"),
-        )
+        pkix_error(format!(
+            "failed to parse signer certificate for PKIX validation: {err}"
+        ))
     })?;
 
     let mut intermediates = Stack::new().map_err(|err| {
-        AsxError::new(
-            ErrorCode::SecurityVerificationFailed,
-            format!("failed to initialize intermediate certificate stack: {err}"),
-            ErrorContext::new("wssec_verify_signature_value"),
-        )
+        pkix_error(format!(
+            "failed to initialize intermediate certificate stack: {err}"
+        ))
     })?;
     for cert_der in x509_certificates_der.iter().skip(1) {
         let cert = X509::from_der(cert_der).map_err(|err| {
-            AsxError::new(
-                ErrorCode::SecurityVerificationFailed,
-                format!("failed to parse intermediate certificate for PKIX validation: {err}"),
-                ErrorContext::new("wssec_verify_signature_value"),
-            )
+            pkix_error(format!(
+                "failed to parse intermediate certificate for PKIX validation: {err}"
+            ))
         })?;
         intermediates.push(cert).map_err(|err| {
-            AsxError::new(
-                ErrorCode::SecurityVerificationFailed,
-                format!("failed to register intermediate certificate: {err}"),
-                ErrorContext::new("wssec_verify_signature_value"),
-            )
+            pkix_error(format!(
+                "failed to register intermediate certificate: {err}"
+            ))
         })?;
     }
 
-    // Collect trust-anchor certs for CRL validation (needed separately from the store).
-    let mut trust_anchor_certs: Vec<X509>;
-    if let Some(ref pre) = revocation_policy.pre_parsed_trust_anchors {
-        trust_anchor_certs = pre.clone();
+    // Use the pre-built X509Store from the CertHandle cache when available:
+    // building a store is O(n_anchors) OpenSSL allocations, the single most
+    // expensive per-message allocation on the hot receive path.
+    let store = if let Some(ref pre) = policy.pre_built_x509_store {
+        std::sync::Arc::clone(pre)
     } else {
-        trust_anchor_certs = Vec::new();
-        for pem in revocation_policy.trust_anchor_pems {
-            let certs = X509::stack_from_pem(pem.as_bytes()).map_err(|err| {
-                AsxError::new(
-                    ErrorCode::SecurityVerificationFailed,
-                    format!("invalid trust-anchor certificate PEM: {err}"),
-                    ErrorContext::new("wssec_verify_signature_value"),
-                )
-            })?;
-            trust_anchor_certs.extend(certs);
-        }
-    }
-
-    // Use the pre-built X509Store from CertHandle cache when available.
-    // Building a store is O(n_anchors) OpenSSL allocations; on the hot receive
-    // path this is the single most expensive per-message allocation.
-    let fresh_store: Option<openssl::x509::store::X509Store>;
-    let store: &openssl::x509::store::X509StoreRef =
-        if let Some(ref pre) = revocation_policy.pre_built_x509_store {
-            pre
+        let trust_anchor_certs: Vec<X509> = if let Some(ref pre) = policy.pre_parsed_trust_anchors {
+            pre.clone()
         } else {
-            let mut builder = X509StoreBuilder::new().map_err(|err| {
-                AsxError::new(
-                    ErrorCode::SecurityVerificationFailed,
-                    format!("failed to initialize PKIX trust store: {err}"),
-                    ErrorContext::new("wssec_verify_signature_value"),
-                )
-            })?;
-            for cert in &trust_anchor_certs {
-                builder.add_cert(cert.clone()).map_err(|err| {
-                    AsxError::new(
-                        ErrorCode::SecurityVerificationFailed,
-                        format!("failed to add trust-anchor certificate: {err}"),
-                        ErrorContext::new("wssec_verify_signature_value"),
-                    )
-                })?;
+            let mut certs = Vec::new();
+            for pem in policy.trust_anchor_pems {
+                certs.extend(X509::stack_from_pem(pem.as_bytes()).map_err(|err| {
+                    pkix_error(format!("invalid trust-anchor certificate PEM: {err}"))
+                })?);
             }
-            fresh_store = Some(builder.build());
-            fresh_store.as_ref().unwrap()
+            certs
         };
-
-    let mut crls = Vec::new();
-    for pem in revocation_policy.revocation_crl_pems {
-        let crl = X509Crl::from_pem(pem.as_bytes()).map_err(|err| {
-            AsxError::new(
-                ErrorCode::SecurityVerificationFailed,
-                format!("invalid revocation CRL PEM: {err}"),
-                ErrorContext::new("wssec_verify_signature_value"),
-            )
-        })?;
-        crls.push(crl);
-    }
-
-    validate_crls(&crls, &intermediates, &trust_anchor_certs)?;
+        let mut builder = X509StoreBuilder::new()
+            .map_err(|err| pkix_error(format!("failed to initialize PKIX trust store: {err}")))?;
+        for cert in &trust_anchor_certs {
+            builder.add_cert(cert.clone()).map_err(|err| {
+                pkix_error(format!("failed to add trust-anchor certificate: {err}"))
+            })?;
+        }
+        std::sync::Arc::new(builder.build())
+    };
 
     let mut context = X509StoreContext::new().map_err(|err| {
-        AsxError::new(
-            ErrorCode::SecurityVerificationFailed,
-            format!("failed to initialize PKIX validation context: {err}"),
-            ErrorContext::new("wssec_verify_signature_value"),
-        )
+        pkix_error(format!(
+            "failed to initialize PKIX validation context: {err}"
+        ))
     })?;
-
-    let valid = context
-        .init(
-            store,
-            &leaf,
-            &intermediates,
-            X509StoreContextRef::verify_cert,
-        )
-        .map_err(|err| {
-            AsxError::new(
-                ErrorCode::SecurityVerificationFailed,
-                format!("PKIX certificate validation failed: {err}"),
-                ErrorContext::new("wssec_verify_signature_value"),
-            )
-        })?;
-
-    if !valid {
-        return Err(AsxError::new(
-            ErrorCode::SecurityVerificationFailed,
-            "PKIX certificate validation did not produce a trusted chain",
-            ErrorContext::new("wssec_verify_signature_value"),
+    let (valid, path) = context
+        .init(&store, &leaf, &intermediates, |ctx| {
+            let valid = ctx.verify_cert()?;
+            let path: Vec<X509> = ctx
+                .chain()
+                .map(|chain| chain.iter().map(|c| c.to_owned()).collect())
+                .unwrap_or_default();
+            Ok((valid, path))
+        })
+        .map_err(|err| pkix_error(format!("PKIX certificate validation failed: {err}")))?;
+    if !valid || path.is_empty() {
+        return Err(pkix_error(
+            "PKIX certificate validation did not produce a trusted chain".to_string(),
         ));
     }
 
-    if !crls.is_empty() {
-        if is_revoked(&leaf, &crls)? {
-            return Err(AsxError::new(
-                ErrorCode::SecurityVerificationFailed,
-                "signer certificate is revoked by configured CRL",
-                ErrorContext::new("wssec_verify_signature_value"),
-            ));
-        }
-
-        for intermediate in intermediates.iter() {
-            if is_revoked(intermediate, &crls)? {
-                return Err(AsxError::new(
-                    ErrorCode::SecurityVerificationFailed,
-                    "intermediate certificate is revoked by configured CRL",
-                    ErrorContext::new("wssec_verify_signature_value"),
-                ));
-            }
-        }
-    }
-
-    let ocsp_outcome = validate_ocsp_status(
-        &leaf,
-        &intermediates,
-        &trust_anchor_certs,
-        store,
-        revocation_policy,
-    )?;
-
-    // A Revoked outcome from OCSP is a hard security failure regardless of policy.
-    if let CertOcspOutcome::Revoked { .. } = &ocsp_outcome {
-        return Err(AsxError::new(
-            ErrorCode::SecurityVerificationFailed,
-            "OCSP response reports signer certificate revoked",
-            ErrorContext::new("wssec_verify_signature_value"),
-        ));
-    }
-
-    Ok(ocsp_outcome)
+    Ok(ValidatedChain { path })
 }
 
-/// Validate an end-entity certificate DER for validity period, CA flag, KeyUsage, and EKU.
 /// Minimum accepted RSA modulus size in bits.
 ///
 /// 2048 bits is the floor mandated by NIST SP 800-131A / BSI TR-02102-2 for
@@ -229,6 +171,7 @@ fn unsigned_bigint_bits(bytes: &[u8]) -> usize {
     }
 }
 
+/// Validate an end-entity certificate DER for validity period, CA flag, KeyUsage, and EKU.
 pub(crate) fn validate_x509_certificate(cert_der: &[u8]) -> Result<()> {
     let cert = parse_x509_certificate(cert_der)?;
 

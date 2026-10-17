@@ -1,596 +1,198 @@
-#![cfg(all(feature = "as4", feature = "testing"))]
-//! AS4 push message receive flow end-to-end tests.
-//!
-//! **P0 Coverage (cryptographically-signed receipt handling):**
-//! - Receipt signature verification with real XMLDSig + X.509 trust anchors
-//! - RefToMessageId semantic validation (mismatch detected post-crypto-verify)
-//! - Trust anchor enforcement (receipts from untrusted certs rejected)
-//! - Negative path: forged/tampered signatures, namespace confusion
-//!
-//! **P1 Blocking Items (documented below):**
-//! 1. **MIME attachment payload packaging** (blocking strict Peppol/CEF conformance)
-//!    Currently: payloads embedded in SOAP `<asx:Base64>` within Body element
-//!    Required: Standard MIME multipart attachment packaging with Content-ID references
-//!    Impact: Strict AP networks expect MIME attachments per OpenPeppol AS4 profile
-//!    See: the CHANGELOG Section 0 and critical finding #3
-//!
-//! 2. **Dynamic SMP-driven P-Mode materialization**
-//!    Required for strict profile compliance: automatic endpoint/cert/service discovery
-//!    See: the CHANGELOG P1 outcome #2
+#![cfg(feature = "as4")]
+//! AS4 one-way push end to end: a real `As4::send` against a real partner
+//! `Inbound`, through the testkit `Loopback`. Receipt verification is in
+//! `as4_receipt_verification.rs` and `as4_send.rs`; dedup outcomes are in
+//! `as4_receive.rs`.
 
-#[path = "common/as4_push.rs"]
-mod common;
+#[path = "common/inbound_harness.rs"]
+mod inbound_harness;
+#[path = "common/peers.rs"]
+mod peers;
 
-use crate::common::{
-    as4_strict_push_policy, as4_unsigned_push_policy, dedup_backend, fixture, pki_fixture, session,
-    session_with_trust_anchor_and_fingerprint_pin, signed_receipt_fixture,
-};
-use asx_rs::as4::{As4ReceivePushRequest, As4ReceivePushSync, receive_push_sync};
-use asx_rs::core::{CertHandle, ErrorCode, OcspMode, SessionContext};
-use asx_rs::observability::{AsxEvent, EventBus, ScopedEventTryRecvError};
-use asx_rs::reliability::InMemoryDedupBackend;
-use tokio::time::{Duration, timeout};
+use asx::ErrorKind;
+use peers::{AS4_PRESETS, B_URL, Preset, pair, soap_part};
+use std::sync::atomic::Ordering;
 
-const PUSH_FLOW_BOUNDARY: &str = "asx-push-flow-boundary";
+/// Every preset: the handler sees the sent ebMS fields and payload, the wire
+/// carries a signed `eb:Messaging` that must be understood, and the sender
+/// holds a receipt signed by the partner for exactly this message.
+#[tokio::test]
+async fn signed_push_is_delivered_and_receipted() {
+    for preset in AS4_PRESETS {
+        let p = pair(preset);
+        let id = format!("push-flow-{preset:?}@asx.test");
+        let receipt = p
+            .sender
+            .send(
+                preset
+                    .message(&p.to_b, b"push-flow-payload")
+                    .message_id(&id),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{preset:?}: {e}"));
 
-fn multipart_content_type() -> String {
-    format!("multipart/related; boundary=\"{PUSH_FLOW_BOUNDARY}\"; type=\"application/soap+xml\"")
-}
+        let soap = soap_part(p.loopback.last_request().unwrap().body());
+        assert!(
+            soap.contains("Messaging soap:mustUnderstand=\"true\""),
+            "{preset:?}"
+        );
+        assert!(
+            soap.contains("<ds:Reference URI=\"#as4-messaging\">"),
+            "{preset:?}"
+        );
+        assert!(soap.contains("<ds:SignatureValue>"), "{preset:?}");
 
-fn ensure_required_strict_properties_in_xml(xml: &str) -> String {
-    let has_original_sender = xml.contains("name=\"originalSender\"");
-    let has_final_recipient = xml.contains("name=\"finalRecipient\"");
-    let has_tracking_identifier = xml.contains("name=\"trackingIdentifier\"");
+        let delivered = p.delivered.lock().unwrap().clone();
+        assert_eq!(delivered.len(), 1, "{preset:?}");
+        let (message_id, from, payloads) = &delivered[0];
+        assert_eq!(message_id, &id, "{preset:?}");
+        assert_eq!(from, &p.a.id, "{preset:?}");
+        assert_eq!(payloads, &vec![b"push-flow-payload".to_vec()], "{preset:?}");
 
-    if has_original_sender && has_final_recipient && has_tracking_identifier {
-        return xml.to_string();
-    }
-
-    let Some(user_message_close) = xml.find("</eb:UserMessage>") else {
-        return xml.to_string();
-    };
-
-    let mut out = String::with_capacity(xml.len() + 256);
-    out.push_str(&xml[..user_message_close]);
-    out.push_str(
-        "<eb:MessageProperties>\
-            <eb:Property name=\"originalSender\">urn:test:sender</eb:Property>\
-            <eb:Property name=\"finalRecipient\">urn:test:recipient</eb:Property>\
-            <eb:Property name=\"trackingIdentifier\">urn:test:tracking</eb:Property>\
-        </eb:MessageProperties>",
-    );
-    out.push_str(&xml[user_message_close..]);
-    out
-}
-
-fn multipart_push_payload() -> Vec<u8> {
-    let payload_cid = "push-flow-body@example.com";
-    let mut soap =
-        String::from_utf8(fixture("as4_push_user_message.golden")).expect("utf8 fixture");
-    soap = ensure_required_strict_properties_in_xml(&soap);
-
-    if !soap.contains("xmlns:xop=\"http://www.w3.org/2004/08/xop/include\"") {
-        soap = soap.replacen(
-            "<S12:Envelope ",
-            "<S12:Envelope xmlns:xop=\"http://www.w3.org/2004/08/xop/include\" ",
-            1,
+        assert_eq!(receipt.signer(), &p.b.signing.certificate(), "{preset:?}");
+        let signal = String::from_utf8(receipt.evidence().signal().unwrap().to_vec()).unwrap();
+        assert!(
+            signal.contains(&format!("RefToMessageId>{id}<")),
+            "{preset:?}: {signal}"
         );
     }
-    if soap.contains("<S12:Body/>") {
-        soap = soap.replacen(
-            "<S12:Body/>",
-            &format!("<S12:Body><xop:Include href=\"cid:{payload_cid}\"/></S12:Body>"),
-            1,
-        );
-    }
-
-    let mut out = Vec::new();
-    out.extend_from_slice(format!("--{PUSH_FLOW_BOUNDARY}\r\n").as_bytes());
-    out.extend_from_slice(
-        b"Content-Type: application/xop+xml; charset=UTF-8; type=\"application/soap+xml\"\r\n",
-    );
-    out.extend_from_slice(b"Content-ID: <soap-root@example.com>\r\n\r\n");
-    out.extend_from_slice(soap.as_bytes());
-    out.extend_from_slice(b"\r\n");
-    out.extend_from_slice(format!("--{PUSH_FLOW_BOUNDARY}\r\n").as_bytes());
-    out.extend_from_slice(
-        format!("Content-Type: application/octet-stream\r\nContent-ID: <{payload_cid}>\r\n\r\n")
-            .as_bytes(),
-    );
-    out.extend_from_slice(b"push-flow-detached-payload\r\n");
-    out.extend_from_slice(format!("--{PUSH_FLOW_BOUNDARY}--\r\n").as_bytes());
-    out
 }
 
-#[test]
-fn as4_push_valid_without_receipt_when_unsigned_push_is_allowed() {
-    let bus = EventBus::new(32).expect("bus");
-    let _events = bus.subscribe_scoped_events();
-
-    let dedup = dedup_backend();
-    let out = receive_push_sync(
-        &session(),
-        &bus,
-        As4ReceivePushSync {
-            request: As4ReceivePushRequest {
-                http_content_type: multipart_content_type(),
-                payload: multipart_push_payload().into(),
-                receipt_payload: None,
-                policy: as4_unsigned_push_policy(),
-                authenticated_sender_scope: None,
-            },
-            dedup: dedup.clone(),
-            signer_pins: None,
-        },
-    )
-    .expect("valid push flow")
-    .unwrap_output()
-    .0;
-
-    assert_eq!(out.user_message.message_id, "msg-push-1");
-    assert_eq!(out.user_message.action, "SubmitOrder");
-    assert_eq!(out.user_message.from_party_id(), "sender-a");
-    assert_eq!(out.user_message.to_party_id(), "receiver-b");
-    assert!(out.user_message.has_ws_security_header);
-    assert!(out.receipt.is_none());
+/// The receive half: a push stripped of its signature is refused before the
+/// handler, with an ebMS error the sender can read.
+#[tokio::test]
+async fn push_missing_signature_is_refused() {
+    let g = inbound_harness::genuine(Preset::Edelivery).await;
+    let r = g.receiver();
+    let unsigned = g.mutated(|s| {
+        let start = s.find("<ds:Signature").expect("signature");
+        let end = s.find("</ds:Signature>").expect("signature end") + "</ds:Signature>".len();
+        format!("{}{}", &s[..start], &s[end..])
+    });
+    // Unsigned where a signature is required is EBMS:0103.
+    r.refused(unsigned, "EBMS:0103")
+        .await
+        .assert_refused_because("EBMS:0103", "signature is required but not present");
 }
 
-#[test]
-fn as4_push_missing_signature_fails_when_required() {
-    let bus = EventBus::new(32).expect("bus");
-    let _events = bus.subscribe_scoped_events();
-
-    let dedup = dedup_backend();
-    let err = receive_push_sync(
-        &session(),
-        &bus,
-        As4ReceivePushSync {
-            request: As4ReceivePushRequest {
-                http_content_type: multipart_content_type(),
-                payload: multipart_push_payload().into(),
-                receipt_payload: None,
-                policy: as4_strict_push_policy(),
-                authenticated_sender_scope: None,
-            },
-            dedup: dedup.clone(),
-            signer_pins: None,
-        },
-    )
-    .expect_err("missing signature must fail");
-
-    assert_eq!(err.code, ErrorCode::SecurityVerificationFailed);
+/// A receipt whose `ds:SignatureValue` was altered in transit is not
+/// evidence: `Indeterminate`, with the evidence kept for the record.
+#[tokio::test]
+async fn forged_receipt_signature_is_indeterminate() {
+    let p = pair(Preset::Edelivery);
+    p.loopback.intercept(|resp| {
+        let text = String::from_utf8(resp.body().to_vec()).unwrap();
+        let at = text.find("SignatureValue>").unwrap() + "SignatureValue>".len();
+        let mut bytes = text.into_bytes();
+        bytes[at] = if bytes[at] == b'A' { b'B' } else { b'A' };
+        *resp.body_mut() = bytes::Bytes::from(bytes);
+    });
+    let err = p
+        .sender
+        .send(Preset::Edelivery.message(&p.to_b, b"x"))
+        .await
+        .expect_err("forged receipt");
+    assert_eq!(err.kind(), ErrorKind::Indeterminate, "{err}");
+    assert!(err.is_retryable());
+    assert!(err.evidence().is_some());
+    // The partner did take the message: the sender cannot know, hence
+    // Indeterminate rather than PartnerError.
+    assert_eq!(p.calls.load(Ordering::SeqCst), 1);
 }
 
-#[test]
-fn forged_receipt_signature_fails_cryptographic_verification() {
-    let bus = EventBus::new(32).expect("bus");
-    let _events = bus.subscribe_scoped_events();
-    let mut scoped_rx = bus.subscribe_scoped_events();
-    let security_before = bus
-        .metrics()
-        .receipt_taxonomy_security_verification_failed();
-    let signing_cert_pem = pki_fixture("receipt_signing.cert.pem");
-    let trusted_session = session_with_trust_anchor_and_fingerprint_pin(&signing_cert_pem);
-
-    let dedup = dedup_backend();
-    let err = receive_push_sync(
-        &trusted_session,
-        &bus,
-        As4ReceivePushSync {
-            request: As4ReceivePushRequest {
-                http_content_type: multipart_content_type(),
-                payload: multipart_push_payload().into(),
-                receipt_payload: Some(fixture("as4_push_signed_receipt.golden")),
-                policy: as4_unsigned_push_policy(),
-                authenticated_sender_scope: None,
-            },
-            dedup: dedup.clone(),
-            signer_pins: None,
-        },
-    )
-    .expect_err("forged receipt signature must fail");
-
-    assert_eq!(err.code, ErrorCode::SecurityVerificationFailed);
-
-    let mut saw_taxonomy = false;
-    for _ in 0..16 {
-        let evt = match scoped_rx.try_recv() {
-            Ok(evt) => evt,
-            Err(ScopedEventTryRecvError::Empty) => continue,
-            Err(ScopedEventTryRecvError::Closed) | Err(_) => break,
-        };
-        if let AsxEvent::ReceiptTaxonomyOutcome {
-            message_id,
-            signal,
-            outcome,
-            detail,
-        } = evt.event.as_ref()
-            && message_id.as_ref() == "msg-push-1"
-            && *signal == "as4"
-            && *outcome == "security_verification_failed"
-            && *detail == "receipt_signature_verification_failed"
-        {
-            saw_taxonomy = true;
-            break;
-        }
-    }
-    assert!(saw_taxonomy);
-    let security_after = bus
-        .metrics()
-        .receipt_taxonomy_security_verification_failed();
-    assert_eq!(security_after, security_before + 1);
+/// A receipt validly signed by a certificate from another CA, carried in the
+/// receipt's own token: neither chained to the trust anchor nor pinned.
+#[tokio::test]
+async fn receipt_signed_by_an_untrusted_certificate_is_indeterminate() {
+    use base64::Engine;
+    let p = pair(Preset::Edelivery);
+    let foreign = asx_testkit::pki::TestCa::new("foreign root", asx_testkit::pki::KeyAlg::Rsa2048)
+        .rsa_party("party-b");
+    let token =
+        base64::engine::general_purpose::STANDARD.encode(foreign.signing.certificate().der());
+    let signer = foreign.signing.clone();
+    p.loopback.intercept(move |resp| {
+        let text = String::from_utf8(resp.body().to_vec()).unwrap();
+        let open = text.find("<wsse:BinarySecurityToken").unwrap();
+        let start = open + text[open..].find('>').unwrap() + 1;
+        let end = start + text[start..].find('<').unwrap();
+        let swapped = format!("{}{token}{}", &text[..start], &text[end..]);
+        let resigned = inbound_harness::resign(&swapped, &[], &signer);
+        *resp.body_mut() = bytes::Bytes::from(resigned);
+    });
+    let err = p
+        .sender
+        .send(Preset::Edelivery.message(&p.to_b, b"x"))
+        .await
+        .expect_err("untrusted receipt signer");
+    assert_eq!(err.kind(), ErrorKind::Indeterminate, "{err}");
+    assert!(err.evidence().is_some());
 }
 
-#[test]
-fn cryptographically_signed_receipt_passes_end_to_end() {
-    let bus = EventBus::new(32).expect("bus");
-    let _events = bus.subscribe_scoped_events();
-    let signing_cert_pem = pki_fixture("receipt_signing.cert.pem");
-    let trusted_session = session_with_trust_anchor_and_fingerprint_pin(&signing_cert_pem);
-
-    let dedup = dedup_backend();
-    let out = receive_push_sync(
-        &trusted_session,
-        &bus,
-        As4ReceivePushSync {
-            request: As4ReceivePushRequest {
-                http_content_type: multipart_content_type(),
-                payload: multipart_push_payload().into(),
-                receipt_payload: Some(signed_receipt_fixture("msg-push-1")),
-                policy: as4_unsigned_push_policy(),
-                authenticated_sender_scope: None,
-            },
-            dedup: dedup.clone(),
-            signer_pins: None,
-        },
-    )
-    .expect("cryptographically signed receipt must be accepted")
-    .unwrap_output()
-    .0;
-
-    let receipt = out.receipt.expect("receipt");
-    assert!(receipt.is_signed);
-    assert!(receipt.has_non_repudiation_info);
-    assert_eq!(receipt.ref_to_message_id, "msg-push-1");
-}
-
-#[test]
-fn library_generated_signed_receipt_passes_strict_receipt_gate() {
-    // Self-interop: a receipt produced by `generate_signed_receipt_with_nri`
-    // must be accepted by the receive path with `require_signed_receipt = true`
-    // (the default) — signature verified against the pinned trust anchor and
-    // classified as a signed NRR receipt.
-    use asx_rs::as4::{As4NriReference, As4ReceiptCredentials, generate_signed_receipt_with_nri};
-    use asx_rs::crypto::wssec::WsSecOutboundKeyInfoProfile;
-
-    let bus = EventBus::new(32).expect("bus");
-    let _events = bus.subscribe_scoped_events();
-    let signing_key_pem = pki_fixture("receipt_signing.key.pem");
-    let signing_cert_pem = pki_fixture("receipt_signing.cert.pem");
-    let trusted_session = session_with_trust_anchor_and_fingerprint_pin(&signing_cert_pem);
-
-    let credentials = As4ReceiptCredentials {
-        signing_key_pem,
-        signing_cert_pem,
-        key_info_profile: WsSecOutboundKeyInfoProfile::X509DataAndRsaKeyValue,
-    };
-    let nri_refs = vec![As4NriReference {
-        uri: "#as4-user-message".to_string(),
-        digest_method_uri: "http://www.w3.org/2001/04/xmlenc#sha256".to_string(),
-        digest_value_b64: "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=".to_string(),
-    }];
-    let receipt = generate_signed_receipt_with_nri(
-        &trusted_session,
-        "receipt-self-interop-1",
-        "msg-push-1",
-        &nri_refs,
-        &credentials,
-    )
-    .expect("signed receipt generation");
-
-    let dedup = dedup_backend();
-    let out = receive_push_sync(
-        &trusted_session,
-        &bus,
-        As4ReceivePushSync {
-            request: As4ReceivePushRequest {
-                http_content_type: multipart_content_type(),
-                payload: multipart_push_payload().into(),
-                receipt_payload: Some(receipt),
-                policy: as4_unsigned_push_policy(),
-                authenticated_sender_scope: None,
-            },
-            dedup: dedup.clone(),
-            signer_pins: None,
-        },
-    )
-    .expect("library-generated signed receipt must pass the strict receipt gate")
-    .unwrap_output()
-    .0;
-
-    let receipt = out.receipt.expect("receipt");
-    assert!(receipt.is_signed, "receipt must be detected as signed");
-    assert!(
-        receipt.has_non_repudiation_info,
-        "receipt must carry NonRepudiationInformation"
-    );
-    assert_eq!(receipt.ref_to_message_id, "msg-push-1");
-}
-
-#[test]
-fn receipt_with_wrong_ref_to_message_id_detected_after_crypto_verify() {
-    let bus = EventBus::new(32).expect("bus");
-    let _events = bus.subscribe_scoped_events();
-    let mut scoped_rx = bus.subscribe_scoped_events();
-    let semantic_before = bus.metrics().receipt_taxonomy_semantic_interop_failure();
-    let signing_cert_pem = pki_fixture("receipt_signing.cert.pem");
-    let trusted_session = session_with_trust_anchor_and_fingerprint_pin(&signing_cert_pem);
-
-    let dedup = dedup_backend();
-    // Receipt is cryptographically valid but refers to a different message ID.
-    let err = receive_push_sync(
-        &trusted_session,
-        &bus,
-        As4ReceivePushSync {
-            request: As4ReceivePushRequest {
-                http_content_type: multipart_content_type(),
-                payload: multipart_push_payload().into(),
-                receipt_payload: Some(signed_receipt_fixture("msg-push-999")),
-                policy: as4_unsigned_push_policy(),
-                authenticated_sender_scope: None,
-            },
-            dedup: dedup.clone(),
-            signer_pins: None,
-        },
-    )
-    .expect_err("receipt with mismatched RefToMessageId must fail");
-
-    // Verify that the error is about semantic interop violation, not crypto failure.
-    // (Crypto verification passes, but the message ID link is broken.)
-    assert_eq!(err.code, ErrorCode::InteropViolation);
-
-    let mut saw_taxonomy = false;
-    for _ in 0..16 {
-        let evt = match scoped_rx.try_recv() {
-            Ok(evt) => evt,
-            Err(ScopedEventTryRecvError::Empty) => continue,
-            Err(ScopedEventTryRecvError::Closed) | Err(_) => break,
-        };
-        if let AsxEvent::ReceiptTaxonomyOutcome {
-            message_id,
-            signal,
-            outcome,
-            detail,
-        } = evt.event.as_ref()
-            && message_id.as_ref() == "msg-push-1"
-            && *signal == "as4"
-            && *outcome == "semantic_interop_failure"
-            && *detail == "receipt_ref_to_message_id_mismatch"
-        {
-            saw_taxonomy = true;
-            break;
-        }
-    }
-    assert!(saw_taxonomy);
-    let semantic_after = bus.metrics().receipt_taxonomy_semantic_interop_failure();
-    assert_eq!(semantic_after, semantic_before + 1);
-}
-
-#[test]
-fn receipt_signed_by_untrusted_cert_rejected_even_if_cryptographically_valid() {
-    let bus = EventBus::new(32).expect("bus");
-    let _events = bus.subscribe_scoped_events();
-    let signing_cert_pem = pki_fixture("receipt_signing.cert.pem");
-    // Create a session WITHOUT the receipt signing cert in the trust anchor.
-    let untrusted_session =
-        SessionContext::new("as4-session-1", "partner-a", "strict").expect("session");
-    let mut cert_handle = CertHandle::new("as4-receipt-signing-other");
-    cert_handle.trust_anchor_pems = vec![]; // Empty trust anchor
-    cert_handle.ocsp_mode = OcspMode::Disabled;
-    cert_handle.fingerprint_sha256 = {
-        let pinned_session = session_with_trust_anchor_and_fingerprint_pin(&signing_cert_pem);
-        pinned_session.cert_handle().fingerprint_sha256.clone()
-    };
-    let untrusted_session = untrusted_session
-        .with_cert_handle(cert_handle)
-        .expect("session trust configuration");
-
-    let dedup = dedup_backend();
-    // Even though the receipt is cryptographically valid, it's signed by a cert
-    // not in the trust anchor, so verification must fail.
-    let err = receive_push_sync(
-        &untrusted_session,
-        &bus,
-        As4ReceivePushSync {
-            request: As4ReceivePushRequest {
-                http_content_type: multipart_content_type(),
-                payload: multipart_push_payload().into(),
-                receipt_payload: Some(signed_receipt_fixture("msg-push-1")),
-                policy: as4_unsigned_push_policy(),
-                authenticated_sender_scope: None,
-            },
-            dedup: dedup.clone(),
-            signer_pins: None,
-        },
-    )
-    .expect_err("receipt signed by untrusted cert must fail");
-
-    assert_eq!(err.code, ErrorCode::SecurityVerificationFailed);
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn duplicate_push_ingress_emits_duplicate_detected_event() {
-    let bus = EventBus::new(32).expect("bus");
-    let _events = bus.subscribe_scoped_events();
-    let mut events = bus
-        .subscribe_session_events("as4-session-1")
-        .expect("subscribe");
-    let dedup: std::sync::Arc<dyn asx_rs::storage::DedupStorage> =
-        std::sync::Arc::new(InMemoryDedupBackend::default());
-
-    // A replay is only a replay once the first delivery has been settled as
-    // accepted — that is what `Duplicate` means.
-    let outcome = push_once(&bus, dedup.clone()).expect("push with dedup");
-    let (_, claim) = outcome.unwrap_output();
-    claim.accept().await.expect("accept claim");
-
-    let replay = push_once(&bus, dedup.clone()).expect("replay");
-    assert!(
-        replay.is_duplicate(),
-        "an accepted message must replay as Duplicate, got {replay:?}"
-    );
-
-    let mut duplicate_seen = false;
-    for _ in 0..6 {
-        if let Ok(Some(evt)) = timeout(Duration::from_millis(200), events.recv()).await
-            && let asx_rs::observability::AsxEvent::DuplicateDetected {
-                message_id,
-                ingress,
-                ..
-            } = evt.as_ref()
-            && message_id.as_ref() == "msg-push-1"
-            && *ingress == asx_rs::observability::AsxIngressStage::As4ReceivePush
-        {
-            duplicate_seen = true;
-            break;
-        }
-    }
-
-    assert!(duplicate_seen);
-}
-
-/// An unsettled claim must not be reported as a duplicate.
-///
-/// Answering `Duplicate` here is what loses messages: the second delivery is
-/// acknowledged as already handled while the first attempt may still fail and
-/// never be recorded anywhere (D57).
-#[tokio::test(flavor = "current_thread")]
-async fn concurrent_delivery_of_an_unsettled_message_reports_in_flight() {
-    let bus = EventBus::new(32).expect("bus");
-    let _events = bus.subscribe_scoped_events();
-    let dedup: std::sync::Arc<dyn asx_rs::storage::DedupStorage> =
-        std::sync::Arc::new(InMemoryDedupBackend::default());
-
-    // Hold the claim: this stands for a delivery still being processed.
-    let first = push_once(&bus, dedup.clone()).expect("first push");
-    let (_, _claim) = first.unwrap_output();
-
-    let concurrent = push_once(&bus, dedup.clone()).expect("concurrent push");
-    assert!(
-        concurrent.is_in_flight(),
-        "an unsettled message must report InFlight, got {concurrent:?}"
-    );
-}
-
-/// The recovery path: abandoning a claim lets the retransmission through.
-///
-/// Before the two-phase protocol the dedup key was spent at receive, so a
-/// message that failed after that point could never be redelivered — the
-/// sender's `ReceptionAwareness` retransmission was answered `200 OK` and the
-/// message was lost.
-#[tokio::test(flavor = "current_thread")]
-async fn abandoned_claim_lets_a_retransmission_be_processed() {
-    let bus = EventBus::new(32).expect("bus");
-    let _events = bus.subscribe_scoped_events();
-    let dedup: std::sync::Arc<dyn asx_rs::storage::DedupStorage> =
-        std::sync::Arc::new(InMemoryDedupBackend::default());
-
-    let first = push_once(&bus, dedup.clone()).expect("first push");
-    let (_, claim) = first.unwrap_output();
-    // The application could not take responsibility for the message.
-    claim.abandon().await.expect("abandon claim");
-
-    let retransmission = push_once(&bus, dedup.clone()).expect("retransmission");
-    assert!(
-        retransmission.is_first_seen(),
-        "a retransmission after an abandoned claim must be processed, got {retransmission:?}"
-    );
-}
-
-fn push_once(
-    bus: &EventBus,
-    dedup: std::sync::Arc<dyn asx_rs::storage::DedupStorage>,
-) -> asx_rs::core::Result<asx_rs::as4::As4ReceiveOutcome> {
-    receive_push_sync(
-        &session(),
-        bus,
-        As4ReceivePushSync {
-            request: As4ReceivePushRequest {
-                http_content_type: multipart_content_type(),
-                payload: multipart_push_payload().into(),
-                receipt_payload: None,
-                policy: as4_unsigned_push_policy(),
-                authenticated_sender_scope: None,
-            },
-            dedup,
-            signer_pins: None,
-        },
-    )
-}
-
-/// A durable, cluster-safe dedup backend on the **real** receive path.
-///
-/// `DedupStorage` returns `BoxFuture` precisely so Redis/PostgreSQL/DynamoDB
-/// backends can implement it natively, and `cluster_safe()` — which the strict
-/// production startup gate requires — implies exactly such an out-of-process
-/// store. Any of them yields at least once, and the receive pipeline runs
-/// inside `spawn_blocking`, so the future has to be driven to completion rather
-/// than polled once and given up on.
+/// A `DedupStore` whose every answer arrives after several yields, on the
+/// real receive path under a multi-thread runtime: the claim is driven to
+/// completion (not polled once), and the retransmission is a duplicate.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn async_backed_dedup_works_on_the_as4_receive_path() {
-    use asx_rs::storage::{BoxFuture, DedupStorage, DedupVerdict};
+async fn async_backed_dedup_works_on_the_receive_path() {
+    use asx::{BoxFuture, Claim, ClaimToken, DedupStore};
     use std::collections::HashMap;
     use std::sync::Mutex;
 
-    /// Correct two-phase semantics, but every answer arrives after a yield.
+    type StoreResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
+
+    /// key → (lease, accepted)
     #[derive(Debug, Default)]
     struct AsyncYieldingDedup {
-        /// key -> settled (`false` while claimed, `true` once accepted)
-        state: Mutex<HashMap<String, bool>>,
+        state: Mutex<HashMap<String, (String, bool)>>,
+        leases: std::sync::atomic::AtomicUsize,
     }
 
-    impl DedupStorage for AsyncYieldingDedup {
-        fn is_durable(&self) -> bool {
-            true
-        }
-        fn cluster_safe(&self) -> bool {
-            true
-        }
-
-        fn claim<'a>(&'a self, key: &'a str) -> BoxFuture<'a, asx_rs::Result<DedupVerdict>> {
+    impl DedupStore for AsyncYieldingDedup {
+        fn claim<'a>(&'a self, key: &'a str) -> BoxFuture<'a, StoreResult<Claim>> {
             Box::pin(async move {
-                // Several yields: one extra poll must not be enough.
                 for _ in 0..4 {
                     tokio::task::yield_now().await;
                 }
-                let mut state = self.state.lock().expect("lock");
+                let mut state = self.state.lock().unwrap();
                 Ok(match state.get(key) {
-                    Some(true) => DedupVerdict::Duplicate,
-                    Some(false) => DedupVerdict::InFlight,
+                    Some((_, true)) => Claim::Duplicate,
+                    Some((_, false)) => Claim::InFlight,
                     None => {
-                        state.insert(key.to_string(), false);
-                        DedupVerdict::Claimed
+                        let lease = format!("lease-{}", self.leases.fetch_add(1, Ordering::SeqCst));
+                        state.insert(key.to_string(), (lease.clone(), false));
+                        Claim::Claimed(ClaimToken::new(lease))
                     }
                 })
             })
         }
 
-        fn accept<'a>(&'a self, key: &'a str) -> BoxFuture<'a, asx_rs::Result<()>> {
+        fn accept<'a>(
+            &'a self,
+            key: &'a str,
+            token: &'a ClaimToken,
+        ) -> BoxFuture<'a, StoreResult<()>> {
             Box::pin(async move {
                 tokio::task::yield_now().await;
-                self.state
-                    .lock()
-                    .expect("lock")
-                    .insert(key.to_string(), true);
-                Ok(())
+                let mut state = self.state.lock().unwrap();
+                match state.get_mut(key) {
+                    Some((lease, accepted)) if lease == token.as_str() => {
+                        *accepted = true;
+                        Ok(())
+                    }
+                    _ => Err("stale claim".into()),
+                }
             })
         }
 
-        fn abandon<'a>(&'a self, key: &'a str) -> BoxFuture<'a, asx_rs::Result<()>> {
+        fn abandon<'a>(
+            &'a self,
+            key: &'a str,
+            token: &'a ClaimToken,
+        ) -> BoxFuture<'a, StoreResult<()>> {
             Box::pin(async move {
                 tokio::task::yield_now().await;
-                let mut state = self.state.lock().expect("lock");
-                if state.get(key) == Some(&false) {
+                let mut state = self.state.lock().unwrap();
+                if matches!(state.get(key), Some((lease, false)) if lease == token.as_str()) {
                     state.remove(key);
                 }
                 Ok(())
@@ -598,48 +200,30 @@ async fn async_backed_dedup_works_on_the_as4_receive_path() {
         }
     }
 
-    let bus = EventBus::new(32).expect("bus");
-    let _events = bus.subscribe_scoped_events();
-    let backend: std::sync::Arc<dyn DedupStorage> =
-        std::sync::Arc::new(AsyncYieldingDedup::default());
-
-    let push = |backend: std::sync::Arc<dyn DedupStorage>| {
-        let bus = bus.clone();
-        async move {
-            asx_rs::as4::receive_push(
-                &session(),
-                &bus,
-                asx_rs::as4::As4ReceivePush {
-                    request: As4ReceivePushRequest {
-                        http_content_type: multipart_content_type(),
-                        payload: multipart_push_payload().into(),
-                        receipt_payload: None,
-                        policy: as4_unsigned_push_policy(),
-                        authenticated_sender_scope: None,
-                    },
-                    dedup: backend,
-                    ordering: None,
-                    signer_pins: None,
-                },
-            )
-            .await
-            .map(asx_rs::as4::As4Ordered::into_inner)
+    let p = pair(Preset::Edelivery);
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let handler = {
+        let calls = calls.clone();
+        move |_m: asx::Verified<asx::as4::UserMessage>| {
+            let calls = calls.clone();
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok::<(), asx::Reject>(())
+            }
         }
     };
-
-    let outcome = push(std::sync::Arc::clone(&backend))
+    p.loopback.mount(
+        B_URL,
+        p.receiver.inbound(AsyncYieldingDedup::default(), handler),
+    );
+    let message = Preset::Edelivery
+        .message(&p.to_b, b"yielding")
+        .message_id("yielding-dedup@asx.test");
+    p.sender
+        .send(message.clone())
         .await
-        .expect("an async-backed dedup store must not panic the receive path");
-    let (_output, claim) = match outcome {
-        asx_rs::as4::As4ReceiveOutcome::FirstSeen { output, claim } => (output, claim),
-        other => panic!("expected FirstSeen, got {other:?}"),
-    };
-
-    // Settling round-trips through the same bridge.
-    claim.accept().await.expect("accept");
-
-    // The replay is a Duplicate, which proves the claim really was recorded in
-    // the async backend rather than silently dropped.
-    let replay = push(backend).await.expect("replay");
-    assert!(replay.is_duplicate(), "expected Duplicate, got {replay:?}");
+        .expect("first delivery");
+    // The retransmission is answered as a duplicate, not delivered.
+    p.sender.send(message).await.expect("duplicate receipted");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
 }

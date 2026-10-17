@@ -1,23 +1,15 @@
-#![cfg(all(feature = "as4", feature = "client"))]
+#![cfg(all(feature = "peppol", feature = "http-client"))]
 //! Enveloped whole-document XML signatures — the shape SMP `ServiceMetadata`
 //! responses use (`ds:Reference URI=""` plus an `enveloped-signature`
 //! transform).
 //!
-//! # Cross-validation status
-//!
-//! Unlike the AS4 signing path, which is checked against xmlsec1 in
-//! `tests/interop_xmlsec_oracle.rs`, this path is **not yet cross-validated
-//! against an independent implementation**. The tests below exercise ASX's
-//! verifier against documents ASX understands; they prove the logic and the
-//! tamper-detection, not byte-level agreement with another stack.
-//!
-//! Closing that gap needs an xmlsec1 *signing* fixture (its `--sign` key
-//! templating did not cooperate) or a captured real PEPPOL SMP response.
+//! The tests below exercise the verifier against documents ASX understands:
+//! they prove the logic and the tamper detection. Agreement with a real
+//! signer is checked against a captured Peppol SMP response in
+//! `tests/interop_peppol_smp_oracle.rs`.
 
-use asx_rs::core::ErrorCode;
-use asx_rs::crypto::wssec::{
-    OwnedRevocationPolicy, RevocationPolicy, verify_enveloped_document_signature,
-};
+use asx::__fuzz::ErrorCode;
+use asx::__fuzz::wssec::{ChainPolicy, OwnedChainPolicy, verify_enveloped_document_signature};
 
 /// A `ServiceMetadata` skeleton with a structurally complete but
 /// cryptographically meaningless signature.
@@ -54,13 +46,13 @@ const ENVELOPED: &str =
     r#"<ds:Transform Algorithm="http://www.w3.org/2000/09/xmldsig#enveloped-signature"/>"#;
 const EXC_C14N: &str = r#"<ds:Transform Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>"#;
 
-fn anchors() -> OwnedRevocationPolicy {
-    OwnedRevocationPolicy::production(vec![])
+fn anchors() -> OwnedChainPolicy {
+    OwnedChainPolicy::production(vec![])
 }
 
-fn verify(xml: &str) -> asx_rs::core::Result<()> {
+fn verify(xml: &str) -> asx::__fuzz::Result<()> {
     let owned = anchors();
-    verify_enveloped_document_signature(xml, &[], &RevocationPolicy::from(&owned)).map(|_| ())
+    verify_enveloped_document_signature(xml, &[], &ChainPolicy::from(&owned)).map(|_| ())
 }
 
 /// A reference that is not whole-document is rejected by name rather than
@@ -104,18 +96,19 @@ fn an_unsupported_transform_is_rejected_by_name() {
     assert!(err.message.contains("urn:made:up"), "{}", err.message);
 }
 
-/// A well-formed enveloped reference gets as far as the digest check and fails
-/// there — proving the reference machinery ran rather than short-circuiting.
+/// A well-formed enveloped reference passes the structural checks and then
+/// stops at the signer: the whole-document digest is computed only for an
+/// authenticated signer (authenticate before expensive work), so a meaningless certificate fails before any digest.
 #[test]
-fn a_well_formed_reference_reaches_and_fails_the_digest_check() {
+fn a_well_formed_reference_with_an_untrusted_signer_fails_before_the_digest() {
     let xml = service_metadata(
         "https://ap.example.com/as4",
         "",
         &format!("{ENVELOPED}{EXC_C14N}"),
     );
-    let err = verify(&xml).expect_err("the placeholder digest must not match");
+    let err = verify(&xml).expect_err("the placeholder signer cannot be trusted");
     assert_eq!(err.code, ErrorCode::SecurityVerificationFailed);
-    assert!(err.message.contains("digest mismatch"), "{}", err.message);
+    assert!(!err.message.contains("digest mismatch"), "{}", err.message);
 }
 
 #[test]
@@ -132,7 +125,7 @@ fn a_document_without_a_signature_is_rejected() {
 /// digest, while the (excluded) signature's own bytes do not.
 #[test]
 fn enveloped_canonicalization_excludes_the_signature_and_covers_the_rest() {
-    use asx_rs::crypto::wssec::{WsSecCanonicalizationProfile, canonicalize_enveloped_document};
+    use asx::__fuzz::wssec::{WsSecCanonicalizationProfile, canonicalize_enveloped_document};
     use roxmltree::Document;
 
     let render = |endpoint: &str, sig_digest: &str| {

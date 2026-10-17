@@ -62,33 +62,20 @@ use std::io::Write;
 ///
 /// * 1–255 printable US-ASCII bytes (range `0x20`–`0x7E`)
 /// * No double-quote (`"`) or backslash (`\`) — RFC 2183 `quoted-string` specials
-/// * No control characters including CR/LF — header-injection hardening
+/// * No control characters including CR/LF — no header injection
 ///
 /// Using a newtype instead of a raw `String` moves validation to the API
 /// boundary ("parse, don't validate"): once a `PayloadFilename` exists, the
 /// send pipeline can embed it in a MIME header without any further checks.
 ///
-/// ## Examples
-///
-/// ```rust
-/// use asx_rs::as4::mime_packaging::PayloadFilename;
-///
-/// let name = PayloadFilename::new("invoice.xml").unwrap();
-///
-/// // BDEW Allgemeine Festlegungen §AF §2.12 — build the filename string in
-/// // your application, then wrap it:
-/// let bdew = format!(
-///     "MSCONS_4011234000000_4011234000001_{}_{}_{}.txt",
-///     "260705", "1230", "REF123"
-/// );
-/// let name = PayloadFilename::new(&bdew).unwrap();
-/// ```
+/// Applications set it with `Payload::named("invoice.xml")`; `send` builds
+/// and validates it.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct PayloadFilename(String);
+pub(crate) struct PayloadFilename(String);
 
 /// Error returned when a string violates [`PayloadFilename`] invariants.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PayloadFilenameError(String);
+pub(crate) struct PayloadFilenameError(String);
 
 impl fmt::Display for PayloadFilenameError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -106,25 +93,18 @@ impl PayloadFilename {
     /// Validates first, then allocates — the `&str` is only copied into an
     /// owned `String` when the value is known to be valid.
     ///
-    /// For callers that already own a `String`, use `TryFrom<String>` to
-    /// avoid a redundant allocation:
-    ///
-    /// ```rust
-    /// use asx_rs::as4::mime_packaging::PayloadFilename;
-    /// let s = "invoice.xml".to_owned();
-    /// let name: PayloadFilename = s.try_into().unwrap();
-    /// ```
+    /// An owned `String` converts without a copy through `TryFrom<String>`.
     ///
     /// Returns `Err` when the string is empty, exceeds 255 bytes, or contains
     /// any character outside `0x20`–`0x7E` or the forbidden `"` and `\`.
-    pub fn new(s: &str) -> std::result::Result<Self, PayloadFilenameError> {
+    pub(crate) fn new(s: &str) -> std::result::Result<Self, PayloadFilenameError> {
         Self::validate_bytes(s.as_bytes())?;
         Ok(Self(s.to_owned()))
     }
 
     /// Return the filename as a string slice.
     #[inline]
-    pub fn as_str(&self) -> &str {
+    pub(crate) fn as_str(&self) -> &str {
         &self.0
     }
 
@@ -173,8 +153,8 @@ impl AsRef<str> for PayloadFilename {
 impl std::str::FromStr for PayloadFilename {
     type Err = PayloadFilenameError;
     /// Parse a `PayloadFilename` from a string slice. Enables the `.parse()` idiom:
-    /// ```rust
-    /// use asx_rs::as4::mime_packaging::PayloadFilename;
+    /// ```text
+    /// use asx::as4::mime_packaging::PayloadFilename;
     /// let name: PayloadFilename = "invoice.xml".parse().unwrap();
     /// ```
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
@@ -202,11 +182,11 @@ impl TryFrom<&str> for PayloadFilename {
 ///
 /// Chosen to be unlikely to appear in any embedded payload data.
 /// Format: `----boundary-{random hex}`
-pub const MIME_BOUNDARY_PREFIX: &str = "----boundary-asx-";
+pub(crate) const MIME_BOUNDARY_PREFIX: &str = "----boundary-asx-";
 
 /// MIME attachment representing a single part within a multipart/related message.
 #[derive(Debug, Clone)]
-pub struct MimeAttachment {
+pub(crate) struct MimeAttachment {
     /// Content-ID for this attachment (e.g., `payload-001@example.com`).
     /// Referenced from `eb:PartInfo href="cid:…"` in the SOAP envelope.
     pub content_id: String,
@@ -232,7 +212,7 @@ impl MimeAttachment {
     /// - `content_type`: RFC 2045 media type
     /// - `body`: Attachment body (binary or text)
     /// - `transfer_encoding`: Encoding scheme (e.g., `binary`, `8bit`)
-    pub fn new(
+    pub(crate) fn new(
         content_id: impl Into<String>,
         content_type: impl Into<String>,
         body: impl Into<Vec<u8>>,
@@ -248,31 +228,116 @@ impl MimeAttachment {
     }
 
     /// Add a Content-Disposition header (e.g., `attachment; name="payload"`).
-    pub fn with_disposition(mut self, disposition: impl Into<String>) -> Self {
+    pub(crate) fn with_disposition(mut self, disposition: impl Into<String>) -> Self {
         self.disposition = Some(disposition.into());
         self
     }
+}
 
-    /// Generate a stable Content-ID from payload digest.
-    ///
-    /// Computes SHA-256 of the payload and formats as `payload-{first 16 hex chars}@example.com`.
-    pub fn content_id_from_digest(payload: &[u8]) -> String {
-        // Use OpenSSL to compute SHA-256 digest
-        use openssl::hash::MessageDigest;
-
-        // Compute SHA-256
-        let digest =
-            openssl::hash::hash(MessageDigest::sha256(), payload).expect("SHA-256 should not fail");
-
-        // Convert first 8 bytes to hex string (16 hex characters)
-        let hex_str = digest
-            .iter()
-            .take(8)
-            .map(|b| format!("{:02x}", b))
-            .collect::<String>();
-
-        format!("payload-{}@example.com", hex_str)
+/// Validate a caller-supplied payload Content-ID (bare, no brackets or
+/// `cid:` scheme).
+///
+/// RFC 2392 `cid` restricted to an unquoted `addr-spec`: 1–255 octets of
+/// printable ASCII without space, `"`, `<`, `>` or `\`. The value is written
+/// as `Content-ID: <…>` and as `cid:…` inside signed XML, so anything outside
+/// this set could break out of the header or the attribute.
+pub(crate) fn validate_content_id(value: &str, field: &str) -> Result<()> {
+    let reject = |reason: String| {
+        Err(AsxError::new(
+            ErrorCode::InvalidInput,
+            format!("{field} {reason}"),
+            ErrorContext::new("as4_send_validate"),
+        ))
+    };
+    if value.is_empty() || value.len() > 255 {
+        return reject(format!("must be 1-255 bytes, got {} bytes", value.len()));
     }
+    if let Some(bad) = value
+        .bytes()
+        .find(|&b| !(0x21..=0x7E).contains(&b) || matches!(b, b'"' | b'<' | b'>' | b'\\'))
+    {
+        return reject(format!(
+            "contains byte 0x{bad:02X}; a Content-ID is printable ASCII without \
+             space, '\"', '<', '>' or '\\'"
+        ));
+    }
+    Ok(())
+}
+
+/// Validate a caller-supplied media type: `type "/" subtype *( OWS ";" OWS
+/// name "=" ( token / quoted-string ) )` per RFC 6838 §4.2 and RFC 9110
+/// §8.3.1, ASCII only, with no control characters anywhere.
+pub(crate) fn validate_media_type(value: &str, field: &str) -> Result<()> {
+    fn is_tchar(b: u8) -> bool {
+        b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b)
+    }
+    fn token(bytes: &[u8], mut i: usize) -> Option<usize> {
+        let start = i;
+        while i < bytes.len() && is_tchar(bytes[i]) {
+            i += 1;
+        }
+        (i > start).then_some(i)
+    }
+    fn quoted_string(bytes: &[u8], mut i: usize) -> Option<usize> {
+        if bytes.get(i) != Some(&b'"') {
+            return None;
+        }
+        i += 1;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'"' => return Some(i + 1),
+                b'\\' => i += 2,
+                _ => i += 1,
+            }
+        }
+        None
+    }
+    fn skip_spaces(bytes: &[u8], mut i: usize) -> usize {
+        while bytes.get(i) == Some(&b' ') {
+            i += 1;
+        }
+        i
+    }
+    fn parse(bytes: &[u8]) -> Option<()> {
+        let mut i = token(bytes, 0)?;
+        if bytes.get(i) != Some(&b'/') {
+            return None;
+        }
+        i = token(bytes, i + 1)?;
+        loop {
+            let j = skip_spaces(bytes, i);
+            if j == bytes.len() {
+                return (j == i).then_some(());
+            }
+            if bytes[j] != b';' {
+                return None;
+            }
+            i = token(bytes, skip_spaces(bytes, j + 1))?;
+            if bytes.get(i) != Some(&b'=') {
+                return None;
+            }
+            i = token(bytes, i + 1).or_else(|| quoted_string(bytes, i + 1))?;
+        }
+    }
+
+    let bytes = value.as_bytes();
+    if let Some(bad) = bytes.iter().copied().find(|&b| !(0x20..0x7F).contains(&b)) {
+        return Err(AsxError::new(
+            ErrorCode::InvalidInput,
+            format!("{field} contains byte 0x{bad:02X}; a media type is printable ASCII"),
+            ErrorContext::new("as4_send_validate"),
+        ));
+    }
+    parse(bytes).ok_or_else(|| {
+        AsxError::new(
+            ErrorCode::InvalidInput,
+            format!(
+                "{field} {value:?} is not a media type (type/subtype with optional \
+                 ; name=value parameters)"
+            ),
+            ErrorContext::new("as4_send_validate"),
+        )
+    })
 }
 
 /// Builder for constructing MIME multipart/related messages.
@@ -280,7 +345,7 @@ impl MimeAttachment {
 /// Handles serialization of SOAP envelope and attachments into properly-formatted
 /// multipart MIME structure with correct boundary markers and headers.
 #[derive(Debug)]
-pub struct MimePackageBuilder {
+pub(crate) struct MimePackageBuilder {
     boundary: String,
     root_soap_content_type: String,
     soap_attachment: Option<MimeAttachment>,
@@ -289,6 +354,15 @@ pub struct MimePackageBuilder {
 
 impl MimePackageBuilder {
     fn write_crlf_line(body: &mut Vec<u8>, line: &str, stage: &'static str) -> Result<()> {
+        // Every header source passes here: a CR, LF or other control octet in
+        // a line would end the header early or inject another one.
+        if let Some(bad) = line.bytes().find(|&b| b < 0x20 || b == 0x7F) {
+            return Err(AsxError::new(
+                ErrorCode::InvalidInput,
+                format!("MIME header line contains control character 0x{bad:02X}"),
+                ErrorContext::new(stage),
+            ));
+        }
         body.write_all(line.as_bytes()).map_err(|_| {
             AsxError::new(
                 ErrorCode::ReliabilityFailure,
@@ -308,20 +382,19 @@ impl MimePackageBuilder {
     /// Create a new MIME package builder.
     ///
     /// Generates a unique boundary marker automatically.
-    pub fn new() -> Self {
-        // Generate boundary using current nanosecond timestamp and incrementing counter
+    pub(crate) fn new() -> Self {
+        // A random boundary plus a process counter: unique without reading
+        // the wall clock.
         use std::sync::atomic::{AtomicU64, Ordering};
-        use std::time::{SystemTime, UNIX_EPOCH};
 
         static COUNTER: AtomicU64 = AtomicU64::new(0);
 
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(0);
-
+        let mut random = [0u8; 8];
+        // On a getrandom failure the counter alone still separates boundaries
+        // within the process.
+        let _ = getrandom::fill(&mut random);
         let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let combined = nanos.wrapping_add(counter);
+        let combined = u64::from_le_bytes(random).wrapping_add(counter);
 
         let boundary = format!("{}{:016x}", MIME_BOUNDARY_PREFIX, combined);
 
@@ -337,7 +410,10 @@ impl MimePackageBuilder {
     ///
     /// Example:
     /// - SOAP 1.2: `application/soap+xml`
-    pub fn with_root_soap_content_type(mut self, soap_content_type: impl Into<String>) -> Self {
+    pub(crate) fn with_root_soap_content_type(
+        mut self,
+        soap_content_type: impl Into<String>,
+    ) -> Self {
         self.root_soap_content_type = soap_content_type.into();
         self
     }
@@ -345,9 +421,8 @@ impl MimePackageBuilder {
     /// Set the SOAP envelope as the root attachment (Content-ID: `<soap-body@example.com>`).
     ///
     /// The root part is `application/soap+xml` — AS4 SwA packaging. (MTOM's
-    /// `application/xop+xml` root, emitted by asx through 0.12.0, makes WSS4J-based
-    /// receivers fail the security-header DOM conversion.)
-    pub fn with_soap_body(mut self, soap_xml: Vec<u8>) -> Self {
+    /// `application/xop+xml` root makes WSS4J-based receivers fail the security-header DOM conversion.)
+    pub(crate) fn with_soap_body(mut self, soap_xml: Vec<u8>) -> Self {
         let content_type = format!("{}; charset=UTF-8", self.root_soap_content_type);
         self.soap_attachment = Some(MimeAttachment::new(
             "soap-body@example.com",
@@ -358,14 +433,8 @@ impl MimePackageBuilder {
         self
     }
 
-    /// Add a binary attachment (e.g., encrypted payload).
-    pub fn add_attachment(mut self, attachment: MimeAttachment) -> Self {
-        self.attachments.push(attachment);
-        self
-    }
-
     /// Add multiple attachments.
-    pub fn add_attachments(mut self, attachments: Vec<MimeAttachment>) -> Self {
+    pub(crate) fn add_attachments(mut self, attachments: Vec<MimeAttachment>) -> Self {
         self.attachments.extend(attachments);
         self
     }
@@ -374,7 +443,7 @@ impl MimePackageBuilder {
     ///
     /// Returns the complete HTTP message body with proper boundary markers
     /// and headers for each part.
-    pub fn build(self) -> Result<Vec<u8>> {
+    pub(crate) fn build(self) -> Result<Vec<u8>> {
         if self.soap_attachment.is_none() {
             return Err(AsxError::new(
                 ErrorCode::PolicyViolation,
@@ -414,16 +483,11 @@ impl MimePackageBuilder {
     /// Returns the multipart/related Content-Type with boundary parameter.
     /// The `type` parameter names the root part's media type per RFC 2387 —
     /// `application/soap+xml` for AS4 SwA packaging.
-    pub fn content_type(&self) -> String {
+    pub(crate) fn content_type(&self) -> String {
         format!(
             "multipart/related; boundary=\"{}\"; type=\"{}\"",
             self.boundary, self.root_soap_content_type
         )
-    }
-
-    /// Get the boundary marker for this package.
-    pub fn boundary(&self) -> &str {
-        &self.boundary
     }
 
     fn write_attachment(body: &mut Vec<u8>, attachment: &MimeAttachment) -> Result<()> {
@@ -493,48 +557,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn mime_attachment_with_digest_generates_stable_content_id() {
-        let payload = b"test payload data";
-        let cid_1 = MimeAttachment::content_id_from_digest(payload);
-        let cid_2 = MimeAttachment::content_id_from_digest(payload);
-
-        // Same payload → same Content-ID
-        assert_eq!(cid_1, cid_2);
-
-        // Format check: should be payload-{hex}@example.com
-        assert!(cid_1.starts_with("payload-"));
-        assert!(cid_1.ends_with("@example.com"));
-    }
-
-    #[test]
-    fn mime_attachment_different_payloads_different_content_ids() {
-        let payload_a = b"payload A";
-        let payload_b = b"payload B";
-
-        let cid_a = MimeAttachment::content_id_from_digest(payload_a);
-        let cid_b = MimeAttachment::content_id_from_digest(payload_b);
-
-        // Different payloads → different Content-IDs
-        assert_ne!(cid_a, cid_b);
-    }
-
-    #[test]
-    fn mime_package_builder_generates_boundary() {
-        let builder_1 = MimePackageBuilder::new();
-        let builder_2 = MimePackageBuilder::new();
-
-        let boundary_1 = builder_1.boundary();
-        let boundary_2 = builder_2.boundary();
-
-        // Each builder gets a unique boundary
-        assert_ne!(boundary_1, boundary_2);
-
-        // Boundary matches prefix pattern
-        assert!(boundary_1.starts_with(MIME_BOUNDARY_PREFIX));
-        assert!(boundary_2.starts_with(MIME_BOUNDARY_PREFIX));
-    }
-
-    #[test]
     fn mime_package_content_type_header() {
         let builder = MimePackageBuilder::new();
         let content_type = builder.content_type();
@@ -553,32 +575,6 @@ mod tests {
         if let Err(e) = result {
             assert_eq!(e.code, ErrorCode::PolicyViolation);
         }
-    }
-
-    #[test]
-    fn mime_package_builder_with_soap_and_attachment() {
-        let soap_body = b"<soap:Envelope>...</soap:Envelope>".to_vec();
-        let payload = b"binary payload".to_vec();
-
-        let attachment = MimeAttachment::new(
-            "payload-001@example.com",
-            "application/octet-stream",
-            payload,
-            "binary",
-        );
-
-        let builder = MimePackageBuilder::new()
-            .with_soap_body(soap_body)
-            .add_attachment(attachment);
-
-        let result = builder.build();
-        assert!(result.is_ok());
-
-        let mime_body = result.unwrap();
-        // Should contain boundary markers
-        assert!(String::from_utf8_lossy(&mime_body).contains("--"));
-        // Should contain Content-ID headers
-        assert!(String::from_utf8_lossy(&mime_body).contains("Content-ID:"));
     }
 
     // ── PayloadFilename tests ─────────────────────────────────────────────────

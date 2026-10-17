@@ -1,347 +1,79 @@
-# asx-rs task runner — run `just` to list recipes.
-#
-# Recipes mirror .github/workflows/rust.yml and the mandatory gates in
-# RELEASING.md. When a gate changes there, change it here too (and vice
-# versa) so local runs and CI cannot drift apart.
+# asx-rs tasks — run `just` to list them. `just ci` runs locally what the CI
+# jobs check, features, msrv and deny run; `just interop` is the CI interop job.
 
 set shell := ["bash", "-euo", "pipefail", "-c"]
-
-# Feature sets kept in sync with the CI `check-test` matrix.
-# Mirrors the `check-test` matrix in `.github/workflows/ci.yml`. Keep the two
-# in step: a combination only CI builds is one only CI can break.
-ci_feature_matrix := "as2,client as4,server as2,as4,client,server,trace as2,as4,testing as2,as4,testing,interop-relaxed as2,as4,compression as4,client,dns"
-
-# Perf gate deliberately omits `testing` — the crate refuses to build release
-# artefacts with that feature (it disables WS-Security enforcement gates).
-perf_features := "as2,as4,client,server,trace,compression,async-ocsp,interop-strict"
-
-perf_iterations := "2000"
-perf_max_regression := "0.25"
-perf_baseline := "benches/perf-baseline.txt"
-
-# Uncompiled (```ignore```) doctests. Lower this whenever an example is
-# converted; `just doctest-ratchet` says when it can drop.
-doctest_ignore_budget := "39"
-
-coverage_threshold := "85"
-coverage_files := "src/interop.rs"
-
-fuzz_iterations := "4000"
-fuzz_budget_ms := "2500"
-fuzz_artifacts := "artifacts/fuzz"
 
 _default:
     @just --list --unsorted
 
-# ---------------------------------------------------------------------------
-# Everyday
-# ---------------------------------------------------------------------------
-
 # Build with all features.
-[group('dev')]
 build:
-    cargo build --all-features
+    cargo build --workspace --all-features
 
-# Type-check every target with all features.
-[group('dev')]
-check:
-    cargo check --all-targets --all-features
-
-# Type-check with warnings escalated to errors (release gate 2).
-[group('dev')]
-check-strict:
-    RUSTFLAGS='-D warnings' cargo check --all-targets --all-features
-
-# Run the whole test suite. Extra args are forwarded: `just test receipt_verify`.
-[group('dev')]
+# Run the tests, doctests included (README and site samples). Args are forwarded.
 test *args:
-    cargo test --all-features {{ args }}
-
-# Unit tests only — fastest useful feedback loop.
-[group('dev')]
-test-lib *args:
-    cargo test --all-features --lib {{ args }}
-
-# Run one integration suite by file stem: `just test-suite as4_push_flow`.
-[group('dev')]
-test-suite name *args:
-    cargo test --all-features --test {{ name }} {{ args }}
+    cargo test --workspace --all-features {{ args }}
 
 # Format the workspace.
-[group('dev')]
 fmt:
     cargo fmt --all
 
-# Apply rustfmt and every machine-applicable clippy suggestion.
-[group('dev')]
-fix:
-    cargo fmt --all
-    cargo clippy --workspace --all-targets --all-features --fix --allow-dirty --allow-staged
-
-# Build rustdoc for this crate only.
-[group('dev')]
-doc:
-    cargo doc --all-features --no-deps
-
-# Build and open rustdoc.
-[group('dev')]
-doc-open:
-    cargo doc --all-features --no-deps --open
-
-# ---------------------------------------------------------------------------
-# Lint gates (release gates 1 and 3)
-# ---------------------------------------------------------------------------
-
-# Formatting check only — never rewrites files.
-[group('lint')]
-fmt-check:
+# fmt check, clippy, rustdoc and the docs rules.
+lint:
     cargo fmt --all -- --check
+    cargo clippy --locked --workspace --all-features --all-targets -- -D warnings
+    RUSTDOCFLAGS='-D warnings' cargo doc --locked --all-features --no-deps
+    bash scripts/check-docs.sh
+    bash scripts/concepts-check.sh
 
-# Clippy with warnings as errors, exactly as CI runs it.
-[group('lint')]
-clippy:
-    cargo clippy --workspace --all-targets --all-features -- -D warnings
+# No default features, each feature alone, all features (needs cargo-hack).
+features:
+    RUSTFLAGS='-D warnings' CARGO_TARGET_DIR=target/features cargo hack check --locked -p asx-rs --each-feature --lib --tests
 
-# fmt-check + clippy + rustdoc links — the CI `lint` job.
-[group('lint')]
-lint: fmt-check clippy doc-links
+# Build on the MSRV floor (Cargo.toml rust-version).
+msrv:
+    cargo +1.88 check --locked --workspace --all-features
 
-# Hygiene scan: no TODO/FIXME/HACK markers, no code-level deprecations.
-#
-# Deprecation scanning is code-only on purpose: prose in site/ legitimately
-# describes deprecated behaviour without introducing any.
-[group('lint')]
-[doc('Scan for TODO/FIXME/HACK markers and code-level deprecations')]
-hygiene:
+# Dependency policy, deny.toml (needs cargo-deny).
+deny:
+    cargo deny --workspace --all-features check advisories licenses bans sources
+
+# What CI runs, minus interop.
+ci: lint test features msrv deny
+
+# Holodeck B2B (arm64-only image, not in CI) runs by hand:
+#   cargo test --all-features --test interop_holodeck_counterparty -- --ignored
+[doc('Interop oracles: openssl, xmlsec1, Redis, phase4 (Docker; builds the phase4 peer unless ASX_PHASE4_IMAGE is set)')]
+interop:
     #!/usr/bin/env bash
     set -euo pipefail
-    if command -v rg >/dev/null 2>&1; then
-        scan() { rg -n "$1" src tests site/content .github scripts \
-            --glob '!RELEASING.md' || true; }
-        scan_code() { rg -n "$1" src tests benches || true; }
-    else
-        scan() { grep -rnE "$1" src tests site/content .github scripts \
-            --exclude=release.md || true; }
-        scan_code() { grep -rnE "$1" src tests benches || true; }
-    fi
-    failed=0
-    markers=$(scan 'TODO|FIXME|HACK')
-    if [ -n "$markers" ]; then
-        echo "hygiene: unresolved work markers found:" >&2
-        echo "$markers" >&2
-        failed=1
-    fi
-    deprecations=$(scan_code 'allow\(deprecated\)|#\[deprecated')
-    if [ -n "$deprecations" ]; then
-        echo "hygiene: code-level deprecation markers found:" >&2
-        echo "$deprecations" >&2
-        failed=1
-    fi
-    [ "$failed" -eq 0 ] && echo "hygiene: clean"
-    exit "$failed"
-
-# ---------------------------------------------------------------------------
-# Test sweeps
-# ---------------------------------------------------------------------------
-
-# Lib tests plus each integration suite separately (release gate 4).
-#
-# Slower than `just test`, but a failure names the suite that broke instead of
-# burying it in one combined run.
-[group('test')]
-[doc('Lib tests plus each integration suite separately (release gate 4)')]
-test-sweep:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    cargo test --all-features --lib
-    for target in $(find tests -maxdepth 1 -name '*.rs' | sed -E 's@.*/@@; s@\.rs$@@' | sort); do
-        echo "── tests/${target}.rs"
-        cargo test --all-features --test "$target"
+    export ASX_PHASE4_IMAGE="${ASX_PHASE4_IMAGE:-$(docker build -q --provenance=false tests/fixtures/phase4)}"
+    for t in interop_openssl_smime_oracle interop_xmlsec_oracle interop_redis_storage_conformance \
+             interop_phase4_counterparty interop_phase4_encryption interop_phase4_path_switch; do
+        echo "── $t"
+        cargo test --locked --all-features --test "$t" -- --ignored --test-threads=1
     done
 
-# Compile and test each CI feature combination (release gate 10).
-#
-# Catches feature-gating breakage that `--all-features` hides — a symbol behind
-# the wrong `cfg` compiles fine when everything is on.
-[group('test')]
-[doc('Compile and test each CI feature combination (release gate 10)')]
-matrix:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    for features in {{ ci_feature_matrix }}; do
-        echo "── features: ${features}"
-        RUSTFLAGS='-D warnings' cargo check --no-default-features --features "$features"
-        cargo test --no-default-features --features "$features"
-    done
+# `bash scripts/public-api-check.sh --update` rewrites tests/public-api.txt.
+[doc('Public-API gate: snapshot, at most 160 items, no deleted name (nightly + cargo-public-api)')]
+public-api:
+    bash scripts/public-api-check.sh
 
-# Compile the benchmarks without running them.
-#
-# Uses the perf feature set, not `--all-features`: `cargo bench` builds in
-# release profile, where the `testing` feature is a hard compile error.
-[group('test')]
-[doc('Compile the benchmarks without running them')]
-bench-check:
-    cargo bench --no-default-features --features "{{ perf_features }}" --no-run
+# No published file cites concepts/, specs/, .specify/ or .claude/; roadmap ↔ specs.
+concepts-check:
+    bash scripts/concepts-check.sh
 
-# Run the Criterion benchmarks.
-[group('perf')]
+# Criterion benchmarks (AS4 parsing, C14N, MIME scanning).
 bench *args:
-    cargo bench --no-default-features --features "{{ perf_features }}" {{ args }}
+    cargo bench --features as4 {{ args }}
 
-# ---------------------------------------------------------------------------
-# Protocol / security gates
-# ---------------------------------------------------------------------------
-
-# Adversarial fuzz gate over profile loading, policy resolution and wire parsing.
-[group('gate')]
-fuzz-gate iterations=fuzz_iterations budget_ms=fuzz_budget_ms out=fuzz_artifacts:
-    bash scripts/run_fuzz_gate.sh {{ iterations }} {{ budget_ms }} {{ out }}
-
-# Interop fixture matrix (release gate 6).
-[group('gate')]
-interop-matrix:
-    bash scripts/run_interop_matrix.sh
-
-# Cross-implementation oracles (needs `openssl`; all but the first need Docker).
-[group('gate')]
-oracles:
-    cargo test --all-features --test interop_openssl_smime_oracle -- --ignored --nocapture
-    cargo test --all-features --test interop_xmlsec_oracle -- --ignored --nocapture
-    cargo test --all-features --test interop_redis_storage_conformance -- --ignored --nocapture
-    cargo test --all-features --test interop_holodeck_counterparty -- --ignored --nocapture
-
-# WS-Security canonicalization / signature vector gate (release gate 7).
-[group('gate')]
-wssec-vectors:
-    bash scripts/run_wssec_vector_gate.sh
-
-# Lint the profile stack for dead overrides and missing invariants.
-[group('gate')]
-profile-lint:
-    cargo run --quiet -p xtask --all-features -- profile-lint-gate
-
-# Fail on a broken intra-doc link.
-#
-# These ship to docs.rs as dead references, and rustdoc only reports them as
-# warnings — so they accumulate silently.
-[group('gate')]
-[doc('Fail on broken rustdoc intra-doc links')]
-doc-links:
-    RUSTDOCFLAGS='-D warnings' cargo doc --all-features --no-deps
-
-# Walk the feature powerset.
-#
-# A hand-written matrix only covers combinations someone thought of. This is
-# the gate that catches a `#[cfg]` whose callee is gated on a different
-# feature, and a guard that only applies outside `testing` builds — neither of
-# which `--all-features` can see.
-#
-# Requires cargo-hack: `cargo install cargo-hack`.
-[group('gate')]
-[doc('Check the feature powerset (depth 2)')]
-powerset:
-    cargo hack check --feature-powerset --depth 2 \
-        --at-least-one-of as2,as4 \
-        --exclude-features prometheus,opentelemetry \
-        --lib --tests
-    # `--at-least-one-of` above never builds without a protocol feature, and
-    # both protocols pull `crypto`. lib.rs documents the protocol-less build
-    # and `xtask` depends on the crate that way, so check it separately.
-    cargo hack check --feature-powerset --depth 2 \
-        --exclude-features as2,as4,server,client,dns,prometheus,opentelemetry \
-        --lib
-
-# Ratchet on uncompiled doctests.
-#
-# A ```ignore``` block is never compiled, so it renders in rustdoc looking like
-# checked Rust while being free to rot. This does not demand zero — it demands
-# the number never grows.
-[group('gate')]
-[doc('Fail if the number of uncompiled (```ignore```) doctests grows')]
-doctest-ratchet budget=doctest_ignore_budget:
-    bash scripts/check_doctest_ratchet.sh {{ budget }}
-
-# Validate the interop fixture catalogue against the repository.
-[group('gate')]
-fixtures-validate:
-    cargo run --quiet -p xtask --all-features -- fixture-repo-validate
-
-# Line-coverage gate on the profile resolver (release gate 8).
-#
-# Requires cargo-llvm-cov: `cargo install cargo-llvm-cov`.
-[group('gate')]
-[doc('Line-coverage gate on the profile resolver (release gate 8)')]
-profile-coverage threshold=coverage_threshold files=coverage_files:
-    bash scripts/check_profile_coverage.sh {{ threshold }} {{ files }}
-
-# Diff two effective-policy snapshots and classify the risk of the change.
-[group('gate')]
-profile-diff before after:
-    cargo run --quiet -p xtask --all-features -- profile-diff-gate {{ before }} {{ after }}
-
-# ---------------------------------------------------------------------------
-# Performance
-# ---------------------------------------------------------------------------
-
-# Perf gate against the recorded baseline (release gate 11).
-[group('perf')]
-perf-gate:
-    cargo run --release -p xtask --no-default-features --features "{{ perf_features }}" -- \
-        perf-gate --iterations {{ perf_iterations }} \
-        --check-baseline {{ perf_baseline }} \
-        --max-regression {{ perf_max_regression }}
-
-# Fast perf smoke run, no baseline comparison.
-[group('perf')]
-perf-smoke iterations="500":
-    cargo run --release -p xtask --no-default-features --features "{{ perf_features }}" -- \
-        perf-gate --iterations {{ iterations }}
-
-# Rewrite the perf baseline. Only run when a change intentionally moves timings,
-# and commit the result with the change that caused it.
-[group('perf')]
-[doc('Rewrite the perf baseline (only for intentional timing changes)')]
-perf-baseline-write:
-    cargo run --release -p xtask --no-default-features --features "{{ perf_features }}" -- \
-        perf-gate --iterations {{ perf_iterations }} --write-baseline {{ perf_baseline }}
-
-# ---------------------------------------------------------------------------
-# Documentation site
-# ---------------------------------------------------------------------------
-
-# Build the documentation site. Also fails on broken internal links and
-# dangling heading anchors.
-[group('site')]
-[doc('Build the documentation site (fails on broken links and anchors)')]
+# Build the site (fails on broken links and anchors).
 site:
     zola --root site build
 
-# Serve the site locally with rewritten URLs.
-#
-# `zola build` emits absolute URLs from `base_url`, so opening `site/public`
-# from disk or a plain file server loads the *deployed* CSS and JS, not the
-# local ones. Use this, not a static server, to preview a change.
-[group('site')]
-[doc('Serve the site locally with rewritten URLs')]
+# Serve the site locally.
 site-serve:
     zola --root site serve
-
-# Regenerate the social card PNG from its SVG source.
-#
-# Social platforms — X, LinkedIn, Facebook, Slack — do not render SVG previews,
-# so `og:image` must point at a raster file. The PNG is committed because the
-# deploy job has no SVG rasteriser.
-#
-# Requires librsvg: `brew install librsvg` / `apt install librsvg2-bin`.
-[group('site')]
-[doc('Regenerate the social-card PNG from its SVG source (needs librsvg)')]
-site-social-card:
-    rsvg-convert -w 1200 -h 630 site/static/social-card.svg -o site/static/social-card.png
-    @echo "regenerated site/static/social-card.png"
-
-# ---------------------------------------------------------------------------
-# Primary sources
-# ---------------------------------------------------------------------------
 
 # Download the RFCs, OASIS/W3C standards, network profiles and national
 # regulations this crate is written against into concepts/references/
@@ -351,9 +83,8 @@ site-social-card:
 # Existing files are kept, so a re-run only fills gaps. Anything the publisher
 # refuses to a non-browser client is listed at the end for a manual download —
 # keep the file name the index uses.
-[group('specs')]
 [doc('Fetch the primary sources into concepts/references/ (gitignored; see its README.md)')]
-specs:
+references:
     #!/usr/bin/env bash
     set -uo pipefail
     ua='Mozilla/5.0'
@@ -524,33 +255,35 @@ specs:
     fetch market oxalis-master.zip \
         'https://github.com/OxalisCommunity/oxalis/archive/refs/heads/master.zip'
 
+    # Added 2026-10-16: the second algorithm generation, the BDEW rules in force,
+    # and the Peppol MLS phase-in and G3 PKI (see concepts/RESEARCH.md).
+    rfc 9231 xmldsig-more-uris
+    rfc 8410 ed25519-x25519-in-pkix
+    rfc 5869 hkdf
+    fetch edelivery edelivery2-as4-security-validator.html \
+        'https://ec.europa.eu/digital-building-blocks/sites/pages/viewpage.action?pageId=900018554'
+    fetch peppol peppol-mls-1.1.0-spec.html \
+        'https://docs.peppol.eu/edelivery/specs/mls/v1.1.0/mls/spec/'
+    fetch peppol SPOG-on-MLS-1.0.0-2026-07-02.pdf \
+        'https://docs.peppol.eu/edelivery/guidelines/mls/SPOG%20on%20MLS%201.0.0%202026-07-02.pdf'
+    fetch peppol Peppol-MLS-Phase-In-1.0.0-2026-07-02.pdf \
+        'https://docs.peppol.eu/edelivery/changelog/2026-07/Peppol%20MLS%20Phase-In%201.0.0%202026-07-02.pdf'
+    fetch peppol Peppol-MLR-Phase-Out-1.0.0-2026-07-02.pdf \
+        'https://docs.peppol.eu/edelivery/changelog/2026-07/Peppol%20MLR%20Phase-Out%201.0.0%202026-07-02.pdf'
+    fetch peppol peppol-pki-g3-migration-plan.html \
+        'https://openpeppol.atlassian.net/wiki/spaces/OPMA/pages/3977936899'
+    fetch bdew regelungen-zum-uebertragungsweg-as4-2.6-20260401.pdf \
+        'https://www.bundesnetzagentur.de/DE/Beschlusskammern/BK06/BK6_83_Zug_Mess/835_mitteilungen_datenformate/Mitteilung_56/Anlagen/Regelungen_zum_Uebertragungsweg_AS4_2_6_20260401.pdf?__blob=publicationFile&v=1'
+    # The SM-PKI documents RzÜ §5.4 points to (spec 026).
+    fetch bdew bsi-tr-03109-4-sm-pki-1.2.1.pdf \
+        'https://www.bsi.bund.de/SharedDocs/Downloads/DE/BSI/Publikationen/TechnischeRichtlinien/TR03109/TR-03109-4_PKI.pdf?__blob=publicationFile&v=3'
+    fetch bdew sm-pki-certificate-policy-1.1.2.pdf \
+        'https://www.bsi.bund.de/SharedDocs/Downloads/DE/BSI/Publikationen/TechnischeRichtlinien/TR03109/PKI_Certificate_Policy.pdf?__blob=publicationFile&v=8'
+    fetch entsog entsog-as4-faq-2025-v0.2.pdf \
+        'https://www.entsog.eu/sites/default/files/2025-06/INT2879_25%20ENTSOG%20AS4%20FAQs%202025%20ver%200.2%20FINAL%20PUBLISHED.pdf'
+    fetch market oxalis-ng-master.zip \
+        'https://github.com/OxalisCommunity/oxalis-ng/archive/refs/heads/master.zip'
+
     if [ -n "$missing" ]; then
         printf '\nNot fetched (download in a browser, keep the file name):\n%s' "$missing" >&2
     fi
-
-# ---------------------------------------------------------------------------
-# Composite
-# ---------------------------------------------------------------------------
-
-# Pre-push check: everything CI's `lint` and `check-test` jobs run.
-[group('composite')]
-ci: lint check-strict test matrix powerset
-
-# Every mandatory release gate, in the order RELEASING.md lists them.
-#
-# Long-running. `just ci` is the fast pre-push subset.
-[group('composite')]
-[doc('Every mandatory release gate, in RELEASING.md order (slow)')]
-release-gate: fmt-check check check-strict clippy doc-links test-sweep powerset interop-matrix wssec-vectors fuzz-gate matrix perf-gate hygiene profile-lint fixtures-validate doctest-ratchet site
-    @echo "release-gate: all implemented gates passed"
-
-# Verify the crate packages cleanly for crates.io.
-[group('composite')]
-publish-dry:
-    cargo publish --dry-run --all-features
-
-# Remove build artefacts, including gate output.
-[group('composite')]
-clean:
-    cargo clean
-    rm -rf {{ fuzz_artifacts }}

@@ -33,7 +33,7 @@
 //!
 //! ASX does this for you. Supply the network's SMP CA:
 //!
-//! ```rust,ignore
+//! ```text
 //! let config = SmpConfig {
 //!     signature_policy: SmpSignaturePolicy::verify_with_trust_anchors(vec![smp_ca_pem]),
 //!     ..SmpConfig::peppol_production()
@@ -55,13 +55,13 @@
 //!
 //! # Example
 //!
-//! ```rust,no_run
-//! # #[cfg(feature = "dns")]
+//! ```text
+//! # #[cfg(feature = "peppol")]
 //! # mod example {
-//! use asx_rs::smp::{HickoryBdxlResolver, SmpClient, SmpConfig, SmpLookupRequest, SmpSignaturePolicy};
+//! use asx::smp::{HickoryBdxlResolver, SmpClient, SmpConfig, SmpLookupRequest, SmpSignaturePolicy};
 //! use std::sync::Arc;
 //!
-//! async fn example(smp_ca_pem: String) -> asx_rs::core::Result<()> {
+//! async fn example(smp_ca_pem: String) -> asx::core::Result<()> {
 //!     let client = SmpClient::with_config(SmpConfig {
 //!         signature_policy: SmpSignaturePolicy::verify_with_trust_anchors(vec![smp_ca_pem]),
 //!         ..SmpConfig::peppol_production()
@@ -91,12 +91,13 @@
 use std::sync::Arc;
 
 use crate::core::{AsxError, ErrorCode, ErrorContext, Result};
+#[cfg(feature = "http-client")]
 use crate::transport::egress::{TransportConfig, validated_pinned_client};
 use roxmltree::Document;
 
 pub mod bdxl;
 
-#[cfg(feature = "dns")]
+#[cfg(feature = "peppol")]
 pub use bdxl::HickoryBdxlResolver;
 pub use bdxl::{
     BdxlResolver, NaptrRecord, SmlDiscovery, StaticBdxlResolver, bdxl_dns_name, legacy_cname_host,
@@ -113,7 +114,7 @@ pub const PEPPOL_AS4_TRANSPORT_PROFILE: &str = "peppol-transport-as4-v2_0";
 /// Re-exported from [`crate::peppol`], which is where the network's own
 /// constants live — the scheme is not a discovery concern, it just happens to
 /// be needed here.
-pub use crate::peppol::PEPPOL_PARTICIPANT_SCHEME;
+pub(crate) use crate::peppol::PEPPOL_PARTICIPANT_SCHEME;
 
 /// SML zone answering for the **Peppol production** network.
 ///
@@ -147,15 +148,13 @@ pub struct SmpConfig {
     pub discovery: SmlDiscovery,
 
     /// Participant identifier scheme prepended to the participant ID before
-    /// hashing.  Default: [`PEPPOL_PARTICIPANT_SCHEME`].
+    /// hashing.  Default: `PEPPOL_PARTICIPANT_SCHEME`.
     pub participant_scheme: String,
 
     /// Default transport profile used when [`SmpLookupRequest::transport_profile`]
     /// is `None`.  Default: [`PEPPOL_AS4_TRANSPORT_PROFILE`].
     pub transport_profile: String,
 
-    /// Whether an unsigned `ServiceMetadata` response is accepted.
-    ///
     /// How the response is authenticated before its contents are trusted.
     ///
     /// Defaults to [`SmpSignaturePolicy::Deny`]; set
@@ -241,7 +240,7 @@ pub enum SmpSignaturePolicy {
     /// Supply the network's SMP CA (PEPPOL / CEF publish these); construct it
     /// with [`verify_with_trust_anchors`](Self::verify_with_trust_anchors). An
     /// empty anchor set with `require_chain_validation` fails closed.
-    Verify(Box<crate::crypto::wssec::OwnedRevocationPolicy>),
+    Verify(Box<crate::crypto::wssec::OwnedChainPolicy>),
 
     /// Require a `ds:Signature` to be present but do not verify it.
     ///
@@ -261,7 +260,7 @@ impl SmpSignaturePolicy {
     /// Verify signatures against the given SMP CA trust anchors.
     pub fn verify_with_trust_anchors(trust_anchor_pems: Vec<String>) -> Self {
         Self::Verify(Box::new(
-            crate::crypto::wssec::OwnedRevocationPolicy::production(trust_anchor_pems),
+            crate::crypto::wssec::OwnedChainPolicy::production(trust_anchor_pems),
         ))
     }
 }
@@ -308,6 +307,10 @@ pub struct SmpEndpoint {
 
     /// Service expiration date in ISO-8601 format (`YYYY-MM-DD`).
     pub service_expiration_date: Option<String>,
+    /// The verified SMP signer's certification path (signer first, anchor
+    /// last); empty unless the signature was verified. The caller checks its
+    /// revocation.
+    pub(crate) signer_path: Vec<openssl::x509::X509>,
 }
 
 /// Parameters for a single SMP endpoint lookup.
@@ -337,8 +340,8 @@ impl SmpLookupRequest {
     /// recipient participant, the document type it is sending, and the process
     /// that document belongs to.
     ///
-    /// ```
-    /// # use asx_rs::smp::SmpLookupRequest;
+    /// ```text
+    /// # use asx::smp::SmpLookupRequest;
     /// let request = SmpLookupRequest::new(
     ///     "0088:1234567890123",
     ///     "urn:cen.eu:en16931:2017#compliant#urn:fdc:peppol.eu:2017:poacc:billing:3.0::2.1",
@@ -381,6 +384,7 @@ pub struct SmpClient {
     /// The client itself is built **per request** so it can be pinned to the
     /// addresses that URL validation actually checked; a long-lived client
     /// would re-resolve DNS and reopen the rebinding hole.
+    #[cfg(feature = "http-client")]
     transport: TransportConfig,
     /// Performs the BDXL NAPTR query. `None` until one is supplied, which is
     /// why [`SmlDiscovery::Naptr`] reports a configuration error rather than
@@ -408,6 +412,7 @@ impl SmpClient {
     pub fn with_config(config: SmpConfig) -> Self {
         Self {
             config,
+            #[cfg(feature = "http-client")]
             transport: TransportConfig {
                 request_timeout: std::time::Duration::from_secs(10),
                 ..TransportConfig::default()
@@ -443,7 +448,31 @@ impl SmpClient {
     /// - [`ErrorCode::TransportFailure`] — HTTP request failed.
     /// - [`ErrorCode::NotFound`] — SMP returned a non-2xx status.
     /// - [`ErrorCode::ParseFailed`] — XML parsing or endpoint extraction failed.
+    #[cfg(feature = "http-client")]
     pub async fn lookup_endpoint(&self, req: SmpLookupRequest) -> Result<SmpEndpoint> {
+        use tracing::Instrument as _;
+        // Schemes only: a participant identifier is a party, not telemetry.
+        let span = tracing::debug_span!(
+            target: "asx",
+            "asx.smp_lookup",
+            participant_scheme = self.config.participant_scheme.as_str(),
+            document_type = "busdox-docid-qns",
+            transport_profile = req
+                .transport_profile
+                .as_deref()
+                .unwrap_or(&self.config.transport_profile),
+            outcome = tracing::field::Empty,
+        );
+        let result = self
+            .lookup_endpoint_inner(req)
+            .instrument(span.clone())
+            .await;
+        crate::telemetry::child_outcome(&span, &result);
+        result
+    }
+
+    #[cfg(feature = "http-client")]
+    async fn lookup_endpoint_inner(&self, req: SmpLookupRequest) -> Result<SmpEndpoint> {
         let smp_base = self.resolve_smp_base_url(&req.participant_id).await?;
         let url = self.build_lookup_url_at(&smp_base, &req);
 
@@ -475,19 +504,77 @@ impl SmpClient {
             ));
         }
 
-        let body = response.bytes().await.map_err(|e| {
-            AsxError::new(
-                ErrorCode::TransportFailure,
-                format!("SMP response body read failed: {e}"),
-                ErrorContext::new("smp_lookup_body"),
-            )
-        })?;
+        // The SMP host comes from DNS a participant registrant controls: cap
+        // what it can make us buffer (real responses are a few KiB).
+        let body = crate::transport::egress::read_body_capped(
+            response,
+            MAX_SMP_RESPONSE_BYTES,
+            "smp_lookup_body",
+        )
+        .await?;
 
         let transport_profile = req
             .transport_profile
             .as_deref()
             .unwrap_or(&self.config.transport_profile);
 
+        parse_service_metadata(
+            &body,
+            &req.process_id,
+            transport_profile,
+            &self.config.signature_policy,
+        )
+    }
+
+    /// [`Self::lookup_endpoint`] through an [`crate::HttpClient`] (for
+    /// `peppol::Smp`): the client is the embedder's or the built-in one.
+    pub(crate) async fn lookup_endpoint_with(
+        &self,
+        req: SmpLookupRequest,
+        http: &dyn crate::HttpClient,
+    ) -> Result<SmpEndpoint> {
+        let smp_base = self.resolve_smp_base_url(&req.participant_id).await?;
+        let url = self.build_lookup_url_at(&smp_base, &req);
+        let request = ::http::Request::get(url.as_str())
+            .body(bytes::Bytes::new())
+            .map_err(|e| {
+                AsxError::new(
+                    ErrorCode::InvalidInput,
+                    format!("SMP lookup URL '{url}' is not a valid request: {e}"),
+                    ErrorContext::new("smp_lookup"),
+                )
+            })?;
+        let response = http.send(request).await.map_err(|e| {
+            AsxError::new(
+                ErrorCode::TransportFailure,
+                format!("SMP HTTP request failed for '{url}': {e}"),
+                ErrorContext::new("smp_lookup"),
+            )
+        })?;
+        if !response.status().is_success() {
+            return Err(AsxError::new(
+                ErrorCode::NotFound,
+                format!(
+                    "SMP returned HTTP {} for participant '{}' / doc-type '{}'",
+                    response.status(),
+                    req.participant_id,
+                    req.document_type_id
+                ),
+                ErrorContext::new("smp_lookup"),
+            ));
+        }
+        let body = response.into_body();
+        if body.len() > MAX_SMP_RESPONSE_BYTES {
+            return Err(AsxError::new(
+                ErrorCode::PayloadTooLarge,
+                format!("SMP response of {} bytes exceeds the limit", body.len()),
+                ErrorContext::new("smp_lookup_body"),
+            ));
+        }
+        let transport_profile = req
+            .transport_profile
+            .as_deref()
+            .unwrap_or(&self.config.transport_profile);
         parse_service_metadata(
             &body,
             &req.process_id,
@@ -584,6 +671,9 @@ impl SmpClient {
 
 // ── XML parsing ───────────────────────────────────────────────────────────
 
+/// Largest SMP response body read (real `SignedServiceMetadata` is a few KiB).
+const MAX_SMP_RESPONSE_BYTES: usize = 1024 * 1024;
+
 /// OASIS BDX SMP 1.0 (`busdox`) — the shape Peppol and CEF eDelivery publish.
 const SMP_NS: &str = "http://busdox.org/serviceMetadata/publishing/1.0/";
 /// OASIS SMP 2.0 document namespace.
@@ -612,15 +702,15 @@ fn parse_service_metadata(
         )
     })?;
 
-    let doc = Document::parse(text).map_err(|e| {
+    let doc = crate::xml::parse(text, crate::xml::XmlLimits::SMP, "smp_parse").map_err(|e| {
         AsxError::new(
             ErrorCode::ParseFailed,
-            format!("SMP ServiceMetadata XML parse failed: {e}"),
+            format!("SMP ServiceMetadata XML parse failed: {}", e.message),
             ErrorContext::new("smp_parse"),
         )
     })?;
 
-    let signer = enforce_smp_signature_policy(text, &doc, signature_policy)?;
+    let (signer, signer_path) = enforce_smp_signature_policy(&doc, signature_policy)?;
     let version = SmpVersion::detect(&doc)?;
 
     let mut endpoint =
@@ -637,16 +727,16 @@ fn parse_service_metadata(
 
     endpoint.signed_document = std::sync::Arc::from(xml);
     endpoint.verified_signer_fingerprint_sha256 = signer;
+    endpoint.signer_path = signer_path;
     Ok(endpoint)
 }
 
 /// Apply [`SmpSignaturePolicy`], returning the verified signer fingerprint when
 /// the signature was actually checked.
 fn enforce_smp_signature_policy(
-    text: &str,
     doc: &Document<'_>,
     policy: &SmpSignaturePolicy,
-) -> Result<Option<String>> {
+) -> Result<(Option<String>, Vec<openssl::x509::X509>)> {
     match policy {
         SmpSignaturePolicy::Deny => Err(AsxError::new(
             ErrorCode::PolicyViolation,
@@ -657,26 +747,31 @@ fn enforce_smp_signature_policy(
              closed or test network",
             ErrorContext::new("smp_signature_policy"),
         )),
-        SmpSignaturePolicy::Verify(revocation) => {
-            let verified = crate::crypto::wssec::verify_enveloped_document_signature(
-                text,
-                // SMP responses are pinned by the network's SMP CA (the
-                // revocation policy's anchors), not by a per-signer fingerprint.
-                &[],
-                &crate::crypto::wssec::RevocationPolicy::from(revocation.as_ref()),
-            )
-            .map_err(|err| {
-                AsxError::new(
-                    ErrorCode::SecurityVerificationFailed,
-                    format!(
-                        "SMP ServiceMetadata signature verification failed: {}. The endpoint \
-                         URL and recipient certificate in this response cannot be trusted",
-                        err.message
-                    ),
-                    ErrorContext::new("smp_verify_signature"),
+        SmpSignaturePolicy::Verify(anchors) => {
+            // The one DOM is verified and then consumed (no re-parse).
+            let verified =
+                crate::crypto::wssec::verify::verify_enveloped_document_signature_with_doc(
+                    doc,
+                    // SMP responses are pinned by the network's SMP CA (the
+                    // chain policy's anchors), not by a per-signer fingerprint.
+                    &[],
+                    &crate::crypto::wssec::ChainPolicy::from(anchors.as_ref()),
                 )
-            })?;
-            Ok(Some(verified.signer_fingerprint_sha256))
+                .map_err(|err| {
+                    AsxError::new(
+                        ErrorCode::SecurityVerificationFailed,
+                        format!(
+                            "SMP ServiceMetadata signature verification failed: {}. The endpoint \
+                         URL and recipient certificate in this response cannot be trusted",
+                            err.message
+                        ),
+                        ErrorContext::new("smp_verify_signature"),
+                    )
+                })?;
+            Ok((
+                Some(verified.signer_fingerprint_sha256),
+                verified.signer_path,
+            ))
         }
         SmpSignaturePolicy::RequireSignaturePresent => {
             if !has_enveloped_signature(doc) {
@@ -689,14 +784,14 @@ fn enforce_smp_signature_policy(
                     ErrorContext::new("smp_parse_signature"),
                 ));
             }
-            Ok(None)
+            Ok((None, Vec::new()))
         }
-        SmpSignaturePolicy::AllowUnsigned => Ok(None),
+        SmpSignaturePolicy::AllowUnsigned => Ok((None, Vec::new())),
     }
 }
 
 /// XML Signature namespace.
-const XMLDSIG_NS: &str = "http://www.w3.org/2000/09/xmldsig#";
+const XMLDSIG_NS: &str = crate::xml::ns::DS;
 
 /// Whether the document contains a `ds:Signature` element.
 ///
@@ -718,7 +813,7 @@ fn has_enveloped_signature(doc: &Document<'_>) -> bool {
 /// from an attribute to an element, renamed the address and the process
 /// identifier, and nested the certificate. Detecting the version and then
 /// parsing with that version's rules is the alternative to a name-matching
-/// walk that accepts a mixture neither specification defines (D5).
+/// walk that accepts a mixture neither specification defines.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SmpVersion {
     /// OASIS BDX SMP 1.0 (`busdox`).
@@ -794,6 +889,7 @@ fn extract_endpoint(
             // Both replaced by `parse_service_metadata` once the policy has run.
             signed_document: std::sync::Arc::from(&[][..]),
             verified_signer_fingerprint_sha256: None,
+            signer_path: Vec::new(),
             url: url.trim().to_string(),
             certificate_der_b64: endpoint_certificate(endpoint, version)
                 .map(|s| s.split_whitespace().collect()),
@@ -831,8 +927,8 @@ fn is_endpoint(node: roxmltree::Node<'_, '_>, version: SmpVersion) -> bool {
 /// The endpoint's transport profile.
 ///
 /// SMP 1.0 carries it as the `transportProfile` attribute; SMP 2.0 moved it
-/// into a `TransportProfileID` child element. Reading only the attribute — as
-/// this crate did — matches no SMP 2.0 endpoint at all.
+/// into a `TransportProfileID` child element; reading only the attribute
+/// matches no SMP 2.0 endpoint.
 fn endpoint_transport_profile<'a>(
     endpoint: roxmltree::Node<'a, '_>,
     version: SmpVersion,
@@ -846,7 +942,9 @@ fn endpoint_transport_profile<'a>(
 /// The URL an AS4 message is POSTed to.
 fn endpoint_address<'a>(endpoint: roxmltree::Node<'a, '_>, version: SmpVersion) -> Option<&'a str> {
     match version {
-        SmpVersion::V1 => child_in(endpoint, SMP_NS, "EndpointReference")
+        // Real SMPs write `wsa:EndpointReference` (WS-Addressing namespace).
+        SmpVersion::V1 => child_in(endpoint, WSA_NS, "EndpointReference")
+            .or_else(|| child_in(endpoint, SMP_NS, "EndpointReference"))
             .and_then(|reference| child_in(reference, WSA_NS, "Address"))
             .or_else(|| child_in(endpoint, SMP_NS, "EndpointURI"))?
             .text(),
@@ -893,7 +991,11 @@ fn ancestor_process_id<'a>(
     match version {
         SmpVersion::V1 => {
             let process = endpoint.parent()?.parent()?;
-            child_in(process, SMP_NS, "ProcessIdentifier")?.text()
+            // Real Peppol SMPs put the identifier in the busdox identifiers
+            // namespace (`id:ProcessIdentifier`), the schema in the SMP one.
+            child_in(process, SMP_NS, "ProcessIdentifier")
+                .or_else(|| child_in(process, BUSDOX_IDENTIFIERS_NS, "ProcessIdentifier"))?
+                .text()
         }
         SmpVersion::V2 => {
             let process_metadata = endpoint.parent()?;
@@ -906,6 +1008,9 @@ fn ancestor_process_id<'a>(
 /// WS-Addressing namespace — SMP 1.0 wraps the endpoint URL in an
 /// `EndpointReference/Address`.
 const WSA_NS: &str = "http://www.w3.org/2005/08/addressing";
+
+/// The Peppol (busdox) identifiers namespace of `id:ProcessIdentifier`.
+const BUSDOX_IDENTIFIERS_NS: &str = "http://busdox.org/transport/identifiers/1.0/";
 
 /// Whether `node` is an element `{namespace}local`.
 fn is_named(node: roxmltree::Node<'_, '_>, namespace: &str, local: &str) -> bool {
@@ -1118,8 +1223,7 @@ mod tests {
 
     /// OASIS SMP 2.0 moved the transport profile from an attribute to an
     /// element, renamed the address and the process identifier, and nested the
-    /// certificate. The crate advertised 2.0 support while reading only the 1.0
-    /// attribute, so no 2.0 endpoint could ever match.
+    /// certificate: a 2.0 endpoint must match through the 2.0 names.
     #[test]
     fn parse_service_metadata_smp2_roundtrip() {
         let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -1190,7 +1294,7 @@ mod tests {
 
     /// Two endpoints for one process and transport profile are ambiguous. The
     /// answer decides where a message goes, so document order must not settle
-    /// it (D5).
+    /// it.
     #[test]
     fn duplicate_endpoints_for_one_process_are_rejected() {
         let xml = r#"<?xml version="1.0" encoding="UTF-8"?>

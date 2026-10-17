@@ -1,0 +1,239 @@
+[
+  {
+    "record_id": "01929d3e-6a1b-7c3e-9f00-3b5c2e4d1a01",
+    "recorded_at": "2026-10-16T09:30:01.007Z",
+    "protocol": "as4",
+    "direction": "outbound",
+    "outcome": "delivered",
+    "message_id": "c2a1f6e0-5d1b-4b0e-9a57-8f7e1d2c3b4a@sender.example",
+    "ref_to_message_id": null,
+    "conversation_id": "conv-1",
+    "local_party": "9900000000001",
+    "partner": "9900000000002",
+    "profile": "bdew",
+    "service": "https://www.bdew.de/as4/communication/services/MP",
+    "action": "https://www.bdew.de/as4/communication/actions/MP",
+    "message_timestamp": "2026-10-16T09:30:11.902Z",
+    "signer": {
+      "certificate_der": "MIIBCgABAgMEBQYHCAkKCwwNDg8QERITFBUWFxgZGhscHR4fICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj9AQUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVpbXF1eX2BhYmNkZWZnaGlqa2xtbm9wcXJzdHV2d3h5ent8fX5/gIGCg4SFhoeIiYqLjI2Oj5CRkpOUlZaXmJmam5ydnp+goaKjpKWmp6ipqqusra6vsLGys7S1tre4ubq7vL2+v8DBwsPExcbHyMnKy8zNzs/Q0dLT1NXW19jZ2tvc3d7f4OHi4+Tl5ufo6err7O3u7/Dx8vP09fb3+Pn6+/z9/v8=",
+      "fingerprint_sha256": "30418c478829cc005f22f1de5d8d6529292c4319b2e38118e944bd0fd3b1059f"
+    },
+    "references": [
+      {
+        "uri": "#body",
+        "digest_algorithm": "http://www.w3.org/2001/04/xmlenc#sha256",
+        "digest": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="
+      },
+      {
+        "uri": "cid:payload-1@sender.example",
+        "digest_algorithm": "http://www.w3.org/2001/04/xmlenc#sha256",
+        "digest": "//////////////////////////////////////////8="
+      }
+    ],
+    "mic": null,
+    "signal": {
+      "bytes": "PGVudjpFbnZlbG9wZT5yZWNlaXB0PC9lbnY6RW52ZWxvcGU+",
+      "sha256": "a09d49f8462ded19b8d6d8fba561d6cd96237ae236e2ea5548aa6f053a04182f",
+      "message_id": "receipt-7@partner.example",
+      "ref_to_message_id": "c2a1f6e0-5d1b-4b0e-9a57-8f7e1d2c3b4a@sender.example",
+      "timestamp": "2026-10-16T09:30:12.201Z",
+      "signed": true,
+      "nrr": [
+        {
+          "uri": "#body",
+          "digest_algorithm": "http://www.w3.org/2001/04/xmlenc#sha256",
+          "digest": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="
+        },
+        {
+          "uri": "cid:payload-1@sender.example",
+          "digest_algorithm": "http://www.w3.org/2001/04/xmlenc#sha256",
+          "digest": "//////////////////////////////////////////8="
+        }
+      ]
+    },
+    "disposition": "receipt",
+    "error_kind": null,
+    "ebms_code": null,
+    "quirks": []
+  },
+  {
+    "record_id": "01929d3e-6a1b-7c3e-9f00-3b5c2e4d1a02",
+    "recorded_at": "2026-10-16T09:30:02.014Z",
+    "protocol": "as2",
+    "direction": "outbound",
+    "outcome": "sent",
+    "message_id": "<as2-async-1@sender.example>",
+    "ref_to_message_id": null,
+    "conversation_id": null,
+    "local_party": "9900000000001",
+    "partner": "9900000000002",
+    "profile": null,
+    "service": null,
+    "action": null,
+    "message_timestamp": null,
+    "signer": null,
+    "references": [],
+    "mic": {
+      "algorithm": "sha-256",
+      "value": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="
+    },
+    "signal": null,
+    "disposition": null,
+    "error_kind": null,
+    "ebms_code": null,
+    "quirks": []
+  },
+  {
+    "record_id": "01929d3e-6a1b-7c3e-9f00-3b5c2e4d1a03",
+    "recorded_at": "2026-10-16T09:30:03.021Z",
+    "protocol": "as4",
+    "direction": "outbound",
+    "outcome": "partner_error",
+    "message_id": "m-partner-error@sender.example",
+    "ref_to_message_id": null,
+    "conversation_id": null,
+    "local_party": "9900000000001",
+    "partner": "9900000000002",
+    "profile": null,
+    "service": null,
+    "action": null,
+    "message_timestamp": null,
+    "signer": null,
+    "references": [],
+    "mic": null,
+    "signal": {
+      "bytes": "//7DKACA",
+      "sha256": "2c64632040dbbfed930daf5f68ae087381c7138d39fca754798441ed8938d34c",
+      "message_id": "err-1",
+      "ref_to_message_id": "m-partner-error@sender.example",
+      "timestamp": null,
+      "signed": false,
+      "nrr": []
+    },
+    "disposition": "error",
+    "error_kind": "partner_error",
+    "ebms_code": "EBMS:0004",
+    "quirks": []
+  },
+  {
+    "record_id": "01929d3e-6a1b-7c3e-9f00-3b5c2e4d1a04",
+    "recorded_at": "2026-10-16T09:30:04.028Z",
+    "protocol": "as4",
+    "direction": "outbound",
+    "outcome": "indeterminate",
+    "message_id": "m-indeterminate@sender.example",
+    "ref_to_message_id": null,
+    "conversation_id": null,
+    "local_party": "9900000000001",
+    "partner": "9900000000002",
+    "profile": null,
+    "service": null,
+    "action": null,
+    "message_timestamp": null,
+    "signer": null,
+    "references": [],
+    "mic": null,
+    "signal": null,
+    "disposition": null,
+    "error_kind": "indeterminate",
+    "ebms_code": null,
+    "quirks": []
+  },
+  {
+    "record_id": "01929d3e-6a1b-7c3e-9f00-3b5c2e4d1a05",
+    "recorded_at": "2026-10-16T09:30:05.035Z",
+    "protocol": "as2",
+    "direction": "inbound",
+    "outcome": "accepted",
+    "message_id": "<äöü-ユニコード-id@partner.example>",
+    "ref_to_message_id": null,
+    "conversation_id": null,
+    "local_party": "Empfänger GmbH",
+    "partner": "Absender ÄG",
+    "profile": null,
+    "service": null,
+    "action": null,
+    "message_timestamp": null,
+    "signer": {
+      "certificate_der": "MIIBCgABAgMEBQYHCAkKCwwNDg8QERITFBUWFxgZGhscHR4fICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj9AQUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVpbXF1eX2BhYmNkZWZnaGlqa2xtbm9wcXJzdHV2d3h5ent8fX5/gIGCg4SFhoeIiYqLjI2Oj5CRkpOUlZaXmJmam5ydnp+goaKjpKWmp6ipqqusra6vsLGys7S1tre4ubq7vL2+v8DBwsPExcbHyMnKy8zNzs/Q0dLT1NXW19jZ2tvc3d7f4OHi4+Tl5ufo6err7O3u7/Dx8vP09fb3+Pn6+/z9/v8=",
+      "fingerprint_sha256": "30418c478829cc005f22f1de5d8d6529292c4319b2e38118e944bd0fd3b1059f"
+    },
+    "references": [],
+    "mic": {
+      "algorithm": "sha-256",
+      "value": "//7DKACA"
+    },
+    "signal": null,
+    "disposition": "automatic-action/MDN-sent-automatically; processed",
+    "error_kind": null,
+    "ebms_code": null,
+    "quirks": []
+  },
+  {
+    "record_id": "01929d3e-6a1b-7c3e-9f00-3b5c2e4d1a06",
+    "recorded_at": "2026-10-16T09:30:06.042Z",
+    "protocol": "as4",
+    "direction": "inbound",
+    "outcome": "duplicate",
+    "message_id": "m-duplicate@partner.example",
+    "ref_to_message_id": null,
+    "conversation_id": null,
+    "local_party": "9900000000001",
+    "partner": "9900000000002",
+    "profile": null,
+    "service": null,
+    "action": null,
+    "message_timestamp": "2026-10-16T09:29:59Z",
+    "signer": {
+      "certificate_der": "MIIBCgABAgMEBQYHCAkKCwwNDg8QERITFBUWFxgZGhscHR4fICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj9AQUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVpbXF1eX2BhYmNkZWZnaGlqa2xtbm9wcXJzdHV2d3h5ent8fX5/gIGCg4SFhoeIiYqLjI2Oj5CRkpOUlZaXmJmam5ydnp+goaKjpKWmp6ipqqusra6vsLGys7S1tre4ubq7vL2+v8DBwsPExcbHyMnKy8zNzs/Q0dLT1NXW19jZ2tvc3d7f4OHi4+Tl5ufo6err7O3u7/Dx8vP09fb3+Pn6+/z9/v8=",
+      "fingerprint_sha256": "30418c478829cc005f22f1de5d8d6529292c4319b2e38118e944bd0fd3b1059f"
+    },
+    "references": [
+      {
+        "uri": "#body",
+        "digest_algorithm": "http://www.w3.org/2001/04/xmlenc#sha256",
+        "digest": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="
+      },
+      {
+        "uri": "cid:payload-1@sender.example",
+        "digest_algorithm": "http://www.w3.org/2001/04/xmlenc#sha256",
+        "digest": "//////////////////////////////////////////8="
+      }
+    ],
+    "mic": null,
+    "signal": null,
+    "disposition": null,
+    "error_kind": null,
+    "ebms_code": null,
+    "quirks": []
+  },
+  {
+    "record_id": "01929d3e-6a1b-7c3e-9f00-3b5c2e4d1a07",
+    "recorded_at": "2026-10-16T09:30:07.049Z",
+    "protocol": "as4",
+    "direction": "inbound",
+    "outcome": "rejected",
+    "message_id": "m-rejected@partner.example",
+    "ref_to_message_id": null,
+    "conversation_id": null,
+    "local_party": "9900000000001",
+    "partner": "9900000000002",
+    "profile": null,
+    "service": null,
+    "action": null,
+    "message_timestamp": null,
+    "signer": {
+      "certificate_der": "MIIBCgABAgMEBQYHCAkKCwwNDg8QERITFBUWFxgZGhscHR4fICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj9AQUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVpbXF1eX2BhYmNkZWZnaGlqa2xtbm9wcXJzdHV2d3h5ent8fX5/gIGCg4SFhoeIiYqLjI2Oj5CRkpOUlZaXmJmam5ydnp+goaKjpKWmp6ipqqusra6vsLGys7S1tre4ubq7vL2+v8DBwsPExcbHyMnKy8zNzs/Q0dLT1NXW19jZ2tvc3d7f4OHi4+Tl5ufo6err7O3u7/Dx8vP09fb3+Pn6+/z9/v8=",
+      "fingerprint_sha256": "30418c478829cc005f22f1de5d8d6529292c4319b2e38118e944bd0fd3b1059f"
+    },
+    "references": [],
+    "mic": null,
+    "signal": null,
+    "disposition": null,
+    "error_kind": "rejected",
+    "ebms_code": "EBMS:0010",
+    "quirks": [
+      "example_quirk"
+    ]
+  }
+]

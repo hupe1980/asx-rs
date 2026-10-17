@@ -20,9 +20,6 @@ target
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
 
-# Gate output (scripts/run_fuzz_gate.sh, `just fuzz-gate`)
-artifacts
-
 # Custom
 CONCEPT.md
 FINDINGS.md
@@ -33,7 +30,7 @@ REVIEW.md
 # and under references/ the third-party specifications, standards, profiles and
 # law the crate is written against (copyrighted, and in several cases
 # redistributable only from the publisher; indexed with retrieval URLs in
-# concepts/references/README.md and rebuilt with `just specs`, so the folder
+# concepts/references/README.md and rebuilt with `just references`, so the folder
 # never needs to be committed).
 concepts/
 
@@ -43,3 +40,14 @@ concepts/
 
 # Zola build output
 site/public/
+
+# This project's own feature specifications and the Spec Kit machinery that
+# produces them: one `specs/NNN-slug/` per ROADMAP item (spec, plan, research,
+# tasks), `.specify/memory/constitution.md`, and the `/speckit-*` skills. Same
+# rule as `concepts/` — internal, and the published tree may not cite a path its
+# reader does not have; `just concepts-check` fails on one that does. Matches
+# billing, sepa and agentplane.
+/specs/
+/.specify/
+/.claude/
+examples/pki/

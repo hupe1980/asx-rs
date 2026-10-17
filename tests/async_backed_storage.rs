@@ -1,96 +1,131 @@
-#![cfg(feature = "testing")]
-//! An async-backed `DedupStorage` must work on the receive paths.
+//! An async-backed `DedupStore` must work on the receive path.
 //!
 //! The trait returns `BoxFuture` precisely so Redis/PostgreSQL/DynamoDB
-//! backends can implement it natively — and `cluster_safe()`, which the strict
-//! production startup gate requires, implies exactly such a store. A backend
-//! that yields must therefore be driven to completion, not polled once.
+//! backends can implement it natively. Every in-tree store resolves on the
+//! first poll, so a store that really suspends is the case that proves the
+//! library drives the future to completion instead of polling it once.
 
-use asx_rs::storage::{BoxFuture, DedupStorage, DedupVerdict, drive_dedup_future};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
-/// Yields before answering, like any network round trip.
-#[derive(Debug, Default)]
+use asx::{BoxFuture, Claim, ClaimToken, DedupStore, MemoryDedup};
+use asx_testkit::dedup::{DedupHarness, conformance};
+
+type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
+/// Yields several times before answering, like any network round trip, and
+/// counts the calls that completed.
+#[derive(Debug, Default, Clone)]
 struct AsyncBackedDedup {
-    claims: AtomicUsize,
+    inner: Arc<MemoryDedup>,
+    completed: Arc<AtomicUsize>,
 }
 
-impl DedupStorage for AsyncBackedDedup {
-    fn is_durable(&self) -> bool {
-        true
-    }
-    fn cluster_safe(&self) -> bool {
-        true
-    }
-
-    fn claim<'a>(&'a self, _key: &'a str) -> BoxFuture<'a, asx_rs::Result<DedupVerdict>> {
-        Box::pin(async move {
-            // Several yields: a single extra poll must not be enough.
-            for _ in 0..4 {
-                tokio::task::yield_now().await;
-            }
-            self.claims.fetch_add(1, Ordering::SeqCst);
-            Ok(DedupVerdict::Claimed)
-        })
-    }
-
-    fn accept<'a>(&'a self, _key: &'a str) -> BoxFuture<'a, asx_rs::Result<()>> {
-        Box::pin(async move {
+impl AsyncBackedDedup {
+    async fn round_trip(&self) {
+        // Several yields: a single extra poll must not be enough.
+        for _ in 0..4 {
             tokio::task::yield_now().await;
-            Ok(())
-        })
+        }
+        self.completed.fetch_add(1, Ordering::SeqCst);
     }
+}
 
-    fn abandon<'a>(&'a self, _key: &'a str) -> BoxFuture<'a, asx_rs::Result<()>> {
+impl DedupStore for AsyncBackedDedup {
+    fn claim<'a>(&'a self, key: &'a str) -> BoxFuture<'a, Result<Claim, BoxError>> {
         Box::pin(async move {
-            tokio::task::yield_now().await;
-            Ok(())
+            self.round_trip().await;
+            self.inner.claim(key).await
+        })
+    }
+    fn accept<'a>(
+        &'a self,
+        key: &'a str,
+        token: &'a ClaimToken,
+    ) -> BoxFuture<'a, Result<(), BoxError>> {
+        Box::pin(async move {
+            self.round_trip().await;
+            self.inner.accept(key, token).await
+        })
+    }
+    fn abandon<'a>(
+        &'a self,
+        key: &'a str,
+        token: &'a ClaimToken,
+    ) -> BoxFuture<'a, Result<(), BoxError>> {
+        Box::pin(async move {
+            self.round_trip().await;
+            self.inner.abandon(key, token).await
         })
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn async_backend_is_driven_on_a_multi_thread_runtime() {
-    let backend = AsyncBackedDedup::default();
-    // `block_in_place` requires a multi-thread runtime; this is the shape a
-    // real deployment uses.
-    let verdict = tokio::task::spawn_blocking(move || {
-        let v = drive_dedup_future(backend.claim("k")).expect("claim");
-        assert_eq!(backend.claims.load(Ordering::SeqCst), 1);
-        v
-    })
-    .await
-    .expect("join");
-    assert_eq!(verdict, DedupVerdict::Claimed);
+#[derive(Debug)]
+struct Harness;
+
+impl DedupHarness for Harness {
+    type Store = AsyncBackedDedup;
+    fn open(&self) -> AsyncBackedDedup {
+        AsyncBackedDedup::default()
+    }
+    fn lease(&self) -> Duration {
+        Duration::from_secs(5 * 60)
+    }
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn async_backend_is_driven_from_spawn_blocking_on_a_current_thread_runtime() {
-    let backend = AsyncBackedDedup::default();
-    let verdict = tokio::task::spawn_blocking(move || drive_dedup_future(backend.claim("k")))
+#[tokio::test(start_paused = true)]
+async fn a_yielding_store_conforms() {
+    let failures = conformance(&Harness).await;
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+#[cfg(feature = "as4")]
+#[path = "common/peers.rs"]
+mod peers;
+#[cfg(feature = "as4")]
+#[allow(unreachable_pub)]
+#[path = "common/ported_as4.rs"]
+mod ported;
+
+/// A message and its retransmission through an `Inbound` over the yielding
+/// store: claimed, accepted, then answered as a duplicate.
+#[cfg(feature = "as4")]
+async fn receive_through_a_yielding_store() {
+    use peers::Preset;
+    let p = peers::pair(Preset::Edelivery);
+    p.sender
+        .send(Preset::Edelivery.message(&p.to_b, b"x"))
         .await
-        .expect("join")
-        .expect("claim");
-    assert_eq!(verdict, DedupVerdict::Claimed);
-}
-
-#[test]
-fn in_memory_backend_still_works_with_no_runtime_at_all() {
-    // The fast path: an immediately-ready future must not need a runtime, so
-    // the pure-sync entry points keep working outside Tokio entirely.
-    let backend = asx_rs::storage::TtlDedupStorage::default();
-    let verdict = drive_dedup_future(backend.claim("k")).expect("claim");
-    assert_eq!(verdict, DedupVerdict::Claimed);
-    drive_dedup_future(backend.accept("k")).expect("accept");
+        .expect("delivered");
+    let request = p.loopback.last_request().unwrap();
+    let store = AsyncBackedDedup::default();
+    let inbound = ported::accepting_inbound(&p.receiver, store.clone());
+    let (status, body) = ported::post(&inbound, ported::clone_request(&request)).await;
+    assert_eq!(status, http::StatusCode::OK);
+    assert!(String::from_utf8_lossy(&body).contains("Receipt"));
     assert_eq!(
-        drive_dedup_future(backend.claim("k")).expect("claim"),
-        DedupVerdict::Duplicate
+        store.completed.load(Ordering::SeqCst),
+        2,
+        "claim and accept ran to completion"
+    );
+    let (status, _) = ported::post(&inbound, request).await;
+    assert_eq!(status, http::StatusCode::OK, "duplicate receipted");
+    assert_eq!(
+        store.completed.load(Ordering::SeqCst),
+        3,
+        "the duplicate's claim"
     );
 }
 
-#[test]
-#[should_panic(expected = "no Tokio runtime available")]
-fn async_backend_with_no_runtime_says_so() {
-    let backend = AsyncBackedDedup::default();
-    let _ = drive_dedup_future(backend.claim("k"));
+#[cfg(feature = "as4")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn async_store_is_driven_on_a_multi_thread_runtime() {
+    receive_through_a_yielding_store().await;
+}
+
+#[cfg(feature = "as4")]
+#[tokio::test(flavor = "current_thread")]
+async fn async_store_is_driven_on_a_current_thread_runtime() {
+    receive_through_a_yielding_store().await;
 }

@@ -1,168 +1,81 @@
 #![cfg(feature = "as2")]
+//! The AS2 send goldens through `As2::send`.
+//!
+//! `Profile::as2()` always signs and encrypts (and adds the MDN request
+//! headers), so the encrypted body is not reproducible octet for octet. What
+//! stays byte-identical is checked instead: the payload the partner recovers is
+//! the golden payload, and the MIC is taken over the signed entity built from
+//! exactly those octets (RFC 4130 §7.3.1).
 
-#[path = "common/strict_bootstrap.rs"]
-mod strict_bootstrap;
+#[path = "common/as2_peers.rs"]
+mod as2_peers;
 
-use asx_rs::as2::send_sync;
-use base64::{Engine as _, engine::general_purpose::STANDARD};
-use sha2::{Digest, Sha256};
+mod api_0_16 {
+    use super::as2_peers::{EDI, field, pair};
+    use asx::Payload;
+    use asx::as2::Message;
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    use sha2::{Digest, Sha256};
+    use std::sync::{Arc, Mutex};
 
-use asx_rs::as2::{
-    As2MicAlgorithm, As2SendCredentials, As2SendPolicy, As2SendRequest, SmimeCipher,
-};
-use asx_rs::core::{InteropMode, SessionContext};
-use asx_rs::observability::{AsxEvent, EventBus};
-
-#[tokio::test]
-async fn as2_send_matches_golden_payload_and_mic() {
-    let session = SessionContext::new("sess-1", "partner-a", "strict").expect("session");
-    let session = strict_bootstrap::strict_bound(session);
-    let bus = EventBus::new(64).expect("event bus");
-    let mut scoped_rx = bus.subscribe_scoped_events();
-
-    let payload = b"ISA*00*          *00*          *ZZ*SENDER         *ZZ*RECEIVER       *240101*1200*U*00401*000000001*0*T*:~".to_vec();
-
-    let out = send_sync(
-        &session,
-        &bus,
-        As2SendRequest {
-            message_id: "msg-42".to_string(),
-            payload,
-            policy: As2SendPolicy {
-                interop_mode: InteropMode::Strict,
-                fail_closed_audit_events: false,
-                sign: false,
-                encrypt: false,
-                compress: false,
-                payload_content_type: None,
-                as2_from_id: String::new(),
-                mic_algorithm: As2MicAlgorithm::Sha256,
-                encryption_cipher: SmimeCipher::Aes256Cbc,
-            },
-            credentials: Some(As2SendCredentials::default()),
-        },
-    )
-    .expect("send");
-
-    let expected_payload =
-        std::fs::read_to_string("tests/fixtures/as2_send_payload.golden").expect("payload fixture");
-    let expected_mic = std::fs::read_to_string("tests/fixtures/as2_send_mic.golden")
-        .expect("mic fixture")
-        .trim()
-        .to_string();
-
-    assert_eq!(String::from_utf8_lossy(&out.mime.body), expected_payload);
-    assert_eq!(out.mic_base64, expected_mic);
-
-    let mut stages = Vec::new();
-    for _ in 0..2 {
-        let evt = scoped_rx.recv().await.expect("event");
-        if evt.session_id == session.session_id() {
-            stages.push(evt.event.as_ref().clone());
+    async fn send_and_capture(payload: &[u8], media_type: &str) -> (Vec<u8>, String, String) {
+        let p = pair();
+        let mic: Arc<Mutex<Option<String>>> = Arc::default();
+        {
+            let mic = mic.clone();
+            p.loopback.intercept(move |resp| {
+                *mic.lock().unwrap() = field(resp.body(), "Received-Content-MIC");
+            });
         }
+        let mdn = p
+            .sender
+            .send(Message::to(
+                &p.to_b,
+                Payload::new(payload.to_vec(), media_type),
+            ))
+            .await
+            .expect("verified MDN");
+        let json = serde_json::to_value(mdn.evidence()).unwrap();
+        let recorded = json["mic"]["value"].as_str().unwrap().to_string();
+        let delivered = p.delivered.lock().unwrap()[0].clone();
+        assert_eq!(delivered.3, media_type);
+        let echoed = mic.lock().unwrap().clone().expect("the MDN echoes a MIC");
+        assert_eq!(echoed, format!("{recorded}, sha-256"));
+        (delivered.2, recorded, delivered.3)
     }
 
-    assert!(matches!(stages[0], AsxEvent::OutboundPrepared { .. }));
-    assert!(matches!(stages[1], AsxEvent::MicComputed { .. }));
-}
+    fn entity_mic(media_type: &str, payload: &[u8]) -> String {
+        let mut entity =
+            format!("Content-Type: {media_type}\r\nContent-Transfer-Encoding: binary\r\n\r\n")
+                .into_bytes();
+        entity.extend_from_slice(payload);
+        STANDARD.encode(Sha256::digest(&entity))
+    }
 
-#[cfg(feature = "interop-relaxed")]
-#[tokio::test]
-async fn strict_and_relaxed_policy_differs_only_when_configured() {
-    let session = SessionContext::new("sess-2", "partner-b", "strict").expect("session");
-    let session = strict_bootstrap::strict_bound(session);
-    let bus = EventBus::new(64).expect("event bus");
+    #[tokio::test]
+    async fn golden_payload_round_trips_with_the_entity_mic() {
+        let payload =
+            std::fs::read("tests/fixtures/as2_send_payload.golden").expect("payload fixture");
+        let content_mic = std::fs::read_to_string("tests/fixtures/as2_send_mic.golden")
+            .expect("mic fixture")
+            .trim()
+            .to_string();
+        // The golden octets are unchanged.
+        assert_eq!(STANDARD.encode(Sha256::digest(&payload)), content_mic);
+        let (delivered, mic, _) = send_and_capture(&payload, "application/octet-stream").await;
+        assert_eq!(
+            delivered, payload,
+            "the partner recovers the golden payload byte for byte"
+        );
+        assert_eq!(mic, entity_mic("application/octet-stream", &payload));
+    }
 
-    let strict = send_sync(
-        &session,
-        &bus,
-        As2SendRequest {
-            message_id: "msg-77".to_string(),
-            payload: Vec::new(),
-            policy: As2SendPolicy {
-                interop_mode: InteropMode::Strict,
-                fail_closed_audit_events: false,
-                sign: true,
-                encrypt: true,
-                compress: false,
-                payload_content_type: None,
-                as2_from_id: String::new(),
-                mic_algorithm: As2MicAlgorithm::Sha256,
-                encryption_cipher: SmimeCipher::Aes256Cbc,
-            },
-            credentials: Some(As2SendCredentials::default()),
-        },
-    );
-    assert!(strict.is_err());
-
-    let relaxed = send_sync(
-        &session,
-        &bus,
-        As2SendRequest {
-            message_id: "  msg-77  ".to_string(),
-            payload: Vec::new(),
-            policy: As2SendPolicy {
-                interop_mode: InteropMode::Relaxed,
-                fail_closed_audit_events: false,
-                sign: false,
-                encrypt: false,
-                compress: false,
-                payload_content_type: None,
-                as2_from_id: String::new(),
-                mic_algorithm: As2MicAlgorithm::Sha256,
-                encryption_cipher: SmimeCipher::Aes256Cbc,
-            },
-            credentials: Some(As2SendCredentials::default()),
-        },
-    )
-    .expect("relaxed ok");
-
-    assert_eq!(relaxed.message_id, "msg-77");
-}
-
-#[tokio::test]
-async fn mic_uses_exact_octet_boundary_without_payload_rewrite() {
-    let session = SessionContext::new("sess-3", "partner-c", "strict").expect("session");
-    let session = strict_bootstrap::strict_bound(session);
-    let bus = EventBus::new(64).expect("event bus");
-
-    let payload = b"Content-Transfer-Encoding: binary\r\n\r\nA\r\nB\r\n--x--".to_vec();
-    let content_type = "application/edi-x12";
-
-    let out = send_sync(
-        &session,
-        &bus,
-        As2SendRequest {
-            message_id: "msg-99".to_string(),
-            payload: payload.clone(),
-            policy: As2SendPolicy {
-                interop_mode: InteropMode::Strict,
-                fail_closed_audit_events: false,
-                sign: false,
-                encrypt: false,
-                compress: false,
-                payload_content_type: Some(content_type),
-                as2_from_id: String::new(),
-                mic_algorithm: As2MicAlgorithm::Sha256,
-                encryption_cipher: SmimeCipher::Aes256Cbc,
-            },
-            credentials: Some(As2SendCredentials::default()),
-        },
-    )
-    .expect("send");
-
-    // RFC 4130 §7.3.1: an unsigned, unencrypted message is MIC'd over the
-    // content alone — MIME headers are deliberately excluded because
-    // intermediaries reorder and rewrite them. The payload here begins with
-    // header-looking text, which must be treated as opaque content and hashed
-    // byte-for-byte rather than reinterpreted as headers.
-    let expected_mic = STANDARD.encode(Sha256::digest(&payload));
-
-    assert_eq!(out.mic_base64, expected_mic);
-    assert_eq!(
-        out.mime.body.as_ref(),
-        payload.as_slice(),
-        "an unprotected AS2 message carries the payload as the entity body, unwrapped"
-    );
-    assert_eq!(out.mime.content_type, content_type);
+    #[tokio::test]
+    async fn header_looking_payload_is_opaque_content() {
+        let payload = b"Content-Transfer-Encoding: binary\r\n\r\nA\r\nB\r\n--x--".to_vec();
+        let (delivered, mic, media_type) = send_and_capture(&payload, EDI).await;
+        assert_eq!(delivered, payload);
+        assert_eq!(media_type, EDI);
+        assert_eq!(mic, entity_mic(EDI, &payload));
+    }
 }

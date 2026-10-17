@@ -14,13 +14,9 @@
 //! Both directions are implemented here: a library that can compress but not
 //! decompress can only talk to itself.
 
-#[cfg(feature = "compression")]
 use flate2::Compression;
-#[cfg(feature = "compression")]
 use flate2::read::{GzDecoder, ZlibDecoder};
-#[cfg(feature = "compression")]
 use flate2::write::{GzEncoder, ZlibEncoder};
-#[cfg(feature = "compression")]
 use std::io::{Read, Write};
 
 use crate::core::{AsxError, ErrorCode, ErrorContext, Result};
@@ -32,7 +28,6 @@ pub const AS2_COMPRESSED_CONTENT_TYPE: &str =
 /// `CompressionType` value the AS4 profile requires for compressed payloads.
 pub const AS4_COMPRESSION_TYPE: &str = "application/gzip";
 
-#[cfg(feature = "compression")]
 /// Upper bound on decompressed output, guarding against compression bombs.
 ///
 /// A 100:1 ratio is far beyond what EDI or XML achieves in practice, so this
@@ -42,7 +37,6 @@ const MAX_DECOMPRESSED_BYTES: usize = 128 * 1024 * 1024;
 // ── AS4: raw gzip ───────────────────────────────────────────────────────────
 
 /// Compress an AS4 payload attachment with gzip.
-#[cfg(feature = "compression")]
 pub fn compress_gzip(payload: &[u8], compression_level: u32) -> Result<Vec<u8>> {
     let level = match compression_level {
         1..=9 => Compression::new(compression_level),
@@ -68,7 +62,6 @@ pub fn compress_gzip(payload: &[u8], compression_level: u32) -> Result<Vec<u8>> 
 }
 
 /// Decompress an AS4 gzip payload attachment.
-#[cfg(feature = "compression")]
 pub fn decompress_gzip(compressed: &[u8]) -> Result<Vec<u8>> {
     read_bounded(
         GzDecoder::new(compressed),
@@ -77,42 +70,29 @@ pub fn decompress_gzip(compressed: &[u8]) -> Result<Vec<u8>> {
     )
 }
 
-/// Detect a gzip stream by its magic header (`1f 8b`).
-pub fn is_gzip_compressed(data: &[u8]) -> bool {
-    data.len() >= 2 && data[0] == 0x1f && data[1] == 0x8b
-}
-
 // ── AS2: RFC 5402 CMS CompressedData ────────────────────────────────────────
 
 // DER object identifiers (RFC 3274 §1, RFC 5652 §4).
-#[cfg(feature = "compression")]
 /// `id-ct-compressedData` — 1.2.840.113549.1.9.16.1.9
 const OID_CT_COMPRESSED_DATA: &[u8] = &[
     0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x09, 0x10, 0x01, 0x09,
 ];
-#[cfg(feature = "compression")]
 /// `id-alg-zlibCompress` — 1.2.840.113549.1.9.16.3.8
 const OID_ALG_ZLIB_COMPRESS: &[u8] = &[
     0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x09, 0x10, 0x03, 0x08,
 ];
-#[cfg(feature = "compression")]
 /// `id-data` — 1.2.840.113549.1.7.1
 const OID_DATA: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x07, 0x01];
 
-#[cfg(feature = "compression")]
 const TAG_OID: u8 = 0x06;
-#[cfg(feature = "compression")]
 const TAG_OCTET_STRING: u8 = 0x04;
-#[cfg(feature = "compression")]
 const TAG_SEQUENCE: u8 = 0x30;
-#[cfg(feature = "compression")]
 const TAG_CONTEXT_0: u8 = 0xa0;
 
 /// Wrap an AS2 payload in a CMS `CompressedData` structure (RFC 5402 / RFC 3274).
 ///
 /// The output is the DER-encoded `ContentInfo` that belongs in a
 /// `application/pkcs7-mime; smime-type=compressed-data` entity.
-#[cfg(feature = "compression")]
 pub fn compress_cms_zlib(payload: &[u8], compression_level: u32) -> Result<Vec<u8>> {
     let level = match compression_level {
         1..=9 => Compression::new(compression_level),
@@ -161,7 +141,6 @@ pub fn compress_cms_zlib(payload: &[u8], compression_level: u32) -> Result<Vec<u
 }
 
 /// Unwrap a CMS `CompressedData` structure produced by an AS2 partner.
-#[cfg(feature = "compression")]
 pub fn decompress_cms_zlib(der: &[u8]) -> Result<Vec<u8>> {
     let stage = "decompression_cms_zlib";
     let fail = |msg: String| AsxError::new(ErrorCode::ParseFailed, msg, ErrorContext::new(stage));
@@ -211,7 +190,6 @@ pub fn is_as2_compressed_content_type(content_type: &str) -> bool {
 
 // ── shared helpers ──────────────────────────────────────────────────────────
 
-#[cfg(feature = "compression")]
 fn read_bounded<R: Read>(mut reader: R, stage: &'static str, message: &str) -> Result<Vec<u8>> {
     let mut output = Vec::new();
     let read = (&mut reader)
@@ -240,7 +218,6 @@ fn read_bounded<R: Read>(mut reader: R, stage: &'static str, message: &str) -> R
 }
 
 /// Encode one DER tag-length-value.
-#[cfg(feature = "compression")]
 fn der_tlv(tag: u8, contents: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(contents.len() + 6);
     out.push(tag);
@@ -263,7 +240,6 @@ fn der_tlv(tag: u8, contents: &[u8]) -> Vec<u8> {
 
 /// Read the value of the next DER element, requiring it to carry `tag`.
 /// Returns `(value, remaining-input)`.
-#[cfg(feature = "compression")]
 fn der_take<'a>(input: &'a [u8], tag: u8, stage: &'static str) -> Result<(&'a [u8], &'a [u8])> {
     let fail = |msg: String| AsxError::new(ErrorCode::ParseFailed, msg, ErrorContext::new(stage));
 
@@ -309,7 +285,6 @@ fn der_take<'a>(input: &'a [u8], tag: u8, stage: &'static str) -> Result<(&'a [u
 }
 
 /// Read a DER element that must span the whole input.
-#[cfg(feature = "compression")]
 fn der_expect<'a>(input: &'a [u8], tag: u8, stage: &'static str) -> Result<&'a [u8]> {
     let (value, rest) = der_take(input, tag, stage)?;
     if !rest.is_empty() {
@@ -322,58 +297,20 @@ fn der_expect<'a>(input: &'a [u8], tag: u8, stage: &'static str) -> Result<&'a [
     Ok(value)
 }
 
-#[cfg(not(feature = "compression"))]
-pub fn compress_gzip(_payload: &[u8], _level: u32) -> Result<Vec<u8>> {
-    Err(feature_disabled())
-}
-
-#[cfg(not(feature = "compression"))]
-pub fn decompress_gzip(_compressed: &[u8]) -> Result<Vec<u8>> {
-    Err(feature_disabled())
-}
-
-#[cfg(not(feature = "compression"))]
-pub fn compress_cms_zlib(_payload: &[u8], _level: u32) -> Result<Vec<u8>> {
-    Err(feature_disabled())
-}
-
-#[cfg(not(feature = "compression"))]
-pub fn decompress_cms_zlib(_der: &[u8]) -> Result<Vec<u8>> {
-    Err(feature_disabled())
-}
-
-#[cfg(not(feature = "compression"))]
-fn feature_disabled() -> AsxError {
-    AsxError::new(
-        ErrorCode::InvalidInput,
-        "compression not available; enable the 'compression' feature",
-        ErrorContext::new("compression_disabled"),
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    #[cfg(feature = "compression")]
     fn gzip_roundtrips() {
         let original = b"EDI segment. ".repeat(64);
         let compressed = compress_gzip(&original, 6).expect("compress");
-        assert!(is_gzip_compressed(&compressed));
+        assert_eq!(&compressed[..2], &[0x1f, 0x8b]);
         assert!(compressed.len() < original.len());
         assert_eq!(decompress_gzip(&compressed).expect("decompress"), original);
     }
 
     #[test]
-    fn gzip_magic_detection() {
-        assert!(!is_gzip_compressed(&[]));
-        assert!(!is_gzip_compressed(&[0x1f]));
-        assert!(is_gzip_compressed(&[0x1f, 0x8b]));
-    }
-
-    #[test]
-    #[cfg(feature = "compression")]
     fn cms_compressed_data_roundtrips() {
         let original = b"ISA*00*          *00*          *ZZ*SENDER~".repeat(32);
         let der = compress_cms_zlib(&original, 6).expect("compress");
@@ -384,7 +321,6 @@ mod tests {
     /// The wrapper must be a real CMS structure, not a bare deflate stream —
     /// this is exactly what distinguishes RFC 5402 from "we ran gzip".
     #[test]
-    #[cfg(feature = "compression")]
     fn cms_output_is_a_content_info_with_the_rfc3274_oids() {
         let der = compress_cms_zlib(b"payload", 6).expect("compress");
         assert_eq!(der[0], TAG_SEQUENCE, "outermost element is a SEQUENCE");
@@ -401,7 +337,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "compression")]
     fn a_bare_gzip_stream_is_rejected_as_cms() {
         let gzip = compress_gzip(b"payload", 6).expect("compress");
         let err = decompress_cms_zlib(&gzip).expect_err("gzip is not CMS CompressedData");
@@ -409,7 +344,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "compression")]
     fn truncated_cms_input_fails_closed() {
         let der = compress_cms_zlib(b"payload here", 6).expect("compress");
         for cut in [1usize, der.len() / 2, der.len() - 1] {
@@ -435,7 +369,6 @@ mod tests {
     /// Lengths ≥ 128 use DER long form; a payload that crosses the boundary
     /// exercises it.
     #[test]
-    #[cfg(feature = "compression")]
     fn long_form_der_lengths_roundtrip() {
         for size in [100usize, 200, 5000, 70_000] {
             let original: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
@@ -449,7 +382,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "compression")]
     fn der_tlv_encodes_short_and_long_forms() {
         assert_eq!(der_tlv(0x04, &[1, 2, 3]), vec![0x04, 0x03, 1, 2, 3]);
         let long = der_tlv(0x04, &vec![0u8; 300]);

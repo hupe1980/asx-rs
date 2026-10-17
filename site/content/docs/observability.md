@@ -1,266 +1,212 @@
 +++
 title = "Observability"
-description = "The event bus, emission modes and backpressure, durable audit sinks, metrics, and how to wire asx-rs into your telemetry stack."
+description = "Tracing spans and events, optional metrics, and the audit records of every exchange."
 +++
 
-The `observability` module provides structured audit event emission, per-session event routing, configurable backpressure, and a durable audit sink trait for external persistence.
+Three observability seams; none can change what happens to a message:
 
----
+- **`tracing`**: every send, receive, signature, decryption, receipt, MDN, SMP lookup, revocation check and audit write runs in a documented span.
+- **`metrics`** (feature `metrics`): seven counters and histograms through the [`metrics`](https://docs.rs/metrics) facade.
+- **[`AuditSink`](#audit-records)**: one evidence record per exchange leg.
 
-## EventBus
+The library never installs a subscriber or recorder and reads no environment variable. With nothing installed, spans cost a disabled-callsite check and metric macros are no-ops. Only an audit sink declared `Durable` can fail an exchange.
 
-`EventBus` is the central fan-out hub for all protocol audit events. Core `as2` and `as4` operations take an `&EventBus` and emit typed `AuditEvent` records as processing proceeds.
+The tables below are a public contract, checked both ways against what the test suite emits (`tests/telemetry_contract.rs`, `tests/metrics_contract.rs`); changes are recorded in `CHANGELOG.md`.
 
-```rust
-use asx_rs::observability::{BackpressurePolicy, EventBus, EventEmissionMode};
+## Wiring it up
 
-// Strict transactional-by-default bus with 64-event channel depth:
-let bus = EventBus::new(64)?;
+The application installs a subscriber and a recorder, for example:
 
-// Optional explicit best-effort mode for loss-tolerant flows:
-let best_effort_bus = EventBus::builder()
-    .capacity(64)
-    .emission_mode(EventEmissionMode::BestEffort)
-    .build()?;
+```toml
+[dependencies]
+asx-rs = { version = "0.16", features = ["metrics"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+metrics-exporter-prometheus = "0.17"
 ```
 
-Pass the same `EventBus` instance across concurrent sessions so all events flow through a single fan-out point. The bus is clone-safe (`Arc`-backed internally).
-
-In strict default mode, emits are transactional with respect to strict preconditions: the bus requires at least one active scoped or per-session subscriber and pre-reservable capacity for all scoped/per-session queues before send.
-
----
-
-## Backpressure
-
-Configure backpressure limits on the builder:
-
-```rust
-use asx_rs::observability::{BackpressureAction, BackpressurePolicy, EventBus};
-
-let bus = EventBus::builder()
-    .capacity(64)
-    .backpressure(BackpressurePolicy {
-        max_dropped: Some(100),
-        max_lagged: Some(50),
-        action: BackpressureAction::FailClosed,
-        window_secs: 60,  // sliding window (must be > 0)
-        session_channel_capacity: 64,
-    })
-    .build()?;
+```text
+// in the application's main, once:
+tracing_subscriber::fmt().json().with_env_filter("info,asx=info").init(); // asx=debug for the child spans
+metrics_exporter_prometheus::PrometheusBuilder::new().install()?;
 ```
 
-| `BackpressureAction` | Behaviour |
-|---|---|
-| `FailClosed` | `emit_audit_event` returns `Err` when thresholds are exceeded; the error propagates up the receive path |
-| `Track` | Saturation is counted but not escalated to a reliability failure |
+For OpenTelemetry, add `tracing-opentelemetry` as a layer: `asx.*` spans become OpenTelemetry spans under the caller's span (for example `tower-http`'s `TraceLayer`). The library propagates no `traceparent` header.
 
-### Windowed counters
+## Tracing
 
-Dropped and lagged counters reset automatically after `window_secs` seconds. This prevents an early burst from permanently latching `FailClosed` in a long-running process.
+### Target
 
----
+Every span and event uses the target `asx`: filter with `RUST_LOG=asx=info` (`asx=debug` for the child spans).
 
-## Audit Sink Integration
+### Spans
 
-`EventBusBuilder::audit_sink` attaches a durable sink that persists every event before fan-out:
+Values learned during the operation (`outcome`, `error.kind`, `ebms.code`, `duplicate`, `duration_ms`, …) are recorded before the span closes; a field that does not apply stays empty.
 
-```rust
-use asx_rs::observability::{
-    BackpressurePolicy, DurableAuditSink, EventBus, EventEmissionMode,
-};
-use asx_rs::Result;
-use std::sync::Arc;
+| Span | Level | Fields |
+|---|---|---|
+| `asx.send` | INFO | `protocol`, `profile`, `partner`, `message_id`, `outcome`, `error.kind`, `ebms.code`, `duration_ms` |
+| `asx.receive` | INFO | `protocol`, `profile`, `partner`, `message_id`, `outcome`, `error.kind`, `ebms.code`, `duplicate`, `duration_ms` |
+| `asx.sign` | DEBUG | `algorithm`, `reference_count` |
+| `asx.verify` | DEBUG | `algorithm`, `signer.fingerprint`, `outcome` |
+| `asx.encrypt` | DEBUG | `algorithm`, `key_transport` |
+| `asx.decrypt` | DEBUG | `algorithm`, `outcome` |
+| `asx.receipt` | DEBUG | `message_id`, `signed`, `nrr`, `outcome` |
+| `asx.mdn` | DEBUG | `message_id`, `disposition`, `signed`, `outcome` |
+| `asx.smp_lookup` | DEBUG | `participant_scheme`, `document_type`, `transport_profile`, `outcome` |
+| `asx.revocation` | DEBUG | `method`, `source`, `signer.fingerprint`, `outcome`, `reason` |
+| `asx.audit` | DEBUG | `record_id`, `durability`, `outcome` |
 
-struct PostgresAuditSink { /* pool */ }
+- **`asx.send`** covers one `As4::send`, `As2::send`, `As2::send_async_mdn` or `As2::verify_async_mdn` call, including the verification of the receipt or MDN.
+- **`asx.receive`** covers one request handled by an `Inbound`, from the first byte read to the response, the handler call included.
+- Child spans nest under whichever of the two is current, also on the crypto pool.
+- **`asx.mdn`** covers the verification of one MDN, synchronous or asynchronous, inside `asx.send`; `disposition` is the disposition type and modifier class (`processed`, `processed/warning`, `processed/error`, `failed`), never the partner's text; `signed` whether it was signed.
+- **`asx.revocation`** covers the check of one non-anchor certificate of a verified signer's path, top-down, after the signature and the sender rule. `method` is the source that decided (`crl` when the certificate names no source), `source` whether the data came from the cache or the network.
 
-impl DurableAuditSink for PostgresAuditSink {
-    fn store_event(&self, event: &asx_rs::observability::AuditEvent) -> Result<()> {
-        // INSERT INTO audit_events ...
-        todo!()
-    }
+Field values: identifiers verbatim; `signer.fingerprint` is the lowercase hex SHA-256 of the DER certificate, the only certificate datum recorded; `participant_scheme` and `document_type` carry identifier **schemes**, never a participant value; `duration_ms` is an integer.
 
-    fn retrieve_events_from(
-        &self,
-        cursor: &asx_rs::observability::ReplayCursor,
-        limit: usize,
-    ) -> Result<Vec<asx_rs::observability::AuditEvent>> {
-        // SELECT ... WHERE sequence > cursor.position LIMIT ?
-        let _ = (cursor, limit);
-        todo!()
-    }
+Never recorded: payload or wire bytes, filenames from a message, private keys, secrets, HTTP header values other than `Content-Type`, certificate subject or issuer names.
 
-    fn acknowledge_cursor(&self, cursor: &asx_rs::observability::ReplayCursor) -> Result<()> {
-        let _ = cursor;
-        Ok(())
-    }
+### Values
 
-    fn current_cursor(&self) -> Result<asx_rs::observability::ReplayCursor> {
-        todo!()
-    }
+| Field | Span | Values |
+|---|---|---|
+| `protocol` | `asx.send`, `asx.receive` | `as2`, `as4` |
+| `outcome` | `asx.send` | `delivered`, `sent`, `partner_error`, `indeterminate`, `config`, `transport`, `storage` |
+| `outcome` | `asx.receive` | `accepted`, `duplicate`, `in_flight`, `pending`, `rejected`, `storage` |
+| `outcome` | `asx.verify`, `asx.decrypt`, `asx.receipt`, `asx.mdn`, `asx.smp_lookup`, `asx.audit` | `ok`, `failed` |
+| `outcome` | `asx.revocation` | `good`, `revoked`, `unknown`, `error` |
+| `error.kind` | `asx.send`, `asx.receive` | `config`, `rejected`, `partner_error`, `transport`, `indeterminate`, `storage` |
+| `nrr` | `asx.receipt` | `verified`, `absent`, `mismatch`, `n/a` |
+| `method` | `asx.revocation` | `ocsp`, `crl` |
+| `source` | `asx.revocation` | `cache`, `network` |
+| `reason` | `asx.revocation` | `ca_distrusted`, `not_obtainable`, `no_source`, `refresh_failing` |
+| `durability` | `asx.audit` | `durable`, `best_effort` |
 
-    fn durability(&self) -> asx_rs::observability::AuditSinkDurability {
-        asx_rs::observability::AuditSinkDurability::Durable
-    }
-}
+`ebms.code` is an ebMS 3.0 §6.7 error code (`EBMS:0001` … `EBMS:0303`). `error.kind` names an `ErrorKind` (`storage` is `ErrorKind::Backend`) and is also an audit record's `error_kind`. The receive outcome `pending` and the closing event `fragment received` are reserved and not emitted.
 
-let bus = EventBus::builder()
-    .capacity(64)
-    .audit_sink(Arc::new(PostgresAuditSink { /* ... */ }))
-    .build()?;
+### Closing events
 
-// Or, for a regulated deployment — this additionally rejects a sink that is not
-// production-durable or does not integrity-protect its replay cursor:
-let bus = EventBus::new_regulated(64, Arc::new(PostgresAuditSink { /* ... */ }))?;
-```
+Every `asx.send` and `asx.receive` span ends with exactly one event inside it.
 
-The sink's `store_event` is called synchronously in the emit hot-path. Keep it fast; delegate to a background writer via an internal channel if latency matters.
+| Span | Condition | Level | Message |
+|---|---|---|---|
+| `asx.send` | delivered, or sent awaiting an asynchronous MDN | INFO | `message sent` |
+| `asx.send` | the partner answered with an `eb:Error` or a negative MDN | WARN | `partner returned an error` |
+| `asx.send` | transmitted, no verifiable receipt | ERROR | `delivery indeterminate` |
+| `asx.send` | failed before or during transmission (`config`, `transport`, `storage`) | WARN | `send failed` |
+| `asx.receive` | accepted | INFO | `message received` |
+| `asx.receive` | a fragment of an incomplete group was stored | INFO | `fragment received` |
+| `asx.receive` | duplicate or in flight | INFO | `duplicate message` |
+| `asx.receive` | rejected, before or after authentication | WARN | `message rejected` |
 
-`AuditEvent::timestamp` is a `u64` Unix seconds epoch value.
+Other events:
 
----
-
-## Per-Session Event Routing
-
-Subscribe to events for a single session using `subscribe_session_events`. This uses an `mpsc` channel keyed by `session_id`, giving O(1) delivery to the interested subscriber without broadcasting to all listeners:
-
-```rust
-let subscription = bus.subscribe_session_events("sess-acme-001")?;
-
-tokio::spawn(async move {
-    while let Some(event) = subscription.recv().await {
-        // Only events emitted for session "sess-acme-001"
-        println!("{:?}", event);
-    }
-});
-```
-
-Dead subscribers are pruned lazily on the next emit for that session — no explicit teardown needed.
-
-For global fan-out across all sessions (e.g., a metrics collector), use `subscribe_scoped_events`:
-
-```rust
-let mut rx = bus.subscribe_scoped_events();
-
-tokio::spawn(async move {
-    while let Some(event) = rx.recv().await {
-        // all events
-        println!("{}", event.event.kind());
-    }
-});
-```
-
----
-
-## Emit Semantics
-
-| Function | Error behaviour |
-|---|---|
-| `emit_audit_event` | Fail-closed — returns `Err` if the sink or backpressure policy rejects the event |
-
-Protocol operations use `emit_audit_event` for security-critical events (signature verification, deduplication). Best-effort behavior is available by configuring `EventBus` with `EventEmissionMode::BestEffort` and `BackpressureAction::Track`.
-
-Emission is strict by default. Select `EventEmissionMode::BestEffort` on the
-builder when subscriber liveness must not gate protocol progress, or
-`StrictWithAuditFallback` — which keeps strictness but persists to the durable
-sink instead of failing when no subscriber is live, and is accepted by the
-[regulated startup gate](@/docs/getting-started.md#regulated-startup-gate-strict-production).
-
----
-
-## AuditEvent Reference
-
-All protocol operations emit a subset of the following events. The list below is canonical; [the AS2 reference](@/docs/as2.md#audit-events) additionally maps them to AS2 send and receive stages.
-
-```rust
-pub struct AuditEvent {
-    pub event_type: AuditEventType,
-    pub session_id: String,
-    pub partner_id: Option<String>,
-    pub message_id: Option<String>,
-    pub timestamp: u64,             // Unix seconds
-    pub details: Option<String>,    // Freeform context (error messages, algorithm names, etc.)
-}
-```
-
-Common event types:
-
-| Event | Description |
-|---|---|
-| `OutboundPrepared` | Send path entered |
-| `MessageSigned` | Signature applied |
-| `MessageEncrypted` | Encryption applied |
-| `InboundReceived` | Receive path entered |
-| `DuplicateDetected` | Message ID already **accepted** — a genuine replay |
-| `DuplicateInFlight` | A concurrent delivery holds an unsettled dedup claim. A sustained rate means claims are being dropped unsettled, or the claim lease outlasts the sender's retransmission interval |
-| `SignatureVerified` | Cryptographic signature check passed |
-| `SignatureFailed` | Cryptographic signature check failed |
-| `MdnGenerated` | AS2 MDN constructed |
-| `MdnReceived` | AS2 MDN parsed from partner |
-| `ReceiptGenerated` | AS4 ebMS3 Receipt signal constructed |
-| `ReceiptReceived` | AS4 Receipt parsed from partner |
-| `PullRequestGenerated` | AS4 Pull request signal constructed |
-
----
+- an audit sink's failure: ERROR `audit record not written` (fields `record_id`, `message_id`, `signal.sha256`, `durability`) inside `asx.audit`;
+- revocation status `revoked` or `unknown`: WARN `certificate revocation status` (field `outcome`) inside `asx.revocation`;
+- a CA distrusted under the BDEW three-day rule: WARN `issuing CA distrusted`, and a CRL whose refresh keeps failing: WARN `CRL refresh failing`, both with fields `ca.fingerprint` (SHA-256 of the CA certificate), `since` (the last successful fetch, the passed `nextUpdate` or the first failed refresh, RFC 3339) and `reason`;
+- everything else is DEBUG.
 
 ## Metrics
 
-`EventBus` exposes atomic counters via `EventBusMetrics`:
+Feature `metrics`. Descriptions and units are registered on first emission. Label values come from the closed sets above; no label carries a partner, participant, message or certificate identifier.
 
-```rust
-let metrics = bus.metrics();
-println!("emitted: {}", metrics.emitted());
-println!("dropped: {}", metrics.dropped());
-println!("lagged:  {}", metrics.lagged());
+| Name | Type | Labels |
+|---|---|---|
+| `asx_messages_sent_total` | counter | `protocol`, `outcome` |
+| `asx_messages_received_total` | counter | `protocol`, `outcome` |
+| `asx_receipt_verifications_total` | counter | `protocol`, `outcome`, `nrr` |
+| `asx_revocation_checks_total` | counter | `method`, `outcome` |
+| `asx_audit_failures_total` | counter | `durability` |
+| `asx_send_duration_seconds` | histogram | `protocol`, `outcome` |
+| `asx_receive_duration_seconds` | histogram | `protocol`, `outcome` |
+
+- `asx_messages_*` and the duration histograms: when `asx.send` / `asx.receive` close, with the span's `outcome`.
+- `asx_receipt_verifications_total`: when the verification of an AS4 receipt or an AS2 MDN ends (`outcome` `ok`/`failed`).
+- `asx_revocation_checks_total`: when `asx.revocation` closes.
+- `asx_audit_failures_total`: when a sink returns `Err`.
+
+There is no `profile` label; the preset name is the span field `profile`.
+
+## Audit records
+
+Install an [`AuditSink`](https://docs.rs/asx-rs/latest/asx/trait.AuditSink.html) per client with `Builder::audit`; without one nothing is stored, but the record is still returned by `Verified::evidence()` and `Error::evidence()`. Implementing a sink, and what a sink failure means, is on the [persistence page](@/docs/persistence.md#the-audit-sink).
+
+### When a record is written
+
+| Leg | Direction / outcome | `signal` |
+|---|---|---|
+| AS4 send, receipt verified | outbound / `delivered` | the receipt as received |
+| AS4 send, `eb:Error` received | outbound / `partner_error` | the error signal |
+| AS4 send, response unverifiable | outbound / `indeterminate` | the response bytes, if any |
+| AS2 send (or `verify_async_mdn`) answered by an MDN | outbound / `delivered`, `partner_error` or `indeterminate` | the MDN |
+| AS4 or AS2 receive, handler returned `Ok` | inbound / `accepted` | the receipt or MDN issued for it |
+| Duplicate, in flight, or refused (before or after authentication) | — | no record |
+
+A record is written **before** an inbound dedup claim is accepted and before a verified receipt or MDN is returned to you.
+
+### The stored form
+
+`AuditRecord` is opaque; a sink stores its serde form. Bytes are standard base64 with padding, digests lowercase hex, `recorded_at` RFC 3339 UTC with three fractional digits, absent values `null`, enums snake_case; unknown fields are ignored on read, so newer records still load. Index accessors: `record_id()` (UUIDv7, the idempotency key), `message_id()`, `partner()`, `signal()`.
+
+```json
+{
+  "record_id": "01929d3e-6a1b-7c3e-9f00-3b5c2e4d1a77",
+  "recorded_at": "2026-10-16T09:30:12.345Z",
+  "protocol": "as4", "direction": "outbound", "outcome": "delivered",
+  "message_id": "c2a1f6e0-…@sender.example", "ref_to_message_id": null,
+  "conversation_id": "conv-1", "local_party": "9900000000001", "partner": "9900000000002",
+  "profile": "bdew", "service": "…", "action": "…",
+  "message_timestamp": "2026-10-16T09:30:11.902Z",
+  "signer": { "certificate_der": "MIIB…", "fingerprint_sha256": "3f1c…" },
+  "references": [ { "uri": "#body", "digest_algorithm": "http://www.w3.org/2001/04/xmlenc#sha256", "digest": "q1w2…" } ],
+  "mic": null,
+  "signal": {
+    "bytes": "PD94bWwg…", "sha256": "9a8b…", "message_id": "receipt-7@partner.example",
+    "ref_to_message_id": "c2a1f6e0-…@sender.example", "timestamp": "2026-10-16T09:30:12.201Z",
+    "signed": true, "nrr": [ { "uri": "#body", "digest_algorithm": "…", "digest": "q1w2…" } ]
+  },
+  "disposition": "receipt", "error_kind": null, "ebms_code": null, "quirks": []
+}
 ```
 
-These are `AtomicU64` values — safe to read from any thread without acquiring a lock. Expose them to Prometheus or your metrics sink by polling on a background task.
+`tests/fixtures/audit/record-as4-delivered.json` and `record-as2-mdn.json` pin this form. `quirks` lists every [partner quirk](@/docs/profiles.md#partners-and-quirks) the leg relied on.
 
-### Receipt-taxonomy and provider-health counters
+### Check your sink before production
 
-Two counter readouts summarise what the protocol paths classified:
+`asx_testkit::audit::conformance` checks the `durability()` claim through fresh handles to the same store.
 
-```rust
-let metrics = bus.metrics();
+```rust,no_run
+use asx::{AuditRecord, BoxFuture};
+use asx_testkit::audit::{conformance, AuditSinkHarness, MemoryAuditSink};
 
-let receipts = metrics.as4_receipt_taxonomy_snapshot();
-println!(
-    "receipts: {} classified, {} security failures, {} interop failures",
-    receipts.total,
-    receipts.security_verification_failed,
-    receipts.semantic_interop_failure,
-);
+/// Opens handles to the store under test. `MemoryAuditSink` stands in for
+/// yours: its clones share one store, as connections to a database do.
+struct Harness(MemoryAuditSink);
 
-let providers = metrics.as2_provider_health_snapshot();
-println!(
-    "spool key provider: {} of {} transitions were into `failing`",
-    providers.transition_to_failing,
-    providers.total_transitions,
-);
+impl AuditSinkHarness for Harness {
+    type Sink = MemoryAuditSink;
+    fn open(&self) -> BoxFuture<'_, MemoryAuditSink> {
+        Box::pin(async move { self.0.clone() })
+    }
+    fn read_all<'a>(&'a self, sink: &'a MemoryAuditSink) -> BoxFuture<'a, Vec<AuditRecord>> {
+        Box::pin(async move { sink.records() })
+    }
+}
+
+#[tokio::main]
+async fn main() {
+    let failures = conformance(&Harness(MemoryAuditSink::new())).await;
+    assert!(failures.is_empty(), "{failures:#?}");
+}
 ```
 
-Numbers, not verdicts.
-
-### Where the thresholds live
-
-`asx-rs` ships no alerting engine: no thresholds, no severity grading, no
-incident types, no scheduler. Whether a 1 % receipt-verification failure rate is
-normal or an incident is a partner-SLA and topology question, and the monitoring
-stack you already run answers it better than a library can.
-
-Scrape the counters, or consume `AsxEvent::ReceiptTaxonomyOutcome`, and write
-the rule where your other rules live:
-
-```promql
-# Page when more than 1% of classified receipts fail verification over 15
-# minutes, with a meaningful sample.
-(
-  sum(rate(asx_as4_receipt_taxonomy_outcome_total{outcome="security_verification_failed"}[15m]))
-  /
-  sum(rate(asx_as4_receipt_taxonomy_outcome_total[15m]))
-) > 0.01
-and
-sum(increase(asx_as4_receipt_taxonomy_outcome_total[15m])) > 100
-```
-
-Metric names are API: renaming one breaks dashboards and alert rules this
-repository cannot see.
+| Check | Fails a sink that … |
+|---|---|
+| `audit.declares_durable` | declares `BestEffort` (nothing else runs) |
+| `audit.recorded_is_readable` | acknowledges a record that its own handle cannot read |
+| `audit.records_survive_a_fresh_handle` | keeps records per handle |
+| `audit.every_field_round_trips` | loses or alters a field of `sample_records()` |
+| `audit.bytes_round_trip_exactly` | alters non-UTF-8 bytes (a 1 MiB signal included) |
+| `audit.record_is_idempotent_by_id` | stores a retried record twice |
+| `audit.distinct_ids_are_distinct_records` | merges records that share a `message_id` |
+| `audit.concurrent_records_all_land` | loses records under 64 concurrent writes over 8 handles |

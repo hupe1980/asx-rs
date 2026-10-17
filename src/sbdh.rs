@@ -36,8 +36,8 @@
 //!
 //! ## Usage
 //!
-//! ```rust
-//! # use asx_rs::sbdh::{
+//! ```text
+//! # use asx::sbdh::{
 //! #     StandardBusinessDocument, SbdhHeader, SbdhParty, SbdhDocumentIdentification,
 //! #     SbdhScope, peppol_scope,
 //! # };
@@ -78,18 +78,10 @@
 //! assert_eq!(parsed.payload, b"<Invoice/>");
 //! ```
 
-use crate::core::{AsxError, ErrorCode, ErrorContext, Result, escape_xml};
-use roxmltree::Document;
+use crate::core::{AsxError, ErrorCode, ErrorContext, Result};
 
 /// XML namespace for SBDH 1.3 documents.
-pub const SBDH_NAMESPACE: &str =
-    "http://www.unece.org/cefact/namespaces/StandardBusinessDocumentHeader";
-
-/// Closing tag used to locate the end of the header block during parsing.
-const HEADER_CLOSE_TAG: &[u8] = b"</StandardBusinessDocumentHeader>";
-
-/// Closing tag used to locate the end of the document envelope during parsing.
-const DOCUMENT_CLOSE_TAG: &[u8] = b"</StandardBusinessDocument>";
+pub const SBDH_NAMESPACE: &str = crate::xml::ns::SBDH;
 
 // ── Public types ──────────────────────────────────────────────────────────────
 
@@ -136,7 +128,7 @@ pub struct SbdhDocumentIdentification {
 // ── Business scope ───────────────────────────────────────────────────────────
 
 /// Peppol's namespace for the non-XML payload wrappers.
-pub const PEPPOL_ENVELOPE_NAMESPACE: &str = "http://peppol.eu/xsd/ticc/envelope/1.0";
+pub const PEPPOL_ENVELOPE_NAMESPACE: &str = crate::xml::ns::PEPPOL_ENVELOPE;
 
 /// Well-known `Scope/Type` values reserved by the Peppol network.
 ///
@@ -244,8 +236,8 @@ pub struct SbdhHeader {
 impl SbdhHeader {
     /// The first scope with this `Type`, if present.
     ///
-    /// ```
-    /// # use asx_rs::sbdh::{SbdhHeader, SbdhScope, peppol_scope};
+    /// ```text
+    /// # use asx::sbdh::{SbdhHeader, SbdhScope, peppol_scope};
     /// # fn example(header: &SbdhHeader) {
     /// let doc_type = header.scope(peppol_scope::DOCUMENT_ID);
     /// # let _ = doc_type;
@@ -292,54 +284,78 @@ impl StandardBusinessDocument {
     /// cannot be safely escaped (e.g., invalid UTF-8 in fields derived from
     /// untrusted input).
     pub fn wrap(&self) -> Result<Vec<u8>> {
+        use crate::xml::{XmlLimits, XmlOut, ns};
         let h = &self.header;
         let di = &h.document_identification;
-        let multiple_type = if di.multiple_type { "true" } else { "false" };
+        let payload = std::str::from_utf8(&self.payload).map_err(|_| {
+            AsxError::new(
+                ErrorCode::InvalidInput,
+                "SBDH payload is not valid UTF-8",
+                ErrorContext::new("sbdh_wrap"),
+            )
+        })?;
 
-        let xml = format!(
-            r#"<?xml version="1.0" encoding="UTF-8"?>
-<StandardBusinessDocument xmlns="{ns}">
-  <StandardBusinessDocumentHeader>
-    <HeaderVersion>{hv}</HeaderVersion>
-    <Sender>
-      <Identifier Authority="{sender_auth}">{sender_id}</Identifier>
-    </Sender>
-    <Receiver>
-      <Identifier Authority="{receiver_auth}">{receiver_id}</Identifier>
-    </Receiver>
-    <DocumentIdentification>
-      <Standard>{standard}</Standard>
-      <TypeVersion>{type_version}</TypeVersion>
-      <InstanceIdentifier>{instance_id}</InstanceIdentifier>
-      <Type>{doc_type}</Type>
-      <MultipleType>{multiple_type}</MultipleType>
-      <CreationDateAndTime>{created_at}</CreationDateAndTime>
-    </DocumentIdentification>{business_scope}
-  </StandardBusinessDocumentHeader>
-  {payload}
-</StandardBusinessDocument>"#,
-            ns = SBDH_NAMESPACE,
-            hv = escape_xml(&h.header_version),
-            sender_auth = escape_xml(&h.sender.authority),
-            sender_id = escape_xml(&h.sender.identifier),
-            receiver_auth = escape_xml(&h.receiver.authority),
-            receiver_id = escape_xml(&h.receiver.identifier),
-            standard = escape_xml(&di.standard),
-            type_version = escape_xml(&di.type_version),
-            instance_id = escape_xml(&di.instance_identifier),
-            doc_type = escape_xml(&di.r#type),
-            multiple_type = multiple_type,
-            created_at = escape_xml(&di.creation_date_and_time),
-            business_scope = render_business_scope(&h.business_scope),
-            payload = std::str::from_utf8(&self.payload).map_err(|_| {
-                AsxError::new(
-                    ErrorCode::InvalidInput,
-                    "SBDH payload is not valid UTF-8",
-                    ErrorContext::new("sbdh_wrap"),
-                )
-            })?,
-        );
-        Ok(xml.into_bytes())
+        // The envelope uses the `sh:` prefix (as phase4 writes it), so an
+        // unprefixed payload keeps its own namespace instead of inheriting the
+        // SBDH default namespace.
+        let mut out = XmlOut::new();
+        out.declaration();
+        out.start("sh:StandardBusinessDocument")?
+            .ns("sh", ns::SBDH)?;
+        out.start("sh:StandardBusinessDocumentHeader")?;
+        out.leaf(
+            "sh:HeaderVersion",
+            &h.header_version,
+            "SbdhHeader::header_version",
+        )?;
+        for (element, party, field) in [
+            ("sh:Sender", &h.sender, "SbdhHeader::sender"),
+            ("sh:Receiver", &h.receiver, "SbdhHeader::receiver"),
+        ] {
+            out.start(element)?
+                .start("sh:Identifier")?
+                .attr("Authority", &party.authority, field)?
+                .text(&party.identifier, field)?
+                .end()?
+                .end()?;
+        }
+        out.start("sh:DocumentIdentification")?;
+        out.leaf(
+            "sh:Standard",
+            &di.standard,
+            "SbdhDocumentIdentification::standard",
+        )?;
+        out.leaf(
+            "sh:TypeVersion",
+            &di.type_version,
+            "SbdhDocumentIdentification::type_version",
+        )?;
+        out.leaf(
+            "sh:InstanceIdentifier",
+            &di.instance_identifier,
+            "SbdhDocumentIdentification::instance_identifier",
+        )?;
+        out.leaf("sh:Type", &di.r#type, "SbdhDocumentIdentification::type")?;
+        out.leaf(
+            "sh:MultipleType",
+            if di.multiple_type { "true" } else { "false" },
+            "SbdhDocumentIdentification::multiple_type",
+        )?;
+        out.leaf(
+            "sh:CreationDateAndTime",
+            &di.creation_date_and_time,
+            "SbdhDocumentIdentification::creation_date_and_time",
+        )?;
+        out.end()?;
+        write_business_scope(&mut out, &h.business_scope)?;
+        out.end()?;
+        out.document_element(
+            payload,
+            XmlLimits::payload(crate::core::DEFAULT_MAX_BODY_BYTES),
+            "StandardBusinessDocument::payload",
+        )?;
+        out.end()?;
+        Ok(out.finish()?.into_string()?.into_bytes())
     }
 
     // ── Parsing ───────────────────────────────────────────────────────────────
@@ -359,132 +375,213 @@ impl StandardBusinessDocument {
     /// required SBDH elements, or not valid UTF-8.
     pub fn unwrap(bytes: &[u8]) -> Result<Self> {
         let ctx = || ErrorContext::new("sbdh_unwrap");
-
-        // Locate the end of <StandardBusinessDocumentHeader>.
-        let header_end_pos = find_subsequence(bytes, HEADER_CLOSE_TAG).ok_or_else(|| {
+        let doc = crate::xml::parse_bytes(
+            bytes,
+            crate::xml::XmlLimits::payload(crate::core::DEFAULT_MAX_BODY_BYTES),
+            "sbdh_unwrap",
+        )
+        .map_err(|err| {
             AsxError::new(
                 ErrorCode::ParseFailed,
-                "SBDH missing </StandardBusinessDocumentHeader>",
+                format!("SBDH XML is malformed: {}", err.message),
                 ctx(),
             )
         })?;
-
-        let header = parse_sbdh_header(bytes, ctx)?;
-
-        // Extract payload: everything after </StandardBusinessDocumentHeader>
-        // and before </StandardBusinessDocument>.
-        let after_header = &bytes[header_end_pos + HEADER_CLOSE_TAG.len()..];
-        let payload_end = find_subsequence(after_header, DOCUMENT_CLOSE_TAG).ok_or_else(|| {
+        let root = doc.root_element();
+        if !is_sbdh(root, "StandardBusinessDocument") {
+            return Err(AsxError::new(
+                ErrorCode::ParseFailed,
+                "SBDH root element is not {http://www.unece.org/cefact/namespaces/\
+                 StandardBusinessDocumentHeader}StandardBusinessDocument",
+                ctx(),
+            ));
+        }
+        let mut children = root.children().filter(roxmltree::Node::is_element);
+        let header_node = children
+            .next()
+            .filter(|n| is_sbdh(*n, "StandardBusinessDocumentHeader"))
+            .ok_or_else(|| {
+                AsxError::new(
+                    ErrorCode::ParseFailed,
+                    "SBDH missing StandardBusinessDocumentHeader as the first child",
+                    ctx(),
+                )
+            })?;
+        let header = parse_sbdh_header(header_node, ctx)?;
+        let payload_node = children.next().ok_or_else(|| {
             AsxError::new(
                 ErrorCode::ParseFailed,
-                "SBDH missing </StandardBusinessDocument>",
+                "SBDH carries no payload element after its header",
                 ctx(),
             )
         })?;
-
-        let payload_slice = &after_header[..payload_end];
-        let payload = trim_ascii(payload_slice).to_vec();
-
-        Ok(Self { header, payload })
+        if children.next().is_some() {
+            return Err(AsxError::new(
+                ErrorCode::ParseFailed,
+                "SBDH carries more than one payload element",
+                ctx(),
+            ));
+        }
+        let payload = payload_with_inherited_namespaces(doc.input_text(), payload_node)?;
+        Ok(Self {
+            header,
+            payload: payload.into_bytes(),
+        })
     }
+}
+
+fn is_sbdh(node: roxmltree::Node<'_, '_>, local: &str) -> bool {
+    node.is_element()
+        && node.tag_name().namespace() == Some(SBDH_NAMESPACE)
+        && node.tag_name().name() == local
+}
+
+/// The payload element's source bytes, with every namespace it uses but
+/// inherits from the envelope re-declared on its start tag, so the payload is
+/// a well-formed document on its own (an SBDH may declare a prefix the
+/// payload uses).
+fn payload_with_inherited_namespaces(
+    text: &str,
+    payload: roxmltree::Node<'_, '_>,
+) -> Result<String> {
+    let element = &text[payload.range()];
+    let start_tag_end = start_tag_end(element);
+    let own = own_namespace_declarations(&element[..start_tag_end]);
+    // Prefixes the payload subtree uses: element prefixes as written, and the
+    // in-scope prefix of every namespaced attribute.
+    let mut used: Vec<Option<&str>> = Vec::new();
+    for node in payload.descendants().filter(roxmltree::Node::is_element) {
+        let source = &text[node.range()];
+        let qname_end = source[1..]
+            .find(|c: char| c.is_whitespace() || c == '/' || c == '>')
+            .map_or(source.len(), |i| i + 1);
+        let prefix = source[1..qname_end].split_once(':').map(|(p, _)| p);
+        if !used.contains(&prefix) {
+            used.push(prefix);
+        }
+        for attr in node.attributes() {
+            if let Some(uri) = attr.namespace() {
+                let prefix = node.lookup_prefix(uri);
+                if prefix.is_some() && !used.contains(&prefix) {
+                    used.push(prefix);
+                }
+            }
+        }
+    }
+    let mut extra = String::new();
+    for ns in payload.namespaces() {
+        let prefix = ns.name();
+        if prefix == Some("xml") || own.contains(&prefix) || !used.contains(&prefix) {
+            continue;
+        }
+        match prefix {
+            Some(p) => {
+                extra.push_str(" xmlns:");
+                extra.push_str(p);
+            }
+            None => extra.push_str(" xmlns"),
+        }
+        extra.push_str("=\"");
+        crate::crypto::wssec::canonicalize::escape_attr_value(ns.uri(), &mut extra).map_err(
+            |_| {
+                AsxError::new(
+                    ErrorCode::ParseFailed,
+                    "SBDH payload namespace could not be re-declared",
+                    ErrorContext::new("sbdh_unwrap"),
+                )
+            },
+        )?;
+        extra.push('"');
+    }
+    if extra.is_empty() {
+        return Ok(element.to_string());
+    }
+    let name_end = element[1..]
+        .find(|c: char| c.is_whitespace() || c == '/' || c == '>')
+        .map_or(element.len(), |i| i + 1);
+    Ok(format!(
+        "{}{}{}",
+        &element[..name_end],
+        extra,
+        &element[name_end..]
+    ))
+}
+
+/// Index of the unquoted `>` that ends the start tag at the beginning of
+/// `element`.
+fn start_tag_end(element: &str) -> usize {
+    let mut quote = None;
+    for (i, b) in element.bytes().enumerate() {
+        match quote {
+            Some(q) if b == q => quote = None,
+            Some(_) => {}
+            None if b == b'"' || b == b'\'' => quote = Some(b),
+            None if b == b'>' => return i,
+            None => {}
+        }
+    }
+    element.len()
+}
+
+/// Prefixes (`None` = default namespace) declared on a start tag.
+fn own_namespace_declarations(start_tag: &str) -> Vec<Option<&str>> {
+    let mut own = Vec::new();
+    let mut rest = start_tag;
+    while let Some(at) = rest.find("xmlns") {
+        let before = rest[..at].chars().last();
+        let after = &rest[at + 5..];
+        if before.is_some_and(char::is_whitespace) {
+            if let Some(tail) = after.strip_prefix(':') {
+                let end = tail
+                    .find(|c: char| c == '=' || c.is_whitespace())
+                    .unwrap_or(tail.len());
+                own.push(Some(&tail[..end]));
+            } else if after.trim_start().starts_with('=') {
+                own.push(None);
+            }
+        }
+        rest = after;
+    }
+    own
 }
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
 
-/// Returns the byte offset of the first occurrence of `needle` in `haystack`,
-/// or `None` if not found.
-/// Render `<BusinessScope>`, or nothing when there are no scopes.
+/// Write `<BusinessScope>`, or nothing when there are no scopes.
 ///
 /// An empty `<BusinessScope/>` is not the same as an absent one: the Peppol
 /// schema gives `Scope` a lower bound of 1 (BME 2.0.1 fixed exactly this), so
 /// emitting an empty container would produce an envelope that fails schema
 /// validation at the receiving access point.
-fn render_business_scope(scopes: &[SbdhScope]) -> String {
+fn write_business_scope(out: &mut crate::xml::XmlOut, scopes: &[SbdhScope]) -> Result<()> {
     if scopes.is_empty() {
-        return String::new();
+        return Ok(());
     }
-
-    let mut out = String::from("\n    <BusinessScope>");
+    out.start("sh:BusinessScope")?;
     for scope in scopes {
-        out.push_str("\n      <Scope>");
-        out.push_str(&format!(
-            "\n        <Type>{}</Type>",
-            escape_xml(&scope.scope_type)
-        ));
+        out.start("sh:Scope")?;
+        out.leaf("sh:Type", &scope.scope_type, "SbdhScope::scope_type")?;
         // Always emitted, even when empty: an indicator attribute is a present
         // element with no value.
-        out.push_str(&format!(
-            "\n        <InstanceIdentifier>{}</InstanceIdentifier>",
-            escape_xml(&scope.instance_identifier)
-        ));
+        out.leaf(
+            "sh:InstanceIdentifier",
+            &scope.instance_identifier,
+            "SbdhScope::instance_identifier",
+        )?;
         if let Some(identifier) = &scope.identifier {
-            out.push_str(&format!(
-                "\n        <Identifier>{}</Identifier>",
-                escape_xml(identifier)
-            ));
+            out.leaf("sh:Identifier", identifier, "SbdhScope::identifier")?;
         }
-        out.push_str("\n      </Scope>");
+        out.end()?;
     }
-    out.push_str("\n    </BusinessScope>");
-    out
+    out.end()?;
+    Ok(())
 }
 
-fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    if needle.is_empty() || needle.len() > haystack.len() {
-        return None;
-    }
-    haystack.windows(needle.len()).position(|w| w == needle)
-}
-
-/// Trim leading and trailing ASCII whitespace from a byte slice.
-fn trim_ascii(s: &[u8]) -> &[u8] {
-    let start = s
-        .iter()
-        .position(|b| !b.is_ascii_whitespace())
-        .unwrap_or(s.len());
-    let end = s
-        .iter()
-        .rposition(|b| !b.is_ascii_whitespace())
-        .map(|i| i + 1)
-        .unwrap_or(0);
-    if start >= end { &[] } else { &s[start..end] }
-}
-
-/// Parse the SBDH header from a full SBDH-wrapped document using roxmltree.
-///
-/// Navigates the DOM to `StandardBusinessDocumentHeader` and extracts all
-/// required fields.  Requires the full document bytes (valid XML including the
-/// outer `<StandardBusinessDocument>` element and its payload child).
-fn parse_sbdh_header(bytes: &[u8], ctx: impl Fn() -> ErrorContext) -> Result<SbdhHeader> {
-    let xml_str = std::str::from_utf8(bytes).map_err(|_| {
-        AsxError::new(
-            ErrorCode::ParseFailed,
-            "SBDH document is not valid UTF-8",
-            ctx(),
-        )
-    })?;
-
-    let doc = Document::parse(xml_str).map_err(|e| {
-        AsxError::new(
-            ErrorCode::ParseFailed,
-            format!("SBDH XML is malformed: {e}"),
-            ctx(),
-        )
-    })?;
-
-    // Locate <StandardBusinessDocumentHeader>
-    let sbdh = doc
-        .root_element()
-        .descendants()
-        .find(|n| n.is_element() && n.tag_name().name() == "StandardBusinessDocumentHeader")
-        .ok_or_else(|| {
-            AsxError::new(
-                ErrorCode::ParseFailed,
-                "SBDH missing StandardBusinessDocumentHeader",
-                ctx(),
-            )
-        })?;
-
+/// Read the header fields from the `StandardBusinessDocumentHeader` node.
+fn parse_sbdh_header(
+    sbdh: roxmltree::Node<'_, '_>,
+    ctx: impl Fn() -> ErrorContext,
+) -> Result<SbdhHeader> {
     // Helper: find a direct child element by local name and return its trimmed text.
     let find_text = |parent: roxmltree::Node<'_, '_>, name: &str| -> Option<String> {
         parent
@@ -706,15 +803,15 @@ mod tests {
         let bytes = doc.wrap().expect("wrap");
         let xml = std::str::from_utf8(&bytes).expect("utf8");
         assert!(
-            xml.contains("<StandardBusinessDocument"),
+            xml.contains("<sh:StandardBusinessDocument"),
             "outer element present"
         );
         assert!(
-            xml.contains("<StandardBusinessDocumentHeader>"),
+            xml.contains("<sh:StandardBusinessDocumentHeader>"),
             "header element present"
         );
         assert!(
-            xml.contains("<HeaderVersion>1.0</HeaderVersion>"),
+            xml.contains("<sh:HeaderVersion>1.0</sh:HeaderVersion>"),
             "header version"
         );
         assert!(xml.contains("0007:1234567890"), "sender id");
@@ -765,18 +862,63 @@ mod tests {
         assert!(result.is_err());
     }
 
+    const HEADER_BODY: &str = "<sh:HeaderVersion>1.0</sh:HeaderVersion>\
+        <sh:Sender><sh:Identifier Authority=\"iso6523-actorid-upis\">0088:s</sh:Identifier></sh:Sender>\
+        <sh:Receiver><sh:Identifier Authority=\"iso6523-actorid-upis\">0088:r</sh:Identifier></sh:Receiver>\
+        <sh:DocumentIdentification><sh:Standard>urn:x</sh:Standard><sh:TypeVersion>2.1</sh:TypeVersion>\
+        <sh:InstanceIdentifier>i</sh:InstanceIdentifier><sh:Type>Invoice</sh:Type>\
+        <sh:CreationDateAndTime>2026-10-16T12:00:00Z</sh:CreationDateAndTime></sh:DocumentIdentification>";
+
+    /// phase4 writes the SBDH with an `sh:` prefix; the header and the
+    /// payload come from the DOM, not from a byte search for unprefixed tags.
     #[test]
-    fn find_subsequence_works() {
-        assert_eq!(find_subsequence(b"hello world", b"world"), Some(6));
-        assert_eq!(find_subsequence(b"hello", b"xyz"), None);
-        assert_eq!(find_subsequence(b"abc", b""), None);
+    fn prefixed_sbdh_unwraps() {
+        let xml = format!(
+            "<sh:StandardBusinessDocument xmlns:sh=\"{SBDH_NAMESPACE}\">\
+             <sh:StandardBusinessDocumentHeader>{HEADER_BODY}</sh:StandardBusinessDocumentHeader>\
+             <Invoice xmlns=\"urn:inv\"><ID>1</ID></Invoice></sh:StandardBusinessDocument>"
+        );
+        let parsed = StandardBusinessDocument::unwrap(xml.as_bytes()).expect("unwrap");
+        assert_eq!(parsed.header.sender.identifier, "0088:s");
+        assert_eq!(
+            parsed.payload,
+            b"<Invoice xmlns=\"urn:inv\"><ID>1</ID></Invoice>".to_vec()
+        );
     }
 
     #[test]
-    fn trim_ascii_removes_whitespace() {
-        assert_eq!(trim_ascii(b"  hello  "), b"hello");
-        assert_eq!(trim_ascii(b"\n\t<Tag/>\n"), b"<Tag/>");
-        assert_eq!(trim_ascii(b"   "), b"");
+    fn comment_with_close_tag_does_not_split_payload() {
+        let payload =
+            "<Invoice xmlns=\"urn:inv\"><!-- </StandardBusinessDocument> --><ID>1</ID></Invoice>";
+        let xml = format!(
+            "<sh:StandardBusinessDocument xmlns:sh=\"{SBDH_NAMESPACE}\">\
+             <sh:StandardBusinessDocumentHeader>{HEADER_BODY}</sh:StandardBusinessDocumentHeader>\
+             {payload}</sh:StandardBusinessDocument>"
+        );
+        let parsed = StandardBusinessDocument::unwrap(xml.as_bytes()).expect("unwrap");
+        assert_eq!(parsed.payload, payload.as_bytes().to_vec());
+    }
+
+    /// A payload that uses a prefix declared on the SBDH root must stay a
+    /// well-formed document on its own: the inherited declaration is
+    /// re-declared on the payload root.
+    #[test]
+    fn payload_redeclares_inherited_namespaces() {
+        let xml = format!(
+            "<sh:StandardBusinessDocument xmlns:sh=\"{SBDH_NAMESPACE}\" xmlns:cbc=\"urn:cbc\">\
+             <sh:StandardBusinessDocumentHeader>{HEADER_BODY}</sh:StandardBusinessDocumentHeader>\
+             <Invoice xmlns=\"urn:inv\"><cbc:ID>1</cbc:ID></Invoice></sh:StandardBusinessDocument>"
+        );
+        let parsed = StandardBusinessDocument::unwrap(xml.as_bytes()).expect("unwrap");
+        let payload = String::from_utf8(parsed.payload).unwrap();
+        let doc = roxmltree::Document::parse(&payload)
+            .unwrap_or_else(|e| panic!("the payload must stand alone: {e}\n{payload}"));
+        let id = doc
+            .descendants()
+            .find(|n| n.tag_name().name() == "ID")
+            .expect("cbc:ID");
+        assert_eq!(id.tag_name().namespace(), Some("urn:cbc"));
+        assert_eq!(doc.root_element().tag_name().namespace(), Some("urn:inv"));
     }
 }
 
@@ -795,24 +937,30 @@ mod tests {
 /// **Not for XML.** The specification says this wrapper MUST NOT be used for a
 /// plain XML payload — that goes in directly.
 ///
-/// ```
-/// use asx_rs::sbdh::wrap_binary_payload;
+/// ```text
+/// use asx::sbdh::wrap_binary_payload;
 ///
-/// let xml = wrap_binary_payload(b"%PDF-1.7", "application/pdf", None);
+/// let xml = wrap_binary_payload(b"%PDF-1.7", "application/pdf", None)?;
 /// assert!(xml.starts_with("<BinaryContent"));
 /// assert!(xml.contains(r#"mimeType="application/pdf""#));
+/// # Ok::<(), asx::core::AsxError>(())
 /// ```
-pub fn wrap_binary_payload(payload: &[u8], mime_type: &str, encoding: Option<&str>) -> String {
+pub fn wrap_binary_payload(
+    payload: &[u8],
+    mime_type: &str,
+    encoding: Option<&str>,
+) -> Result<String> {
     use base64::Engine as _;
     let encoded = base64::engine::general_purpose::STANDARD.encode(payload);
-    let encoding_attr = encoding
-        .map(|e| format!(r#" encoding="{}""#, escape_xml(e)))
-        .unwrap_or_default();
-    format!(
-        r#"<BinaryContent xmlns="{ns}" mimeType="{mime}"{encoding_attr}>{encoded}</BinaryContent>"#,
-        ns = PEPPOL_ENVELOPE_NAMESPACE,
-        mime = escape_xml(mime_type),
-    )
+    let mut out = crate::xml::XmlOut::new();
+    out.start("BinaryContent")?
+        .ns("", PEPPOL_ENVELOPE_NAMESPACE)?
+        .attr("mimeType", mime_type, "mime_type")?;
+    if let Some(encoding) = encoding {
+        out.attr("encoding", encoding, "encoding")?;
+    }
+    out.text(&encoded, "payload")?.end()?;
+    out.finish()?.into_string()
 }
 
 /// Wrap a **text** payload for transport inside an SBDH (BME §2.3.2).
@@ -824,19 +972,21 @@ pub fn wrap_binary_payload(payload: &[u8], mime_type: &str, encoding: Option<&st
 ///
 /// **Not for XML.**
 ///
-/// ```
-/// use asx_rs::sbdh::wrap_text_payload;
+/// ```text
+/// use asx::sbdh::wrap_text_payload;
 ///
-/// let xml = wrap_text_payload("UNB+UNOA:2+...", "Application/EDIFACT");
+/// let xml = wrap_text_payload("UNB+UNOA:2+...", "Application/EDIFACT")?;
 /// assert!(xml.contains("UNB+UNOA:2+..."));
+/// # Ok::<(), asx::core::AsxError>(())
 /// ```
-pub fn wrap_text_payload(payload: &str, mime_type: &str) -> String {
-    format!(
-        r#"<TextContent xmlns="{ns}" mimeType="{mime}">{body}</TextContent>"#,
-        ns = PEPPOL_ENVELOPE_NAMESPACE,
-        mime = escape_xml(mime_type),
-        body = escape_xml(payload),
-    )
+pub fn wrap_text_payload(payload: &str, mime_type: &str) -> Result<String> {
+    let mut out = crate::xml::XmlOut::new();
+    out.start("TextContent")?
+        .ns("", PEPPOL_ENVELOPE_NAMESPACE)?
+        .attr("mimeType", mime_type, "mime_type")?
+        .text(payload, "payload")?
+        .end()?;
+    out.finish()?.into_string()
 }
 
 #[cfg(test)]
@@ -974,7 +1124,8 @@ mod business_scope_tests {
             b"hello",
             "application/vnd.etsi.asic-e+zip",
             Some("iso-8859-1"),
-        );
+        )
+        .expect("wrap");
         assert!(xml.contains(r#"xmlns="http://peppol.eu/xsd/ticc/envelope/1.0""#));
         assert!(xml.contains(r#"mimeType="application/vnd.etsi.asic-e+zip""#));
         assert!(xml.contains(r#"encoding="iso-8859-1""#));
@@ -983,7 +1134,7 @@ mod business_scope_tests {
 
     #[test]
     fn text_payload_wrapper_escapes_xml_special_characters() {
-        let xml = wrap_text_payload("a<b&c", "Application/EDIFACT");
+        let xml = wrap_text_payload("a<b&c", "Application/EDIFACT").expect("wrap");
         assert!(xml.contains("a&lt;b&amp;c"), "must stay well-formed: {xml}");
         assert!(!xml.contains("a<b"), "raw '<' must not survive: {xml}");
     }
@@ -996,10 +1147,8 @@ mod peppol_example_conformance {
     /// The specification's own example instance, parsed.
     ///
     /// Copied from Peppol Business Message Envelope 2.0.2 §3.1 (non-normative
-    /// example). Parsing the document the standard prints is the closest this
-    /// module gets to a foreign witness: the alternative is asserting that our
-    /// serializer round-trips through our own parser, which agrees with itself
-    /// by construction.
+    /// example): a foreign witness, unlike a round trip through our own
+    /// serializer and parser.
     const BME_EXAMPLE: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 <StandardBusinessDocument xmlns="http://www.unece.org/cefact/namespaces/StandardBusinessDocumentHeader">
   <StandardBusinessDocumentHeader>

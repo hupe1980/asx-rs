@@ -1,0 +1,233 @@
+pub mod asx
+pub mod asx::as2
+pub struct asx::as2::As2(_)
+impl asx::as2::As2
+pub fn asx::as2::As2::builder(asx::Profile) -> asx::Builder<asx::as2::As2>
+pub fn asx::as2::As2::inbound(&self, impl asx::DedupStore, impl asx::Handler<asx::as2::Received>) -> asx::Inbound
+pub async fn asx::as2::As2::send(&self, asx::as2::Message) -> asx::Result<asx::Verified<asx::Receipt>>
+pub async fn asx::as2::As2::send_async_mdn(&self, asx::as2::Message, &str) -> asx::Result<asx::as2::PendingMdn>
+pub async fn asx::as2::As2::verify_async_mdn(&self, http::request::Request<bytes::bytes::Bytes>, &asx::as2::PendingMdn) -> asx::Result<asx::Verified<asx::Receipt>>
+pub struct asx::as2::Message
+impl asx::as2::Message
+pub fn asx::as2::Message::message_id(self, impl core::convert::Into<alloc::string::String>) -> asx::as2::Message
+pub fn asx::as2::Message::to(&asx::Partner, asx::Payload) -> asx::as2::Message
+pub struct asx::as2::PendingMdn
+impl asx::as2::PendingMdn
+pub fn asx::as2::PendingMdn::lookup_key(&http::request::Request<bytes::bytes::Bytes>) -> core::option::Option<alloc::string::String>
+pub fn asx::as2::PendingMdn::message_id(&self) -> &str
+pub struct asx::as2::Received
+impl asx::as2::Received
+pub fn asx::as2::Received::from(&self) -> &str
+pub fn asx::as2::Received::message_id(&self) -> &str
+pub fn asx::as2::Received::payload(&self) -> &asx::Payload
+pub mod asx::as4
+#[non_exhaustive] pub enum asx::as4::PathSwitch
+pub asx::as4::PathSwitch::Confirm
+pub asx::as4::PathSwitch::Request
+pub struct asx::as4::As4(_)
+impl asx::as4::As4
+pub fn asx::as4::As4::builder(asx::Profile) -> asx::Builder<asx::as4::As4>
+pub fn asx::as4::As4::inbound(&self, impl asx::DedupStore, impl asx::Handler<asx::as4::UserMessage>) -> asx::Inbound
+pub async fn asx::as4::As4::send(&self, asx::as4::Message) -> asx::Result<asx::Verified<asx::Receipt>>
+pub struct asx::as4::Message
+impl asx::as4::Message
+pub fn asx::as4::Message::action(self, impl core::convert::Into<alloc::string::String>) -> asx::as4::Message
+pub fn asx::as4::Message::conversation_id(self, impl core::convert::Into<alloc::string::String>) -> asx::as4::Message
+pub fn asx::as4::Message::message_id(self, impl core::convert::Into<alloc::string::String>) -> asx::as4::Message
+pub fn asx::as4::Message::path_switch(&asx::Partner, asx::as4::PathSwitch) -> asx::as4::Message
+pub fn asx::as4::Message::payload(self, asx::Payload) -> asx::as4::Message
+pub fn asx::as4::Message::ping(&asx::Partner) -> asx::as4::Message
+pub fn asx::as4::Message::service(self, impl core::convert::Into<alloc::string::String>) -> asx::as4::Message
+pub fn asx::as4::Message::timestamp(self, std::time::SystemTime) -> asx::as4::Message
+pub fn asx::as4::Message::to(&asx::Partner) -> asx::as4::Message
+pub struct asx::as4::UserMessage
+impl asx::as4::UserMessage
+pub fn asx::as4::UserMessage::action(&self) -> &str
+pub fn asx::as4::UserMessage::conversation_id(&self) -> &str
+pub fn asx::as4::UserMessage::from(&self) -> &str
+pub fn asx::as4::UserMessage::message_id(&self) -> &str
+pub fn asx::as4::UserMessage::path_switch(&self) -> core::option::Option<asx::as4::PathSwitch>
+pub fn asx::as4::UserMessage::payloads(&self) -> &[asx::Payload]
+pub fn asx::as4::UserMessage::service(&self) -> &str
+pub mod asx::peppol
+pub struct asx::peppol::Smp
+impl asx::peppol::Smp
+pub async fn asx::peppol::Smp::lookup(&self, &str, &str, &str) -> asx::Result<asx::Partner>
+pub fn asx::peppol::Smp::production(impl asx::HttpClient, asx::Certificate) -> asx::peppol::Smp
+pub fn asx::peppol::Smp::test(impl asx::HttpClient, asx::Certificate) -> asx::peppol::Smp
+pub fn asx::peppol::not_serviced() -> asx::Reject
+pub enum asx::AuditDurability
+pub asx::AuditDurability::BestEffort
+pub asx::AuditDurability::Durable
+pub enum asx::Claim
+pub asx::Claim::Claimed(asx::ClaimToken)
+pub asx::Claim::Duplicate
+pub asx::Claim::InFlight
+#[non_exhaustive] pub enum asx::ErrorKind
+pub asx::ErrorKind::Backend
+pub asx::ErrorKind::Config
+pub asx::ErrorKind::Indeterminate
+pub asx::ErrorKind::PartnerError
+pub asx::ErrorKind::Rejected
+pub asx::ErrorKind::Transport
+#[non_exhaustive] pub enum asx::KeyOp<'a>
+pub asx::KeyOp::Ecdh(&'a [u8])
+pub asx::KeyOp::RsaOaep(&'a [u8])
+pub asx::KeyOp::RsaPkcs1v15(&'a [u8])
+#[non_exhaustive] pub enum asx::Quirk
+pub asx::Quirk::ReceiptWithoutNonRepudiation
+pub asx::Quirk::UnsignedMdn
+#[non_exhaustive] pub enum asx::SignatureAlgorithm
+pub asx::SignatureAlgorithm::EcdsaSha256
+pub asx::SignatureAlgorithm::RsaSha256
+#[non_exhaustive] pub struct asx::AuditRecord
+impl asx::AuditRecord
+pub fn asx::AuditRecord::message_id(&self) -> &str
+pub fn asx::AuditRecord::partner(&self) -> &str
+pub fn asx::AuditRecord::record_id(&self) -> &str
+pub fn asx::AuditRecord::signal(&self) -> core::option::Option<&[u8]>
+pub struct asx::Builder<C>
+impl asx::Builder<asx::as2::As2>
+pub fn asx::Builder<asx::as2::As2>::build(self) -> asx::Result<asx::as2::As2>
+impl asx::Builder<asx::as4::As4>
+pub fn asx::Builder<asx::as4::As4>::build(self) -> asx::Result<asx::as4::As4>
+impl<C> asx::Builder<C>
+pub fn asx::Builder<C>::audit(self, impl asx::AuditSink + 'static) -> asx::Builder<C>
+pub fn asx::Builder<C>::crl_signer(self, asx::Certificate) -> asx::Builder<C>
+pub fn asx::Builder<C>::http_client(self, impl asx::HttpClient) -> asx::Builder<C>
+pub fn asx::Builder<C>::local(self, asx::LocalParty) -> asx::Builder<C>
+pub fn asx::Builder<C>::partner(self, asx::Partner) -> asx::Builder<C>
+pub fn asx::Builder<C>::trust_anchor(self, asx::Certificate) -> asx::Builder<C>
+impl<C> core::fmt::Debug for asx::Builder<C>
+pub fn asx::Builder<C>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct asx::Certificate(_)
+impl asx::Certificate
+pub fn asx::Certificate::der(&self) -> &[u8]
+pub fn asx::Certificate::from_pem(&[u8]) -> asx::Result<asx::Certificate>
+impl core::cmp::Eq for asx::Certificate
+impl core::cmp::PartialEq for asx::Certificate
+pub fn asx::Certificate::eq(&self, &Self) -> bool
+impl core::fmt::Debug for asx::Certificate
+pub fn asx::Certificate::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::hash::Hash for asx::Certificate
+pub fn asx::Certificate::hash<H: core::hash::Hasher>(&self, &mut H)
+pub struct asx::ClaimToken(_)
+impl asx::ClaimToken
+pub fn asx::ClaimToken::as_str(&self) -> &str
+pub fn asx::ClaimToken::new(impl core::convert::Into<alloc::string::String>) -> asx::ClaimToken
+pub struct asx::Error
+impl asx::Error
+pub fn asx::Error::ebms_code(&self) -> core::option::Option<&str>
+pub fn asx::Error::evidence(&self) -> core::option::Option<&asx::AuditRecord>
+pub fn asx::Error::is_retryable(&self) -> bool
+pub fn asx::Error::kind(&self) -> asx::ErrorKind
+pub fn asx::Error::mdn_disposition(&self) -> core::option::Option<&str>
+impl core::error::Error for asx::Error
+pub fn asx::Error::source(&self) -> core::option::Option<&(dyn core::error::Error + 'static)>
+impl core::fmt::Display for asx::Error
+pub fn asx::Error::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct asx::Inbound
+impl core::fmt::Debug for asx::Inbound
+pub fn asx::Inbound::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl<B> tower_service::Service<http::request::Request<B>> for asx::Inbound where B: http_body::Body + core::marker::Send + 'static, <B as http_body::Body>::Data: core::marker::Send, <B as http_body::Body>::Error: core::convert::Into<alloc::boxed::Box<(dyn core::error::Error + core::marker::Send + core::marker::Sync)>>
+pub type asx::Inbound::Error = never
+pub type asx::Inbound::Future = core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = core::result::Result<<asx::Inbound as tower_service::Service<http::request::Request<B>>>::Response, never>> + core::marker::Send)>>
+pub type asx::Inbound::Response = http::response::Response<http_body_util::full::Full<bytes::bytes::Bytes>>
+pub fn asx::Inbound::call(&mut self, http::request::Request<B>) -> Self::Future
+pub fn asx::Inbound::poll_ready(&mut self, &mut core::task::wake::Context<'_>) -> core::task::poll::Poll<core::result::Result<(), core::convert::Infallible>>
+pub struct asx::KeyPair(_)
+impl asx::KeyPair
+pub fn asx::KeyPair::from_pem(&[u8], &[u8]) -> asx::Result<asx::KeyPair>
+impl asx::Decrypter for asx::KeyPair
+pub fn asx::KeyPair::certificate(&self) -> &asx::Certificate
+pub fn asx::KeyPair::decrypt<'a>(&'a self, asx::KeyOp<'a>) -> asx::BoxFuture<'a, core::result::Result<zeroize::Zeroizing<alloc::vec::Vec<u8>>, alloc::boxed::Box<(dyn core::error::Error + core::marker::Send + core::marker::Sync)>>>
+impl asx::Signer for asx::KeyPair
+pub fn asx::KeyPair::certificate_chain(&self) -> &[asx::Certificate]
+pub fn asx::KeyPair::sign<'a>(&'a self, asx::SignatureAlgorithm, &'a [u8]) -> asx::BoxFuture<'a, core::result::Result<alloc::vec::Vec<u8>, alloc::boxed::Box<(dyn core::error::Error + core::marker::Send + core::marker::Sync)>>>
+impl core::fmt::Debug for asx::KeyPair
+pub fn asx::KeyPair::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct asx::LocalParty
+impl asx::LocalParty
+pub fn asx::LocalParty::decrypter(self, impl asx::Decrypter) -> asx::LocalParty
+pub fn asx::LocalParty::new(impl core::convert::Into<alloc::string::String>) -> asx::LocalParty
+pub fn asx::LocalParty::party_type(self, impl core::convert::Into<alloc::string::String>) -> asx::LocalParty
+pub fn asx::LocalParty::signer(self, impl asx::Signer) -> asx::LocalParty
+pub fn asx::LocalParty::tls_identity(self, asx::KeyPair) -> asx::LocalParty
+pub struct asx::MemoryDedup
+impl asx::DedupStore for asx::MemoryDedup
+pub fn asx::MemoryDedup::abandon<'a>(&'a self, &'a str, &'a asx::ClaimToken) -> asx::BoxFuture<'a, core::result::Result<(), alloc::boxed::Box<(dyn core::error::Error + core::marker::Send + core::marker::Sync)>>>
+pub fn asx::MemoryDedup::accept<'a>(&'a self, &'a str, &'a asx::ClaimToken) -> asx::BoxFuture<'a, core::result::Result<(), alloc::boxed::Box<(dyn core::error::Error + core::marker::Send + core::marker::Sync)>>>
+pub fn asx::MemoryDedup::claim<'a>(&'a self, &'a str) -> asx::BoxFuture<'a, core::result::Result<asx::Claim, alloc::boxed::Box<(dyn core::error::Error + core::marker::Send + core::marker::Sync)>>>
+pub struct asx::Partner(_)
+impl asx::Partner
+pub fn asx::Partner::encryption_cert(self, asx::Certificate) -> asx::Partner
+pub fn asx::Partner::endpoint(self, impl core::convert::AsRef<str>) -> asx::Partner
+pub fn asx::Partner::new(impl core::convert::Into<alloc::string::String>) -> asx::Partner
+pub fn asx::Partner::party_type(self, impl core::convert::Into<alloc::string::String>) -> asx::Partner
+pub fn asx::Partner::quirk(self, asx::Quirk) -> asx::Partner
+pub fn asx::Partner::signing_cert(self, asx::Certificate) -> asx::Partner
+pub struct asx::Payload
+impl asx::Payload
+pub fn asx::Payload::bytes(&self) -> &bytes::bytes::Bytes
+pub fn asx::Payload::mime_type(&self) -> &str
+pub fn asx::Payload::name(&self) -> core::option::Option<&str>
+pub fn asx::Payload::named(self, impl core::convert::Into<alloc::string::String>) -> asx::Payload
+pub fn asx::Payload::new(impl core::convert::Into<bytes::bytes::Bytes>, impl core::convert::Into<alloc::string::String>) -> asx::Payload
+pub struct asx::Profile
+impl asx::Profile
+pub fn asx::Profile::as2() -> asx::Profile
+pub fn asx::Profile::bdew() -> asx::Profile
+pub fn asx::Profile::edelivery_1_15() -> asx::Profile
+pub fn asx::Profile::entsog() -> asx::Profile
+pub fn asx::Profile::max_message_bytes(self, u64) -> asx::Profile
+pub fn asx::Profile::peppol() -> asx::Profile
+pub struct asx::Receipt
+pub struct asx::Reject
+impl asx::Reject
+pub fn asx::Reject::new(impl core::convert::Into<alloc::boxed::Box<(dyn core::error::Error + core::marker::Send + core::marker::Sync)>>) -> asx::Reject
+impl<E: core::error::Error + core::marker::Send + core::marker::Sync + 'static> core::convert::From<E> for asx::Reject
+pub fn asx::Reject::from(E) -> asx::Reject
+pub struct asx::Verified<T>
+impl<T> asx::Verified<T>
+pub fn asx::Verified<T>::evidence(&self) -> &asx::AuditRecord
+pub fn asx::Verified<T>::into_inner(self) -> T
+pub fn asx::Verified<T>::signer(&self) -> &asx::Certificate
+impl<T: core::fmt::Debug> core::fmt::Debug for asx::Verified<T>
+pub fn asx::Verified<T>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl<T> core::ops::deref::Deref for asx::Verified<T>
+pub type asx::Verified<T>::Target = T
+pub fn asx::Verified<T>::deref(&self) -> &T
+pub trait asx::AuditSink: core::marker::Send + core::marker::Sync + core::fmt::Debug
+pub fn asx::AuditSink::durability(&self) -> asx::AuditDurability
+pub fn asx::AuditSink::record<'a>(&'a self, &'a asx::AuditRecord) -> asx::BoxFuture<'a, core::result::Result<(), alloc::boxed::Box<(dyn core::error::Error + core::marker::Send + core::marker::Sync)>>>
+impl<T: asx::AuditSink + ?core::marker::Sized> asx::AuditSink for alloc::sync::Arc<T>
+pub fn alloc::sync::Arc<T>::durability(&self) -> asx::AuditDurability
+pub fn alloc::sync::Arc<T>::record<'a>(&'a self, &'a asx::AuditRecord) -> asx::BoxFuture<'a, core::result::Result<(), alloc::boxed::Box<(dyn core::error::Error + core::marker::Send + core::marker::Sync)>>>
+pub trait asx::Decrypter: core::marker::Send + core::marker::Sync + core::fmt::Debug + 'static
+pub fn asx::Decrypter::certificate(&self) -> &asx::Certificate
+pub fn asx::Decrypter::decrypt<'a>(&'a self, asx::KeyOp<'a>) -> asx::BoxFuture<'a, core::result::Result<zeroize::Zeroizing<alloc::vec::Vec<u8>>, alloc::boxed::Box<(dyn core::error::Error + core::marker::Send + core::marker::Sync)>>>
+impl asx::Decrypter for asx::KeyPair
+pub fn asx::KeyPair::certificate(&self) -> &asx::Certificate
+pub fn asx::KeyPair::decrypt<'a>(&'a self, asx::KeyOp<'a>) -> asx::BoxFuture<'a, core::result::Result<zeroize::Zeroizing<alloc::vec::Vec<u8>>, alloc::boxed::Box<(dyn core::error::Error + core::marker::Send + core::marker::Sync)>>>
+pub trait asx::DedupStore: core::marker::Send + core::marker::Sync + core::fmt::Debug + 'static
+pub fn asx::DedupStore::abandon<'a>(&'a self, &'a str, &'a asx::ClaimToken) -> asx::BoxFuture<'a, core::result::Result<(), alloc::boxed::Box<(dyn core::error::Error + core::marker::Send + core::marker::Sync)>>>
+pub fn asx::DedupStore::accept<'a>(&'a self, &'a str, &'a asx::ClaimToken) -> asx::BoxFuture<'a, core::result::Result<(), alloc::boxed::Box<(dyn core::error::Error + core::marker::Send + core::marker::Sync)>>>
+pub fn asx::DedupStore::claim<'a>(&'a self, &'a str) -> asx::BoxFuture<'a, core::result::Result<asx::Claim, alloc::boxed::Box<(dyn core::error::Error + core::marker::Send + core::marker::Sync)>>>
+impl asx::DedupStore for asx::MemoryDedup
+pub fn asx::MemoryDedup::abandon<'a>(&'a self, &'a str, &'a asx::ClaimToken) -> asx::BoxFuture<'a, core::result::Result<(), alloc::boxed::Box<(dyn core::error::Error + core::marker::Send + core::marker::Sync)>>>
+pub fn asx::MemoryDedup::accept<'a>(&'a self, &'a str, &'a asx::ClaimToken) -> asx::BoxFuture<'a, core::result::Result<(), alloc::boxed::Box<(dyn core::error::Error + core::marker::Send + core::marker::Sync)>>>
+pub fn asx::MemoryDedup::claim<'a>(&'a self, &'a str) -> asx::BoxFuture<'a, core::result::Result<asx::Claim, alloc::boxed::Box<(dyn core::error::Error + core::marker::Send + core::marker::Sync)>>>
+pub trait asx::Handler<M>: core::marker::Send + core::marker::Sync + 'static
+pub fn asx::Handler::handle(&self, asx::Verified<M>) -> asx::BoxFuture<'_, core::result::Result<(), asx::Reject>>
+impl<M, F, Fut> asx::Handler<M> for F where M: core::marker::Send + 'static, F: core::ops::function::Fn(asx::Verified<M>) -> Fut + core::marker::Send + core::marker::Sync + 'static, Fut: core::future::future::Future<Output = core::result::Result<(), asx::Reject>> + core::marker::Send + 'static
+pub fn F::handle(&self, asx::Verified<M>) -> asx::BoxFuture<'_, core::result::Result<(), asx::Reject>>
+pub trait asx::HttpClient: core::marker::Send + core::marker::Sync + core::fmt::Debug + 'static
+pub fn asx::HttpClient::send(&self, http::request::Request<bytes::bytes::Bytes>) -> asx::BoxFuture<'_, core::result::Result<http::response::Response<bytes::bytes::Bytes>, alloc::boxed::Box<(dyn core::error::Error + core::marker::Send + core::marker::Sync)>>>
+pub trait asx::Signer: core::marker::Send + core::marker::Sync + core::fmt::Debug + 'static
+pub fn asx::Signer::certificate_chain(&self) -> &[asx::Certificate]
+pub fn asx::Signer::sign<'a>(&'a self, asx::SignatureAlgorithm, &'a [u8]) -> asx::BoxFuture<'a, core::result::Result<alloc::vec::Vec<u8>, alloc::boxed::Box<(dyn core::error::Error + core::marker::Send + core::marker::Sync)>>>
+impl asx::Signer for asx::KeyPair
+pub fn asx::KeyPair::certificate_chain(&self) -> &[asx::Certificate]
+pub fn asx::KeyPair::sign<'a>(&'a self, asx::SignatureAlgorithm, &'a [u8]) -> asx::BoxFuture<'a, core::result::Result<alloc::vec::Vec<u8>, alloc::boxed::Box<(dyn core::error::Error + core::marker::Send + core::marker::Sync)>>>
+pub type asx::BoxFuture<'a, T> = core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = T> + core::marker::Send + 'a)>>
+pub type asx::Result<T, E> = core::result::Result<T, E>

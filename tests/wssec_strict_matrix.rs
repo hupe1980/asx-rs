@@ -1,7 +1,7 @@
 #![cfg(feature = "as4")]
 
-use asx_rs::core::ErrorCode;
-use asx_rs::crypto::wssec::{
+use asx::__fuzz::ErrorCode;
+use asx::__fuzz::wssec::{
     WsSecCanonicalizationProfile, WsSecVerifyOptions, canonicalize_reference,
     parse_signature_references, verify_enveloped_signature, verify_signature_references_strict,
 };
@@ -54,14 +54,8 @@ fn strict_profile_accepts_spec_compliant_reference() {
 }
 
 /// A digest computed over a differently-indented copy of the signed subtree
-/// must not verify.
-///
-/// This used to work by contrasting `strip_blank_text: true` against `false`.
-/// That knob is gone — no W3C canonicalization removes whitespace-only text
-/// nodes, and pretending otherwise is what made ASX's signatures
-/// non-interoperable (see the CHANGELOG entry on XML canonicalization). The property under test is
-/// unchanged and now expressed directly: canonicalization is whitespace-exact,
-/// so re-indenting the payload changes the digest.
+/// must not verify: no W3C canonicalization removes whitespace-only text
+/// nodes, so re-indenting the payload changes the digest.
 #[test]
 fn strict_mode_rejects_whitespace_digest_mismatch() {
     let indented =
@@ -131,7 +125,7 @@ fn strict_profile_rejects_malformed_signature_value() {
         xmlns:wsu="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd"
         xmlns:ds="http://www.w3.org/2000/09/xmldsig#"
         xmlns:eb="urn:example:eb">
-    <soap:Header>
+    <soap:Header><wsse:Security xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd">
         <ds:Signature>
             <ds:SignedInfo>
                 <ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/>
@@ -150,7 +144,7 @@ fn strict_profile_rejects_malformed_signature_value() {
                 </ds:KeyValue>
             </ds:KeyInfo>
         </ds:Signature>
-    </soap:Header>
+    </wsse:Security></soap:Header>
     <soap:Body>
         <eb:Payload wsu:Id="payload-1">ABC</eb:Payload>
     </soap:Body>
@@ -160,14 +154,8 @@ fn strict_profile_rejects_malformed_signature_value() {
         xml,
         WsSecVerifyOptions::new()
             .with_expected_fingerprints(&[])
-            .with_revocation(asx_rs::crypto::wssec::RevocationPolicy {
+            .with_chain_policy(asx::__fuzz::wssec::ChainPolicy {
                 trust_anchor_pems: &[],
-                revocation_crl_pems: &[],
-                ocsp_mode: asx_rs::core::OcspMode::Disabled,
-                ocsp_failure_mode: asx_rs::core::OcspFailureMode::HardFail,
-                stapled_ocsp_responses_der: &[],
-                responder_ocsp_responses_der: &[],
-                ocsp_cache_namespace: "strict-matrix-test",
                 require_chain_validation: false,
                 pre_parsed_trust_anchors: None,
                 pre_built_x509_store: None,
