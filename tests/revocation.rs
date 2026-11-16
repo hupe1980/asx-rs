@@ -178,7 +178,7 @@ async fn an_unauthorized_signer_triggers_no_revocation_request() {
     use tower::ServiceExt;
     // A genuine message from A, re-signed by a certificate that claims
     // another MP-ID in its OU; the receiver has no configured partner A
-    // (BDEW §2.3.4.4 sender rule). `build()` refuses such a certificate for a
+    // (BDEW Kap. 2.3.4.4 sender rule). `build()` refuses such a certificate for a
     // local party, so the forgery is made on the wire.
     let g = inbound_harness::genuine(Preset::Bdew).await;
     let wrong = g.pair.ca.issue_with_options(

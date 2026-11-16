@@ -157,7 +157,7 @@ connection never bypasses a check:
   the builder's trust anchors as the *only* TLS roots (the SM-PKI root), no
   wildcard host names (CP SM-PKI Anhang A.7.1), and the server chain checked
   against its CRLs with the three-day rule before a request is written (BDEW
-  AS4-Profil 1.2 §2.3.7). Every refusal is a not-written transport error
+  AS4-Profil 1.2 Kap. 2.3.7). Every refusal is a not-written transport error
   (`tests/egress_mtls.rs`: unknown CA, wrong host, no `serverAuth`, revoked,
   RSA server; foreign witness `tests/interop_openssl_tls_oracle.rs`);
 - other profiles: the platform's roots, TLS ≥ 1.2, OpenSSL's defaults;

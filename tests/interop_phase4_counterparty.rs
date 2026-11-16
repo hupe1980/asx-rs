@@ -135,7 +135,7 @@ async fn bdew_ping_phase4_to_crate() {
 }
 
 /// phase4 → crate business message signed and compressed but NOT
-/// encrypted: BDEW requires payload encryption (AS4-Profil 1.2 §2.2.6.2.2),
+/// encrypted: BDEW requires payload encryption (AS4-Profil 1.2 Kap. 2.2.6.2.2),
 /// so the crate answers with an ebMS error (`EBMS:0103`) and delivers nothing.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs Docker and the phase4 peer: just interop"]

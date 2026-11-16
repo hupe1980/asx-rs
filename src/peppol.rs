@@ -164,7 +164,10 @@ impl Smp {
         let cn = certificate.subject_cn().ok_or_else(|| {
             Error::new(
                 crate::ErrorKind::Rejected,
-                "the access point certificate has no single CN (Peppol AS4 §4.5)",
+                format!(
+                    "the access point certificate has no single CN ({})",
+                    crate::Profile::peppol().cite("4.5")
+                ),
             )
         })?;
         Ok(Partner::new(cn)

@@ -120,8 +120,10 @@ impl Payload {
         }
     }
 
-    /// A file name (`Content-Disposition`; BDEW AF §2.12). Refused under
-    /// `Profile::peppol()` (Peppol AS4 §4.10). Validated at `send`.
+    /// A file name, sent as the part's `Content-Disposition` (RFC 6266).
+    /// Refused under `Profile::peppol()` (Peppol AS4 2.0.3 §4.10: "SHALL NOT
+    /// be used"); the other profiles neither require nor forbid it.
+    /// Validated at `send`.
     pub fn named(self, name: impl Into<String>) -> Payload {
         Payload {
             name: Some(name.into()),

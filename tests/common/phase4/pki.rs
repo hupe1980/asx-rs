@@ -1,6 +1,6 @@
 //! Per-run identities for both sides of a variant, issued by one test CA.
 //!
-//! BDEW (AS4-Profil 1.2 §2.3.4.4, RzÜ AS4 2.6 Kap. 5.2): separate
+//! BDEW (AS4-Profil 1.2 Kap. 2.3.4.4, RzÜ AS4 2.6 Kap. 5.2): separate
 //! BrainpoolP256r1 pairs for signing, encryption and TLS; the MP-ID is the
 //! subject's OU. phase4's BDEW validator additionally requires `EMT.MAK` in
 //! the signing certificate's CN (`BDEWCompatibilityValidator

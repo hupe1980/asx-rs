@@ -1,5 +1,5 @@
 #![cfg(feature = "as4")]
-//! The BDEW transmission-path-switch service (BDEW AS4-Profil 1.2 §2.2.8,
+//! The BDEW transmission-path-switch service (BDEW AS4-Profil 1.2 Kap. 2.2.8,
 //! §2.3.7): receive and send.
 //!
 //! `a` sends through the testkit `Loopback` to an `Inbound` of `b` whose
@@ -338,7 +338,11 @@ async fn send_refusals() {
                 .await
                 .expect_err("only BDEW has the service");
             assert_eq!(err.kind(), ErrorKind::Config, "{preset:?}: {err}");
-            assert!(err.to_string().contains("§2.3.7"), "{preset:?}: {err}");
+            assert!(
+                err.to_string()
+                    .contains("BDEW AS4-Profil 1.2 Kap. 2.2.8, 2.3.7"),
+                "{preset:?}: {err}"
+            );
         }
         assert_eq!(pair.loopback.requests(), 0, "{preset:?}: nothing sent");
     }

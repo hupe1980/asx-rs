@@ -1,7 +1,7 @@
 #![cfg(feature = "as4")]
 //! ECDSA `ds:SignatureValue` is XMLDSig 1.1 `r ‖ s` in both directions
 //! (XMLDSig 1.1 §6.4.3, RFC 9231 §2.3.6; BDEW AS4-Profil 1.2
-//! §2.2.6.2.1 mandates `ecdsa-sha256` on brainpoolP256r1).
+//! Kap. 2.2.6.2.1 mandates `ecdsa-sha256` on brainpoolP256r1).
 //!
 //! The blocking foreign witness is `tests/fixtures/wssec/ecdsa/`: documents
 //! signed by xmlsec1 1.3.11 (verified here) and documents signed by this crate

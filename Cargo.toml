@@ -1,6 +1,6 @@
 [package]
 name = "asx-rs"
-version = "0.17.0"
+version = "0.18.0"
 edition = "2024"
 authors = ["hupe1980"]
 description = "AS2 and AS4 (ebMS3) B2B messaging: BDEW, Peppol, eDelivery and ENTSOG profiles, signed receipts and MDNs, one tower Service to receive"

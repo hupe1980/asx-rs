@@ -4,7 +4,7 @@
 //!
 //! [`TlsMsh`] serves an `asx::Inbound` over TLS with the server party's TLS
 //! certificate and **requires** a client certificate that chains to the
-//! given CA, as a BDEW MSH does (BDEW AS4-Profil 1.2 §2.2.6.1). It records
+//! given CA, as a BDEW MSH does (BDEW AS4-Profil 1.2 Kap. 2.2.6.1). It records
 //! every client chain presented, the SNI name and the handshake count. A
 //! second, plain-HTTP listener serves the CRLs every [`TestCa`] publishes,
 //! so revocation checks run over the network too.

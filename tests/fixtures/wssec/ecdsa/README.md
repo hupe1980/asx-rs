@@ -2,7 +2,7 @@
 
 Foreign witness for the ECDSA `ds:SignatureValue` form: XMLDSig 1.1 §6.4.3
 (RFC 9231 §2.3.6) defines it as `I2OSP(r, l) ‖ I2OSP(s, l)`, `l` the octet
-length of the curve order. BDEW AS4-Profil 1.2 §2.2.6.2.1 signs `ecdsa-sha256`
+length of the curve order. BDEW AS4-Profil 1.2 Kap. 2.2.6.2.1 signs `ecdsa-sha256`
 on brainpoolP256r1. `tests/wssec_ecdsa_signature_value.rs` checks these files in
 the normal test suite.
 

@@ -26,20 +26,20 @@ pub(crate) const BDEW_SERVICES: &[&str] = &[
     "https://www.bdew.de/as4/communication/services/SO",
 ];
 
-/// The BDEW transmission-path-switch service (B §2.3.1.2.1, §2.3.7).
+/// The BDEW transmission-path-switch service (B Kap. 2.3.1.2.1, 2.3.7).
 pub(crate) const PATH_SWITCH_SERVICE: &str =
     "https://www.bdew.de/as4/communication/services/pathSwitch";
-/// The path-switch request action (B §2.3.1.2.2, §2.3.7).
+/// The path-switch request action (B Kap. 2.3.1.2.2, 2.3.7).
 pub(crate) const REQUEST_SWITCH_ACTION: &str =
     "https://www.bdew.de/as4/communication/actions/requestSwitch";
-/// The path-switch confirmation action (B §2.3.1.2.2, §2.3.7).
+/// The path-switch confirmation action (B Kap. 2.3.1.2.2, 2.3.7).
 pub(crate) const CONFIRM_SWITCH_ACTION: &str =
     "https://www.bdew.de/as4/communication/actions/confirmSwitch";
 
 pub(crate) const BDEW_AGREEMENT: &str = "https://www.bdew.de/as4/communication/agreement";
 pub(crate) const PEPPOL_AGREEMENT: &str = "urn:fdc:peppol.eu:2017:agreements:tia:ap_provider";
 pub(crate) const PEPPOL_PARTY_TYPE: &str = "urn:fdc:peppol.eu:2017:identifiers:ap";
-/// ebMS3 Core §5.2.2 default action, also BDEW's fixed action (B §2.3.1.2.2).
+/// ebMS3 Core §5.2.2 default action, also BDEW's fixed action (B Kap. 2.3.1.2.2).
 pub(crate) const DEFAULT_ACTION: &str = "http://docs.oasis-open.org/ebxml-msg/as4/200902/action";
 pub(crate) const INITIATOR_ROLE: &str =
     "http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/initiator";
@@ -83,7 +83,7 @@ pub(crate) enum Protocol {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SenderRule {
     /// Chains to an anchor and the claimed MP-ID is in the signer's subject
-    /// (BDEW AS4-Profil 1.2 §2.3.2, §2.3.4.4).
+    /// (BDEW AS4-Profil 1.2 Kap. 2.3.2, 2.3.4.4).
     AnchorAndSubject,
     /// Chains to an anchor and the signer's CN equals the claimed party id
     /// (Peppol AS4 2.0.3 §4.5, §4.7).
@@ -96,7 +96,7 @@ pub(crate) enum SenderRule {
 /// The form of the signing certificate reference.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TokenRef {
-    /// BST `#X509PKIPathv1` (BDEW §2.2.6.2.1).
+    /// BST `#X509PKIPathv1` (BDEW Kap. 2.2.6.2.1).
     PkiPath,
     /// BST `#X509v3`.
     X509v3,
@@ -159,25 +159,25 @@ impl Profile {
     ///
     /// | Setting | Value |
     /// |---|---|
-    /// | MEP | One-Way/Push, receipts and errors synchronous (B §2.2.1, §2.2.2, §2.2.4, §2.2.5) |
-    /// | Packaging | SwA, one MIME part per payload, empty Body; part type `application/octet-stream` (B §2.2.3.2) |
-    /// | Compression | gzip, always (B §2.2.3.3 "MUSS"); uncompressed inbound accepted (eDelivery 1.15 §3.3.1) |
-    /// | Signature | `ecdsa-sha256` on BrainpoolP256r1, SHA-256 digests (B §2.2.6.2.1; BSI TR-03116-3 §9.1) |
-    /// | Signing token | BST `#X509PKIPathv1` (B §2.2.6.2.1) |
-    /// | Encryption | ECDH-ES + ConcatKDF (SHA-256) + `kw-aes128`, `aes128-gcm`, recipient by `X509SKI` (B §2.2.6.2.2, §2.3.4.3; TR §9.2) |
-    /// | Keys | separate EC BrainpoolP256r1 key pairs for signing, encryption and TLS (B §2.3.4.4) |
+    /// | MEP | One-Way/Push, receipts and errors synchronous (B Kap. 2.2.1, 2.2.2, 2.2.4, 2.2.5) |
+    /// | Packaging | SwA, one MIME part per payload, empty Body; part type `application/octet-stream` (B Kap. 2.2.3.2) |
+    /// | Compression | gzip, always (B Kap. 2.2.3.3 "MUSS"); uncompressed inbound accepted (eDelivery 1.15 §3.3.1) |
+    /// | Signature | `ecdsa-sha256` on BrainpoolP256r1, SHA-256 digests (B Kap. 2.2.6.2.1; BSI TR-03116-3 §9.1) |
+    /// | Signing token | BST `#X509PKIPathv1` (B Kap. 2.2.6.2.1) |
+    /// | Encryption | ECDH-ES + ConcatKDF (SHA-256) + `kw-aes128`, `aes128-gcm`, recipient by `X509SKI` (B Kap. 2.2.6.2.2, 2.3.4.3; TR §9.2) |
+    /// | Keys | separate EC BrainpoolP256r1 key pairs for signing, encryption and TLS, compared by key, not by certificate: locally, the partner's signing and encryption certificates, and an inbound signer against the configured partner's encryption key (B Kap. 2.3.4.4) |
     /// | Certificates | each of the triple names the MP-ID in its subject's OU and exactly one AS4 address as URI subjectAltName; the partner's endpoint is that address (RzÜ AS4 2.6 Kap. 2, Kap. 5.2) |
-    /// | TLS (built-in client) | mutual, with `LocalParty::tls_identity` (B §2.2.6.1); BSI TR-03116-3 suites and Brainpool groups; the server chain verified against the trust anchors and its CRLs checked before a request is written (B §2.3.7); SNI, so the endpoint must be a DNS name (RzÜ AS4 2.6 Kap. 3) |
-    /// | Party id | the 13-digit MP-ID; type one of `…:iso6523:0088`, `…:unregistered:BDEW`, `…:DVGW`, `…:BAHN` (B §2.3.1.1) |
-    /// | Service | one of `https://www.bdew.de/as4/communication/services/{MP,FP,RD,KW,SO}` (B §2.3.1.2.1) |
-    /// | Action | fixed `http://docs.oasis-open.org/ebxml-msg/as4/200902/action` (B §2.3.1.2.2); the path-switch service has its own two |
-    /// | Roles | fixed initiator / responder (B §2.3.1.2.3) |
-    /// | ConversationId | always empty (B §2.3.1.2.4) |
-    /// | AgreementRef | `https://www.bdew.de/as4/communication/agreement`, no `pmode`/`type` (B §2.3.2) |
-    /// | Inbound senders | any sender whose verified SM-PKI subject carries the claimed MP-ID, plus the pins of a configured partner (B §2.3.2, §2.3.4.4) |
-    /// | Test service | receipted, never delivered (B §2.3.6) |
-    /// | Path switch | B §2.2.8 "MUSS zusätzlich einen AS4-Übertragungspfadänderungsdienst (Kapitel 2.3.7) implementieren": Service `https://www.bdew.de/as4/communication/services/pathSwitch`, Actions `https://www.bdew.de/as4/communication/actions/requestSwitch` and `…/actions/confirmSwitch` (B §2.3.1.2.1, §2.3.1.2.2, §2.3.7); payload-less, signed, not encrypted; sent with [`Message::path_switch`](crate::as4::Message::path_switch), recognised by [`UserMessage::path_switch`](crate::as4::UserMessage::path_switch) |
-    /// | Duplicate detection | required (B §2.2.5) |
+    /// | TLS (built-in client) | mutual, with `LocalParty::tls_identity` (B Kap. 2.2.6.1); BSI TR-03116-3 suites and Brainpool groups; the server chain verified against the trust anchors and its CRLs checked before a request is written (B Kap. 2.3.7); SNI, so the endpoint must be a DNS name (RzÜ AS4 2.6 Kap. 3) |
+    /// | Party id | the 13-digit MP-ID; type one of `…:iso6523:0088`, `…:unregistered:BDEW`, `…:DVGW`, `…:BAHN` (B Kap. 2.3.1.1) |
+    /// | Service | one of `https://www.bdew.de/as4/communication/services/{MP,FP,RD,KW,SO}` (B Kap. 2.3.1.2.1) |
+    /// | Action | fixed `http://docs.oasis-open.org/ebxml-msg/as4/200902/action` (B Kap. 2.3.1.2.2); the path-switch service has its own two |
+    /// | Roles | fixed initiator / responder (B Kap. 2.3.1.2.3) |
+    /// | ConversationId | always empty (B Kap. 2.3.1.2.4) |
+    /// | AgreementRef | `https://www.bdew.de/as4/communication/agreement`, no `pmode`/`type` (B Kap. 2.3.2) |
+    /// | Inbound senders | any sender whose verified SM-PKI subject carries the claimed MP-ID, plus the pins of a configured partner (B Kap. 2.3.2, 2.3.4.4) |
+    /// | Test service | receipted, never delivered (B Kap. 2.3.6) |
+    /// | Path switch | B Kap. 2.2.8 "MUSS zusätzlich einen AS4-Übertragungspfadänderungsdienst (Kapitel 2.3.7) implementieren": Service `https://www.bdew.de/as4/communication/services/pathSwitch`, Actions `https://www.bdew.de/as4/communication/actions/requestSwitch` and `…/actions/confirmSwitch` (B Kap. 2.3.1.2.1, 2.3.1.2.2, 2.3.7); payload-less, signed, not encrypted; sent with [`Message::path_switch`](crate::as4::Message::path_switch), recognised by [`UserMessage::path_switch`](crate::as4::UserMessage::path_switch) |
+    /// | Duplicate detection | required (B Kap. 2.2.5) |
     /// | Revocation | CRL from each certificate's CRL distribution point only, no OCSP (CP SM-PKI §4.9, §7.3); `nextUpdate` required (BSI TR-03109-4 Anhang B); refetched after 24 h, the last known CRL used while a fetch fails (CP Tabelle 10, §4.8.3); a certificate without CDP refused (TR Anhang A item 10); the three-day rule below (RzÜ AS4 2.6 Kap. 5.4) |
     ///
     /// Revocation (RzÜ AS4 2.6 Kap. 5.4): "Wenn die CRL einer CA über die im
@@ -310,7 +310,7 @@ impl Profile {
         }
     }
 
-    /// The section a refusal names.
+    /// The document a refusal cites; [`Profile::cite`] adds the section.
     pub(crate) fn citation(&self) -> &'static str {
         match self.id {
             ProfileId::Bdew12 => "BDEW AS4-Profil 1.2",
@@ -318,6 +318,18 @@ impl Profile {
             ProfileId::Edelivery115 => "eDelivery AS4 1.15",
             ProfileId::Entsog36 => "ENTSOG AS4 Usage Profile 3.6",
             ProfileId::As2 => "RFC 4130",
+        }
+    }
+
+    /// A section of the profile's document, in that document's own
+    /// numbering: the BDEW AS4-Profil numbers chapters as „Kapitel"
+    /// („BDEW AS4-Profil 1.2 Kap. 2.3.4.4"); the English-language profiles
+    /// and RFC 4130 use „§" („eDelivery AS4 1.15 §3.2.6"). Every refusal
+    /// that cites the profile renders its citation here.
+    pub(crate) fn cite(&self, section: &str) -> String {
+        match self.id {
+            ProfileId::Bdew12 => format!("{} Kap. {section}", self.citation()),
+            _ => format!("{} §{section}", self.citation()),
         }
     }
 
@@ -394,7 +406,7 @@ impl Profile {
     }
 
     /// How an outbound `xenc:EncryptedKey` names the recipient: the Subject
-    /// Key Identifier for BDEW (B §2.2.6.2.2 "x509SKI"; phase4
+    /// Key Identifier for BDEW (B Kap. 2.2.6.2.2 "x509SKI"; phase4
     /// `Phase4BDEWSender` `X509_SKI_KEY_IDENTIFIER`), a BST reference elsewhere
     /// (eDelivery 1.15 §3.2.6 "most widely implemented"; Peppol §4.7).
     #[cfg(feature = "as4")]
@@ -408,7 +420,7 @@ impl Profile {
 
     /// The encryption suite an inbound message must use, as identifiers:
     /// ECDH-ES + ConcatKDF (SHA-256) + `kw-aes128`, `aes128-gcm` for BDEW
-    /// (B §2.2.6.2.2; BSI TR-03116-3 §9.2); RSA-OAEP (`xmlenc11#rsa-oaep`),
+    /// (B Kap. 2.2.6.2.2; BSI TR-03116-3 §9.2); RSA-OAEP (`xmlenc11#rsa-oaep`),
     /// `aes128-gcm` elsewhere (eDelivery 1.15 §3.2.6; `rsa-oaep-mgf1p` is
     /// refused).
     #[cfg(feature = "as4")]
@@ -446,7 +458,7 @@ impl Profile {
         self.id != ProfileId::Peppol203
     }
 
-    /// The part media type the profile fixes (BDEW §2.2.3.2).
+    /// The part media type the profile fixes (BDEW Kap. 2.2.3.2).
     pub(crate) fn fixed_part_type(&self) -> Option<&'static str> {
         (self.id == ProfileId::Bdew12).then_some("application/octet-stream")
     }
@@ -463,7 +475,7 @@ impl Profile {
     }
 
     /// Whether the profile has the payload-less transmission-path-switch
-    /// service (B §2.2.8 "MUSS zusätzlich einen
+    /// service (B Kap. 2.2.8 "MUSS zusätzlich einen
     /// AS4-Übertragungspfadänderungsdienst (Kapitel 2.3.7) implementieren").
     /// BDEW only.
     pub(crate) fn path_switch(&self) -> bool {
@@ -821,6 +833,15 @@ mod tests {
             Profile::bdew().fixed_part_type(),
             Some("application/octet-stream")
         );
+        assert_eq!(
+            Profile::bdew().cite("2.3.4.4"),
+            "BDEW AS4-Profil 1.2 Kap. 2.3.4.4"
+        );
+        assert_eq!(
+            Profile::edelivery_1_15().cite("3.2.6"),
+            "eDelivery AS4 1.15 §3.2.6"
+        );
+        assert_eq!(Profile::as2().cite("6.2"), "RFC 4130 §6.2");
         assert_eq!(BDEW_SERVICES.len(), 5);
         // The revocation rule per preset.
         {
@@ -873,7 +894,7 @@ mod tests {
                 assert!(!rule.unobtainable_accepted, "{}", p.name());
             }
         }
-        // The path-switch service is BDEW's alone (B §2.2.8).
+        // The path-switch service is BDEW's alone (B Kap. 2.2.8).
         for (p, switch) in [
             (Profile::bdew(), true),
             (Profile::peppol(), false),
@@ -886,7 +907,7 @@ mod tests {
         }
     }
 
-    /// B §2.3.1.2.1/§2.3.1.2.2 name the path-switch URIs exactly; they are
+    /// B Kap. 2.3.1.2.1/2.3.1.2.2 name the path-switch URIs exactly; they are
     /// pinned as literals (phase4 `BDEWPMode.java:68-78` carries the same).
     #[test]
     fn the_path_switch_uris_match_the_profile() {

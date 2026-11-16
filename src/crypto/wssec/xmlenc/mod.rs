@@ -5,7 +5,7 @@
 //! | Recipient key | Algorithm | Standard |
 //! |---|---|---|
 //! | RSA | RSA-OAEP (SHA-256 / MGF1-SHA-256, no label) | eDelivery AS4 v1.15 / PEPPOL |
-//! | EC  | ECDH-ES + ConcatKDF (SHA-256) + AES Key Wrap | BSI TR-03116-3 §9.2 / BDEW AS4-Profil 1.2 §2.2.6.2.2 |
+//! | EC  | ECDH-ES + ConcatKDF (SHA-256) + AES Key Wrap | BSI TR-03116-3 §9.2 / BDEW AS4-Profil 1.2 Kap. 2.2.6.2.2 |
 //!
 //! Content is AES-128-GCM (eDelivery default) or AES-256-GCM; CBC is never
 //! accepted.
@@ -77,7 +77,7 @@ const DECRYPTION_FAILED: &str = "XML Encryption decryption failed";
 pub(crate) enum KeyTransport {
     /// RSA-OAEP, SHA-256 / MGF1-SHA-256 (eDelivery AS4 1.15 §3.2.6).
     RsaOaep,
-    /// ECDH-ES + `kdf` + AES key wrap (BDEW AS4-Profil 1.2 §2.2.6.2.2).
+    /// ECDH-ES + `kdf` + AES key wrap (BDEW AS4-Profil 1.2 Kap. 2.2.6.2.2).
     EcdhEs { kdf: KdfAlg },
 }
 
@@ -88,7 +88,7 @@ pub(crate) enum RecipientForm {
     /// A `wsse:Reference` to a `#X509v3` BinarySecurityToken in the header
     /// (Peppol, eDelivery 1.15, ENTSOG).
     Bst,
-    /// `wsse:KeyIdentifier #X509SubjectKeyIdentifier` (BDEW 1.2 §2.2.6.2.2
+    /// `wsse:KeyIdentifier #X509SubjectKeyIdentifier` (BDEW 1.2 Kap. 2.2.6.2.2
     /// "x509SKI"; phase4 `Phase4BDEWSender` `X509_SKI_KEY_IDENTIFIER`).
     Ski,
 }

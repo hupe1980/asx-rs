@@ -8,7 +8,7 @@ aliases = ["/docs/reliability/"]
 
 ```toml
 [dependencies]
-asx-rs = "0.17"
+asx-rs = "0.18"
 ```
 
 The package is `asx-rs`; the library is `asx`. Features are additive and none

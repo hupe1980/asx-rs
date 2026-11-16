@@ -317,7 +317,7 @@ async fn unconfigured_bdew_sender_with_matching_subject_is_accepted() {
     p.sender
         .send(Preset::Bdew.message(&p.to_b, b"x"))
         .await
-        .expect("BDEW §2.3.2: any sender whose subject carries the MP-ID");
+        .expect("BDEW Kap. 2.3.2: any sender whose subject carries the MP-ID");
     assert_eq!(p.calls.load(Ordering::SeqCst), 1);
 }
 
@@ -364,7 +364,7 @@ async fn tampered_payload_is_refused_without_a_claim() {
     let _ = soap_part(&[]);
 }
 
-/// BDEW AS4-Profil 1.2 §2.3.2/§2.3.4.4 with RzÜ AS4 2.6 Kap. 5.2: the MP-ID is
+/// BDEW AS4-Profil 1.2 Kap. 2.3.2/2.3.4.4 with RzÜ AS4 2.6 Kap. 5.2: the MP-ID is
 /// the subject's OU. A sender whose certificate carries it only in the CN is
 /// neither accepted unregistered nor configurable as a partner.
 #[tokio::test(flavor = "current_thread")]
@@ -393,7 +393,10 @@ async fn bdew_mp_id_must_be_in_the_ou() {
         .http_client(p.loopback.clone())
         .build()
         .expect_err("V20");
-    assert!(err.to_string().contains("§2.3.4.4"), "{err}");
+    assert!(
+        err.to_string().contains("BDEW AS4-Profil 1.2 Kap. 2.3.4.4"),
+        "{err}"
+    );
     // Not configurable as the local party either.
     let err = As4::builder(Profile::bdew())
         .local(e.local())
@@ -407,7 +410,7 @@ async fn bdew_mp_id_must_be_in_the_ou() {
 }
 
 /// A genuine message from `a` re-signed by `signer`, posted to a receiver
-/// that does not know `a` (the BDEW §2.3.2 unregistered-sender path), is
+/// that does not know `a` (the BDEW Kap. 2.3.2 unregistered-sender path), is
 /// refused as EBMS:0101 and never delivered.
 async fn assert_forged_signer_refused(signer: &asx::testkit::pki::KeyPair) {
     let g = inbound_harness::genuine(Preset::Bdew).await;
@@ -482,6 +485,76 @@ async fn bdew_signer_uri_san_required() {
         .bdew_party_at("9900000000004", "https://d.example/as4");
     let (status, body) = post(&stranger_receiver(&g.pair, Profile::bdew(), &d), forged).await;
     assert_eq!(status, http::StatusCode::OK, "{body}");
+}
+
+/// BDEW AS4-Profil 1.2 Kap. 2.3.4.4 inbound: a configured partner without
+/// signing pins is admitted on the SM-PKI subject rule, but a signer that
+/// certifies the key of the partner's own encryption certificate is refused
+/// as FailedAuthentication during sender authorization (inside signature
+/// verification, before any key selection or decryption). Control: the
+/// same path with the partner's real signing key is delivered.
+#[tokio::test(flavor = "current_thread")]
+async fn bdew_signer_sharing_the_partner_encryption_key_is_refused() {
+    use asx::testkit::pki::{IssueOptions, KeyAlg, Nid};
+    let g = inbound_harness::genuine(Preset::Bdew).await;
+    let a = &g.pair.a;
+    let receiver = As4::builder(Profile::bdew())
+        .local(g.pair.b.local())
+        .trust_anchor(g.pair.ca.anchor())
+        .partner(
+            asx::Partner::new(&a.id)
+                .party_type(asx::testkit::pki::BDEW_PARTY_TYPE)
+                .endpoint(A_URL)
+                .encryption_cert(a.encryption.certificate()),
+        )
+        .http_client(g.pair.loopback.clone())
+        .build()
+        .expect("a partner known by its encryption certificate alone");
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let inbound = {
+        let calls = calls.clone();
+        receiver.inbound(MemoryDedup::default(), move |_m: Verified<UserMessage>| {
+            let calls = calls.clone();
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok::<(), Reject>(())
+            }
+        })
+    };
+    // A conformant SM-PKI signing certificate (OU = MP-ID, one URI SAN)
+    // over the encryption key pair.
+    let shared = g.pair.ca.issue_with_options(
+        "sig",
+        KeyAlg::EcBrainpoolP256r1,
+        IssueOptions {
+            subject: vec![
+                (Nid::COMMONNAME, format!("Test MP {} sig", a.id)),
+                (Nid::ORGANIZATIONALUNITNAME, a.id.clone()),
+            ],
+            uri_sans: vec![A_URL.to_string()],
+            key_pem: Some(a.encryption.key_pem.clone()),
+            ..IssueOptions::default()
+        },
+    );
+    let forged = g.with_soap(&inbound_harness::resign_as(
+        &g.soap(),
+        &g.plaintext_attachments(),
+        &shared,
+    ));
+    let (status, body) = post(&inbound, forged).await;
+    assert_eq!(status, http::StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.contains("EBMS:0101"), "{body}");
+    assert!(body.contains("BDEW AS4-Profil 1.2 Kap. 2.3.4.4"), "{body}");
+    assert_eq!(calls.load(Ordering::SeqCst), 0, "never delivered");
+    // Control: the partner's real signing key on the same path.
+    let genuine = g.with_soap(&inbound_harness::resign_as(
+        &g.soap(),
+        &g.plaintext_attachments(),
+        &a.signing,
+    ));
+    let (status, body) = post(&inbound, genuine).await;
+    assert_eq!(status, http::StatusCode::OK, "{body}");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
 
 /// The handler sees each payload with the media type its signed

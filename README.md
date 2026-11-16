@@ -26,7 +26,7 @@ stay yours.
 
 ```toml
 [dependencies]
-asx-rs = "0.17"
+asx-rs = "0.18"
 ```
 
 The package is `asx-rs`; the library is `asx`. Features are additive and
@@ -162,6 +162,12 @@ addressee, revocation, the timestamp, decryption and the replay store. A
 receipt's non-repudiation digests must equal what you signed; an MDN's MIC and
 `Original-Message-ID` must match. `Verified<T>` has no public constructor and
 carries its audit record (`evidence()`).
+
+`build()` checks the configuration once, against the profile. Under
+`Profile::bdew()` that includes the SM-PKI triple: the signing, decryption and
+TLS certificates carry the MP-ID and the AS4 address (RzÜ AS4 2.6 Kap. 5.2),
+and the three key pairs differ by key, not just by certificate, as do the
+partner's signing and encryption keys (BDEW AS4-Profil 1.2 Kap. 2.3.4.4).
 
 ## Design
 

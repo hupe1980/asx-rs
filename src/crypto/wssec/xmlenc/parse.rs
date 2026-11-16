@@ -115,7 +115,7 @@ fn cipher_value(parent: Node<'_, '_>, what: &str) -> Result<Vec<u8>> {
 }
 
 /// RSA-OAEP parameters. Only SHA-256 / MGF1-SHA-256 with no label are accepted
-/// (BDEW AS4-Profil 1.2 §2.2.6.2.2; eDelivery AS4 1.15).
+/// (BDEW AS4-Profil 1.2 Kap. 2.2.6.2.2; eDelivery AS4 1.15).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct RsaOaepParams {
     pub(crate) digest: WsSecDigestMethod,

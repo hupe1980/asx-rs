@@ -9,13 +9,13 @@ pub const INITIATOR_ROLE: &str =
     "http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/initiator";
 pub const RESPONDER_ROLE: &str =
     "http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/responder";
-/// BDEW AS4-Profil 1.2 §2.3.1.2.1 (Marktprozesse).
+/// BDEW AS4-Profil 1.2 Kap. 2.3.1.2.1 (Marktprozesse).
 pub const BDEW_SERVICE_MP: &str = "https://www.bdew.de/as4/communication/services/MP";
-/// BDEW §2.3.2.
+/// BDEW Kap. 2.3.2.
 pub const BDEW_AGREEMENT: &str = "https://www.bdew.de/as4/communication/agreement";
-/// BDEW §2.3.1.2.2: the fixed action (ebMS3 Core default action).
+/// BDEW Kap. 2.3.1.2.2: the fixed action (ebMS3 Core default action).
 pub const BDEW_ACTION: &str = "http://docs.oasis-open.org/ebxml-msg/as4/200902/action";
-/// BDEW §2.3.1.1 party-id type for 99-prefixed MP-IDs.
+/// BDEW Kap. 2.3.1.1 party-id type for 99-prefixed MP-IDs.
 pub const BDEW_PARTY_TYPE: &str = "urn:oasis:names:tc:ebcore:partyid-type:unregistered:BDEW";
 /// The crate's MP-ID in the BDEW variant.
 pub const CRATE_MP_ID: &str = "9900000000001";

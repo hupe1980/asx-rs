@@ -1,6 +1,6 @@
 //! The built-in client against a real TLS MSH on 127.0.0.1 (`TlsMsh`):
 //! BDEW mutual TLS with BrainpoolP256r1 SM-PKI certificates (BDEW
-//! AS4-Profil 1.2 §2.2.6.1, §2.3.4.4; BSI TR-03116-3 §4), SNI
+//! AS4-Profil 1.2 Kap. 2.2.6.1, 2.3.4.4; BSI TR-03116-3 §4), SNI
 //! (RzÜ AS4 2.6 Kap. 3), connection reuse, and every server-side refusal:
 //! unknown CA, wrong host, missing serverAuth, revoked, a suite outside
 //! TR-03116-3.

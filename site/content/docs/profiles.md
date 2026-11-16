@@ -32,31 +32,31 @@ Sources: **B** BDEW AS4-Profil 1.2 (01.04.2026); **RzÜ** Regelungen zum
 
 | Setting | `bdew()` | `peppol()` | `edelivery_1_15()` | `entsog()` |
 |---|---|---|---|---|
-| MEP | One-Way/Push, receipts and errors synchronous (B §2.2.1, §2.2.2, §2.2.4, §2.2.5) | One-Way/Push (P §4.1) | One-Way/Push, signed receipt synchronous (E §3.2.1, §3.3.2) | One-Way/Push (G4 §2.2.1–2.2.2) |
-| Packaging | SwA, one MIME part per payload, empty Body, part type `application/octet-stream` (B §2.2.3.2) | attachments only (P §4.10) | SwA (E §3.2.3) | SwA (G4 §2.2.3) |
-| Compression | gzip, always (B §2.2.3.3 "MUSS") | gzip (P §4.10) | gzip (E §3.3.1 "SHOULD compress") | gzip, always (3.6 "Mandatory", G-FAQ §2.4) |
+| MEP | One-Way/Push, receipts and errors synchronous (B Kap. 2.2.1, 2.2.2, 2.2.4, 2.2.5) | One-Way/Push (P §4.1) | One-Way/Push, signed receipt synchronous (E §3.2.1, §3.3.2) | One-Way/Push (G4 §2.2.1–2.2.2) |
+| Packaging | SwA, one MIME part per payload, empty Body, part type `application/octet-stream` (B Kap. 2.2.3.2) | attachments only (P §4.10) | SwA (E §3.2.3) | SwA (G4 §2.2.3) |
+| Compression | gzip, always (B Kap. 2.2.3.3 "MUSS") | gzip (P §4.10) | gzip (E §3.3.1 "SHOULD compress") | gzip, always (3.6 "Mandatory", G-FAQ §2.4) |
 | File name (`Payload::named`) | allowed (BDEW file names) | **refused** (P §4.10 "SHALL NOT be used") | allowed | allowed |
-| Signature | `ecdsa-sha256` on BrainpoolP256r1, SHA-256 digests (B §2.2.6.2.1; TR §9.1) | `rsa-sha256`, RSA ≥ 2048 (P §3 → E §3.2.6) | `rsa-sha256`, RSA ≥ 2048 (E §3.2.6) | `rsa-sha256`, RSA ≥ 2048 (G-FAQ §2.4 on §2.2.6.2) |
-| Signing token | BST `#X509PKIPathv1` with the chain (B §2.2.6.2.1) | BST `#X509v3` (P §4.7) | BST `#X509v3` (E §3.2.6) | BST `#X509v3` |
-| Key transport | ECDH-ES + ConcatKDF (SHA-256) + `kw-aes128` (B §2.2.6.2.2; TR §9.2) | RSA-OAEP, MGF1-SHA-256, SHA-256 (E §3.2.6) | RSA-OAEP, MGF1-SHA-256, SHA-256 (E §3.2.6) | RSA-OAEP (G-FAQ §2.4 on §2.2.6.3) |
-| Recipient reference | `X509SKI` (B §2.2.6.2.2, §2.3.4.3) | BST `#X509v3` (P §4.7) | BST (E §3.2.6) | BST |
-| Keys | separate EC BrainpoolP256r1 pairs for signing, encryption and TLS (B §2.3.4.4); each certificate carries the MP-ID in the OU and the AS4 address as its one URI subjectAltName (RzÜ AS4 2.6 Kap. 5.2) | one AP certificate for both (P §4.7) | not required to differ | not required to differ |
+| Signature | `ecdsa-sha256` on BrainpoolP256r1, SHA-256 digests (B Kap. 2.2.6.2.1; TR §9.1) | `rsa-sha256`, RSA ≥ 2048 (P §3 → E §3.2.6) | `rsa-sha256`, RSA ≥ 2048 (E §3.2.6) | `rsa-sha256`, RSA ≥ 2048 (G-FAQ §2.4 on §2.2.6.2) |
+| Signing token | BST `#X509PKIPathv1` with the chain (B Kap. 2.2.6.2.1) | BST `#X509v3` (P §4.7) | BST `#X509v3` (E §3.2.6) | BST `#X509v3` |
+| Key transport | ECDH-ES + ConcatKDF (SHA-256) + `kw-aes128` (B Kap. 2.2.6.2.2; TR §9.2) | RSA-OAEP, MGF1-SHA-256, SHA-256 (E §3.2.6) | RSA-OAEP, MGF1-SHA-256, SHA-256 (E §3.2.6) | RSA-OAEP (G-FAQ §2.4 on §2.2.6.3) |
+| Recipient reference | `X509SKI` (B Kap. 2.2.6.2.2, 2.3.4.3) | BST `#X509v3` (P §4.7) | BST (E §3.2.6) | BST |
+| Keys | separate EC BrainpoolP256r1 pairs for signing, encryption and TLS (B Kap. 2.3.4.4), compared by key, not by certificate, for the local triple and the partner's signing and encryption certificates; each certificate carries the MP-ID in the OU and the AS4 address as its one URI subjectAltName (RzÜ AS4 2.6 Kap. 5.2) | one AP certificate for both (P §4.7) | not required to differ | not required to differ |
 | Endpoint | taken from the encryption certificate's URI subjectAltName (RzÜ AS4 2.6 Kap. 2); a DNS name (Kap. 3, SNI) | set on the `Partner` (or from the SMP) | set on the `Partner` | set on the `Partner` |
-| Transport | mutual TLS, BSI TR-03116-3 §4: TLS ≥ 1.2, ECDHE-ECDSA suites, Brainpool groups, the SM-PKI root as the only TLS trust, server chain CRL-checked (B §2.2.6.1, §2.3.7) | TLS ≥ 1.2, platform roots | TLS ≥ 1.2, platform roots | TLS ≥ 1.2, platform roots |
-| Party id | the 13-digit MP-ID; type one of `urn:oasis:names:tc:ebcore:partyid-type:iso6523:0088`, `…:unregistered:BDEW`, `…:unregistered:DVGW`, `…:unregistered:BAHN` (B §2.3.1.1) | fixed type `urn:fdc:peppol.eu:2017:identifiers:ap`; id = the AP certificate's CN (P §4.5) | caller-set (E §3.4.1) | caller-set |
-| Service | one of `https://www.bdew.de/as4/communication/services/{MP,FP,RD,KW,SO}` (B §2.3.1.2.1) | the process id (P §4.6) | caller-set, required (E §3.4.4) | caller-set, required |
-| Action | fixed `http://docs.oasis-open.org/ebxml-msg/as4/200902/action` (B §2.3.1.2.2) | the document type id (P §4.6) | caller-set (E §3.4.4) | caller-set |
-| Roles | fixed initiator / responder (B §2.3.1.2.3) | fixed, same (P §4.5) | default, same | default, same |
-| ConversationId | always empty; setting one fails (B §2.3.1.2.4) | caller-set | caller-set | caller-set |
-| AgreementRef | `https://www.bdew.de/as4/communication/agreement`, no `pmode`/`type` (B §2.3.2) | `urn:fdc:peppol.eu:2017:agreements:tia:ap_provider` (P §4.3) | none | per G4 §2.3.2 |
-| Who may send to you | any sender whose verified certificate chains to an anchor, carries the claimed MP-ID as the subject's OU and exactly one URI subjectAltName, plus the pins of a configured partner (B §2.3.2, §2.3.4.4; RzÜ AS4 2.6 Kap. 5.2) | any AP whose certificate chains to an anchor and whose CN equals `eb:From/PartyId`, plus pins (P §4.5, §4.7) | configured partners with pinned certificates only | configured partners with pinned certificates only |
-| Test service | receipted, never delivered (B §2.3.6) | as eDelivery | receipted, never delivered (E §3.2.4, §3.4.3) | as eDelivery |
-| Path switch | requestSwitch / confirmSwitch, payload-less (B §2.2.8, §2.3.7) | — | — | — |
+| Transport | mutual TLS, BSI TR-03116-3 §4: TLS ≥ 1.2, ECDHE-ECDSA suites, Brainpool groups, the SM-PKI root as the only TLS trust, server chain CRL-checked (B Kap. 2.2.6.1, 2.3.7) | TLS ≥ 1.2, platform roots | TLS ≥ 1.2, platform roots | TLS ≥ 1.2, platform roots |
+| Party id | the 13-digit MP-ID; type one of `urn:oasis:names:tc:ebcore:partyid-type:iso6523:0088`, `…:unregistered:BDEW`, `…:unregistered:DVGW`, `…:unregistered:BAHN` (B Kap. 2.3.1.1) | fixed type `urn:fdc:peppol.eu:2017:identifiers:ap`; id = the AP certificate's CN (P §4.5) | caller-set (E §3.4.1) | caller-set |
+| Service | one of `https://www.bdew.de/as4/communication/services/{MP,FP,RD,KW,SO}` (B Kap. 2.3.1.2.1) | the process id (P §4.6) | caller-set, required (E §3.4.4) | caller-set, required |
+| Action | fixed `http://docs.oasis-open.org/ebxml-msg/as4/200902/action` (B Kap. 2.3.1.2.2) | the document type id (P §4.6) | caller-set (E §3.4.4) | caller-set |
+| Roles | fixed initiator / responder (B Kap. 2.3.1.2.3) | fixed, same (P §4.5) | default, same | default, same |
+| ConversationId | always empty; setting one fails (B Kap. 2.3.1.2.4) | caller-set | caller-set | caller-set |
+| AgreementRef | `https://www.bdew.de/as4/communication/agreement`, no `pmode`/`type` (B Kap. 2.3.2) | `urn:fdc:peppol.eu:2017:agreements:tia:ap_provider` (P §4.3) | none | per G4 §2.3.2 |
+| Who may send to you | any sender whose verified certificate chains to an anchor, carries the claimed MP-ID as the subject's OU and exactly one URI subjectAltName and, for a configured partner, does not certify its encryption key, plus the pins of a configured partner (B Kap. 2.3.2, 2.3.4.4; RzÜ AS4 2.6 Kap. 5.2) | any AP whose certificate chains to an anchor and whose CN equals `eb:From/PartyId`, plus pins (P §4.5, §4.7) | configured partners with pinned certificates only | configured partners with pinned certificates only |
+| Test service | receipted, never delivered (B Kap. 2.3.6) | as eDelivery | receipted, never delivered (E §3.2.4, §3.4.3) | as eDelivery |
+| Path switch | requestSwitch / confirmSwitch, payload-less (B Kap. 2.2.8, 2.3.7) | — | — | — |
 
 Common to all four: sign, then encrypt, `eb:Messaging` never encrypted
-(B §2.2.6.2; E §3.2.6; AS4 §5.1.6); content encryption `aes128-gcm`
-(B §2.2.6.2.2; E §3.2.6); uncompressed inbound accepted (E §3.3.1); duplicate
-detection required (B §2.2.5; E §3.3.2; AS4 §3.2); size ceiling 256 MiB.
+(B Kap. 2.2.6.2; E §3.2.6; AS4 §5.1.6); content encryption `aes128-gcm`
+(B Kap. 2.2.6.2.2; E §3.2.6); uncompressed inbound accepted (E §3.3.1); duplicate
+detection required (B Kap. 2.2.5; E §3.3.2; AS4 §3.2); size ceiling 256 MiB.
 
 **Revocation** of every non-anchor certificate of a verified signer's path
 (inbound senders, receipt and MDN signers), per preset. The mechanics are on
@@ -140,12 +140,12 @@ section (tested in `tests/build_rejections.rs`).
 
 | Area | Refused |
 |---|---|
-| Local party | missing; no signer; no decrypter (every preset encrypts inbound); signer or decrypter key type not allowed by the profile; empty signer chain or a leaf not valid now; signer not chaining to a trust anchor; two decrypters with the same certificate |
-| BDEW local party | signer certificate equal to a decrypter certificate; TLS identity equal to either, missing with the built-in client (B §2.2.6.1) or not EC (B §2.3.4.4); a signing, decryption or TLS certificate whose OU is not the local MP-ID or which does not carry exactly one URI subjectAltName (RzÜ AS4 2.6 Kap. 5.2); party id not a 13-digit MP-ID; party type missing or not one of the four of B §2.3.1.1 |
+| Local party | missing; no signer; no decrypter (every preset encrypts inbound); signer or decrypter key type not allowed by the profile; empty signer chain or a leaf not valid now; signer not chaining to a trust anchor; two decrypters with the same certificate, key or key identifier |
+| BDEW local party | signer, decrypter and TLS identity not on three different keys (B Kap. 2.3.4.4; compared by key, so two certificates over one key count as one); TLS identity missing with the built-in client (B Kap. 2.2.6.1) or not EC (B Kap. 2.3.4.4); a signing, decryption or TLS certificate whose OU is not the local MP-ID or which does not carry exactly one URI subjectAltName (RzÜ AS4 2.6 Kap. 5.2); party id not a 13-digit MP-ID; party type missing or not one of the four of B Kap. 2.3.1.1 |
 | Peppol local party | a party type set (the profile fixes it) |
 | Trust | no trust anchor |
 | Partners | endpoint not `https`, unparseable or carrying userinfo; an endpoint without an encryption certificate (except BDEW, where the path switch needs none); a registered partner without a signing certificate (eDelivery, ENTSOG, AS2); a certificate key type the profile does not allow; an expired or not-yet-valid certificate; two partners with the same (type, id); a partner id equal to the local id |
-| BDEW partners | a signing or encryption certificate whose subject OU does not carry the partner's MP-ID, or which does not carry exactly one URI subjectAltName (RzÜ AS4 2.6 Kap. 5.2); an endpoint that is not the encryption certificate's URI (Kap. 2; compared with scheme and host case-insensitive and the default port dropped) or names an IP address (Kap. 3) |
+| BDEW partners | a signing certificate (current or rollover) on the encryption certificate's key (B Kap. 2.3.4.4); a signing or encryption certificate whose subject OU does not carry the partner's MP-ID, or which does not carry exactly one URI subjectAltName (RzÜ AS4 2.6 Kap. 5.2); an endpoint that is not the encryption certificate's URI (Kap. 2; compared with scheme and host case-insensitive and the default port dropped) or names an IP address (Kap. 3) |
 | Peppol partners | a signing certificate whose CN is not the partner id |
 | Transport | a TLS identity the linked OpenSSL cannot load or whose key does not match its certificate; a `Builder::resolve` host given twice or not a host name; a pin while a custom `HttpClient` is set |
 | Other | `max_message_bytes` zero or above the ceiling; a profile of the other protocol; a quirk of the other protocol; an AS2 id that is not 1–128 printable ASCII characters (RFC 4130 §6.2); no HTTP client with `http-client` off |

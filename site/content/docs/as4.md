@@ -41,7 +41,7 @@ async fn send_invoice(as4: &As4, partner: &Partner, invoice: Vec<u8>, attachment
   German market processes fill the RzÜ AS4 2.6 Kap. 6 properties from the
   EDIFACT envelope and send one Übertragungsdatei per message (Kap. 7.2).
   Both are market-process rules: the library carries the values and does not
-  check them (BDEW AS4-Profil 1.2 §2.3.5):
+  check them (BDEW AS4-Profil 1.2 Kap. 2.3.5):
 
   | Property | From |
   |---|---|
@@ -74,7 +74,7 @@ async fn send_utilmd(as4: &As4, partner: &Partner, interchange: Vec<u8>) -> asx:
 - **Message id and timestamp.** Fresh by default; set both from your outbox
   for [retries](@/docs/getting-started.md#retrying).
 - **Ping.** `Message::ping(&partner)` sends a test-service message
-  (eDelivery 1.15 §3.2.4, BDEW §2.3.6): receipted, never delivered. It still
+  (eDelivery 1.15 §3.2.4, BDEW Kap. 2.3.6): receipted, never delivered. It still
   needs a payload.
 
 ```rust
@@ -88,7 +88,7 @@ async fn ping(as4: &As4, partner: &Partner) -> asx::Result<()> {
 
 ### The BDEW path switch
 
-Mandatory under BDEW (§2.2.8). `Message::path_switch(&partner, PathSwitch::Request)`
+Mandatory under BDEW (Kap. 2.2.8). `Message::path_switch(&partner, PathSwitch::Request)`
 sends a payload-less user message (pathSwitch service, requestSwitch action);
 the partner answers with a new message carrying `PathSwitch::Confirm`. It is
 signed but not encrypted (no payload part, AS4 §5.1.6), so the partner needs no

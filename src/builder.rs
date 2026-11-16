@@ -182,21 +182,18 @@ fn refuse(
     if section.is_empty() {
         Error::config(format!("{setting}: {detail}"))
     } else {
-        Error::config(format!(
-            "{setting}: {detail} ({} {section})",
-            profile.citation()
-        ))
+        Error::config(format!("{setting}: {detail} ({})", profile.cite(section)))
     }
 }
 
-/// BDEW: the MP-ID is a 13-digit number (B §2.3.1.1).
+/// BDEW: the MP-ID is a 13-digit number (B Kap. 2.3.1.1).
 pub(crate) fn is_mp_id(id: &str) -> bool {
     id.len() == 13 && id.bytes().all(|b| b.is_ascii_digit())
 }
 
 /// BDEW: the MP-ID is carried in the subject's OU (RzÜ AS4 2.6 Kap. 5.2: "Das
 /// Feld Organisational Unit („OU") des Subject muss die MP-ID enthalten";
-/// B §2.3.4.4). One OU value must equal the MP-ID exactly; a CN or a
+/// B Kap. 2.3.4.4). One OU value must equal the MP-ID exactly; a CN or a
 /// substring does not count.
 pub(crate) fn bdew_subject_carries(cert: &Certificate, mp_id: &str) -> bool {
     cert.subject_values().iter().any(|(nid, value)| {
@@ -225,6 +222,41 @@ pub(crate) fn bdew_endpoint_uri(cert: &Certificate) -> std::result::Result<Strin
 /// The citation of the triple rules.
 const RZUE_5_2: &str = "RzÜ AS4 2.6 Kap. 5.2";
 
+/// Key-pair separation where the profile requires it, compared by key, not
+/// by certificate: a CA can certify one key pair twice
+/// (`Certificate::same_key`). BDEW AS4-Profil 1.2 Kap. 2.3.4.4: „Für die
+/// Signatur, die Verschlüsselung und den Aufbau der TLS-Verbindung MÜSSEN
+/// unterschiedliche Schlüsselpaare verwendet werden."
+fn check_key_roles(p: &Profile, local: &LocalParty, signer: &Certificate) -> Result<()> {
+    if !p.separate_keys() {
+        return Ok(());
+    }
+    let decrypters: Vec<&Certificate> = local
+        .decrypters
+        .iter()
+        .map(|d| d.decrypter.certificate())
+        .collect();
+    if decrypters.iter().any(|d| d.same_key(signer)) {
+        return Err(refuse(
+            p,
+            "LocalParty::signer",
+            "the signing key pair must differ from the decryption key pair",
+            "2.3.4.4",
+        ));
+    }
+    if let Some(tls) = &local.tls
+        && (tls.leaf().same_key(signer) || decrypters.iter().any(|d| d.same_key(tls.leaf())))
+    {
+        return Err(refuse(
+            p,
+            "LocalParty::tls_identity",
+            "the TLS key pair must differ from the signing and decryption key pairs",
+            "2.3.4.4",
+        ));
+    }
+    Ok(())
+}
+
 /// Both rules of RzÜ AS4 2.6 Kap. 5.2 for one certificate of `mp_id`'s
 /// triple: the MP-ID in the subject's OU and exactly one URI SAN.
 fn check_bdew_triple_cert(
@@ -238,7 +270,7 @@ fn check_bdew_triple_cert(
             profile,
             setting,
             format!("the certificate subject (OU) does not carry the MP-ID {mp_id} ({RZUE_5_2})"),
-            "§2.3.4.4",
+            "2.3.4.4",
         ));
     }
     bdew_endpoint_uri(cert)
@@ -345,6 +377,16 @@ fn check_bdew_partner(profile: &Profile, partner: &Partner) -> Result<()> {
         return Ok(());
     };
     check_bdew_triple_cert(profile, &setting("encryption_cert"), enc, id)?;
+    // Kap. 2.3.4.4 binds the partner's key pairs too: never encrypt to a key
+    // its holder also signs with.
+    if profile.separate_keys() && partner.signing_certs().iter().any(|c| c.same_key(enc)) {
+        return Err(refuse(
+            profile,
+            &setting("signing_cert"),
+            "the signing key pair must differ from the encryption key pair",
+            "2.3.4.4",
+        ));
+    }
     let san = bdew_endpoint_uri(enc).unwrap_or_default();
     let endpoint = partner.endpoint_url().unwrap_or(&san);
     if let Some(url) = partner.endpoint_url()
@@ -392,7 +434,7 @@ pub(crate) fn check_partner(
     if let Some(url) = partner.endpoint_url() {
         check_endpoint(url).map_err(|d| refuse(profile, &setting("endpoint"), d, ""))?;
         // Under BDEW a partner may be reached for the payload-less
-        // path-switch service alone (B §2.3.2 dynamic P-Mode, §2.3.7): `send`
+        // path-switch service alone (B Kap. 2.3.2 dynamic P-Mode, 2.3.7): `send`
         // refuses a business message to it.
         if partner.encryption_certificate().is_none() && !profile.path_switch() {
             return Err(refuse(
@@ -442,7 +484,7 @@ pub(crate) fn check_partner(
                     profile,
                     &setting("signing_cert"),
                     format!("the certificate subject (OU) does not carry the MP-ID {id}"),
-                    "§2.3.4.4",
+                    "2.3.4.4",
                 ));
             }
             SenderRule::AnchorAndCn if cert.subject_cn().as_deref() != Some(id) => {
@@ -450,7 +492,7 @@ pub(crate) fn check_partner(
                     profile,
                     &setting("signing_cert"),
                     format!("the certificate CN is not the party id {id}"),
-                    "§4.5",
+                    "4.5",
                 ));
             }
             _ => {}
@@ -498,7 +540,7 @@ pub(crate) fn check_partner(
             profile,
             &setting("id"),
             "an AS2 identifier is 1-128 printable ASCII characters",
-            "§6.2",
+            "6.2",
         ));
     }
     Ok(())
@@ -511,21 +553,21 @@ fn encryption_allowed(profile: &Profile, kind: KeyKind) -> bool {
 
 fn signature_section(profile: &Profile) -> &'static str {
     match profile.id() {
-        ProfileId::Bdew12 => "§2.2.6.2.1",
-        ProfileId::Peppol203 => "§3",
-        ProfileId::Edelivery115 => "§3.2.6",
-        ProfileId::Entsog36 => "§2.2.6.2",
-        ProfileId::As2 => "§2.4",
+        ProfileId::Bdew12 => "2.2.6.2.1",
+        ProfileId::Peppol203 => "3",
+        ProfileId::Edelivery115 => "3.2.6",
+        ProfileId::Entsog36 => "2.2.6.2",
+        ProfileId::As2 => "2.4",
     }
 }
 
 fn encryption_section(profile: &Profile) -> &'static str {
     match profile.id() {
-        ProfileId::Bdew12 => "§2.2.6.2.2",
-        ProfileId::Peppol203 => "§3",
-        ProfileId::Edelivery115 => "§3.2.6",
-        ProfileId::Entsog36 => "§2.2.6.3",
-        ProfileId::As2 => "§2.4",
+        ProfileId::Bdew12 => "2.2.6.2.2",
+        ProfileId::Peppol203 => "3",
+        ProfileId::Edelivery115 => "3.2.6",
+        ProfileId::Entsog36 => "2.2.6.3",
+        ProfileId::As2 => "2.4",
     }
 }
 
@@ -537,13 +579,13 @@ fn check_party_type(profile: &Profile, setting: &str, party_type: Option<&str>) 
                 profile,
                 setting,
                 format!("{t:?} is not one of {allowed:?}"),
-                "§2.3.1.1",
+                "2.3.1.1",
             )),
             None => Err(refuse(
                 profile,
                 setting,
                 format!("a party type is required, one of {allowed:?}"),
-                "§2.3.1.1",
+                "2.3.1.1",
             )),
         },
         PartyTypeRule::Fixed(fixed) => match party_type {
@@ -552,7 +594,7 @@ fn check_party_type(profile: &Profile, setting: &str, party_type: Option<&str>) 
                 profile,
                 setting,
                 format!("the profile fixes the party type to {fixed:?}; do not set it"),
-                "§4.5",
+                "4.5",
             )),
         },
         PartyTypeRule::CallerSet => Ok(()),
@@ -655,9 +697,8 @@ fn validate<C>(builder: Builder<C>, protocol: Protocol) -> Result<ClientConfig> 
             signature_section(p),
         ));
     }
-    let mut seen_certs: Vec<&Certificate> = Vec::new();
     let mut seen_skis: Vec<Vec<u8>> = Vec::new();
-    for decrypter in &local.decrypters {
+    for (i, decrypter) in local.decrypters.iter().enumerate() {
         let cert = decrypter.decrypter.certificate();
         let kind = cert.key_kind();
         if !encryption_allowed(p, kind) {
@@ -672,44 +713,37 @@ fn validate<C>(builder: Builder<C>, protocol: Protocol) -> Result<ClientConfig> 
                 encryption_section(p),
             ));
         }
-        let skis = cert.ski_candidates();
-        if seen_certs.contains(&cert) || skis.iter().any(|s| seen_skis.contains(s)) {
-            return Err(refuse(
-                p,
-                "LocalParty::decrypter",
-                "two decrypters with the same certificate or key identifier (inbound key selection would be ambiguous)",
-                "",
-            ));
-        }
-        seen_certs.push(cert);
-        seen_skis.extend(skis);
-    }
-    if p.separate_keys() {
-        if seen_certs.contains(&signer_leaf) {
-            return Err(refuse(
-                p,
-                "LocalParty::signer",
-                "the signing key pair must differ from the decryption key pair",
-                "§2.3.4.4",
-            ));
-        }
-        if let Some(tls) = &local.tls
-            && (tls.leaf() == signer_leaf || seen_certs.contains(&tls.leaf()))
+        // Inbound key selection would be ambiguous: by key (a CA can
+        // certify one key twice), and by SKI (two decrypters answering to
+        // one identifier, whatever their keys).
+        if local.decrypters[..i]
+            .iter()
+            .any(|earlier| earlier.decrypter.certificate().same_key(cert))
         {
             return Err(refuse(
                 p,
-                "LocalParty::tls_identity",
-                "the TLS key pair must differ from the signing and decryption key pairs",
-                "§2.3.4.4",
+                "LocalParty::decrypter",
+                "two decrypters certify the same key (inbound key selection would be ambiguous)",
+                "",
             ));
         }
+        let skis = cert.ski_candidates();
+        if skis.iter().any(|s| seen_skis.contains(s)) {
+            return Err(refuse(
+                p,
+                "LocalParty::decrypter",
+                "two decrypters with the same key identifier (inbound key selection would be ambiguous)",
+                "",
+            ));
+        }
+        seen_skis.extend(skis);
     }
     if let Some(tls) = &local.tls
         && p.separate_keys()
         && !matches!(tls.key_kind(), KeyKind::Ec { .. })
     {
-        // BDEW AS4-Profil 1.2 §2.3.4.4: "Die Schlüsselpaare MÜSSEN EC-basiert
-        // sein" — the TLS pair too.
+        // BDEW AS4-Profil 1.2 Kap. 2.3.4.4: "Die Schlüsselpaare MÜSSEN
+        // EC-basiert sein" — the TLS pair too.
         return Err(refuse(
             p,
             "LocalParty::tls_identity",
@@ -717,9 +751,10 @@ fn validate<C>(builder: Builder<C>, protocol: Protocol) -> Result<ClientConfig> 
                 "{} key not allowed, the TLS key pair must be EC",
                 tls.key_kind().describe()
             ),
-            "§2.3.4.4",
+            "2.3.4.4",
         ));
     }
+    check_key_roles(p, &local, signer_leaf)?;
     if p.sender_rule() == SenderRule::AnchorAndSubject {
         check_bdew_triple_cert(p, "LocalParty::signer", signer_leaf, &local.id)?;
         for decrypter in &local.decrypters {
@@ -739,7 +774,7 @@ fn validate<C>(builder: Builder<C>, protocol: Protocol) -> Result<ClientConfig> 
             p,
             "LocalParty::new",
             format!("{:?} is not a 13-digit MP-ID", local.id),
-            "§2.3.1.1",
+            "2.3.1.1",
         ));
     }
     if protocol == Protocol::As2 && !is_as2_id(&local.id) {
@@ -747,7 +782,7 @@ fn validate<C>(builder: Builder<C>, protocol: Protocol) -> Result<ClientConfig> 
             p,
             "LocalParty::new",
             "an AS2 identifier is 1-128 printable ASCII characters",
-            "§6.2",
+            "6.2",
         ));
     }
     check_party_type(p, "LocalParty::party_type", local.party_type.as_deref())?;
@@ -917,14 +952,14 @@ fn default_http(
 ) -> Result<(Arc<dyn HttpClient>, Builtin)> {
     use crate::transport::tls::TlsPolicy;
     let bdew = profile.id() == ProfileId::Bdew12;
-    // BDEW AS4-Profil 1.2 §2.2.6.1: "Client-Authentifizierung ist
+    // BDEW AS4-Profil 1.2 Kap. 2.2.6.1: "Client-Authentifizierung ist
     // ERFORDERLICH."
     if bdew && local.tls.is_none() {
         return Err(refuse(
             profile,
             "LocalParty::tls_identity",
             "the built-in client needs a TLS identity: client authentication is required",
-            "§2.2.6.1",
+            "2.2.6.1",
         ));
     }
     let policy = if bdew {

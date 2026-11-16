@@ -1,6 +1,6 @@
 #![cfg(feature = "as4")]
 //! Reception Awareness / Non-Repudiation of Receipt on `As4::send` (BDEW
-//! AS4-Profil §4.6.3, eDelivery AS4 1.15 §5.1): a receipt is
+//! AS4-Profil Kap. 4.6.3, eDelivery AS4 1.15 §5.1): a receipt is
 //! evidence of delivery only when it is signed by the pinned partner, refers
 //! to the sent message, and its `MessagePartNRInformation` echoes the
 //! digests the sent message was signed over.

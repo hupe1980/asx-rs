@@ -8,7 +8,9 @@
 
 use asx::as4::As4;
 use asx::testkit::loopback::Loopback;
-use asx::testkit::pki::{BDEW_PARTY_TYPE, KeyAlg, Nid, TestCa, TestParty};
+use asx::testkit::pki::{
+    BDEW_PARTY_TYPE, Eku, IssueOptions, KeyAlg, KeyPair as TestKeyPair, Nid, TestCa, TestParty,
+};
 use asx::{
     Certificate, ErrorKind, LocalParty, Partner, Profile, Quirk, SignatureAlgorithm, Signer,
 };
@@ -16,8 +18,6 @@ use asx::{
 const A: &str = "9900000000001";
 const B: &str = "9900000000002";
 const B_URL: &str = "https://b.example/as4";
-const BDEW: &str = "BDEW AS4-Profil 1.2";
-const PEPPOL: &str = "Peppol AS4 Profile 2.0.3";
 
 // ── helpers ─────────────────────────────────────────────────────────────────
 
@@ -70,6 +70,38 @@ impl Bdew {
     fn partner_b(&self) -> Partner {
         Partner::new(B).party_type(BDEW_PARTY_TYPE).endpoint(B_URL)
     }
+}
+
+/// A second certificate over `key`'s key pair (another serial number),
+/// with the BDEW subject and URI SAN of `mp_id` at `url`: a conformant
+/// certificate whose only defect is the key it certifies. `tls` adds the
+/// DNS SAN and the serverAuth/clientAuth usages of a TLS certificate.
+fn recertify(ca: &TestCa, key: &TestKeyPair, mp_id: &str, url: &str, tls: bool) -> TestKeyPair {
+    let host = url
+        .trim_start_matches("https://")
+        .split('/')
+        .next()
+        .unwrap()
+        .to_string();
+    ca.issue_with_options(
+        "recertified",
+        KeyAlg::EcBrainpoolP256r1,
+        IssueOptions {
+            subject: vec![
+                (Nid::COMMONNAME, format!("Test MP {mp_id} recertified")),
+                (Nid::ORGANIZATIONALUNITNAME, mp_id.to_string()),
+            ],
+            uri_sans: vec![url.to_string()],
+            dns_sans: if tls { vec![host] } else { Vec::new() },
+            eku: if tls {
+                vec![Eku::ServerAuth, Eku::ClientAuth]
+            } else {
+                Vec::new()
+            },
+            key_pem: Some(key.key_pem.clone()),
+            ..IssueOptions::default()
+        },
+    )
 }
 
 /// An RSA party (eDelivery 1.15 / ENTSOG) builder with partner `b`.
@@ -239,7 +271,7 @@ fn signer_key_type_not_allowed() {
         .tls_identity(pki.a.tls.key_pair());
     assert_refused(
         pki.without_local().local(local).build(),
-        &["LocalParty::signer", BDEW, "§2.2.6.2.1"],
+        &["LocalParty::signer", "BDEW AS4-Profil 1.2 Kap. 2.2.6.2.1"],
     );
 
     // peppol: EC P-256 instead of RSA >= 2048.
@@ -255,7 +287,7 @@ fn signer_key_type_not_allowed() {
             .trust_anchor(ca.anchor())
             .http_client(Loopback::new())
             .build(),
-        &["LocalParty::signer", PEPPOL, "§3"],
+        &["LocalParty::signer", "Peppol AS4 Profile 2.0.3 §3"],
     );
 }
 
@@ -275,7 +307,7 @@ fn as2_signer_key_type_not_allowed() {
             .trust_anchor(ca.anchor())
             .http_client(Loopback::new())
             .build(),
-        &["LocalParty::signer", "RFC 4130", "§2.4"],
+        &["LocalParty::signer", "RFC 4130 §2.4"],
     );
 }
 
@@ -296,7 +328,10 @@ fn decrypter_key_type_not_allowed() {
         .tls_identity(pki.a.tls.key_pair());
     assert_refused(
         pki.without_local().local(local).build(),
-        &["LocalParty::decrypter", BDEW, "§2.2.6.2.2"],
+        &[
+            "LocalParty::decrypter",
+            "BDEW AS4-Profil 1.2 Kap. 2.2.6.2.2",
+        ],
     );
 }
 
@@ -338,7 +373,30 @@ fn bdew_signer_equals_decrypter() {
         .tls_identity(pki.a.tls.key_pair());
     assert_refused(
         pki.without_local().local(local).build(),
-        &["LocalParty::signer", BDEW, "§2.3.4.4"],
+        &["LocalParty::signer", "BDEW AS4-Profil 1.2 Kap. 2.3.4.4"],
+    );
+}
+
+/// Kap. 2.3.4.4 separates key pairs, not certificates: a decryption
+/// certificate re-certifying the signing key (another serial, a valid BDEW
+/// subject) is the same key pair.
+#[test]
+fn bdew_decrypter_recertifying_the_signing_key() {
+    let pki = bdew();
+    let shared = recertify(&pki.ca, &pki.a.signing, A, "https://a.example/as4", false);
+    assert_ne!(shared.certificate(), pki.a.signing.certificate());
+    let local = LocalParty::new(A)
+        .party_type(BDEW_PARTY_TYPE)
+        .signer(pki.a.signing.key_pair())
+        .decrypter(shared.key_pair())
+        .tls_identity(pki.a.tls.key_pair());
+    assert_refused(
+        pki.without_local().local(local).build(),
+        &[
+            "LocalParty::signer",
+            "signing key pair must differ",
+            "BDEW AS4-Profil 1.2 Kap. 2.3.4.4",
+        ],
     );
 }
 
@@ -353,8 +411,104 @@ fn bdew_tls_identity_equals_signer_or_decrypter() {
             .tls_identity(tls.key_pair());
         assert_refused(
             pki.without_local().local(local).build(),
-            &["LocalParty::tls_identity", BDEW, "§2.3.4.4"],
+            &[
+                "LocalParty::tls_identity",
+                "BDEW AS4-Profil 1.2 Kap. 2.3.4.4",
+            ],
         );
+    }
+}
+
+/// A TLS certificate re-certifying the signing key, or a decryption key,
+/// with every TLS attribute in place (DNS SAN, serverAuth, clientAuth).
+#[test]
+fn bdew_tls_recertifying_the_signing_or_a_decryption_key() {
+    let pki = bdew();
+    for key in [&pki.a.signing, &pki.a.encryption] {
+        let tls = recertify(&pki.ca, key, A, "https://a.example/as4", true);
+        let local = LocalParty::new(A)
+            .party_type(BDEW_PARTY_TYPE)
+            .signer(pki.a.signing.key_pair())
+            .decrypter(pki.a.encryption.key_pair())
+            .tls_identity(tls.key_pair());
+        assert_refused(
+            pki.without_local().local(local).build(),
+            &[
+                "LocalParty::tls_identity",
+                "TLS key pair must differ",
+                "BDEW AS4-Profil 1.2 Kap. 2.3.4.4",
+            ],
+        );
+    }
+}
+
+/// The re-certified certificates alone are conformant: with distinct keys
+/// the same helper builds.
+#[test]
+fn bdew_recertified_triple_with_distinct_keys_builds() {
+    let pki = bdew();
+    let url = "https://a.example/as4";
+    let local = LocalParty::new(A)
+        .party_type(BDEW_PARTY_TYPE)
+        .signer(recertify(&pki.ca, &pki.a.signing, A, url, false).key_pair())
+        .decrypter(recertify(&pki.ca, &pki.a.encryption, A, url, false).key_pair())
+        .tls_identity(recertify(&pki.ca, &pki.a.tls, A, url, true).key_pair());
+    pki.without_local()
+        .local(local)
+        .build()
+        .expect("distinct keys build");
+}
+
+/// Two decrypters over one key make inbound key selection ambiguous under
+/// every profile, also when the certificates differ.
+#[test]
+fn two_decrypters_certifying_one_key() {
+    let ca = rsa_ca();
+    let a = ca.rsa_party("party-a");
+    let b = ca.rsa_party("party-b");
+    let again = ca.issue_with_options(
+        "party-a",
+        KeyAlg::Rsa2048,
+        IssueOptions {
+            key_pem: Some(a.encryption.key_pem.clone()),
+            ..IssueOptions::default()
+        },
+    );
+    assert_ne!(again.certificate(), a.encryption.certificate());
+    let local = a.local().decrypter(again.key_pair());
+    for profile in [Profile::edelivery_1_15(), Profile::entsog()] {
+        assert_refused(
+            As4::builder(profile)
+                .local(local.clone())
+                .trust_anchor(ca.anchor())
+                .partner(b.partner(B_URL))
+                .http_client(Loopback::new())
+                .build(),
+            &["LocalParty::decrypter", "certify the same key"],
+        );
+    }
+}
+
+/// Profiles that do not separate key pairs accept one key in every role
+/// (a Peppol AP certificate signs and decrypts).
+#[test]
+fn edelivery_accepts_one_key_in_every_role() {
+    let ca = rsa_ca();
+    let a = ca.rsa_party("party-a");
+    let b = ca.rsa_party("party-b");
+    let local = LocalParty::new("party-a")
+        .party_type(asx::testkit::pki::UNREGISTERED_PARTY_TYPE)
+        .signer(a.signing.key_pair())
+        .decrypter(a.signing.key_pair())
+        .tls_identity(a.signing.key_pair());
+    for profile in [Profile::edelivery_1_15(), Profile::entsog()] {
+        As4::builder(profile)
+            .local(local.clone())
+            .trust_anchor(ca.anchor())
+            .partner(b.partner(B_URL))
+            .http_client(Loopback::new())
+            .build()
+            .expect("one key in every role");
     }
 }
 
@@ -368,7 +522,10 @@ fn bdew_local_id_not_mp_id() {
         .trust_anchor(ca.anchor())
         .partner(b.partner(B_URL))
         .http_client(Loopback::new());
-    assert_refused(builder.build(), &["LocalParty::new", BDEW, "§2.3.1.1"]);
+    assert_refused(
+        builder.build(),
+        &["LocalParty::new", "BDEW AS4-Profil 1.2 Kap. 2.3.1.1"],
+    );
 }
 
 #[test]
@@ -382,13 +539,13 @@ fn bdew_party_type_missing_or_unknown() {
     };
     assert_refused(
         pki.without_local().local(base()).build(),
-        &["LocalParty::party_type", BDEW, "§2.3.1.1"],
+        &["LocalParty::party_type", "BDEW AS4-Profil 1.2 Kap. 2.3.1.1"],
     );
     assert_refused(
         pki.without_local()
             .local(base().party_type("urn:example:not-a-bdew-type"))
             .build(),
-        &["LocalParty::party_type", BDEW, "§2.3.1.1"],
+        &["LocalParty::party_type", "BDEW AS4-Profil 1.2 Kap. 2.3.1.1"],
     );
 }
 
@@ -405,7 +562,7 @@ fn peppol_party_type_set() {
             .trust_anchor(ca.anchor())
             .http_client(Loopback::new())
             .build(),
-        &["LocalParty::party_type", PEPPOL, "§4.5"],
+        &["LocalParty::party_type", "Peppol AS4 Profile 2.0.3 §4.5"],
     );
 }
 
@@ -436,7 +593,7 @@ fn two_decrypters_same_certificate() {
     let local = pki.a.local().decrypter(pki.a.encryption.key_pair());
     assert_refused(
         pki.without_local().local(local).build(),
-        &["LocalParty::decrypter", "same certificate"],
+        &["LocalParty::decrypter", "certify the same key"],
     );
 }
 
@@ -549,7 +706,10 @@ fn partner_certificate_key_type_not_allowed() {
         .encryption_cert(pki.b.encryption.certificate());
     assert_refused(
         pki.without_partner().partner(signing).build(),
-        &["Partner(9900000000002)::signing_cert", BDEW, "§2.2.6.2.1"],
+        &[
+            "Partner(9900000000002)::signing_cert",
+            "BDEW AS4-Profil 1.2 Kap. 2.2.6.2.1",
+        ],
     );
     let encryption = pki
         .partner_b()
@@ -559,8 +719,7 @@ fn partner_certificate_key_type_not_allowed() {
         pki.without_partner().partner(encryption).build(),
         &[
             "Partner(9900000000002)::encryption_cert",
-            BDEW,
-            "§2.2.6.2.2",
+            "BDEW AS4-Profil 1.2 Kap. 2.2.6.2.2",
         ],
     );
 }
@@ -609,10 +768,53 @@ fn bdew_partner_subject_lacks_mp_id() {
         &[
             "Partner(9900000000002)::signing_cert",
             "MP-ID",
-            BDEW,
-            "§2.3.4.4",
+            "BDEW AS4-Profil 1.2 Kap. 2.3.4.4",
         ],
     );
+}
+
+/// Kap. 2.3.4.4 binds the partner's key pairs too: a signing certificate
+/// re-certifying its encryption key is refused, also as a rollover.
+#[test]
+fn bdew_partner_signing_recertifying_its_encryption_key() {
+    let pki = bdew();
+    let shared = recertify(&pki.ca, &pki.b.encryption, B, B_URL, false);
+    let alone = pki
+        .partner_b()
+        .signing_cert(shared.certificate())
+        .encryption_cert(pki.b.encryption.certificate());
+    let rollover = pki
+        .partner_b()
+        .signing_cert(pki.b.signing.certificate())
+        .signing_cert(shared.certificate())
+        .encryption_cert(pki.b.encryption.certificate());
+    for partner in [alone, rollover] {
+        assert_refused(
+            pki.without_partner().partner(partner).build(),
+            &[
+                "Partner(9900000000002)::signing_cert",
+                "signing key pair must differ from the encryption key pair",
+                "BDEW AS4-Profil 1.2 Kap. 2.3.4.4",
+            ],
+        );
+    }
+}
+
+/// Under eDelivery a partner may sign and encrypt with one key.
+#[test]
+fn edelivery_partner_with_one_key_builds() {
+    let ca = rsa_ca();
+    let a = ca.rsa_party("party-a");
+    let b = ca.rsa_party("party-b");
+    let partner = Partner::new("party-b")
+        .party_type(asx::testkit::pki::UNREGISTERED_PARTY_TYPE)
+        .endpoint(B_URL)
+        .signing_cert(b.signing.certificate())
+        .encryption_cert(b.signing.certificate());
+    rsa_builder(Profile::edelivery_1_15(), &ca, &a)
+        .partner(partner)
+        .build()
+        .expect("one partner key under eDelivery");
 }
 
 #[test]
@@ -631,7 +833,10 @@ fn peppol_partner_cn_not_party_id() {
             .partner(partner)
             .http_client(Loopback::new())
             .build(),
-        &["Partner(POP000999)::signing_cert", PEPPOL, "§4.5"],
+        &[
+            "Partner(POP000999)::signing_cert",
+            "Peppol AS4 Profile 2.0.3 §4.5",
+        ],
     );
 }
 
@@ -739,7 +944,7 @@ fn as2_id_not_printable_ascii() {
             .decrypter(a.encryption.key_pair());
         assert_refused(
             builder().local(local).build(),
-            &["LocalParty::new", "RFC 4130", "§6.2"],
+            &["LocalParty::new", "RFC 4130 §6.2"],
         );
     }
     let partner = Partner::new("bad\u{7f}id")
@@ -748,7 +953,7 @@ fn as2_id_not_printable_ascii() {
         .encryption_cert(b.encryption.certificate());
     assert_refused(
         builder().local(a.local()).partner(partner).build(),
-        &["::id", "RFC 4130", "§6.2"],
+        &["::id", "RFC 4130 §6.2"],
     );
 }
 
@@ -819,7 +1024,10 @@ fn bdew_builtin_client_requires_a_tls_identity() {
         .decrypter(pki.a.encryption.key_pair());
     assert_refused(
         builtin_bdew(&pki, without).build(),
-        &["LocalParty::tls_identity", BDEW, "§2.2.6.1"],
+        &[
+            "LocalParty::tls_identity",
+            "BDEW AS4-Profil 1.2 Kap. 2.2.6.1",
+        ],
     );
     // Control: with it, the built-in client builds.
     builtin_bdew(&pki, pki.a.local()).build().expect("builds");
@@ -843,7 +1051,11 @@ fn bdew_tls_identity_must_be_ec() {
     let local = pki.a.local().tls_identity(rsa.key_pair());
     assert_refused(
         pki.without_local().local(local).build(),
-        &["LocalParty::tls_identity", "EC", "§2.3.4.4"],
+        &[
+            "LocalParty::tls_identity",
+            "EC",
+            "BDEW AS4-Profil 1.2 Kap. 2.3.4.4",
+        ],
     );
 }
 

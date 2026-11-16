@@ -287,6 +287,11 @@ pub struct IssueOptions {
     pub dns_sans: Vec<String>,
     /// Extended key usages; the extension is absent when empty.
     pub eku: Vec<Eku>,
+    /// The PKCS#8 PEM private key to certify (a re-certification: a new
+    /// certificate and serial over an existing key pair, e.g.
+    /// [`KeyPair::key_pem`]); a fresh key of the given algorithm when `None`.
+    /// The key must be of that algorithm (it selects the key usage).
+    pub key_pem: Option<Vec<u8>>,
 }
 
 impl TestCa {
@@ -465,7 +470,7 @@ impl TestCa {
     }
 
     /// A BDEW market participant whose AS4 endpoint is `url` (BDEW
-    /// AS4-Profil 1.2 §2.3.4.4; RzÜ AS4 2.6 Kap. 5.2; CP SM-PKI Anhang A.7.1
+    /// AS4-Profil 1.2 Kap. 2.3.4.4; RzÜ AS4 2.6 Kap. 5.2; CP SM-PKI Anhang A.7.1
     /// Tabelle 28): separate BrainpoolP256r1 key pairs for signing,
     /// encryption and TLS, each with the MP-ID as the subject's OU and `url`
     /// as its one URI subjectAltName. The TLS certificate also carries the
@@ -606,7 +611,12 @@ impl TestCa {
     }
 
     fn issue_leaf(&self, subject: X509Name, alg: KeyAlg, options: IssueOptions) -> KeyPair {
-        let key = alg.generate();
+        let key = match &options.key_pem {
+            Some(pem) => {
+                PKey::private_key_from_pem(pem).expect("IssueOptions::key_pem is a PEM private key")
+            }
+            None => alg.generate(),
+        };
         let extensions = self.locator_extensions(&options);
         let cert = build_cert(
             &subject,

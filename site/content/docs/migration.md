@@ -1,7 +1,23 @@
 +++
 title = "Migrating"
-description = "Every 0.16 to 0.17 and 0.15 to 0.16 wire change and API replacement, grouped by task."
+description = "Every 0.17 to 0.18, 0.16 to 0.17 and 0.15 to 0.16 wire change and API replacement, grouped by task."
 +++
+
+## 0.17 to 0.18: key pairs by key
+
+BDEW key-pair separation (BDEW AS4-Profil 1.2 Kap. 2.3.4.4) is checked on the
+keys the certificates certify, not on the certificates.
+
+| Change | 0.17 | 0.18 | Consequence |
+|---|---|---|---|
+| **BDEW local triple** | refused when two roles share a *certificate* | refused when two roles share a *key*, also over different certificates | a re-issued certificate over the signing key cannot serve as TLS or decryption certificate |
+| **BDEW partner** | signing and encryption certificates not compared | a signing certificate (current or rollover) certifying the encryption key is refused | fix the partner record, not the check |
+| **Inbound BDEW signer** | any SM-PKI signer with the MP-ID and one URI SAN | also refused (`EBMS:0101`) when it certifies the configured partner's encryption key | |
+| **Two decrypters** | refused on equal certificate or SKI | also refused on one key, under every profile | one decrypter per key; a re-certified key needs no second decrypter |
+| **Citation text** | BDEW AS4-Profil sections with „§" | „BDEW AS4-Profil 1.2 Kap. 2.3.4.4"; other profiles keep „§" | tests matching refusal texts change |
+
+To test re-certified keys in your own suite, issue a certificate over an
+existing key with `IssueOptions { key_pem: Some(pair.key_pem.clone()), .. }`.
 
 ## 0.16 to 0.17: BDEW end to end
 
@@ -50,14 +66,14 @@ instance in a trading relationship together.
 |---|---|---|---|
 | **SwA encryption shape** | a standalone `xenc:EncryptedData` document per MIME part, outside `wsse:Security` | WSS SwA 1.1 §5.5: `xenc:EncryptedKey` and one `xenc:EncryptedData` per part (`Attachment-Content-Only`, `CipherReference` to the `cid:`) in `wsse:Security`; parts are `application/octet-stream` IV ‖ ciphertext ‖ tag | **lockstep**: neither side decrypts the other (0.16 answers `EBMS:0103`); WSS4J peers (phase4, Holodeck, Domibus) interoperate |
 | **Order** | compress → encrypt → sign (the `cid:` digests covered ciphertext) | compress → **sign → encrypt** (digests cover the compressed plaintext); inbound decrypts only after verifying | resends reproduce every digest |
-| **Every AS4 preset encrypts** | sign-only possible (default `encrypt: false`) | always sign and encrypt (eDelivery 1.15 §3.2.6, BDEW §2.2.6.2.2) | sign-only partners have no equivalent |
+| **Every AS4 preset encrypts** | sign-only possible (default `encrypt: false`) | always sign and encrypt (eDelivery 1.15 §3.2.6, BDEW Kap. 2.2.6.2.2) | sign-only partners have no equivalent |
 | **ECDSA `ds:SignatureValue`** | ASN.1 DER | XMLDSig 1.1 `r ‖ s` (64 octets on P-256 and BrainpoolP256r1); DER is refused | **lockstep** for EC (BDEW) peers; RSA unchanged |
 | **`eb:MessageId`** | carried `wsu:Id="as4-message-id"` (invalid per the ebMS3 schema) | no attribute | `eb:Messaging` digest changes; phase4 no longer answers `EBMS:0009` |
 | **PKIPath token reference** | STR to the `#X509PKIPathv1` token without a token type | `wsse11:TokenType="…#X509PKIPathv1"` (WS-I BSP R5215); the last certificate of the path is the signer | WSS4J accepts BDEW signatures |
 | **`eb:Property`** | value in a `value` attribute; compression properties read from `eb:Properties` | value as element text; compression properties from the signed `eb:PartProperties` only; a `value` attribute or a part property repeated in one `eb:PartInfo` is refused | |
 | **Message ids** | AS2 sent `Message-ID: <id@asx>` | AS2 `<id>` with your RFC 2822 `id-left@id-right`; AS4 ids are RFC 2822 msg-ids too | build ids as `"{id}@{your-domain}"` |
 | **Unsigned AS4 message** | answered `EBMS:0101` | answered `EBMS:0103` PolicyNoncompliance | |
-| **BDEW unconfigured senders** | refused unless pinned | accepted when the verified SM-PKI certificate carries the claimed MP-ID as subject **OU** (BDEW 1.2 §2.3.2, §2.3.4.4; RzÜ AS4 2.6 Kap. 5.2) | MP-ID only in the CN is refused, also at `build()` |
+| **BDEW unconfigured senders** | refused unless pinned | accepted when the verified SM-PKI certificate carries the claimed MP-ID as subject **OU** (BDEW 1.2 Kap. 2.3.2, 2.3.4.4; RzÜ AS4 2.6 Kap. 5.2) | MP-ID only in the CN is refused, also at `build()` |
 | **`eb:Timestamp` window** | 300 s both ways | 300 s ahead, 7 days behind (the dedup retention) | a retry within 7 days (BDEW: 72 h) is a duplicate, not a replay |
 | **BDEW header** | caller-set action, roles, conversation id, agreement | always gzip; fixed Action, roles and `AgreementRef` ([profiles](@/docs/profiles.md#what-each-preset-fixes)); empty `ConversationId`; no `eb:MessageProperties`; PKIPath token | setting a conversation id is refused |
 | **Content-IDs** | random | `part<N>.<hash>@asx` from message id and part index; deterministic gzip | identical resends |
@@ -70,7 +86,7 @@ instance in a trading relationship together.
 | **Peppol file names** | `Content-Disposition` allowed | not written; `Payload::named` refused (Peppol AS4 §4.10) | |
 | **Decryption failures** | distinguishable errors | one indistinguishable answer (`EBMS:0102` / `decryption-failed`) | |
 | **Inbound XML Encryption parameters** | KDF, curve and OAEP parameters ignored | required and checked before the key is used; `rsa-1_5`, `rsa-oaep-mgf1p`, `mgf1sha1`, CBC refused | |
-| **BDEW path switch** | not implemented | `requestSwitch`/`confirmSwitch` sent and accepted (BDEW 1.2 §2.2.8) | |
+| **BDEW path switch** | not implemented | `requestSwitch`/`confirmSwitch` sent and accepted (BDEW 1.2 Kap. 2.2.8) | |
 | **Revocation** | OCSP modes, failure modes, static CRL lists (`revocation_crl_pems`); AS2 checked the signer only | the profile's rule (BDEW: CRL-DP with the RzÜ AS4 2.6 Kap. 5.4 three-day rule; others: CRL-DP then OCSP) over the signer's whole path, via the client's `HttpClient`; `Builder::crl_signer` for indirect CRLs ([security](@/docs/security.md#revocation)) | no revocation settings, no stapled responses |
 
 ### Cargo

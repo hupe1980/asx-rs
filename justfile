@@ -279,7 +279,7 @@ references:
         'https://openpeppol.atlassian.net/wiki/spaces/OPMA/pages/3977936899'
     fetch bdew regelungen-zum-uebertragungsweg-as4-2.6-20260401.pdf \
         'https://www.bundesnetzagentur.de/DE/Beschlusskammern/BK06/BK6_83_Zug_Mess/835_mitteilungen_datenformate/Mitteilung_56/Anlagen/Regelungen_zum_Uebertragungsweg_AS4_2_6_20260401.pdf?__blob=publicationFile&v=1'
-    # The SM-PKI documents RzÜ §5.4 points to (spec 026).
+    # The SM-PKI documents RzÜ Kap. 5.4 points to (spec 026).
     fetch bdew bsi-tr-03109-4-sm-pki-1.2.1.pdf \
         'https://www.bsi.bund.de/SharedDocs/Downloads/DE/BSI/Publikationen/TechnischeRichtlinien/TR03109/TR-03109-4_PKI.pdf?__blob=publicationFile&v=3'
     fetch bdew sm-pki-certificate-policy-1.1.2.pdf \

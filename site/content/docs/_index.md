@@ -19,7 +19,7 @@ trust boundaries are, and what you decide.
 6. [Observability](@/docs/observability.md): spans, metrics, audit records.
 7. [Security model](@/docs/security.md): what is checked, in which order.
 8. [Testing](@/docs/testing.md) and [Conformance](@/docs/conformance.md).
-9. [Migrating](@/docs/migration.md) from 0.15 or 0.16.
+9. [Migrating](@/docs/migration.md) from 0.15, 0.16 or 0.17.
 
 Every Rust sample here is compiled in CI. For type-level detail see the
 [API documentation](https://docs.rs/asx-rs).

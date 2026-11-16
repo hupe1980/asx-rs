@@ -239,7 +239,7 @@ const RECEIPT_BODY_WSU_ID: &str = "as4-receipt-body";
 /// Signature covers the `eb:Messaging` header (the SignalMessage including
 /// the `NonRepudiationInformation` block) and the SOAP Body — providing
 /// Non-Repudiation of Receipt (NRR) as required by profiles such as the BDEW
-/// AS4-Profil §2.2.4.  The result verifies with
+/// AS4-Profil Kap. 2.2.4.  The result verifies with
 /// [`crate::crypto::wssec::verify_enveloped_signature`] and is accepted by
 /// counterparties enforcing `require_signed_receipt = true`.
 ///

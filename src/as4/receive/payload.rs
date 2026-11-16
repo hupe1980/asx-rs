@@ -103,7 +103,7 @@ pub(super) fn check_payload_less(
             ErrorCode::PolicyViolation,
             format!(
                 "a payload-less path-switch message carries xenc:{}; it has nothing to \
-                 encrypt (AS4 Profile 1.0 §5.1.6, BDEW AS4-Profil 1.2 §2.3.7)",
+                 encrypt (AS4 Profile 1.0 §5.1.6, BDEW AS4-Profil 1.2 Kap. 2.3.7)",
                 xenc.tag_name().name()
             ),
             context(),

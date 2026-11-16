@@ -12,7 +12,7 @@
 //! 4. TLS with SNI for a DNS name (RzÜ AS4 2.6 Kap. 3, RFC 6066 §3) and
 //!    host-name verification (RFC 6125) under the profile's [`TlsPolicy`];
 //! 5. under BDEW, the server chain's revocation status from the client's CRL
-//!    validator (BDEW AS4-Profil 1.2 §2.3.7) — before a request is written.
+//!    validator (BDEW AS4-Profil 1.2 Kap. 2.3.7) — before a request is written.
 //!
 //! Steps 1–4 share the connect timeout; step 5 is bounded by the revocation
 //! fetch's own timeouts (3 s connect, 10 s request). Every failure is
@@ -301,7 +301,7 @@ async fn handshake(
     Ok(stream)
 }
 
-/// BDEW §2.3.7: an SM-PKI certificate is trusted after its signature *and
+/// BDEW Kap. 2.3.7: an SM-PKI certificate is trusted after its signature *and
 /// its revocation status* are validated. Runs once per connection, before
 /// the first request is written on it.
 async fn check_server_chain(

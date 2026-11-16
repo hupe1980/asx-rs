@@ -14,9 +14,16 @@
 #                 outside the migration page.
 #   migration     a name from scripts/deleted-names.txt is missing from the
 #                 migration page.
-#   citation      "RzÜ … §N": the Regelungen zum Übertragungsweg number their
-#                 sections as Kapitel ("RzÜ AS4 2.6 Kap. 5.2"); checked in the
-#                 Markdown above, THREAT_MODEL.md and src/**/*.rs.
+#   citation      a BDEW document cited with "§": the BDEW AS4-Profil and the
+#                 Regelungen zum Übertragungsweg number their sections as
+#                 Kapitel ("BDEW AS4-Profil 1.2 Kap. 2.3.4.4", "RzÜ AS4 2.6
+#                 Kap. 5.2", the profile tables' "B Kap. 2.3.1.1"), also in a
+#                 list ("Kap. 2.2.6.1, 2.3.4.4", never "…, §2.3.4.4") and
+#                 across a line break. "§" stays for the English-language
+#                 sources on the same line ("…; BSI TR-03116-3 §4"). Checked
+#                 in the Markdown above, THREAT_MODEL.md, SECURITY.md,
+#                 concepts/*.md and the Rust sources of src/, examples/,
+#                 xtask/ and benches/.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -101,16 +108,31 @@ if os.path.exists(readme):
         if not os.path.exists(ex) or open(ex, encoding="utf-8").read() != block:
             findings.append(f"README.md: golden: block for examples/{name}.rs is not byte-identical to the file")
 
-citation = re.compile(r"RzÜ[^§\n]{0,25}§")
+# A BDEW document name directly followed by "§", or "§" continuing a "Kap."
+# list. `doc_end` finds a document name, or an open "Kap." list, at the end of a line whose citation
+# continues on the next.
+BDEW_DOC = (r"(?<![\w.\-])(?:BDEW(?: AS4-Profil)?(?: \d\.\d+)?|AS4-Profil(?: \d\.\d+)?"
+            r"|B|RzÜ(?: AS4)?(?: \d\.\d+)?|Regelungen zum Übertragungsweg AS4\*?(?: \d\.\d+)?)")
+citation = re.compile(BDEW_DOC + r" §\d")
+kap_list = re.compile(r"Kap\. \d[\d.]*(?:(?:, ?|/|–)(?:Kap\. )?\d[\d.]*)*(?:, ?|/|–)§\d")
+doc_end = re.compile(BDEW_DOC + r"\s*$|Kap\. \d[\d.]*(?:, ?\d[\d.]*)*,\s*$")
+next_section = re.compile(r"^\s*(?:///?!?|\*|#)?\s*§\d")
 cited = list(files)
-if os.path.exists(os.path.join(root, "THREAT_MODEL.md")):
-    cited.append(os.path.join(root, "THREAT_MODEL.md"))
-for d, _, fs in os.walk(os.path.join(root, "src")):
-    cited += [os.path.join(d, f) for f in sorted(fs) if f.endswith(".rs")]
+for extra in ("THREAT_MODEL.md", "SECURITY.md"):
+    if os.path.exists(os.path.join(root, extra)):
+        cited.append(os.path.join(root, extra))
+concepts = os.path.join(root, "concepts")
+if os.path.isdir(concepts):
+    cited += [os.path.join(concepts, f) for f in sorted(os.listdir(concepts)) if f.endswith(".md")]
+for code in ("src", "examples", "xtask", "benches"):
+    for d, _, fs in os.walk(os.path.join(root, code)):
+        cited += [os.path.join(d, f) for f in sorted(fs) if f.endswith(".rs")]
 for path in cited:
-    for i, line in enumerate(open(path, encoding="utf-8").read().split("\n"), 1):
-        if citation.search(line):
-            findings.append(f"{os.path.relpath(path, root)}:{i}: citation: RzÜ numbers sections as Kapitel (\"RzÜ AS4 2.6 Kap. N\")")
+    lines = open(path, encoding="utf-8").read().split("\n")
+    for i, line in enumerate(lines, 1):
+        split = doc_end.search(line) and i < len(lines) and next_section.match(lines[i])
+        if citation.search(line) or kap_list.search(line) or split:
+            findings.append(f"{os.path.relpath(path, root)}:{i}: citation: BDEW documents number sections as Kapitel (\"BDEW AS4-Profil 1.2 Kap. N\", \"RzÜ AS4 2.6 Kap. N\")")
 
 for f in findings:
     print(f)

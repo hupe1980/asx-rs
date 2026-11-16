@@ -17,6 +17,35 @@ Versioning follows the [SemVer policy](#semver-policy) below.
 
 ## [Unreleased]
 
+## [0.18.0] — 2026-11-16
+
+BDEW key pairs separated by key, and every citation in its source's own
+numbering. A hard cut; see the
+[migration page](https://hupe1980.github.io/asx-rs/docs/migration/).
+
+### Wire / crypto
+
+- **Inbound BDEW signer vs. the partner's encryption key.** A message from a
+  configured partner whose signing certificate certifies the key of that
+  partner's encryption certificate is refused as `EBMS:0101` before
+  decryption (BDEW AS4-Profil 1.2 Kap. 2.3.4.4). It concerns signers admitted
+  on the SM-PKI subject rule; pinned signers are checked at `build()`.
+
+### API
+
+- **`build()` compares keys, not certificates.** Under `Profile::bdew()` a
+  signer, decrypter and TLS identity whose certificates certify one key pair
+  are refused even when the certificates differ (another serial, another
+  validity), and so is a partner whose signing certificate (current or
+  rollover) certifies its encryption key. Keys are compared by value, so a
+  compressed and an uncompressed EC point are one key.
+- **Two decrypters over one key** are refused under every profile (inbound
+  key selection would be ambiguous), also with different certificates.
+- **Citations.** BDEW refusals cite „BDEW AS4-Profil 1.2 Kap. n" (was „§n");
+  the other profiles keep „§n". Assertions on refusal texts change.
+- **testkit:** `IssueOptions::key_pem` certifies an existing key pair, for
+  testing re-certified keys.
+
 ## [0.17.0] — 2026-11-16
 
 BDEW end to end: SM-PKI mutual TLS and the *Regelungen zum Übertragungsweg

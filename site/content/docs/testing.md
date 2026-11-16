@@ -9,7 +9,7 @@ throw-away keys.
 
 ```toml
 [dev-dependencies]
-asx-rs = { version = "0.17", features = ["test-util"] }
+asx-rs = { version = "0.18", features = ["test-util"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "test-util"] }
 ```
 
@@ -20,7 +20,7 @@ exactly what each profile's `build()` accepts:
 
 | Constructor | Issues |
 |---|---|
-| `TestCa::sm_pki().bdew_party_at(mp_id, url)` | the SM-PKI certificate triple: separate BrainpoolP256r1 signing, encryption and TLS key pairs, each with the MP-ID as the subject's OU and `url` as its one URI subjectAltName (BDEW 1.2 §2.3.4.4, RzÜ AS4 2.6 Kap. 5.2); the TLS certificate also carries the URL's host as DNS name and `serverAuth` + `clientAuth`; party type `…:unregistered:BDEW` |
+| `TestCa::sm_pki().bdew_party_at(mp_id, url)` | the SM-PKI certificate triple: separate BrainpoolP256r1 signing, encryption and TLS key pairs, each with the MP-ID as the subject's OU and `url` as its one URI subjectAltName (BDEW 1.2 Kap. 2.3.4.4, RzÜ AS4 2.6 Kap. 5.2); the TLS certificate also carries the URL's host as DNS name and `serverAuth` + `clientAuth`; party type `…:unregistered:BDEW` |
 | `TestCa::sm_pki().bdew_party(mp_id)` | the same at `https://mp<mp_id>.testkit.example/as4` |
 | `ca.peppol_party(cn)` | one RSA AP certificate for signing and encryption, `cn` as the CN (the party id) |
 | `ca.rsa_party(name)` | separate RSA 2048 pairs (eDelivery, ENTSOG) |
@@ -33,8 +33,11 @@ partner endpoint must be that address) and `anchor()`. For revocation tests,
 `TestCa::issue_with` takes a validity window; `TestCa::crl` and `TestCa::ocsp`
 produce signed DER responses. `TestCa::issue_with_options` takes
 `pki::IssueOptions` (subject attributes, `uri_sans`, `dns_sans`, `eku` as
-`pki::Eku`, CRL/OCSP locations) to issue a leaf with one defect for a refusal
-test.
+`pki::Eku`, CRL/OCSP locations, and `key_pem` to certify an existing key
+pair) to issue a leaf with one defect for a refusal test. A second certificate
+over a party's signing key, used as its TLS or decryption certificate, is how
+to test the BDEW key-pair separation (Kap. 2.3.4.4): `build()` compares keys,
+not certificates.
 
 ## A loopback partner
 

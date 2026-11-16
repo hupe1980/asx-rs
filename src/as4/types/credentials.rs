@@ -5,7 +5,7 @@ use super::*;
 /// Credentials required to generate a signed AS4 `eb:Receipt` signal.
 ///
 /// Per eDelivery AS4 v1.15 §5.1.8 and profile derivatives (e.g. BDEW
-/// AS4-Profil §2.2.4), receipts must carry a WS-Security XML Signature so
+/// AS4-Profil Kap. 2.2.4), receipts must carry a WS-Security XML Signature so
 /// that Non-Repudiation of Receipt (NRR) holds.  Pass these credentials to
 /// [`crate::as4::signals::generate_signed_receipt_with_nri`].
 #[derive(Clone)]

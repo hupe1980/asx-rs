@@ -620,29 +620,46 @@ impl SenderAuthorizer for Authorizer<'_> {
         let check: Option<Box<crate::crypto::wssec::verify::SignerCheck>> = match rule {
             SenderRule::AnchorAndSubject => {
                 let from = from.clone();
+                let partner_enc = registered.and_then(|p| p.encryption_cert.clone());
+                let profile = config.profile.clone();
                 Some(Box::new(move |der: &[u8]| {
                     let cert = Certificate::from_der(der)
                         .map_err(|_| unauthorized("the signer certificate is unreadable"))?;
                     if !crate::builder::bdew_subject_carries(&cert, &from) {
                         return Err(unauthorized(format!(
                             "the signer's subject (OU) does not carry the claimed MP-ID {from:?} \
-                             (BDEW AS4-Profil 1.2 §2.3.2, §2.3.4.4)"
+                             ({})",
+                            profile.cite("2.3.2, 2.3.4.4")
                         )));
                     }
                     // RzÜ AS4 2.6 Kap. 5.2 and Kap. 9 Verstoßvariante 2: a
                     // signer outside the certificate rules is refused as
                     // FailedAuthentication.
-                    crate::builder::bdew_endpoint_uri(&cert)
-                        .map(|_| ())
-                        .map_err(|detail| {
-                            unauthorized(format!(
-                                "the signer certificate: {detail} (RzÜ AS4 2.6 Kap. 5.2)"
-                            ))
-                        })
+                    crate::builder::bdew_endpoint_uri(&cert).map_err(|detail| {
+                        unauthorized(format!(
+                            "the signer certificate: {detail} (RzÜ AS4 2.6 Kap. 5.2)"
+                        ))
+                    })?;
+                    // `build()` separates a configured partner's pinned
+                    // signing keys from its encryption key; a signer
+                    // admitted on the subject rule alone is checked here,
+                    // before anything is decrypted.
+                    if profile.separate_keys()
+                        && partner_enc.as_ref().is_some_and(|enc| enc.same_key(&cert))
+                    {
+                        return Err(unauthorized(format!(
+                            "the signer certificate certifies the key of the partner's \
+                             encryption certificate; signing and encryption key pairs must \
+                             differ ({})",
+                            profile.cite("2.3.4.4")
+                        )));
+                    }
+                    Ok(())
                 }))
             }
             SenderRule::AnchorAndCn => {
                 let from = from.clone();
+                let profile = config.profile.clone();
                 Some(Box::new(move |der: &[u8]| {
                     let cert = Certificate::from_der(der)
                         .map_err(|_| unauthorized("the signer certificate is unreadable"))?;
@@ -650,7 +667,8 @@ impl SenderAuthorizer for Authorizer<'_> {
                         Ok(())
                     } else {
                         Err(unauthorized(format!(
-                            "the signer's CN is not the claimed party {from:?} (Peppol AS4 §4.5)"
+                            "the signer's CN is not the claimed party {from:?} ({})",
+                            profile.cite("4.5")
                         )))
                     }
                 }))

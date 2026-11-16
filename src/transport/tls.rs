@@ -1,7 +1,7 @@
 //! The built-in client's TLS (D92): OpenSSL, because BDEW's transport is
 //! BrainpoolP256r1 end to end and no other stack in reach speaks it.
 //!
-//! - **BDEW** (BDEW AS4-Profil 1.2 §2.2.6.1, §2.3.4.4; BSI TR-03116-3 §4):
+//! - **BDEW** (BDEW AS4-Profil 1.2 Kap. 2.2.6.1, 2.3.4.4; BSI TR-03116-3 §4):
 //!   TLS ≥ 1.2, the ECDHE-ECDSA AES-GCM/CBC suites, ECDSA signature
 //!   schemes only (Brainpool's RFC 8734 schemes in TLS 1.3), Brainpool groups first,
 //!   the server chain verified against the builder's trust anchors (the

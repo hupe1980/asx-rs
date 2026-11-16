@@ -14,7 +14,7 @@ trait with a conformance suite in `asx::testkit`:
 ## Duplicate detection: claim, then accept or abandon
 
 Every target profile requires duplicate detection (AS4 §3.2, eDelivery 1.15
-§3.3.2, BDEW §2.2.5, RFC 4130 §9.3). After a message verified and decrypted,
+§3.3.2, BDEW Kap. 2.2.5, RFC 4130 §9.3). After a message verified and decrypted,
 the `Inbound` calls:
 
 1. `claim(key)`, which returns one of

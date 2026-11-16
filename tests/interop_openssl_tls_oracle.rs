@@ -1,5 +1,5 @@
 //! TLS oracle: the OpenSSL command line as the foreign implementation of
-//! BDEW mutual TLS (BDEW AS4-Profil 1.2 §2.2.6.1; BSI TR-03116-3 §4).
+//! BDEW mutual TLS (BDEW AS4-Profil 1.2 Kap. 2.2.6.1; BSI TR-03116-3 §4).
 //!
 //! - **asx → `openssl s_server`**: the built-in client completes a mutually
 //!   authenticated BrainpoolP256r1 handshake with a server that demands a
@@ -202,9 +202,13 @@ async fn without_a_tls_identity_a_bdew_client_does_not_build() {
         .party_type(asx::testkit::pki::BDEW_PARTY_TYPE)
         .signer(w.us.signing.key_pair())
         .decrypter(w.us.encryption.key_pair());
-    let err = client(&w, free_port(), &crl, local).expect_err("§2.2.6.1");
+    let err = client(&w, free_port(), &crl, local).expect_err("Kap. 2.2.6.1");
     assert!(
         err.to_string().contains("LocalParty::tls_identity"),
+        "{err}"
+    );
+    assert!(
+        err.to_string().contains("BDEW AS4-Profil 1.2 Kap. 2.2.6.1"),
         "{err}"
     );
 }

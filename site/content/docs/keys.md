@@ -37,7 +37,7 @@ fn local_party() -> Result<LocalParty, Box<dyn std::error::Error>> {
 `from_pem` refuses a key that does not match the leaf. A `KeyPair` is both
 `Signer` and `Decrypter`, zeroizes its key on drop and `Debug`-prints only the
 certificate. BDEW requires three different BrainpoolP256r1 key pairs for
-signing, decryption and TLS (B §2.3.4.4).
+signing, decryption and TLS (B Kap. 2.3.4.4).
 
 ## HSM and KMS: implementing `Signer` and `Decrypter`
 
@@ -140,7 +140,7 @@ a key the linked OpenSSL cannot use, or one that does not match its
 certificate, is `ErrorKind::Config`.
 
 Under `Profile::bdew()` it is required with the built-in client (BDEW
-AS4-Profil 1.2 §2.2.6.1), must be an EC key of its own (§2.3.4.4), and its
+AS4-Profil 1.2 Kap. 2.2.6.1), must be an EC key of its own (Kap. 2.3.4.4), and its
 certificate carries the MP-ID in the OU and your AS4 address as its one URI
 subjectAltName, like the signing and decryption certificates (RzÜ AS4 2.6
 Kap. 1.3, 5.2).

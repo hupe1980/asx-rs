@@ -11,7 +11,7 @@ pub(crate) struct As4PushPolicy {
     /// When `true`, every declared payload part must be encrypted (every
     /// AS4 preset); otherwise EBMS:0103.
     pub require_encrypted_inbound: bool,
-    /// Accept a payload-less BDEW path-switch message (B §2.2.8, §2.3.7):
+    /// Accept a payload-less BDEW path-switch message (B Kap. 2.2.8, 2.3.7):
     /// `Profile::bdew()` only.
     pub accept_path_switch: bool,
     /// Replay-window enforcement for inbound `<eb:Timestamp>`: refused more

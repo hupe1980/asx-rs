@@ -19,7 +19,7 @@ The application installs a subscriber and a recorder, for example:
 
 ```toml
 [dependencies]
-asx-rs = { version = "0.17", features = ["metrics"] }
+asx-rs = { version = "0.18", features = ["metrics"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 metrics-exporter-prometheus = "0.17"
 ```

@@ -71,7 +71,7 @@ impl LocalParty {
 
     /// The TLS client certificate presented by the built-in HTTP client.
     /// Must differ from the signing and decryption keys under
-    /// `Profile::bdew()` (BDEW AS4-Profil §2.3.4.4).
+    /// `Profile::bdew()` (BDEW AS4-Profil Kap. 2.3.4.4).
     pub fn tls_identity(self, key_pair: KeyPair) -> LocalParty {
         LocalParty {
             tls: Some(key_pair),

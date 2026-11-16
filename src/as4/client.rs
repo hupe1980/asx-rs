@@ -96,12 +96,12 @@ pub(crate) fn session_for(config: &ClientConfig, policy: &PartnerPolicy) -> Resu
     )
 }
 
-/// The BDEW transmission-path-switch service (BDEW AS4-Profil 1.2 §2.2.8,
-/// §2.3.7). Only [`Profile::bdew()`] has it.
+/// The BDEW transmission-path-switch service (BDEW AS4-Profil 1.2 Kap. 2.2.8,
+/// 2.3.7). Only [`Profile::bdew()`] has it.
 ///
-/// B §2.2.8: a BDEW endpoint "MUSS zusätzlich einen
+/// B Kap. 2.2.8: a BDEW endpoint "MUSS zusätzlich einen
 /// AS4-Übertragungspfadänderungsdienst (Kapitel 2.3.7) implementieren".
-/// B §2.3.7: party A sends a user message with Service
+/// B Kap. 2.3.7: party A sends a user message with Service
 /// `https://www.bdew.de/as4/communication/services/pathSwitch` and Action
 /// `https://www.bdew.de/as4/communication/actions/requestSwitch`; party B
 /// answers "mit einer neuen Nachricht" with the Action
@@ -139,7 +139,7 @@ pub enum PathSwitch {
     Request,
     /// Action `https://www.bdew.de/as4/communication/actions/confirmSwitch`:
     /// a new message answering a request (not a receipt, no
-    /// `RefToMessageId`, B §2.3.1.2.4).
+    /// `RefToMessageId`, B Kap. 2.3.1.2.4).
     Confirm,
 }
 
@@ -153,7 +153,7 @@ impl PathSwitch {
 }
 
 /// The path-switch kind of a (verified) Service/Action pair: both URIs must
-/// match byte for byte (B §2.3.1.2.1, §2.3.1.2.2). Profile-agnostic:
+/// match byte for byte (B Kap. 2.3.1.2.1, 2.3.1.2.2). Profile-agnostic:
 /// callers gate it on [`Profile::path_switch`].
 pub(crate) fn classify_path_switch(service: &str, action: &str) -> Option<PathSwitch> {
     if service != PATH_SWITCH_SERVICE {
@@ -204,7 +204,7 @@ impl Message {
     }
 
     /// An ebMS3 test-service message (eDelivery AS4 1.15 §3.2.4, BDEW
-    /// §2.3.6). The receiver answers it with a receipt and never delivers it.
+    /// Kap. 2.3.6). The receiver answers it with a receipt and never delivers it.
     pub fn ping(partner: &Partner) -> Message {
         Message {
             kind: MessageKind::Ping,
@@ -213,7 +213,7 @@ impl Message {
     }
 
     /// A payload-less BDEW path-switch message to `partner` (BDEW
-    /// AS4-Profil 1.2 §2.2.8, §2.3.7): Service
+    /// AS4-Profil 1.2 Kap. 2.2.8, 2.3.7): Service
     /// `https://www.bdew.de/as4/communication/services/pathSwitch`, Action
     /// `…/actions/requestSwitch` or `…/actions/confirmSwitch`, an empty
     /// `ConversationId`, no `RefToMessageId`, no `eb:PayloadInfo`.
@@ -324,7 +324,7 @@ impl UserMessage {
     }
 
     /// `Some` if the verified Service and Action are a BDEW path-switch pair
-    /// under [`Profile::bdew()`] (BDEW AS4-Profil 1.2 §2.2.8, §2.3.7; both
+    /// under [`Profile::bdew()`] (BDEW AS4-Profil 1.2 Kap. 2.2.8, 2.3.7; both
     /// URIs compared exactly): Service
     /// `https://www.bdew.de/as4/communication/services/pathSwitch` with Action
     /// `https://www.bdew.de/as4/communication/actions/requestSwitch`
@@ -348,8 +348,8 @@ fn refuse(profile: &Profile, field: &str, detail: impl std::fmt::Display, sectio
         Error::config(format!("Message::{field}: {detail}"))
     } else {
         Error::config(format!(
-            "Message::{field}: {detail} ({} {section})",
-            profile.citation()
+            "Message::{field}: {detail} ({})",
+            profile.cite(section)
         ))
     }
 }
@@ -423,7 +423,7 @@ pub(crate) fn check_message(
                     profile,
                     "service",
                     format!("{s:?} is not one of {allowed:?}"),
-                    "§2.3.1.2.1",
+                    "2.3.1.2.1",
                 ));
             }
             (_, Some(s)) => s.to_string(),
@@ -434,7 +434,7 @@ pub(crate) fn check_message(
                     profile,
                     "action",
                     format!("the profile fixes the action to {fixed:?}"),
-                    "§2.3.1.2.2",
+                    "2.3.1.2.2",
                 ));
             }
             (Some(fixed), _) => fixed.to_string(),
@@ -448,7 +448,7 @@ pub(crate) fn check_message(
             profile,
             "conversation_id",
             "the profile requires an empty ConversationId",
-            "§2.3.1.2.4",
+            "2.3.1.2.4",
         ));
     }
     // A path-switch message carries no payload.
@@ -467,7 +467,7 @@ pub(crate) fn check_message(
                 profile,
                 "payload",
                 "file names are not allowed",
-                "§4.10",
+                "4.10",
             ));
         }
         crate::as4::mime_packaging::validate_media_type(payload.mime_type(), "Payload::mime_type")
@@ -531,7 +531,7 @@ pub(crate) fn check_message(
             service,
             service_type: String::new(),
             action,
-            // BDEW §2.3.1.2.4: the (schema-mandatory) element is always empty.
+            // BDEW Kap. 2.3.1.2.4: the (schema-mandatory) element is always empty.
             conversation_id: if profile.conversation_id_allowed() {
                 message.conversation_id.clone()
             } else {
@@ -586,7 +586,7 @@ fn check_path_switch(profile: &Profile, message: &Message) -> Result<()> {
     if !profile.path_switch() {
         return Err(Error::config(format!(
             "Message::path_switch: the transmission-path-switch service is defined only by \
-             BDEW AS4-Profil 1.2 §2.2.8, §2.3.7; {} has none",
+             BDEW AS4-Profil 1.2 Kap. 2.2.8, 2.3.7; {} has none",
             profile.citation()
         )));
     }
@@ -602,7 +602,7 @@ fn check_path_switch(profile: &Profile, message: &Message) -> Result<()> {
             field,
             "a path-switch message carries no payload and a library-set Service, Action and \
              empty ConversationId",
-            "§2.3.7",
+            "2.3.7",
         ));
     }
     Ok(())
@@ -662,7 +662,7 @@ mod tests {
         assert!(valid_message_id(&fresh_message_id().unwrap()));
     }
 
-    /// Exactly the two §2.3.7 pairs classify (byte-exact).
+    /// Exactly the two Kap. 2.3.7 pairs classify (byte-exact).
     #[test]
     fn path_switch_classification_table() {
         const S: &str = PATH_SWITCH_SERVICE;
@@ -743,7 +743,11 @@ mod tests {
         ] {
             let err = check_path_switch(&profile, &request()).unwrap_err();
             assert_eq!(err.kind(), ErrorKind::Config);
-            assert!(err.to_string().contains("§2.3.7"), "{err}");
+            assert!(
+                err.to_string()
+                    .contains("BDEW AS4-Profil 1.2 Kap. 2.2.8, 2.3.7"),
+                "{err}"
+            );
         }
         // Nothing the library sets may be set by the caller.
         for (message, field) in [

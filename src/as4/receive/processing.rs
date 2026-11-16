@@ -213,7 +213,7 @@ pub(crate) fn open_inbound(
         });
     }
 
-    // A payload-less BDEW path-switch message (B §2.2.8, §2.3.7),
+    // A payload-less BDEW path-switch message (B Kap. 2.2.8, 2.3.7),
     // classified from the verified header after signer authorization, eb:To,
     // revocation and freshness. Every other payload-less message falls
     // through to the part match and is refused there.

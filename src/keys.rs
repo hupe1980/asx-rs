@@ -214,6 +214,19 @@ impl Certificate {
         }
         out
     }
+
+    /// Whether `self` and `other` certify the same public key, compared by
+    /// value (`EVP_PKEY_eq`): a compressed and an uncompressed EC point, or a
+    /// named and an explicit curve, are one key. Certificates are labels; two
+    /// of them with different serials can certify one key pair (BDEW
+    /// AS4-Profil 1.2 Kap. 2.3.4.4 separates key pairs, not certificates).
+    /// A key that cannot be read is no key and matches nothing.
+    pub(crate) fn same_key(&self, other: &Certificate) -> bool {
+        match (self.0.x509.public_key(), other.0.x509.public_key()) {
+            (Ok(a), Ok(b)) => a.public_eq(&b),
+            _ => false,
+        }
+    }
 }
 
 /// The `subjectPublicKey` BIT STRING contents of `cert`.
@@ -272,7 +285,7 @@ impl fmt::Debug for Certificate {
 /// A signing key, in memory or in an HSM/KMS. Object-safe.
 pub trait Signer: Send + Sync + fmt::Debug + 'static {
     /// Leaf first. The chain is emitted where the profile requires it (BDEW
-    /// `X509PKIPathv1`, BDEW AS4-Profil §2.2.6.2.1).
+    /// `X509PKIPathv1`, BDEW AS4-Profil Kap. 2.2.6.2.1).
     fn certificate_chain(&self) -> &[Certificate];
 
     /// Sign `message` (unhashed) with `algorithm`. RSA: PKCS#1 v1.5 signature
@@ -662,6 +675,106 @@ mod tests {
             self_signed(&key, "ec"),
             key.private_key_to_pem_pkcs8().unwrap(),
         )
+    }
+
+    /// A certificate over `public` (any encoding), signed by a throwaway key.
+    fn certify(public: &PKey<openssl::pkey::Public>, serial: u32) -> Certificate {
+        let issuer = PKey::from_rsa(Rsa::generate(2048).unwrap()).unwrap();
+        let mut name = openssl::x509::X509NameBuilder::new().unwrap();
+        name.append_entry_by_nid(Nid::COMMONNAME, "same-key")
+            .unwrap();
+        let name = name.build();
+        let mut b = X509::builder().unwrap();
+        b.set_version(2).unwrap();
+        let serial = openssl::bn::BigNum::from_u32(serial).unwrap();
+        b.set_serial_number(&serial.to_asn1_integer().unwrap())
+            .unwrap();
+        b.set_subject_name(&name).unwrap();
+        b.set_issuer_name(&name).unwrap();
+        b.set_pubkey(public).unwrap();
+        b.set_not_before(&openssl::asn1::Asn1Time::days_from_now(0).unwrap())
+            .unwrap();
+        b.set_not_after(&openssl::asn1::Asn1Time::days_from_now(30).unwrap())
+            .unwrap();
+        b.sign(&issuer, MessageDigest::sha256()).unwrap();
+        Certificate::from_x509(b.build()).unwrap()
+    }
+
+    fn brainpool() -> EcKey<Private> {
+        let group = EcGroup::from_curve_name(Nid::BRAINPOOL_P256R1).unwrap();
+        EcKey::generate(&group).unwrap()
+    }
+
+    fn public_of(key: &EcKey<Private>) -> PKey<openssl::pkey::Public> {
+        PKey::public_key_from_der(&key.public_key_to_der().unwrap()).unwrap()
+    }
+
+    /// The SubjectPublicKeyInfo of `key` with the point in compressed form
+    /// (SEC 1 §2.3.3): the same AlgorithmIdentifier, BIT STRING 00 ‖ 02/03 ‖ x.
+    fn compressed_spki(key: &EcKey<Private>) -> Vec<u8> {
+        let der = key.public_key_to_der().unwrap();
+        assert!(der[1] < 0x80, "short-form outer length");
+        let alg = &der[2..4 + der[3] as usize];
+        let mut ctx = openssl::bn::BigNumContext::new().unwrap();
+        let point = key
+            .public_key()
+            .to_bytes(
+                key.group(),
+                openssl::ec::PointConversionForm::COMPRESSED,
+                &mut ctx,
+            )
+            .unwrap();
+        let mut body = alg.to_vec();
+        body.extend([0x03, point.len() as u8 + 1, 0x00]);
+        body.extend(point);
+        let mut out = vec![0x30, body.len() as u8];
+        out.extend(body);
+        out
+    }
+
+    #[test]
+    fn same_key_compares_keys_not_certificates() {
+        let key = brainpool();
+        let a = certify(&public_of(&key), 1);
+        let b = certify(&public_of(&key), 2);
+        assert_ne!(a, b, "two certificates");
+        assert!(a.same_key(&a));
+        assert!(a.same_key(&b) && b.same_key(&a));
+        let other = certify(&public_of(&brainpool()), 3);
+        assert!(!a.same_key(&other));
+        let (rsa_pem, _) = rsa();
+        let rsa_cert = Certificate::from_pem(&rsa_pem).unwrap();
+        assert!(!a.same_key(&rsa_cert) && !rsa_cert.same_key(&a));
+    }
+
+    #[test]
+    fn same_key_ignores_the_point_encoding() {
+        let key = brainpool();
+        let uncompressed = certify(&public_of(&key), 1);
+        let compressed = certify(
+            &PKey::public_key_from_der(&compressed_spki(&key)).unwrap(),
+            2,
+        );
+        // The certificates really carry two encodings of the point.
+        let bits = |c: &Certificate| public_key_bits(c.x509()).unwrap();
+        assert_eq!(bits(&uncompressed)[0], 0x04);
+        assert!(matches!(bits(&compressed)[0], 0x02 | 0x03));
+        assert_eq!(bits(&compressed).len(), 33);
+        assert!(uncompressed.same_key(&compressed));
+        assert!(compressed.same_key(&uncompressed));
+    }
+
+    #[test]
+    fn same_key_ignores_the_curve_encoding() {
+        let key = brainpool();
+        let named = certify(&public_of(&key), 1);
+        let mut group = EcGroup::from_curve_name(Nid::BRAINPOOL_P256R1).unwrap();
+        group.set_asn1_flag(openssl::ec::Asn1Flag::EXPLICIT_CURVE);
+        let explicit_key = EcKey::from_public_key(&group, key.public_key()).unwrap();
+        let explicit = certify(&PKey::from_ec_key(explicit_key).unwrap(), 2);
+        let spki = |c: &Certificate| c.x509().public_key().unwrap().public_key_to_der().unwrap();
+        assert_ne!(spki(&named), spki(&explicit), "two SPKI encodings");
+        assert!(named.same_key(&explicit));
     }
 
     #[test]

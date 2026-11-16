@@ -118,7 +118,7 @@ pub enum WsSecOutboundKeyInfoProfile {
     /// element contains a `<wsse:SecurityTokenReference>` pointing to the BST
     /// by `wsu:Id` instead of an inline `ds:X509Certificate`.
     ///
-    /// Required by BDEW AS4-Profil §2.2.6.2.1 and some German energy market
+    /// Required by BDEW AS4-Profil Kap. 2.2.6.2.1 and some German energy market
     /// profiles.  When this profile is selected, the caller must also use
     /// [`WsSecurityHeaderBuilder::with_signing_cert_pkipath_der`](crate::crypto::soap_builder::WsSecurityHeaderBuilder::with_signing_cert_pkipath_der) so that the
     /// BST element and `ds:KeyInfo` reference are consistent.

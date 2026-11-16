@@ -20,39 +20,39 @@ async fn sent_wire(preset: Preset) -> (String, String) {
 #[tokio::test]
 async fn bdew_header_values() {
     let (soap, body) = sent_wire(Preset::Bdew).await;
-    // B §2.3.1.2.1: the service.
+    // B Kap. 2.3.1.2.1: the service.
     assert!(
         soap.contains(">https://www.bdew.de/as4/communication/services/MP</"),
         "{soap}"
     );
-    // B §2.3.1.2.2: the fixed action.
+    // B Kap. 2.3.1.2.2: the fixed action.
     assert!(soap.contains(">http://docs.oasis-open.org/ebxml-msg/as4/200902/action</"));
-    // B §2.3.1.2.3: roles.
+    // B Kap. 2.3.1.2.3: roles.
     assert!(
         soap.contains(">http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/initiator</")
     );
     assert!(
         soap.contains(">http://docs.oasis-open.org/ebxml-msg/ebms/v3.0/ns/core/200704/responder</")
     );
-    // B §2.3.2: AgreementRef without pmode/type.
+    // B Kap. 2.3.2: AgreementRef without pmode/type.
     assert!(
         soap.contains("AgreementRef>https://www.bdew.de/as4/communication/agreement</"),
         "{soap}"
     );
     assert!(!soap.contains("pmode="));
-    // B §2.3.1.2.4: ConversationId always empty.
+    // B Kap. 2.3.1.2.4: ConversationId always empty.
     assert!(
         soap.contains("ConversationId></") || soap.contains("ConversationId/>"),
         "{soap}"
     );
-    // B §2.3.1.1: the party-id type.
+    // B Kap. 2.3.1.1: the party-id type.
     assert!(soap.contains("type=\"urn:oasis:names:tc:ebcore:partyid-type:unregistered:BDEW\""));
-    // B §2.2.6.2.1: the signing token is a PKIPath.
+    // B Kap. 2.2.6.2.1: the signing token is a PKIPath.
     assert!(soap.contains("#X509PKIPathv1"), "{soap}");
-    // B §2.2.3.3: gzip, always; B §2.2.3.2: octet-stream part type.
+    // B Kap. 2.2.3.3: gzip, always; B Kap. 2.2.3.2: octet-stream part type.
     assert!(soap.contains("application/gzip"));
     assert!(soap.contains(">application/octet-stream</"), "{soap}");
-    // B §2.2.6.2.2: ECDH-ES key agreement, recipient by its Subject Key
+    // B Kap. 2.2.6.2.2: ECDH-ES key agreement, recipient by its Subject Key
     // Identifier (`wsse:KeyIdentifier #X509SubjectKeyIdentifier`).
     assert!(
         body.contains("ECDH-ES") || body.contains("ecdh-es"),

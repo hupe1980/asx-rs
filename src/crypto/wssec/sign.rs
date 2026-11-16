@@ -36,7 +36,7 @@ const STAGE: &str = "wssec_generate_signature";
 
 /// The digest of every `ds:Reference` — same-document and `cid:` alike —
 /// whatever the signature method's hash (eDelivery AS4 1.15 §3.2.6,
-/// BDEW AS4-Profil 1.2 §2.2.6.2.1). One value feeds the computation and the
+/// BDEW AS4-Profil 1.2 Kap. 2.2.6.2.1). One value feeds the computation and the
 /// declaration, so they cannot disagree.
 pub(crate) const REFERENCE_DIGEST: WsSecDigestMethod = WsSecDigestMethod::Sha256;
 

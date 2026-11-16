@@ -1,6 +1,6 @@
 #![cfg(all(feature = "as4", feature = "http-client"))]
 //! phase4 witnesses the BDEW transmission-path-switch service (BDEW
-//! AS4-Profil 1.2 §2.2.8, §2.3.7).
+//! AS4-Profil 1.2 Kap. 2.2.8, 2.3.7).
 //!
 //! ```text
 //! just interop

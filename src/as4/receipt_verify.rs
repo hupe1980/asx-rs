@@ -1,7 +1,7 @@
 //! Verification of the counterparty's synchronous AS4 response signal.
 //!
 //! In the AS4 One-Way/Push MEP with Reception Awareness (eDelivery AS4 v1.15
-//! §5.1, BDEW AS4-Profil §4.6.3) the receiving MSH answers the same HTTP
+//! §5.1, BDEW AS4-Profil Kap. 4.6.3) the receiving MSH answers the same HTTP
 //! connection with either
 //!
 //! * an `eb:Receipt` SignalMessage acknowledging the `eb:UserMessage`, or
