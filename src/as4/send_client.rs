@@ -77,7 +77,7 @@ pub(crate) async fn send(client: &As4, message: Message) -> Result<Verified<Rece
         if let Some(name) = filename(part.name())? {
             extra = extra.with_filename(name);
         }
-        additional.push(extra);
+        additional.push(extra.with_properties(part.properties().to_vec()));
     }
     let signer = &config.local.signer_ref().signer;
     let algorithm = profile.signature_algorithm();
@@ -94,6 +94,10 @@ pub(crate) async fn send(client: &As4, message: Message) -> Result<Verified<Rece
         primary_overrides: PrimaryPartOverrides {
             mime_type: primary.as_ref().map(|p| part_type(p.mime_type())),
             content_id: None,
+            properties: primary
+                .as_ref()
+                .map(|p| p.properties().to_vec())
+                .unwrap_or_default(),
         },
         additional_payloads: additional,
         timestamp: Some(checked.timestamp.clone()),

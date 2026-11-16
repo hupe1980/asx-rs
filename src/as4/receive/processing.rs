@@ -29,13 +29,18 @@ fn enforce_non_fragment_timestamp_freshness(
 
 // ── The inbound path ────────────────────────────────────────────────────────
 
+/// One verified payload part: Content-ID, bytes, `MimeType` and the other
+/// part properties in document order.
+pub(crate) type VerifiedPart = (String, Vec<u8>, String, Vec<(String, String)>);
+
 /// What `Inbound` needs of one verified, decrypted message. No dedup claim
 /// has been taken: the caller claims after this returns.
 pub(crate) struct VerifiedInbound {
     pub(crate) parsed: super::super::ParsedAs4UserMessage,
-    /// `(content id, decrypted and decompressed bytes, declared MimeType)`,
-    /// primary first; a part without a `MimeType` is `application/octet-stream`.
-    pub(crate) payloads: Vec<(String, Vec<u8>, String)>,
+    /// `(content id, decrypted and decompressed bytes, declared MimeType,
+    /// other part properties)`, primary first; a part without a `MimeType` is
+    /// `application/octet-stream`.
+    pub(crate) payloads: Vec<VerifiedPart>,
     /// The verified signer (DER).
     pub(crate) signer_der: Vec<u8>,
     /// The verified references, for the record.
@@ -332,6 +337,8 @@ pub(crate) fn open_inbound(
         .zip(plaintexts)
         .collect();
     let mut payloads = Vec::with_capacity(declared.len());
+    // One budget for the whole message: a bomb split over parts is still one.
+    let mut budget = usize::try_from(policy.max_decompressed_bytes).unwrap_or(usize::MAX);
     for cid in declared {
         let at = by_cid
             .iter()
@@ -343,13 +350,16 @@ pub(crate) fn open_inbound(
             &cid,
             &part_properties.compression,
             bytes,
+            budget,
         )?;
+        budget = budget.saturating_sub(bytes.len());
         let mime_type = part_properties
             .mime_types
             .get(&cid)
             .cloned()
             .unwrap_or_else(|| "application/octet-stream".to_string());
-        payloads.push((cid, bytes, mime_type));
+        let properties = part_properties.other.get(&cid).cloned().unwrap_or_default();
+        payloads.push((cid, bytes, mime_type, properties));
     }
 
     Ok(VerifiedInbound {

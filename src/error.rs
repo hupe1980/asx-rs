@@ -48,6 +48,16 @@ pub enum ErrorKind {
     Rejected,
     /// The partner refused our message (`eb:Error`, or MDN `processed/error` /
     /// `failed`).
+    ///
+    /// An AS4 `eb:Error` is reported as received, not as proven: error signals
+    /// are usually unsigned, so anything that answered on the connection could
+    /// have produced it (under `Profile::bdew()` the mutually authenticated,
+    /// SM-PKI-verified TLS channel narrows that to the partner's endpoint).
+    /// Treat it as a routing hint — [`Error::is_retryable`] is true only for
+    /// `EBMS:0202` DeliveryFailure — never as evidence of the message's fate;
+    /// only a verified receipt is. Before dead-lettering on another code, keep
+    /// the message and its id: resending it is safe, because receivers detect
+    /// duplicates.
     PartnerError,
     /// Definitely not delivered (connect, DNS, TLS, or request not written).
     /// Resend the same message.

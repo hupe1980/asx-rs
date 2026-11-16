@@ -14,6 +14,9 @@
 #                 outside the migration page.
 #   migration     a name from scripts/deleted-names.txt is missing from the
 #                 migration page.
+#   citation      "RzÜ … §N": the Regelungen zum Übertragungsweg number their
+#                 sections as Kapitel ("RzÜ AS4 2.6 Kap. 5.2"); checked in the
+#                 Markdown above, THREAT_MODEL.md and src/**/*.rs.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -97,6 +100,17 @@ if os.path.exists(readme):
         ex = os.path.join(root, "examples", name + ".rs")
         if not os.path.exists(ex) or open(ex, encoding="utf-8").read() != block:
             findings.append(f"README.md: golden: block for examples/{name}.rs is not byte-identical to the file")
+
+citation = re.compile(r"RzÜ[^§\n]{0,25}§")
+cited = list(files)
+if os.path.exists(os.path.join(root, "THREAT_MODEL.md")):
+    cited.append(os.path.join(root, "THREAT_MODEL.md"))
+for d, _, fs in os.walk(os.path.join(root, "src")):
+    cited += [os.path.join(d, f) for f in sorted(fs) if f.endswith(".rs")]
+for path in cited:
+    for i, line in enumerate(open(path, encoding="utf-8").read().split("\n"), 1):
+        if citation.search(line):
+            findings.append(f"{os.path.relpath(path, root)}:{i}: citation: RzÜ numbers sections as Kapitel (\"RzÜ AS4 2.6 Kap. N\")")
 
 for f in findings:
     print(f)

@@ -2,6 +2,8 @@
 //! `As4::inbound`: verification order, dedup settlement and the response
 //! table.
 
+#[path = "common/inbound_harness.rs"]
+mod inbound_harness;
 #[path = "common/peers.rs"]
 mod peers;
 
@@ -247,7 +249,7 @@ async fn oversized_body_is_413() {
 async fn message_for_another_party_is_refused() {
     let p = pair(Preset::Bdew);
     // a sends to c; the request is posted to b.
-    let c = p.ca.bdew_party("9900000000003");
+    let c = p.ca.bdew_party_at("9900000000003", "https://c.example/as4");
     let to_c = c.partner("https://c.example/as4");
     p.loopback
         .mount("https://c.example/as4", receiver_inbound(&p));
@@ -309,7 +311,7 @@ fn stranger_receiver(
 #[tokio::test(flavor = "current_thread")]
 async fn unconfigured_bdew_sender_with_matching_subject_is_accepted() {
     let p = pair(Preset::Bdew);
-    let d = p.ca.bdew_party("9900000000004");
+    let d = p.ca.bdew_party_at("9900000000004", "https://d.example/as4");
     p.loopback
         .mount(B_URL, stranger_receiver(&p, Profile::bdew(), &d));
     p.sender
@@ -362,7 +364,7 @@ async fn tampered_payload_is_refused_without_a_claim() {
     let _ = soap_part(&[]);
 }
 
-/// BDEW AS4-Profil 1.2 §2.3.2/§2.3.4.4 with RzÜ AS4 2.6 §5.2: the MP-ID is
+/// BDEW AS4-Profil 1.2 §2.3.2/§2.3.4.4 with RzÜ AS4 2.6 Kap. 5.2: the MP-ID is
 /// the subject's OU. A sender whose certificate carries it only in the CN is
 /// neither accepted unregistered nor configurable as a partner.
 #[tokio::test(flavor = "current_thread")]
@@ -392,21 +394,94 @@ async fn bdew_mp_id_must_be_in_the_ou() {
         .build()
         .expect_err("V20");
     assert!(err.to_string().contains("§2.3.4.4"), "{err}");
-    // Unregistered: refused at signer authorization.
-    let sender = As4::builder(Profile::bdew())
+    // Not configurable as the local party either.
+    let err = As4::builder(Profile::bdew())
         .local(e.local())
         .trust_anchor(p.ca.anchor())
-        .partner(p.b.partner(B_URL))
         .http_client(p.loopback.clone())
         .build()
-        .unwrap();
-    let to_b = p.b.partner(B_URL);
-    let err = sender
-        .send(Preset::Bdew.message(&to_b, b"x"))
-        .await
-        .expect_err("CN is not where the MP-ID lives");
-    assert_eq!(err.ebms_code(), Some("EBMS:0101"), "{err}");
-    assert_eq!(p.calls.load(Ordering::SeqCst), 0);
+        .expect_err("local OU");
+    assert!(err.to_string().contains("LocalParty::signer"), "{err}");
+    // Unregistered, on the wire: refused at signer authorization.
+    assert_forged_signer_refused(&cn_only("sig")).await;
+}
+
+/// A genuine message from `a` re-signed by `signer`, posted to a receiver
+/// that does not know `a` (the BDEW §2.3.2 unregistered-sender path), is
+/// refused as EBMS:0101 and never delivered.
+async fn assert_forged_signer_refused(signer: &asx::testkit::pki::KeyPair) {
+    let g = inbound_harness::genuine(Preset::Bdew).await;
+    let forged = g.with_soap(&inbound_harness::resign_as(
+        &g.soap(),
+        &g.plaintext_attachments(),
+        signer,
+    ));
+    let d = g
+        .pair
+        .ca
+        .bdew_party_at("9900000000004", "https://d.example/as4");
+    let inbound = stranger_receiver(&g.pair, Profile::bdew(), &d);
+    let (status, body) = post(&inbound, forged).await;
+    assert_eq!(status, http::StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.contains("EBMS:0101"), "{body}");
+    assert_eq!(
+        g.pair.calls.load(Ordering::SeqCst),
+        1,
+        "only the genuine delivery"
+    );
+}
+
+/// RzÜ AS4 2.6 Kap. 5.2 and Kap. 9 Verstoßvariante 2: an inbound BDEW signer
+/// must name exactly one AS4 address; without one, or with two, the message
+/// is refused as FailedAuthentication. Control: the same forgery path with
+/// the genuine certificate is delivered.
+#[tokio::test(flavor = "current_thread")]
+async fn bdew_signer_uri_san_required() {
+    use asx::testkit::pki::{IssueOptions, KeyAlg, Nid};
+    fn issue(ca: &asx::testkit::pki::TestCa, uris: &[&str]) -> asx::testkit::pki::KeyPair {
+        ca.issue_with_options(
+            "sig",
+            KeyAlg::EcBrainpoolP256r1,
+            IssueOptions {
+                subject: vec![
+                    (Nid::COMMONNAME, "Test MP 9900000000001 sig".into()),
+                    (Nid::ORGANIZATIONALUNITNAME, "9900000000001".into()),
+                ],
+                uri_sans: uris.iter().map(|u| u.to_string()).collect(),
+                ..IssueOptions::default()
+            },
+        )
+    }
+    for uris in [&[][..], &[A_URL, "https://a2.example/as4"][..]] {
+        let g = inbound_harness::genuine(Preset::Bdew).await;
+        let signer = issue(&g.pair.ca, uris);
+        let forged = g.with_soap(&inbound_harness::resign_as(
+            &g.soap(),
+            &g.plaintext_attachments(),
+            &signer,
+        ));
+        let d = g
+            .pair
+            .ca
+            .bdew_party_at("9900000000004", "https://d.example/as4");
+        let (status, body) = post(&stranger_receiver(&g.pair, Profile::bdew(), &d), forged).await;
+        assert_eq!(status, http::StatusCode::BAD_REQUEST, "{uris:?}: {body}");
+        assert!(body.contains("EBMS:0101"), "{uris:?}: {body}");
+    }
+    // Control: one URI SAN is accepted on the same path.
+    let g = inbound_harness::genuine(Preset::Bdew).await;
+    let signer = issue(&g.pair.ca, &[A_URL]);
+    let forged = g.with_soap(&inbound_harness::resign_as(
+        &g.soap(),
+        &g.plaintext_attachments(),
+        &signer,
+    ));
+    let d = g
+        .pair
+        .ca
+        .bdew_party_at("9900000000004", "https://d.example/as4");
+    let (status, body) = post(&stranger_receiver(&g.pair, Profile::bdew(), &d), forged).await;
+    assert_eq!(status, http::StatusCode::OK, "{body}");
 }
 
 /// The handler sees each payload with the media type its signed

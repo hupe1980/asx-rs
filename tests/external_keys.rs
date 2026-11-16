@@ -12,7 +12,7 @@ mod as2_peers;
 
 #[cfg(feature = "as4")]
 mod as4 {
-    use super::peers::{A_URL, B_URL, MP, Preset};
+    use super::peers::{A_URL, B_URL, Preset};
     use asx::as4::{As4, UserMessage};
     use asx::testkit::keys::CountingKeys;
     use asx::testkit::loopback::Loopback;
@@ -41,19 +41,22 @@ mod as4 {
     /// `b` holds `extra` additional decryption keys; `a` encrypts to `b_enc_for`.
     fn setup(extra: usize, encrypt_to_last: bool) -> Setup {
         let ca = TestCa::sm_pki();
-        let a = ca.bdew_party("9900000000001");
-        let b = ca.bdew_party("9900000000002");
+        let a = ca.bdew_party_at("9900000000001", A_URL);
+        let b = ca.bdew_party_at("9900000000002", B_URL);
         let mut b_keys = vec![b.encryption.clone()];
         for i in 0..extra {
-            b_keys.push(ca.issue_named(
-                &[
-                    (asx::testkit::pki::Nid::COMMONNAME, &format!("b enc {i}")),
-                    (
-                        asx::testkit::pki::Nid::ORGANIZATIONALUNITNAME,
-                        "9900000000002",
-                    ),
-                ],
+            use asx::testkit::pki::{IssueOptions, Nid};
+            b_keys.push(ca.issue_with_options(
+                "b enc",
                 asx::testkit::pki::KeyAlg::EcBrainpoolP256r1,
+                IssueOptions {
+                    subject: vec![
+                        (Nid::COMMONNAME, format!("b enc {i}")),
+                        (Nid::ORGANIZATIONALUNITNAME, "9900000000002".to_string()),
+                    ],
+                    uri_sans: vec![B_URL.to_string()],
+                    ..IssueOptions::default()
+                },
             ));
         }
         let a_sign = CountingKeys::new(&a.signing);
@@ -134,11 +137,7 @@ mod as4 {
         s.a_sign.fail();
         let err = s
             .sender
-            .send(
-                asx::as4::Message::to(&s.to_b)
-                    .service(MP)
-                    .payload(asx::Payload::new(&b"x"[..], "application/octet-stream")),
-            )
+            .send(Preset::Bdew.message(&s.to_b, b"x"))
             .await
             .expect_err("signer down");
         assert_eq!(err.kind(), ErrorKind::Backend, "{err}");

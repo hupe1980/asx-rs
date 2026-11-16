@@ -103,6 +103,7 @@ fn soap_envelope_infoset_golden() {
         "second@asx.test".to_string(),
         "text/plain".to_string(),
         None,
+        Vec::new(),
     )])
     .with_ws_addressing(WsAddressingHeaders::new(
         format!("urn:uuid:{TRICKY}"),

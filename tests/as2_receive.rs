@@ -531,6 +531,35 @@ async fn unaddressable_requests_are_400() {
     );
 }
 
+/// A transport header the receiver acts on, sent twice, is ambiguous:
+/// refused with a bare 400 before anything is read (constitution III).
+#[tokio::test]
+async fn a_repeated_as2_header_is_400_and_never_delivered() {
+    let p = pair();
+    for (name, value) in [
+        ("AS2-From", "MALLORY"),
+        ("AS2-To", B_ID),
+        ("Message-ID", "<other@test>"),
+        ("Content-Type", "application/pkcs7-mime"),
+        (
+            "Disposition-Notification-Options",
+            "signed-receipt-protocol=optional, pkcs7-signature; signed-receipt-micalg=optional, sha-256",
+        ),
+    ] {
+        let (content_type, body) = raw_message(Some(&p.a.signing), Some(&p.b.encryption));
+        let mut req = request(A_ID, B_ID, "twice@test", &content_type, body);
+        req.headers_mut()
+            .append(name, http::HeaderValue::from_str(value).unwrap());
+        let resp = post(&p, req).await;
+        assert_eq!(resp.status(), http::StatusCode::BAD_REQUEST, "{name}");
+        assert!(
+            resp.body().is_empty(),
+            "{name}: no MDN for an ambiguous request"
+        );
+    }
+    assert_eq!(p.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
 #[tokio::test]
 async fn an_async_mdn_request_is_answered_synchronously() {
     let p = pair();

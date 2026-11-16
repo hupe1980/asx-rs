@@ -42,8 +42,8 @@ impl Preset {
     pub fn parties(self, ca: &TestCa) -> (TestParty, TestParty) {
         match self {
             Preset::Bdew => (
-                ca.bdew_party("9900000000001"),
-                ca.bdew_party("9900000000002"),
+                ca.bdew_party_at("9900000000001", A_URL),
+                ca.bdew_party_at("9900000000002", B_URL),
             ),
             Preset::Peppol => (ca.peppol_party("POP000001"), ca.peppol_party("POP000002")),
             Preset::Edelivery | Preset::Entsog => {
@@ -63,7 +63,7 @@ impl Preset {
     pub fn message(self, to: &Partner, body: &[u8]) -> Message {
         let payload = Payload::new(body.to_vec(), "application/octet-stream");
         match self {
-            Preset::Bdew => Message::to(to).service(MP).payload(payload.named("UTILMD.txt")),
+            Preset::Bdew => Message::to(to).service(MP).payload(bdew_metadata(payload.named("UTILMD.txt"))),
             Preset::Peppol => Message::to(to)
                 .service("urn:fdc:peppol.eu:2017:poacc:billing:01:1.0")
                 .action("busdox-docid-qns::urn:oasis:names:specification:ubl:schema:xsd:Invoice-2::Invoice##urn:cen.eu:en16931:2017::2.1")
@@ -74,6 +74,14 @@ impl Preset {
                 .payload(payload.named("doc.bin")),
         }
     }
+}
+
+/// The RzÜ AS4 2.6 Kap. 6 part properties of a market-process message.
+pub fn bdew_metadata(payload: Payload) -> Payload {
+    payload
+        .property("BDEWDocumentType", "UTILMD")
+        .property("BDEWDocumentDate", "2026-11-16")
+        .property("BDEWDocumentNo", "ABC123")
 }
 
 /// What the receiving handler does.

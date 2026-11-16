@@ -47,9 +47,9 @@
 //!
 //! # SSRF protection
 //!
-//! The SMP URL is validated **and pinned** before the HTTP request is issued,
-//! so a host that passed the check cannot be swapped for a private address on
-//! the connection. The `sml_zone` in [`SmpConfig`] names the DNS zone that is
+//! The built-in client checks every address the SMP host resolves to against
+//! the private-address filter and connects to the address it checked, so a
+//! DNS answer cannot rebind the lookup to an internal host. The `sml_zone` in [`SmpConfig`] names the DNS zone that is
 //! allowed to answer for participants — treat it as configuration, not user
 //! data — and a NAPTR record may only name an `https` SMP.
 //!
@@ -92,7 +92,6 @@ use std::sync::Arc;
 
 use crate::core::{AsxError, ErrorCode, ErrorContext, Result};
 #[cfg(feature = "http-client")]
-use crate::transport::egress::{TransportConfig, validated_pinned_client};
 use roxmltree::Document;
 
 pub mod bdxl;
@@ -379,17 +378,14 @@ impl SmpLookupRequest {
 #[derive(Clone, Debug)]
 pub struct SmpClient {
     config: SmpConfig,
-    /// Timeouts and pool settings for the per-lookup pinned client.
-    ///
-    /// The client itself is built **per request** so it can be pinned to the
-    /// addresses that URL validation actually checked; a long-lived client
-    /// would re-resolve DNS and reopen the rebinding hole.
-    #[cfg(feature = "http-client")]
-    transport: TransportConfig,
     /// Performs the BDXL NAPTR query. `None` until one is supplied, which is
     /// why [`SmlDiscovery::Naptr`] reports a configuration error rather than
     /// silently falling back to a scheme the network no longer publishes.
     resolver: Option<Arc<dyn BdxlResolver>>,
+    /// The built-in client, made on the first lookup and shared by clones,
+    /// so lookups reuse pooled connections.
+    #[cfg(feature = "http-client")]
+    http: Arc<std::sync::OnceLock<crate::http_client::BuiltinClient>>,
 }
 
 impl SmpClient {
@@ -412,12 +408,9 @@ impl SmpClient {
     pub fn with_config(config: SmpConfig) -> Self {
         Self {
             config,
-            #[cfg(feature = "http-client")]
-            transport: TransportConfig {
-                request_timeout: std::time::Duration::from_secs(10),
-                ..TransportConfig::default()
-            },
             resolver: None,
+            #[cfg(feature = "http-client")]
+            http: Arc::default(),
         }
     }
 
@@ -443,10 +436,11 @@ impl SmpClient {
     ///
     /// # Errors
     ///
-    /// - [`ErrorCode::InvalidInput`] — URL validation failed (bad SML zone or
-    ///   private-range host after DNS resolution).
-    /// - [`ErrorCode::TransportFailure`] — HTTP request failed.
+    /// - [`ErrorCode::InvalidInput`] — URL validation failed (bad SML zone).
+    /// - [`ErrorCode::TransportFailure`] — HTTP request failed, including a
+    ///   host that is or resolves to a private address.
     /// - [`ErrorCode::NotFound`] — SMP returned a non-2xx status.
+    /// - [`ErrorCode::PayloadTooLarge`] — the response exceeds the size cap.
     /// - [`ErrorCode::ParseFailed`] — XML parsing or endpoint extraction failed.
     #[cfg(feature = "http-client")]
     pub async fn lookup_endpoint(&self, req: SmpLookupRequest) -> Result<SmpEndpoint> {
@@ -473,57 +467,30 @@ impl SmpClient {
 
     #[cfg(feature = "http-client")]
     async fn lookup_endpoint_inner(&self, req: SmpLookupRequest) -> Result<SmpEndpoint> {
-        let smp_base = self.resolve_smp_base_url(&req.participant_id).await?;
-        let url = self.build_lookup_url_at(&smp_base, &req);
-
-        // Validate **and pin** in one step. Validating the URL and then letting
-        // a separately-built client resolve DNS again is a
-        // time-of-check/time-of-use hole: the attacker answers the check with a
-        // public address and the connection with a private one. An SMP lookup
-        // decides where a message goes and which key it is encrypted to, so it
-        // is the last place to leave that open.
-        let http = validated_pinned_client(&url, &self.transport, "smp_lookup").await?;
-
-        let response = http.get(&url).send().await.map_err(|e| {
-            AsxError::new(
-                ErrorCode::TransportFailure,
-                format!("SMP HTTP request failed for '{url}': {e}"),
-                ErrorContext::new("smp_lookup"),
-            )
-        })?;
-
-        let status = response.status();
-        if !status.is_success() {
-            return Err(AsxError::new(
-                ErrorCode::NotFound,
-                format!(
-                    "SMP returned HTTP {status} for participant '{}' / doc-type '{}'",
-                    req.participant_id, req.document_type_id
-                ),
-                ErrorContext::new("smp_lookup"),
-            ));
-        }
-
-        // The SMP host comes from DNS a participant registrant controls: cap
-        // what it can make us buffer (real responses are a few KiB).
-        let body = crate::transport::egress::read_body_capped(
-            response,
-            MAX_SMP_RESPONSE_BYTES,
-            "smp_lookup_body",
-        )
-        .await?;
-
-        let transport_profile = req
-            .transport_profile
-            .as_deref()
-            .unwrap_or(&self.config.transport_profile);
-
-        parse_service_metadata(
-            &body,
-            &req.process_id,
-            transport_profile,
-            &self.config.signature_policy,
-        )
+        // The built-in client: its connector checks every resolved address
+        // against the private-address filter and connects to the address it
+        // checked, so a DNS answer cannot rebind the lookup to an internal
+        // host. An SMP lookup decides where a message goes and which key it is
+        // encrypted to.
+        let http = match self.http.get() {
+            Some(http) => http,
+            None => {
+                let built = crate::http_client::BuiltinClient::new(
+                    crate::transport::tls::TlsPolicy::Platform,
+                    None,
+                    Arc::default(),
+                )
+                .map_err(|detail| {
+                    AsxError::new(
+                        ErrorCode::TransportFailure,
+                        format!("SMP client: {detail}"),
+                        ErrorContext::new("smp_lookup"),
+                    )
+                })?;
+                self.http.get_or_init(|| built)
+            }
+        };
+        self.lookup_endpoint_with(req, http).await
     }
 
     /// [`Self::lookup_endpoint`] through an [`crate::HttpClient`] (for

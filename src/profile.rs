@@ -166,6 +166,8 @@ impl Profile {
     /// | Signing token | BST `#X509PKIPathv1` (B §2.2.6.2.1) |
     /// | Encryption | ECDH-ES + ConcatKDF (SHA-256) + `kw-aes128`, `aes128-gcm`, recipient by `X509SKI` (B §2.2.6.2.2, §2.3.4.3; TR §9.2) |
     /// | Keys | separate EC BrainpoolP256r1 key pairs for signing, encryption and TLS (B §2.3.4.4) |
+    /// | Certificates | each of the triple names the MP-ID in its subject's OU and exactly one AS4 address as URI subjectAltName; the partner's endpoint is that address (RzÜ AS4 2.6 Kap. 2, Kap. 5.2) |
+    /// | TLS (built-in client) | mutual, with `LocalParty::tls_identity` (B §2.2.6.1); BSI TR-03116-3 suites and Brainpool groups; the server chain verified against the trust anchors and its CRLs checked before a request is written (B §2.3.7); SNI, so the endpoint must be a DNS name (RzÜ AS4 2.6 Kap. 3) |
     /// | Party id | the 13-digit MP-ID; type one of `…:iso6523:0088`, `…:unregistered:BDEW`, `…:DVGW`, `…:BAHN` (B §2.3.1.1) |
     /// | Service | one of `https://www.bdew.de/as4/communication/services/{MP,FP,RD,KW,SO}` (B §2.3.1.2.1) |
     /// | Action | fixed `http://docs.oasis-open.org/ebxml-msg/as4/200902/action` (B §2.3.1.2.2); the path-switch service has its own two |
@@ -176,9 +178,9 @@ impl Profile {
     /// | Test service | receipted, never delivered (B §2.3.6) |
     /// | Path switch | B §2.2.8 "MUSS zusätzlich einen AS4-Übertragungspfadänderungsdienst (Kapitel 2.3.7) implementieren": Service `https://www.bdew.de/as4/communication/services/pathSwitch`, Actions `https://www.bdew.de/as4/communication/actions/requestSwitch` and `…/actions/confirmSwitch` (B §2.3.1.2.1, §2.3.1.2.2, §2.3.7); payload-less, signed, not encrypted; sent with [`Message::path_switch`](crate::as4::Message::path_switch), recognised by [`UserMessage::path_switch`](crate::as4::UserMessage::path_switch) |
     /// | Duplicate detection | required (B §2.2.5) |
-    /// | Revocation | CRL from each certificate's CRL distribution point only, no OCSP (CP SM-PKI §4.9, §7.3); `nextUpdate` required (BSI TR-03109-4 Anhang B); refetched after 24 h, the last known CRL used while a fetch fails (CP Tabelle 10, §4.8.3); a certificate without CDP refused (TR Anhang A item 10); the three-day rule below (RzÜ AS4 2.6 §5.4) |
+    /// | Revocation | CRL from each certificate's CRL distribution point only, no OCSP (CP SM-PKI §4.9, §7.3); `nextUpdate` required (BSI TR-03109-4 Anhang B); refetched after 24 h, the last known CRL used while a fetch fails (CP Tabelle 10, §4.8.3); a certificate without CDP refused (TR Anhang A item 10); the three-day rule below (RzÜ AS4 2.6 Kap. 5.4) |
     ///
-    /// Revocation (RzÜ AS4 2.6 §5.4): "Wenn die CRL einer CA über die im
+    /// Revocation (RzÜ AS4 2.6 Kap. 5.4): "Wenn die CRL einer CA über die im
     /// Zertifikat eingetragene Certificate Revocation List Distribution Point
     /// (CRL-DP) von einer CA über 3 Tage nicht abrufbar ist oder im
     /// Gültigkeitszeitraum nicht verlängert wurde, dann ist der ausstellenden
@@ -265,7 +267,7 @@ impl Profile {
     /// | MDN request | synchronous, signed, `signed-receipt-micalg=sha-256` (R4130 §7.3) |
     /// | MDN verification | signature by the partner pin (absent only with [`Quirk::UnsignedMdn`]); `Original-Message-ID` = sent id; MIC = computed MIC; disposition `processed` (R4130 §7.3.1, §7.4.3, §7.5) |
     /// | Inbound | signed and encrypted, else `processed/error: insufficient-message-security` (R4130 §7.5.3); duplicates answered `processed/warning: duplicate-document` (R4130 §9.3, §7.5.6) |
-    /// | Inbound async-MDN request | answered synchronously (named gap) |
+    /// | Inbound async-MDN request | answered synchronously (asynchronous MDNs are not implemented) |
     /// | Senders | configured partners with pinned certificates |
     /// | Signer key | RSA >= 2048 or EC P-256/P-384 |
     /// | Revocation | the signer's whole path (and an MDN signer's): CRL-DP, then OCSP from the AIA; a pinned certificate publishing neither is accepted and recorded |
@@ -339,8 +341,8 @@ impl Profile {
         self.max_message_bytes.unwrap_or(CEILING).min(CEILING)
     }
 
-    /// The revocation rule: BDEW CRL-DP only with the three-day rule (RzÜ AS4
-    /// 2.6 §5.4); Peppol CRL-DP then OCSP, no source refused; the pin-based
+    /// The revocation rule: BDEW CRL-DP only with the three-day rule
+    /// (RzÜ AS4 2.6 Kap. 5.4); Peppol CRL-DP then OCSP, no source refused; the pin-based
     /// profiles CRL-DP then OCSP, no source accepted and recorded.
     pub(crate) fn revocation(&self) -> crate::revocation::RevocationRule {
         use crate::revocation::{MissingSource, RevocationRule};
@@ -557,7 +559,14 @@ pub(crate) fn resolve(
             .map(|c| c.fingerprint().clone())
             .collect(),
         encryption_cert: partner.encryption_certificate().cloned(),
-        endpoint: partner.endpoint_url().map(str::to_owned),
+        endpoint: partner.endpoint_url().map(str::to_owned).or_else(|| {
+            // BDEW: the endpoint is the one its encryption certificate names
+            // (RzÜ AS4 2.6 Kap. 2: "muss … entnommen werden").
+            (profile.sender_rule() == SenderRule::AnchorAndSubject)
+                .then(|| partner.encryption_certificate())
+                .flatten()
+                .and_then(|cert| crate::builder::bdew_endpoint_uri(cert).ok())
+        }),
         quirks: partner.quirks().to_vec(),
     }
 }
@@ -647,6 +656,7 @@ pub(crate) fn receive_view(profile: &Profile) -> crate::as4::As4PushPolicy {
                 future: std::time::Duration::from_secs(300),
                 past: crate::dedup::MIN_RETENTION,
             }),
+            max_decompressed_bytes: profile.max_bytes(),
         };
         probe::record("as4.receive", &view);
         view

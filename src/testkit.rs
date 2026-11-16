@@ -1,5 +1,5 @@
-//! Test support: test PKI, an in-process loopback partner, counting keys,
-//! store conformance suites and trace capture.
+//! Test support: test PKI, an in-process loopback partner, a TLS MSH on
+//! 127.0.0.1, counting keys, store conformance suites and trace capture.
 //!
 //! Enabled by the `test-util` feature; use it from `[dev-dependencies]` only.
 //! Everything here is built on the public API: nothing in this module weakens
@@ -12,4 +12,5 @@ pub mod keys;
 pub mod loopback;
 pub mod pki;
 pub mod revocation;
+pub mod tls;
 pub mod trace;

@@ -89,6 +89,23 @@ type Answer = (
 
 impl As4Inbound {
     async fn handle(&self, request: http::Request<Bytes>) -> Answer {
+        // Two Content-Type headers are two readings of the MIME structure;
+        // neither is chosen (constitution III).
+        if request
+            .headers()
+            .get_all(http::header::CONTENT_TYPE)
+            .iter()
+            .nth(1)
+            .is_some()
+        {
+            let err = AsxError::new(
+                ErrorCode::InteropViolation,
+                "the request carries more than one Content-Type header",
+                crate::core::ErrorContext::new("as4_receive_push"),
+            );
+            let response = refusal(&err, self.client.config().clock.now());
+            return (response, ReceiveOutcome::Rejected, None, Some(err), None);
+        }
         let content_type = request
             .headers()
             .get(http::header::CONTENT_TYPE)
@@ -208,8 +225,11 @@ impl As4Inbound {
             payloads: verified
                 .payloads
                 .iter()
-                .map(|(_, bytes, mime_type)| {
-                    Payload::new(Bytes::from(bytes.clone()), mime_type.as_str())
+                .map(|(_, bytes, mime_type, properties)| {
+                    properties.iter().fold(
+                        Payload::new(Bytes::from(bytes.clone()), mime_type.as_str()),
+                        |payload, (name, value)| payload.property(name, value),
+                    )
                 })
                 .collect(),
             // Derived once from the verified header, BDEW only.
@@ -603,14 +623,22 @@ impl SenderAuthorizer for Authorizer<'_> {
                 Some(Box::new(move |der: &[u8]| {
                     let cert = Certificate::from_der(der)
                         .map_err(|_| unauthorized("the signer certificate is unreadable"))?;
-                    if crate::builder::bdew_subject_carries(&cert, &from) {
-                        Ok(())
-                    } else {
-                        Err(unauthorized(format!(
+                    if !crate::builder::bdew_subject_carries(&cert, &from) {
+                        return Err(unauthorized(format!(
                             "the signer's subject (OU) does not carry the claimed MP-ID {from:?} \
                              (BDEW AS4-Profil 1.2 §2.3.2, §2.3.4.4)"
-                        )))
+                        )));
                     }
+                    // RzÜ AS4 2.6 Kap. 5.2 and Kap. 9 Verstoßvariante 2: a
+                    // signer outside the certificate rules is refused as
+                    // FailedAuthentication.
+                    crate::builder::bdew_endpoint_uri(&cert)
+                        .map(|_| ())
+                        .map_err(|detail| {
+                            unauthorized(format!(
+                                "the signer certificate: {detail} (RzÜ AS4 2.6 Kap. 5.2)"
+                            ))
+                        })
                 }))
             }
             SenderRule::AnchorAndCn => {

@@ -38,10 +38,10 @@ async fn sent_bdew(payloads: &[&[u8]]) -> (peers::Pair, Vec<u8>) {
         .message_id("golden-1@asx.test")
         .timestamp(fixed_time());
     for (i, body) in payloads.iter().enumerate() {
-        message = message.payload(
+        message = message.payload(peers::bdew_metadata(
             asx::Payload::new(body.to_vec(), "application/octet-stream")
                 .named(format!("part{i}.txt")),
-        );
+        ));
     }
     let _ = p.sender.send(message).await;
     let body = p.loopback.last_request().expect("request").body().to_vec();
@@ -102,7 +102,9 @@ fn reference_digests(soap: &str) -> Vec<(String, String)> {
 /// The `eb:Messaging` and Body digests of a fixed message are byte-identical
 /// with or without encryption (the SwA envelope lives only in
 /// `wsse:Security`, outside every signed subtree). The ConcatKDF golden is
-/// `xmlenc::kdf::tests::concat_kdf_bdew_golden_is_unchanged`.
+/// `xmlenc::kdf::tests::concat_kdf_bdew_golden_is_unchanged`. The
+/// `eb:Messaging` digest covers the part's RzÜ AS4 2.6 Kap. 6 properties
+/// (`BDEWDocumentType`, `BDEWDocumentDate`, `BDEWDocumentNo`).
 #[tokio::test]
 async fn messaging_and_body_digests_golden_is_unchanged() {
     let (_, body) = sent_bdew(&[b"UNB+UNOC:3"]).await;
@@ -117,7 +119,7 @@ async fn messaging_and_body_digests_golden_is_unchanged() {
         vec![
             (
                 "#as4-messaging".to_string(),
-                "nMv/gKo1hahp5aCWA5MpfJ7p1HLC7t8UFQ/ezpJeFNU=".to_string()
+                "eiF1Qug3s8eojZbrTzUjqQ8c7FgsA2VPCPLO/Vy+fVw=".to_string()
             ),
             (
                 "#as4-body".to_string(),

@@ -5,7 +5,9 @@
 #      tests/public-api.txt (regenerate with `just public-api-update` and
 #      review the diff in the same change).
 #   2. The declared item count is at most 160: lines starting with `pub `,
-#      excluding members of `impl Trait for Type` blocks (fixed by the trait).
+#      excluding members of `impl Trait for Type` blocks (fixed by the trait)
+#      and modules that declare no item (documentation only, such as
+#      `asx::threat_model`: nothing to call, nothing to break).
 #   3. No name in scripts/deleted-names.txt is a segment of an `asx::` path.
 #   4. No declared item name selects signing, encryption, compression,
 #      an algorithm, a token reference, or a receipt/MDN/MIC requirement —
@@ -29,6 +31,22 @@ fi
 # count SNAPSHOT: declared items (see 2. above).
 count() {
 printf '%s\n' "$1" | awk '
+    # First pass: every module path that has a member.
+    NR == FNR {
+        p = $0
+        while (p ~ /^#\[[^]]*\] /) sub(/^#\[[^]]*\] /, "", p)
+        if (p ~ /^pub /) {
+            sub(/^pub [a-z ]*(fn|struct|enum|trait|type|const|static|mod) /, "", p)
+            sub(/[<( ].*$/, "", p)
+            while (match(p, /::[^:]*$/)) { p = substr(p, 1, RSTART - 1); has[p] = 1 }
+        }
+        next
+    }
+    /^pub mod / {
+        m = $0; sub(/^pub mod /, "", m)
+        if (!(m in has)) next
+    }
+
     /^impl/ {
         self = ""
         if ($0 ~ / for /) {
@@ -48,7 +66,7 @@ printf '%s\n' "$1" | awk '
         count++
     }
     END { print count + 0 }
-'
+' - <(printf '%s\n' "$1")
 }
 
 # 1. Snapshot equality.

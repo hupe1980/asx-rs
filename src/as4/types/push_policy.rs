@@ -17,6 +17,9 @@ pub(crate) struct As4PushPolicy {
     /// Replay-window enforcement for inbound `<eb:Timestamp>`: refused more
     /// than `future` ahead or `past` behind (see [`TimestampWindow`]).
     pub timestamp_window: Option<TimestampWindow>,
+    /// The most decompressed payload bytes one message may expand to: the
+    /// profile's `max_message_bytes`, shared by all of its parts.
+    pub max_decompressed_bytes: u64,
 }
 
 /// The inbound `eb:Timestamp` window, asymmetric: `future` is the clock skew (eDelivery AS4 1.15 §5.1.3, 300 s);

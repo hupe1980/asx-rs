@@ -336,6 +336,11 @@ async fn invalid_messages_are_refused_before_sending() {
         Message::to(&p.to_b, Payload::new(&b"x"[..], "text/plain\r\nX: y")),
         Message::to(&p.to_b, Payload::new(&b""[..], EDI)),
         Message::to(&p.to_b, Payload::new(&b"x"[..], EDI).named("a.txt")),
+        // AS2 has no part properties (they are AS4 eb:PartProperties).
+        Message::to(
+            &p.to_b,
+            Payload::new(&b"x"[..], EDI).property("BDEWDocumentNo", "1"),
+        ),
         p.message(b"x").message_id("<bracketed@test>"),
         p.message(b"x").message_id("no-at-sign"),
     ] {

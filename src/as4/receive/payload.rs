@@ -207,12 +207,14 @@ pub(super) fn match_parts<'a>(
         .collect()
 }
 
-/// The `CompressionType` and `MimeType` part properties of the verified
-/// `eb:Messaging` header, each keyed by the referenced payload Content-ID.
+/// The part properties of the verified `eb:Messaging` header, keyed by the
+/// referenced payload Content-ID: `CompressionType` and `MimeType`, and every
+/// other property in document order (`Payload::properties`).
 #[derive(Debug, Default)]
 pub(super) struct PartProperties {
     pub(super) compression: std::collections::HashMap<String, String>,
     pub(super) mime_types: std::collections::HashMap<String, String>,
+    pub(super) other: std::collections::HashMap<String, Vec<(String, String)>>,
 }
 
 /// Read [`PartProperties`] from the one `eb:Messaging` the signature covers.
@@ -221,7 +223,7 @@ pub(super) struct PartProperties {
 /// compressed (AS4 profile §3.1): sniffing the gzip magic number would expand
 /// a business document that merely is a gzip file. `MimeType` is the business
 /// type the handler sees. A property named twice in one `eb:PartInfo` is
-/// ambiguous and refused.
+/// ambiguous and refused, whatever its name.
 pub(super) fn part_properties(
     session: &crate::core::SessionContext,
     doc: &roxmltree::Document<'_>,
@@ -247,6 +249,7 @@ pub(super) fn part_properties(
         };
         let cid = normalize_cid(href);
         let (mut compression, mut mime_type) = (None, None);
+        let mut other: Vec<(String, String)> = Vec::new();
         for property in part_info.descendants().filter(|n| is_eb(n, "Property")) {
             if !property
                 .parent()
@@ -262,7 +265,21 @@ pub(super) fn part_properties(
             let slot = match name {
                 Some("CompressionType") => &mut compression,
                 Some("MimeType") => &mut mime_type,
-                _ => continue,
+                Some(other_name) => {
+                    let value = crate::as4::parser::property_value_from_node(
+                        property,
+                        session,
+                        "as4_receive_push",
+                    )?;
+                    if other.iter().any(|(n, _)| n == other_name) {
+                        return Err(reject(format!(
+                            "eb:PartInfo cid:{cid} declares the {other_name} property more than once"
+                        )));
+                    }
+                    other.push((other_name.to_string(), value.unwrap_or_default()));
+                    continue;
+                }
+                None => continue,
             };
             let value = crate::as4::parser::property_value_from_node(
                 property,
@@ -282,6 +299,9 @@ pub(super) fn part_properties(
         }
         if let Some(Some(value)) = mime_type {
             out.mime_types.insert(cid.to_string(), value);
+        }
+        if !other.is_empty() {
+            out.other.insert(cid.to_string(), other);
         }
     }
     Ok(out)
@@ -331,6 +351,7 @@ pub(super) fn decompress_payload_if_declared(
     content_id: &str,
     compression_types: &std::collections::HashMap<String, String>,
     payload: Vec<u8>,
+    limit: usize,
 ) -> Result<Vec<u8>> {
     let Some(compression_type) = compression_types.get(normalize_cid(content_id)) else {
         return Ok(payload);
@@ -348,7 +369,7 @@ pub(super) fn decompress_payload_if_declared(
         ));
     }
 
-    crate::crypto::compression::decompress_gzip(&payload).map_err(|err| {
+    crate::crypto::compression::decompress_gzip(&payload, limit).map_err(|err| {
         AsxError::new(
             err.code,
             format!(

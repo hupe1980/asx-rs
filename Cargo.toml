@@ -1,6 +1,6 @@
 [package]
 name = "asx-rs"
-version = "0.16.2"
+version = "0.17.0"
 edition = "2024"
 authors = ["hupe1980"]
 description = "AS2 and AS4 (ebMS3) B2B messaging: BDEW, Peppol, eDelivery and ENTSOG profiles, signed receipts and MDNs, one tower Service to receive"
@@ -42,13 +42,13 @@ as2 = ["dep:openssl", "dep:cms", "dep:der", "dep:flate2"]
 ## AS4 (ebMS3 / eDelivery): `asx::as4`.
 as4 = ["dep:openssl", "dep:roxmltree", "dep:aes-gcm", "dep:aes-kw", "dep:flate2"]
 ## The built-in HTTPS client (reqwest).
-http-client = ["dep:reqwest"]
+http-client = ["dep:openssl", "dep:hyper", "dep:hyper-util", "dep:tokio-openssl", "dep:rustls-native-certs", "tokio/net"]
 ## Peppol: SMP lookup through BDXL with the bundled resolver; implies `as4`.
 peppol = ["as4", "dep:hickory-resolver"]
 ## Counters and histograms through the `metrics` facade.
 metrics = ["dep:metrics"]
 ## Test support (`asx::testkit`). Dev-dependencies only; adds helpers, changes nothing.
-test-util = ["as2", "as4", "dep:uuid", "dep:serde_json", "dep:tracing-subscriber", "tokio/rt-multi-thread", "tokio/macros"]
+test-util = ["as2", "as4", "http-client", "dep:uuid", "dep:serde_json", "dep:tracing-subscriber", "tokio/rt-multi-thread", "tokio/macros", "tokio/net", "hyper/server", "hyper-util/server", "hyper-util/server-auto"]
 
 [lints.rust]
 # `unsafe_code` is forbidden in `src/lib.rs`, not here: a test target
@@ -78,8 +78,13 @@ aes-gcm = { version = "0.11", optional = true }
 # RFC 3394 AES Key Wrap (XML Encryption kw-aes*).
 aes-kw = { version = "0.3", optional = true, default-features = false, features = ["zeroize"] }
 flate2 = { version = "1", optional = true }
-# `rustls` verifies against the platform trust store (rustls-platform-verifier).
-reqwest = { version = ">=0.13, <0.14", default-features = false, features = ["json", "rustls", "http2"], optional = true }
+# The built-in HTTPS client (D92): hyper's pooled client over a crate-private
+# connector (SSRF filter, pins, OpenSSL TLS — Brainpool for BDEW, TR-03116-3).
+hyper = { version = "1", default-features = false, features = ["client", "http1", "http2"], optional = true }
+hyper-util = { version = "0.1", default-features = false, features = ["client-legacy", "tokio", "http1", "http2"], optional = true }
+tokio-openssl = { version = "0.6", optional = true }
+# Platform roots for non-BDEW TLS, loaded as DER into an OpenSSL store.
+rustls-native-certs = { version = "0.8", optional = true }
 lru = "0.18"
 memchr = "2"
 getrandom = "0.3"
@@ -109,6 +114,8 @@ tower = { version = "0.5", features = ["util"] }
 # Paused-time lease tests (`MemoryDedup`, the dedup conformance suite).
 tokio = { version = "1", features = ["test-util", "macros", "rt-multi-thread"] }
 criterion = { version = "0.5", features = ["html_reports"] }
+# The interop harnesses (phase4, Holodeck) drive their peers over plain HTTP.
+reqwest = { version = ">=0.13, <0.14", default-features = false, features = ["json", "rustls", "http2"] }
 # Docker-backed oracles (`tests/interop_*`, `#[ignore]`d; `just interop`).
 testcontainers = { version = "0.27", features = ["blocking"] }
 redis = { version = "1.7", features = ["tokio-comp"] }

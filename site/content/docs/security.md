@@ -118,7 +118,7 @@ and runs outside the crypto pool.
   `CertificateIssuer` entries of indirect CRLs are honoured. Decisions on static
   vectors agree with `openssl verify -crl_check_all`
   (`tests/revocation_openssl_oracle.rs`).
-- **The three-day rule (BDEW, RzÜ AS4 2.6 §5.4).** A CA whose newest valid CRL
+- **The three-day rule (BDEW, RzÜ AS4 2.6 Kap. 5.4).** A CA whose newest valid CRL
   is past its `nextUpdate`, or whose CRL could not be fetched for more than
   72 h after the last successful fetch, is distrusted with everything below it
   until a current CRL is obtained; the distrust is not stored. Boundaries are
@@ -136,14 +136,34 @@ and runs outside the crypto pool.
   entry is verified again on read and its unsigned fetch time clamped into
   `[thisUpdate, now]`. Concurrent checks of one CA make one fetch.
 
-## Outbound HTTP
+## Outbound HTTP and TLS
 
-The built-in client (feature `http-client`):
+The built-in client (feature `http-client`) is OpenSSL with pooled
+connections. Every new connection is made by one connector, so a pooled
+connection never bypasses a check:
 
 - accepts only `https` endpoints without userinfo (`partner_endpoint_invalid`);
-- refuses private, loopback, link-local and transition-mechanism addresses,
-  and connects to the addresses it validated (no second DNS lookup);
-- follows no redirects; connects within 10 s, completes within 300 s;
+- resolves the host (or takes its `Builder::resolve` pin), refuses private,
+  loopback, link-local and transition-mechanism addresses in *every* DNS
+  answer, and connects to the address it checked (no second lookup). Only an
+  exactly pinned host is exempt; the pin shows in the builder's `Debug`
+  (`tests/egress_mtls.rs` and the connector's unit tests);
+- sends SNI for every DNS name (RzÜ AS4 2.6 Kap. 3) and verifies the server
+  certificate against the host name (RFC 6125) and, where an EKU is present,
+  `serverAuth`;
+- under `Profile::bdew()`: BSI TR-03116-3 §4 — TLS ≥ 1.2 (TLS 1.3 from
+  OpenSSL 3.2, which brings the RFC 8734 Brainpool schemes), ECDHE-ECDSA
+  AES-GCM/CBC suites, ECDSA signature schemes only, Brainpool groups first —
+  the builder's trust anchors as the *only* TLS roots (the SM-PKI root), no
+  wildcard host names (CP SM-PKI Anhang A.7.1), and the server chain checked
+  against its CRLs with the three-day rule before a request is written (BDEW
+  AS4-Profil 1.2 §2.3.7). Every refusal is a not-written transport error
+  (`tests/egress_mtls.rs`: unknown CA, wrong host, no `serverAuth`, revoked,
+  RSA server; foreign witness `tests/interop_openssl_tls_oracle.rs`);
+- other profiles: the platform's roots, TLS ≥ 1.2, OpenSSL's defaults;
+- presents `LocalParty::tls_identity` when asked (loaded at `build()`);
+- follows no redirects; connects (TCP and TLS) within 10 s, completes within
+  300 s; keeps at most 4 idle connections per host for 90 s;
 - reads at most 16 MiB of response (SMP 1 MiB, OCSP 64 KiB).
 
 An error from an `HttpClient` you supply is `Indeterminate`: the request may
@@ -170,6 +190,11 @@ cannot change an outcome
 (`tests/no_observer.rs::exchanges_succeed_unobserved_and_an_idle_observer_changes_nothing`).
 
 ## What the library does not protect against
+
+The [threat model](https://docs.rs/asx-rs/latest/asx/threat_model/)
+(`asx::threat_model`; [THREAT_MODEL.md](https://github.com/hupe1980/asx-rs/blob/main/THREAT_MODEL.md)
+in the repository) lists every known threat class with its status and
+evidence, open ones included. The main limits:
 
 - **A compromised trust anchor.** The network CA can issue for any party; pin
   partner certificates if you need more than network membership.

@@ -94,8 +94,11 @@ fn normalized_cid_bytes(content_id: &[u8]) -> &[u8] {
     }
 }
 
+/// The value of `header_name` in a MIME part header block. A header that
+/// occurs twice is ambiguous and refused (constitution III).
 fn header_value_from_block<'a>(headers: &'a [u8], header_name: &str) -> Result<Option<&'a str>> {
     let header_name_bytes = header_name.as_bytes();
+    let mut found = None;
 
     for raw_line in headers.split(|b| *b == b'\n') {
         let line = raw_line.strip_suffix(b"\r").unwrap_or(raw_line);
@@ -123,34 +126,33 @@ fn header_value_from_block<'a>(headers: &'a [u8], header_name: &str) -> Result<O
                 )
             })?;
 
-            return Ok(Some(value));
+            if found.replace(value).is_some() {
+                return Err(AsxError::new(
+                    ErrorCode::InteropViolation,
+                    format!("a MIME part carries the {header_name} header more than once"),
+                    ErrorContext::new("as4_receive_push"),
+                ));
+            }
         }
     }
 
-    Ok(None)
+    Ok(found)
 }
 
-/// Efficient substring search using the two-way algorithm (O(n) time, O(1) space).
-/// Substantially faster than the naive O(n·m) `.windows()` loop for long needles or
-/// large MIME payloads (validated in the benchmark suite).
+/// Substring search (`memchr::memmem`, linear time).
 #[inline]
 fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     memmem::find(haystack, needle)
 }
 
-/// Streaming MIME part reference: (headers_bytes, body_bytes) - both as slices.
-/// This avoids materializing parts into Vec until we know we need them.
+/// One MIME part as slices of the request body: its header block and body.
 struct StreamingMimePartRef<'a> {
     headers: &'a [u8],
     body: &'a [u8],
 }
 
-/// Efficient streaming MIME parser: yields part references without materializing intermediate Vecs.
-/// Key optimization: only materializes parts we actually need (root SOAP + referenced attachment).
-/// Non-matching parts are skipped entirely without intermediate Vec allocation.
-///
-/// Boundary byte patterns are pre-computed once in `new()` so that each call to
-/// `next_part_slice` never formats a String or allocates a Vec for boundary matching.
+/// A multipart parser that yields each part as slices of the body, copying
+/// nothing. The delimiters are computed once in `new()`.
 struct StreamingMimeParser<'a> {
     raw_body: &'a [u8],
     /// Pre-computed: `--<boundary>` (start delimiter for inter-part scanning)
@@ -386,7 +388,7 @@ pub(super) fn extract_multipart_related_payload_if_present<'a>(
         })?;
         payloads.push(InboundAttachment {
             content_id,
-            content_type: content_type_from_block(part.headers),
+            content_type: content_type_from_block(part.headers)?,
             bytes: part.body,
         });
     }
@@ -412,25 +414,28 @@ fn content_id_from_block(headers: &[u8]) -> Result<Option<&str>> {
 }
 
 /// The `Content-Type` header value of a MIME part header block, if present
-/// and valid UTF-8. Folded continuation lines are joined with a single space.
-fn content_type_from_block(headers: &[u8]) -> Option<&str> {
-    let text = std::str::from_utf8(headers).ok()?;
-    let mut lines = text.lines();
-    while let Some(line) = lines.next() {
+/// and valid UTF-8. A folded continuation is not joined: the media type (the
+/// part that selects the SwA transform) is always on the first line. A part
+/// with two `Content-Type` headers is ambiguous and refused.
+fn content_type_from_block(headers: &[u8]) -> Result<Option<&str>> {
+    let Ok(text) = std::str::from_utf8(headers) else {
+        return Ok(None);
+    };
+    let mut found = None;
+    for line in text.lines() {
         let Some((name, value)) = line.split_once(':') else {
             continue;
         };
-        if !name.trim().eq_ignore_ascii_case("content-type") {
-            continue;
+        if name.trim().eq_ignore_ascii_case("content-type") && found.replace(value.trim()).is_some()
+        {
+            return Err(AsxError::new(
+                ErrorCode::InteropViolation,
+                "a MIME part carries the Content-Type header more than once",
+                ErrorContext::new("as4_receive_push"),
+            ));
         }
-        let value = value.trim();
-        // Continuation lines are rare on Content-Type; when present, fall back
-        // to the unfolded first line rather than allocating — the media type
-        // (the part that selects the SwA transform) is always on it.
-        let _ = lines;
-        return Some(value);
     }
-    None
+    Ok(found)
 }
 
 fn trim_ascii_whitespace(bytes: &[u8]) -> &[u8] {

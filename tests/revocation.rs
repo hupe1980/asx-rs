@@ -9,9 +9,11 @@
 
 #[path = "common/revocation_net.rs"]
 mod net;
+pub(crate) use net::peers;
+#[path = "common/inbound_harness.rs"]
+mod inbound_harness;
 
 use asx::as4::{As4, UserMessage};
-use asx::testkit::loopback::Loopback;
 use asx::testkit::pki::{Cdp, IssueOptions, KeyAlg, TestCa};
 use asx::testkit::revocation::RevocationHttp;
 use asx::{ErrorKind, MemoryDedup, Profile, Verified};
@@ -173,38 +175,54 @@ async fn a_revoked_receipt_signer_leaves_the_delivery_indeterminate() {
 
 #[tokio::test]
 async fn an_unauthorized_signer_triggers_no_revocation_request() {
-    let root = TestCa::sm_pki();
-    // `a` claims MP-ID A but its certificate carries another MP-ID, and the
-    // receiver has no configured partner A (BDEW §2.3.4.4 sender rule).
-    let a = bdew(&root, A, "9900000000009", Cdp::Issuer);
-    let b = bdew(&root, B, B, Cdp::Issuer);
-    let loopback = Loopback::new();
-    let b_http = RevocationHttp::new().with_fallback(loopback.clone());
+    use tower::ServiceExt;
+    // A genuine message from A, re-signed by a certificate that claims
+    // another MP-ID in its OU; the receiver has no configured partner A
+    // (BDEW §2.3.4.4 sender rule). `build()` refuses such a certificate for a
+    // local party, so the forgery is made on the wire.
+    let g = inbound_harness::genuine(Preset::Bdew).await;
+    let wrong = g.pair.ca.issue_with_options(
+        "wrong",
+        KeyAlg::EcBrainpoolP256r1,
+        IssueOptions {
+            subject: vec![
+                (
+                    asx::testkit::pki::Nid::COMMONNAME,
+                    "Test MP wrong sig".into(),
+                ),
+                (
+                    asx::testkit::pki::Nid::ORGANIZATIONALUNITNAME,
+                    "9900000000009".into(),
+                ),
+            ],
+            uri_sans: vec![net::peers::A_URL.to_string()],
+            ..IssueOptions::default()
+        },
+    );
+    let forged = g.with_soap(&inbound_harness::resign_as(
+        &g.soap(),
+        &g.plaintext_attachments(),
+        &wrong,
+    ));
+    let b_http = RevocationHttp::new();
     let receiver = As4::builder(Profile::bdew())
-        .local(b.local())
-        .trust_anchor(root.anchor())
+        .local(g.pair.b.local())
+        .trust_anchor(g.pair.ca.anchor())
         .http_client(b_http.clone())
         .build()
         .unwrap();
-    loopback.mount(
-        B_URL,
-        receiver.inbound(MemoryDedup::default(), |_m: Verified<UserMessage>| async {
+    let response = receiver
+        .inbound(MemoryDedup::default(), |_m: Verified<UserMessage>| async {
             Ok::<(), asx::Reject>(())
-        }),
-    );
-    let sender = As4::builder(Profile::bdew())
-        .local(a.local())
-        .trust_anchor(root.anchor())
-        .partner(b.partner(B_URL))
-        .http_client(loopback.clone())
-        .build()
-        .unwrap();
-    let to_b = b.partner(B_URL);
-    assert_refused_0101(
-        sender
-            .send(Preset::Bdew.message(&to_b, b"unauthorized"))
-            .await,
-    );
+        })
+        .oneshot(forged.map(http_body_util::Full::new))
+        .await
+        .unwrap_or_else(|never| match never {});
+    let body = http_body_util::BodyExt::collect(response.into_body())
+        .await
+        .unwrap()
+        .to_bytes();
+    assert!(String::from_utf8_lossy(&body).contains("EBMS:0101"));
     assert_eq!(
         b_http.requests(),
         0,

@@ -69,7 +69,7 @@ jobs:
       - run: cargo deny --workspace --all-features check advisories licenses bans sources
 
   # Foreign implementations as oracles (the `#[ignore]`d interop tests):
-  # openssl CLI (AS2 S/MIME), xmlsec1 (XML-DSig), Redis (async storage) and
+  # openssl CLI (AS2 S/MIME, BDEW Brainpool mutual TLS), xmlsec1 (XML-DSig), Redis (async storage) and
   # phase4 4.8.1 as the BDEW counterparty, built here from tests/fixtures/phase4.
   interop:
     runs-on: ubuntu-latest

@@ -582,10 +582,15 @@ pub(crate) fn unlock_cek(
     }
 }
 
+/// The implicit-rejection key: random, so decryption fails like any wrong
+/// key. Without randomness it fails closed: an empty key, which content
+/// decryption refuses for its length — the same uniform `DecryptionFailed`,
+/// never a predictable (all-zero) key an attacker could encrypt under.
 fn random_cek(cipher: XmlEncPayloadAlgorithm) -> Zeroizing<Vec<u8>> {
     let mut cek = Zeroizing::new(vec![0u8; cipher.key_len()]);
-    // A zero key only if the OS has no randomness — the tag check still fails.
-    let _ = getrandom::fill(&mut cek);
+    if getrandom::fill(&mut cek).is_err() {
+        return Zeroizing::new(Vec::new());
+    }
     cek
 }
 
@@ -621,6 +626,44 @@ mod tests {
     use super::*;
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD as B64;
+
+    /// Every content key and nonce is fresh (SP 800-38D §8.2.2: a repeated
+    /// GCM nonce under one key loses confidentiality and integrity).
+    #[test]
+    fn content_keys_nonces_and_rejection_keys_are_fresh() {
+        let cipher = XmlEncPayloadAlgorithm::Aes128Gcm;
+        let mut keys = std::collections::HashSet::new();
+        let mut nonces = std::collections::HashSet::new();
+        let mut rejections = std::collections::HashSet::new();
+        for _ in 0..256 {
+            let cek = randomness::cek(cipher.key_len()).expect("cek");
+            assert_eq!(cek.len(), cipher.key_len());
+            assert!(cek.iter().any(|b| *b != 0));
+            assert!(keys.insert(cek.to_vec()), "a content key repeated");
+            assert!(
+                nonces.insert(gcm::fresh_nonce().expect("nonce")),
+                "a nonce repeated"
+            );
+            let rejection = random_cek(cipher);
+            assert_eq!(rejection.len(), cipher.key_len());
+            assert!(
+                rejections.insert(rejection.to_vec()),
+                "a rejection key repeated"
+            );
+        }
+    }
+
+    /// The fail-closed rejection key (no randomness) is refused by content
+    /// decryption with the one uniform error.
+    #[test]
+    fn an_empty_rejection_key_fails_uniformly() {
+        let cipher = XmlEncPayloadAlgorithm::Aes128Gcm;
+        let key = vec![7u8; cipher.key_len()];
+        let nonce = gcm::fresh_nonce().unwrap();
+        let blob = gcm::encrypt(cipher, &key, nonce, b"payload").unwrap();
+        let err = gcm::decrypt(cipher, &[], &blob).expect_err("empty key");
+        assert_eq!(err.code, ErrorCode::DecryptionFailed);
+    }
 
     fn rsa_pair() -> (Vec<u8>, Vec<u8>) {
         crate::test_support::self_signed_rsa("asx-xmlenc-unit")

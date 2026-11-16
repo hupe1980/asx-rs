@@ -118,6 +118,23 @@ impl Certificate {
             .unwrap_or(KeyKind::Other)
     }
 
+    /// The `uniformResourceIdentifier` subjectAltNames, in order (RFC 5280
+    /// §4.2.1.6). BDEW: exactly one, the AS4 web-service address
+    /// (RzÜ AS4 2.6 Kap. 5.2; CP SM-PKI Anhang A.7.1 Tabelle 28).
+    #[cfg_attr(not(feature = "as4"), allow(dead_code))]
+    pub(crate) fn uri_sans(&self) -> Vec<String> {
+        self.0
+            .x509
+            .subject_alt_names()
+            .map(|names| {
+                names
+                    .iter()
+                    .filter_map(|name| name.uri().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// Every value of every subject attribute, in order.
     pub(crate) fn subject_values(&self) -> Vec<(Nid, String)> {
         self.0
@@ -410,21 +427,17 @@ impl KeyPair {
         KeyKind::of_public(&self.0.secret.pkey)
     }
 
-    /// The private key as PEM, for the TLS identity of the built-in HTTP
-    /// client only: AS2 and AS4 reach keys through [`Signer`] and
-    /// [`Decrypter`]. Never logged.
+    /// The certificate chain, leaf first.
     #[cfg_attr(not(feature = "http-client"), allow(dead_code))]
-    pub(crate) fn key_pem(&self) -> &[u8] {
-        &self.0.secret.pem
+    pub(crate) fn chain(&self) -> &[Certificate] {
+        &self.0.chain
     }
 
+    /// The private key, for the TLS identity of the built-in HTTP client
+    /// only: AS2 and AS4 reach keys through [`Signer`] and [`Decrypter`].
     #[cfg_attr(not(feature = "http-client"), allow(dead_code))]
-    pub(crate) fn chain_pem(&self) -> Vec<u8> {
-        let mut out = Vec::new();
-        for cert in &self.0.chain {
-            out.extend_from_slice(cert.pem().as_bytes());
-        }
-        out
+    pub(crate) fn private_key(&self) -> &PKey<Private> {
+        &self.0.secret.pkey
     }
 
     fn sign_now(&self, algorithm: SignatureAlgorithm, message: &[u8]) -> Result<Vec<u8>> {

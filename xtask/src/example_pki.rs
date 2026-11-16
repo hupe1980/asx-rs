@@ -12,13 +12,18 @@ pub(crate) fn run(args: &[String]) -> Result<(), String> {
         std::fs::write(dir.join(name), bytes).map_err(|e| format!("{name}: {e}"))
     };
     let sm_pki = TestCa::sm_pki();
-    let me = sm_pki.bdew_party("9900000000001");
-    let partner = sm_pki.bdew_party("9900000000002");
+    // Each triple names its AS4 endpoint (RzÜ AS4 2.6 Kap. 5.2); the
+    // partner's is where the send example goes (`localhost` resolves to a
+    // loopback address, which the built-in client refuses unless pinned).
+    let me = sm_pki.bdew_party_at("9900000000001", "https://as4.example.org/as4");
+    let partner = sm_pki.bdew_party_at("9900000000002", "https://as4.partner.example/msh");
     write("sm-pki-root.crt", sm_pki.cert_pem())?;
     write("sig.crt", &me.signing.cert_pem)?;
     write("sig.key", &me.signing.key_pem)?;
     write("enc.crt", &me.encryption.cert_pem)?;
     write("enc.key", &me.encryption.key_pem)?;
+    write("tls.crt", &me.tls.cert_pem)?;
+    write("tls.key", &me.tls.key_pem)?;
     write("partner-sig.crt", &partner.signing.cert_pem)?;
     write("partner-enc.crt", &partner.encryption.cert_pem)?;
     write(

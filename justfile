@@ -53,7 +53,7 @@ interop:
     #!/usr/bin/env bash
     set -euo pipefail
     export ASX_PHASE4_IMAGE="${ASX_PHASE4_IMAGE:-$(docker build -q --provenance=false tests/fixtures/phase4)}"
-    for t in interop_openssl_smime_oracle interop_xmlsec_oracle interop_redis_storage_conformance \
+    for t in interop_openssl_smime_oracle interop_openssl_tls_oracle interop_xmlsec_oracle interop_redis_storage_conformance \
              interop_phase4_counterparty interop_phase4_encryption interop_phase4_path_switch; do
         echo "── $t"
         cargo test --locked --all-features --test "$t" -- --ignored --test-threads=1

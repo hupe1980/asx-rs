@@ -67,6 +67,9 @@ pub fn bdew(ca: &TestCa, mp_id: &str, ou: &str, cdp: Cdp) -> Party {
                     (Nid::COMMONNAME, format!("Test MP {mp_id} {role}")),
                     (Nid::ORGANIZATIONALUNITNAME, ou.to_string()),
                 ],
+                // RzÜ AS4 2.6 Kap. 5.2: the endpoint the partner is
+                // registered at.
+                uri_sans: vec![if mp_id == A { A_URL } else { B_URL }.to_string()],
                 ..IssueOptions::default()
             },
         )

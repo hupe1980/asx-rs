@@ -484,6 +484,9 @@ pub(crate) fn check_message(
         }
         total = total.saturating_add(payload.bytes().len() as u64);
     }
+    for payload in &message.payloads {
+        check_properties(profile, payload)?;
+    }
     if total > profile.max_bytes() {
         return Err(refuse(
             profile,
@@ -538,6 +541,43 @@ pub(crate) fn check_message(
         message_id,
         timestamp,
     })
+}
+
+/// The part properties the library writes itself (ebMS3 Core §5.2.2.13,
+/// AS4 Profile §3.1).
+const RESERVED_PROPERTIES: [&str; 2] = ["MimeType", "CompressionType"];
+
+/// Every profile: an embedder's part property has a non-empty name without
+/// whitespace that is neither the library's nor repeated in the part, and a
+/// non-empty value without CR or LF (header text an ebMS processor may trim
+/// or fold is ambiguous).
+pub(crate) fn check_properties(profile: &Profile, payload: &Payload) -> Result<()> {
+    let refuse_property = |detail: String| refuse(profile, "Payload::property", detail, "");
+    let mut seen: Vec<&str> = Vec::new();
+    for (name, value) in payload.properties() {
+        if RESERVED_PROPERTIES.contains(&name.as_str()) {
+            return Err(refuse_property(format!(
+                "{name:?} is written by the library and cannot be set"
+            )));
+        }
+        if name.is_empty() || name.chars().any(|c| c.is_whitespace() || c.is_control()) {
+            return Err(refuse_property(format!(
+                "{name:?} is not a property name (empty, whitespace or control characters)"
+            )));
+        }
+        if value.is_empty() || value.contains(['\r', '\n']) {
+            return Err(refuse_property(format!(
+                "the value of {name:?} is empty or contains CR or LF"
+            )));
+        }
+        if seen.contains(&name.as_str()) {
+            return Err(refuse_property(format!(
+                "{name:?} is set twice on one payload"
+            )));
+        }
+        seen.push(name);
+    }
+    Ok(())
 }
 
 /// A path-switch message exists only under BDEW, and its header is the

@@ -18,7 +18,7 @@ stay yours.
 📖 **[Documentation](https://hupe1980.github.io/asx-rs)** ·
 🦀 **[API reference](https://docs.rs/asx-rs)** ·
 📋 **[Changelog](CHANGELOG.md)** ·
-🔀 **[Migrating from 0.15](https://hupe1980.github.io/asx-rs/docs/migration/)**
+🔀 **[Migrating](https://hupe1980.github.io/asx-rs/docs/migration/)**
 
 ---
 
@@ -26,7 +26,7 @@ stay yours.
 
 ```toml
 [dependencies]
-asx-rs = "0.16"
+asx-rs = "0.17"
 ```
 
 The package is `asx-rs`; the library is `asx`. Features are additive and
@@ -36,13 +36,10 @@ none changes security behaviour:
 |------|---------|---------|
 | `as2` | AS2 (RFC 4130): `asx::as2` | ✅ |
 | `as4` | AS4 (ebMS3, eDelivery, BDEW, Peppol, ENTSOG): `asx::as4` | ✅ |
-| `http-client` | The built-in HTTPS client (reqwest, HTTPS only, address pinning, mTLS identity) | ✅ |
+| `http-client` | The built-in HTTPS client (OpenSSL, pooled; HTTPS only, SNI, private addresses refused unless pinned, mTLS identity; BSI TR-03116-3 with Brainpool under BDEW) | ✅ |
 | `peppol` | SMP lookup through BDXL (`asx::peppol::Smp`); implies `as4` | ❌ |
 | `metrics` | Counters and histograms through the `metrics` facade (spans via `tracing` are always on) | ❌ |
-| `test-util` | `asx::testkit`: test PKI, loopback partner, store suites; `[dev-dependencies]` only | ❌ |
-
-Test helpers (test PKI, in-process loopback partner, conformance suites) are
-in `asx::testkit`, behind the `test-util` feature for `[dev-dependencies]`.
+| `test-util` | `asx::testkit`: test PKI, loopback partner, a TLS MSH on 127.0.0.1, store suites; `[dev-dependencies]` only | ❌ |
 
 ## Golden paths
 
@@ -62,19 +59,22 @@ use std::fs::read;
 #[rustfmt::skip]
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // The endpoint is the URI the partner's encryption certificate names (RzÜ AS4 2.6 Kap. 2).
     let partner = Partner::new("9900000000002").party_type("urn:oasis:names:tc:ebcore:partyid-type:unregistered:BDEW")
-        .endpoint("https://as4.partner.example/msh")
         .signing_cert(Certificate::from_pem(&read("partner-sig.crt")?)?)
         .encryption_cert(Certificate::from_pem(&read("partner-enc.crt")?)?);
     let as4 = As4::builder(Profile::bdew())
         .local(LocalParty::new("9900000000001").party_type("urn:oasis:names:tc:ebcore:partyid-type:unregistered:BDEW")
             .signer(KeyPair::from_pem(&read("sig.crt")?, &read("sig.key")?)?)
-            .decrypter(KeyPair::from_pem(&read("enc.crt")?, &read("enc.key")?)?))
+            .decrypter(KeyPair::from_pem(&read("enc.crt")?, &read("enc.key")?)?)
+            .tls_identity(KeyPair::from_pem(&read("tls.crt")?, &read("tls.key")?)?)) // BrainpoolP256r1 mutual TLS
         .trust_anchor(Certificate::from_pem(&read("sm-pki-root.crt")?)?)
         .partner(partner.clone())
         .build()?;
     let receipt = as4.send(Message::to(&partner).service("https://www.bdew.de/as4/communication/services/MP")
-        .payload(Payload::new(read("UTILMD.edi")?, "application/octet-stream").named("UTILMD.txt"))).await?;
+        .payload(Payload::new(read("UTILMD.edi")?, "application/octet-stream").named("UTILMD.txt")
+            .property("BDEWDocumentType", "UTILMD").property("BDEWDocumentDate", "2026-11-16") // RzÜ AS4 2.6 Kap. 6
+            .property("BDEWDocumentNo", "ABC123"))).await?;
     std::fs::write("receipt.json", serde_json::to_vec(receipt.evidence())?)?; // the audit record as JSON
     Ok(())
 }
@@ -105,7 +105,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let as4 = As4::builder(Profile::bdew())
         .local(LocalParty::new("9900000000001").party_type("urn:oasis:names:tc:ebcore:partyid-type:unregistered:BDEW")
             .signer(KeyPair::from_pem(&read("sig.crt")?, &read("sig.key")?)?)
-            .decrypter(KeyPair::from_pem(&read("enc.crt")?, &read("enc.key")?)?))
+            .decrypter(KeyPair::from_pem(&read("enc.crt")?, &read("enc.key")?)?)
+            .tls_identity(KeyPair::from_pem(&read("tls.crt")?, &read("tls.key")?)?)) // the SM-PKI triple (RzÜ AS4 2.6 Kap. 1.3)
         .trust_anchor(Certificate::from_pem(&read("sm-pki-root.crt")?)?)
         .partner(Partner::new("9900000000002").party_type("urn:oasis:names:tc:ebcore:partyid-type:unregistered:BDEW")
             .signing_cert(Certificate::from_pem(&read("partner-sig.crt")?)?)
@@ -172,6 +173,10 @@ carries its audit record (`evidence()`).
   MP-ID as the certificate subject's OU, Peppol access points their party id
   as CN; other profiles accept configured partners only. Pinned partner
   certificates always apply.
+- **BDEW end to end.** `build()` checks the SM-PKI certificate triple (MP-ID
+  in the OU, exactly one URI subjectAltName, the partner endpoint taken from
+  it: RzÜ AS4 2.6 Kap. 2, 5.2); the built-in client speaks BSI TR-03116-3
+  mutual TLS (details under Status).
 - **Keys can live in an HSM or KMS.** `Signer` and `Decrypter` are async traits
   for the private-key operation; `KeyPair` is the in-memory implementation.
 - **Integration points are traits.** `DedupStore`, `AuditSink` and
@@ -179,7 +184,9 @@ carries its audit record (`evidence()`).
   suites. No retry scheduler, storage backend or listener is built in.
 
 See the **[security model](https://hupe1980.github.io/asx-rs/docs/security/)**
-for trust boundaries and what the library does *not* protect against.
+for trust boundaries and what the library does *not* protect against, and the
+**[threat model](THREAT_MODEL.md)** (also on docs.rs as `asx::threat_model`)
+for every known threat class with its status and evidence.
 
 ## Status
 
@@ -188,12 +195,18 @@ for trust boundaries and what the library does *not* protect against.
 - Presets: BDEW AS4-Profil 1.2, Peppol AS4 2.0.3, eDelivery AS4 1.15,
   ENTSOG 3.6, AS2 (RFC 4130).
 - AS4 One-Way/Push: sign, then encrypt (WSS SwA 1.1), gzip; signed NRR
-  receipts; duplicates, the test service and the BDEW path switch handled.
+  receipts; duplicates, the test service and the BDEW path switch handled;
+  part properties (`Payload::property`) under every profile.
 - AS2: signed and encrypted, signed MDN with the MIC verified, asynchronous
   MDNs (`PendingMdn`), duplicate detection.
 - WS-Security: RSA-SHA256, ECDSA-SHA256 (`r ‖ s`, brainpoolP256r1 for BDEW),
   RSA-OAEP, ECDH-ES + ConcatKDF + AES-KW, AES-GCM.
-- Revocation from CRL distribution points (and OCSP outside BDEW).
+- Revocation from CRL distribution points (and OCSP outside BDEW), for
+  message signers and, under BDEW, the TLS server chain.
+- TLS: OpenSSL with connection pooling and SNI; under BDEW mutual TLS on
+  BrainpoolP256r1 (BSI TR-03116-3), the SM-PKI root as the only TLS trust,
+  the server chain CRL-checked before a request is written; TLS 1.3 from
+  OpenSSL 3.2, TLS 1.2 before.
 - Peppol SMP lookup returning a `Partner`.
 
 Independent witnesses (phase4, Holodeck B2B, xmlsec1, the openssl CLI, a
