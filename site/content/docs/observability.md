@@ -11,7 +11,7 @@ Three observability seams; none can change what happens to a message:
 
 The library never installs a subscriber or recorder and reads no environment variable. With nothing installed, spans cost a disabled-callsite check and metric macros are no-ops. Only an audit sink declared `Durable` can fail an exchange.
 
-The tables below are a public contract, checked both ways against what the test suite emits (`tests/telemetry_contract.rs`, `tests/metrics_contract.rs`); changes are recorded in `CHANGELOG.md`.
+The tables below are a public contract, checked both ways against what the test suite emits (`tests/telemetry_contract.rs`, `tests/metrics_contract.rs`).
 
 ## Wiring it up
 
@@ -19,7 +19,7 @@ The application installs a subscriber and a recorder, for example:
 
 ```toml
 [dependencies]
-asx-rs = { version = "0.16", features = ["metrics"] }
+asx-rs = { version = "0.17", features = ["metrics"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 metrics-exporter-prometheus = "0.17"
 ```
@@ -72,7 +72,7 @@ Never recorded: payload or wire bytes, filenames from a message, private keys, s
 |---|---|---|
 | `protocol` | `asx.send`, `asx.receive` | `as2`, `as4` |
 | `outcome` | `asx.send` | `delivered`, `sent`, `partner_error`, `indeterminate`, `config`, `transport`, `storage` |
-| `outcome` | `asx.receive` | `accepted`, `duplicate`, `in_flight`, `pending`, `rejected`, `storage` |
+| `outcome` | `asx.receive` | `accepted`, `duplicate`, `in_flight`, `rejected`, `storage` |
 | `outcome` | `asx.verify`, `asx.decrypt`, `asx.receipt`, `asx.mdn`, `asx.smp_lookup`, `asx.audit` | `ok`, `failed` |
 | `outcome` | `asx.revocation` | `good`, `revoked`, `unknown`, `error` |
 | `error.kind` | `asx.send`, `asx.receive` | `config`, `rejected`, `partner_error`, `transport`, `indeterminate`, `storage` |
@@ -82,7 +82,7 @@ Never recorded: payload or wire bytes, filenames from a message, private keys, s
 | `reason` | `asx.revocation` | `ca_distrusted`, `not_obtainable`, `no_source`, `refresh_failing` |
 | `durability` | `asx.audit` | `durable`, `best_effort` |
 
-`ebms.code` is an ebMS 3.0 §6.7 error code (`EBMS:0001` … `EBMS:0303`). `error.kind` names an `ErrorKind` (`storage` is `ErrorKind::Backend`) and is also an audit record's `error_kind`. The receive outcome `pending` and the closing event `fragment received` are reserved and not emitted.
+`ebms.code` is an ebMS 3.0 §6.7 error code (`EBMS:0001` … `EBMS:0303`). `error.kind` names an `ErrorKind` (`storage` is `ErrorKind::Backend`) and is also an audit record's `error_kind`.
 
 ### Closing events
 
@@ -95,7 +95,6 @@ Every `asx.send` and `asx.receive` span ends with exactly one event inside it.
 | `asx.send` | transmitted, no verifiable receipt | ERROR | `delivery indeterminate` |
 | `asx.send` | failed before or during transmission (`config`, `transport`, `storage`) | WARN | `send failed` |
 | `asx.receive` | accepted | INFO | `message received` |
-| `asx.receive` | a fragment of an incomplete group was stored | INFO | `fragment received` |
 | `asx.receive` | duplicate or in flight | INFO | `duplicate message` |
 | `asx.receive` | rejected, before or after authentication | WARN | `message rejected` |
 

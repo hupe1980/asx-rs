@@ -32,6 +32,43 @@ async fn send_invoice(as4: &As4, partner: &Partner, invoice: Vec<u8>, attachment
 - **Payloads.** One MIME part (SwA) each, with Content-IDs derived from the
   message id and part index, so a resend produces the same parts. `named` sets
   a file name (`Content-Disposition`); Peppol refuses it.
+- **Part properties.** `Payload::property(name, value)` adds an `eb:Property`
+  to the part's signed `eb:PartProperties`, after the library's `MimeType` and
+  `CompressionType`, in the order added (ebMS3 Core §5.2.2.13), under every
+  profile. Refused: those two names, empty or whitespace names, empty values,
+  CR/LF, a name repeated in one part.
+
+  German market processes fill the RzÜ AS4 2.6 Kap. 6 properties from the
+  EDIFACT envelope and send one Übertragungsdatei per message (Kap. 7.2).
+  Both are market-process rules: the library carries the values and does not
+  check them (BDEW AS4-Profil 1.2 §2.3.5):
+
+  | Property | From |
+  |---|---|
+  | `BDEWDocumentType` | UNH DE0065, the message type (`UTILMD`, `MSCONS`, …) |
+  | `BDEWDocumentDate` | the creation date, `YYYY-MM-DD` |
+  | `BDEWDocumentNo` | UNB DE0020, the interchange reference |
+  | `BDEWApplicationReference` | UNB DE0026, if present |
+
+  `BDEWFulfillmentDate`, `BDEWSubjectPartyID` and `BDEWSubjectPartyRole` are
+  "nicht verwendet" in market communication.
+
+```rust
+use asx::{as4::{As4, Message}, Partner, Payload};
+
+async fn send_utilmd(as4: &As4, partner: &Partner, interchange: Vec<u8>) -> asx::Result<()> {
+    as4.send(Message::to(partner)
+        .service("https://www.bdew.de/as4/communication/services/MP")
+        .payload(Payload::new(interchange, "application/edifact")
+            .property("BDEWDocumentType", "UTILMD")
+            .property("BDEWDocumentDate", "2026-11-16")
+            .property("BDEWDocumentNo", "ABC123")
+            .property("BDEWApplicationReference", "TL")))
+        .await?;
+    Ok(())
+}
+```
+
 - **Action.** Unless the profile fixes it or you set one, the ebMS3 default
   `http://docs.oasis-open.org/ebxml-msg/as4/200902/action`.
 - **Message id and timestamp.** Fresh by default; set both from your outbox
@@ -110,8 +147,10 @@ message id: delivery is at least once (a crashed holder's claim is released
 when its lease expires). `?` converts any error into a `Reject`.
 
 Each payload's `mime_type()` is the `MimeType` part property of its signed
-`eb:PartInfo`, else `application/octet-stream`. A part property named twice
-in one `eb:PartInfo` is refused with `EBMS:0004`.
+`eb:PartInfo`, else `application/octet-stream`; `properties()` returns the
+other part properties in document order (for example the BDEW metadata of
+RzÜ AS4 2.6 Kap. 6). A part property named twice in one `eb:PartInfo` is
+refused with `EBMS:0004`.
 
 ```rust
 use asx::{as4::{As4, UserMessage}, DedupStore, Inbound, Reject, Verified};
@@ -134,13 +173,13 @@ fn endpoint(as4: &As4, store: impl DedupStore) -> Inbound {
 | Situation | Response | Handler | Dedup |
 |---|---|---|---|
 | Body above `max_message_bytes` | HTTP 413 | no | — |
-| Unparseable, ambiguous, or not SwA | HTTP 400 + `EBMS:0004` | no | — |
+| Unparseable, ambiguous (a repeated `Content-Type` or MIME part header included), or not SwA | HTTP 400 + `EBMS:0004` | no | — |
 | Signature invalid, or signer not authorized for the claimed sender | HTTP 400 + `EBMS:0101` | no | — |
 | `eb:To` is not the local party | HTTP 400 + `EBMS:0004` | no | — |
 | Unsigned or unencrypted where the profile requires it | HTTP 400 + `EBMS:0103` | no | — |
 | Decryption failed (any cause, one indistinguishable answer) | HTTP 400 + `EBMS:0102` | no | — |
 | Attachment digest mismatch | HTTP 400 + `EBMS:0101` | no | — |
-| Decompression failed | HTTP 400 + `EBMS:0303` | no | — |
+| Decompression failed, or output above `max_message_bytes` | HTTP 400 + `EBMS:0303` | no | — |
 | Test-service message | HTTP 200 + signed receipt | no | — |
 | Duplicate (`Claim::Duplicate`) | HTTP 200 + a fresh signed receipt | no | unchanged |
 | In flight (`Claim::InFlight`) | HTTP 503 | no | unchanged |
@@ -227,4 +266,3 @@ built: put the complete document in the `Payload`.
 ## Not supported
 
 One-Way/Pull, split/join of large messages, Two-Way MEPs, ordered delivery.
-See the [migration page](@/docs/migration.md) for 0.15 users.

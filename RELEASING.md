@@ -18,7 +18,7 @@ Two workflows, mirrored by two `just` recipes:
 | `features` | `cargo hack check --each-feature --lib --tests` with `-D warnings`: no default features, each feature alone, all features |
 | `msrv` | `cargo +1.88 check --workspace --all-features` |
 | `deny` | `cargo deny check advisories licenses bans sources` (`deny.toml`) |
-| `interop` | the `#[ignore]`d oracle suites: openssl CLI (AS2 S/MIME), xmlsec1, Redis, and phase4 4.8.1 as the BDEW counterparty. The phase4 peer is built in the job from `tests/fixtures/phase4` (GitHub Actions layer cache) and passed in `ASX_PHASE4_IMAGE` |
+| `interop` | the `#[ignore]`d oracle suites: openssl CLI (AS2 S/MIME, BDEW mutual TLS), xmlsec1, Redis, and phase4 4.8.1 as the BDEW counterparty. The phase4 peer is built in the job from `tests/fixtures/phase4` (GitHub Actions layer cache) and passed in `ASX_PHASE4_IMAGE` |
 
 Not in CI: `just public-api` (needs nightly and `cargo-public-api`; run it on
 every API change, the snapshot is `tests/public-api.txt`, budget 160 items) and

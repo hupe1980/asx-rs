@@ -40,8 +40,8 @@ struct Bdew {
 
 fn bdew() -> Bdew {
     let ca = TestCa::sm_pki();
-    let a = ca.bdew_party(A);
-    let b = ca.bdew_party(B);
+    let a = ca.bdew_party_at(A, "https://a.example/as4");
+    let b = ca.bdew_party_at(B, B_URL);
     Bdew { ca, a, b }
 }
 
@@ -362,7 +362,7 @@ fn bdew_tls_identity_equals_signer_or_decrypter() {
 fn bdew_local_id_not_mp_id() {
     let ca = TestCa::sm_pki();
     let a = ca.bdew_party("99000000001");
-    let b = ca.bdew_party(B);
+    let b = ca.bdew_party_at(B, B_URL);
     let builder = As4::builder(Profile::bdew())
         .local(a.local())
         .trust_anchor(ca.anchor())
@@ -531,9 +531,17 @@ fn as2_registered_partner_without_signing_cert() {
 #[test]
 fn partner_certificate_key_type_not_allowed() {
     let pki = bdew();
-    let rsa = pki.ca.issue_named(
-        &[(Nid::COMMONNAME, "rsa"), (Nid::ORGANIZATIONALUNITNAME, B)],
+    let rsa = pki.ca.issue_with_options(
+        "rsa",
         KeyAlg::Rsa2048,
+        asx::testkit::pki::IssueOptions {
+            subject: vec![
+                (Nid::COMMONNAME, "rsa".to_string()),
+                (Nid::ORGANIZATIONALUNITNAME, B.to_string()),
+            ],
+            uri_sans: vec![B_URL.to_string()],
+            ..Default::default()
+        },
     );
     let signing = pki
         .partner_b()
@@ -631,9 +639,7 @@ fn peppol_partner_cn_not_party_id() {
 fn duplicate_partner() {
     let pki = bdew();
     assert_refused(
-        pki.valid()
-            .partner(pki.b.partner("https://b2.example/as4"))
-            .build(),
+        pki.valid().partner(pki.b.partner(B_URL)).build(),
         &["Partner(9900000000002)", "twice"],
     );
 }
@@ -792,4 +798,234 @@ fn crl_signer_rules() {
             .build(),
         &["Builder::crl_signer", "twice"],
     );
+}
+
+// ── RzÜ AS4 2.6: TLS identity, pins, the certificate triple ─────────────────
+
+/// A BDEW builder over the built-in client (no `http_client`).
+fn builtin_bdew(pki: &Bdew, local: LocalParty) -> asx::Builder<As4> {
+    As4::builder(Profile::bdew())
+        .local(local)
+        .trust_anchor(pki.ca.anchor())
+        .partner(pki.b.partner(B_URL))
+}
+
+#[test]
+fn bdew_builtin_client_requires_a_tls_identity() {
+    let pki = bdew();
+    let without = LocalParty::new(A)
+        .party_type(BDEW_PARTY_TYPE)
+        .signer(pki.a.signing.key_pair())
+        .decrypter(pki.a.encryption.key_pair());
+    assert_refused(
+        builtin_bdew(&pki, without).build(),
+        &["LocalParty::tls_identity", BDEW, "§2.2.6.1"],
+    );
+    // Control: with it, the built-in client builds.
+    builtin_bdew(&pki, pki.a.local()).build().expect("builds");
+}
+
+#[test]
+fn bdew_tls_identity_must_be_ec() {
+    let pki = bdew();
+    let rsa = pki.ca.issue_with_options(
+        "tls",
+        KeyAlg::Rsa2048,
+        asx::testkit::pki::IssueOptions {
+            subject: vec![
+                (Nid::COMMONNAME, "tls".into()),
+                (Nid::ORGANIZATIONALUNITNAME, A.into()),
+            ],
+            uri_sans: vec!["https://a.example/as4".into()],
+            ..Default::default()
+        },
+    );
+    let local = pki.a.local().tls_identity(rsa.key_pair());
+    assert_refused(
+        pki.without_local().local(local).build(),
+        &["LocalParty::tls_identity", "EC", "§2.3.4.4"],
+    );
+}
+
+#[test]
+fn builder_debug_shows_pins_but_no_key_material() {
+    let pki = bdew();
+    let builder =
+        builtin_bdew(&pki, pki.a.local()).resolve("b.example", "10.1.2.3:443".parse().unwrap());
+    let shown = format!("{builder:?}");
+    assert!(
+        shown.contains("b.example") && shown.contains("10.1.2.3:443"),
+        "{shown}"
+    );
+    let key = String::from_utf8_lossy(&pki.a.tls.key_pem).to_string();
+    let body: String = key.lines().filter(|l| !l.starts_with("-----")).collect();
+    assert!(!shown.contains(&body[..32]), "no key bytes in Debug");
+    assert!(!shown.contains("PRIVATE KEY"), "{shown}");
+}
+
+#[test]
+fn pins_are_unique_hosts_and_need_the_builtin_client() {
+    let pki = bdew();
+    let addr: std::net::SocketAddr = "127.0.0.1:4443".parse().unwrap();
+    assert_refused(
+        builtin_bdew(&pki, pki.a.local())
+            .resolve("msh.test", addr)
+            .resolve("MSH.test", addr)
+            .build(),
+        &["Builder::resolve", "twice"],
+    );
+    assert_refused(
+        pki.valid().resolve("msh.test", addr).build(),
+        &["Builder::resolve", "built-in HTTP client only"],
+    );
+    assert_refused(
+        builtin_bdew(&pki, pki.a.local())
+            .resolve("https://msh.test", addr)
+            .build(),
+        &["Builder::resolve", "not a host name"],
+    );
+}
+
+/// A certificate of `mp_id` with `ou` and `uris`.
+fn triple_cert(pki: &Bdew, ou: &str, uris: &[&str]) -> asx::testkit::pki::KeyPair {
+    pki.ca.issue_with_options(
+        "cert",
+        KeyAlg::EcBrainpoolP256r1,
+        asx::testkit::pki::IssueOptions {
+            subject: vec![
+                (Nid::COMMONNAME, "Test MP cert".into()),
+                (Nid::ORGANIZATIONALUNITNAME, ou.into()),
+            ],
+            uri_sans: uris.iter().map(|u| u.to_string()).collect(),
+            ..Default::default()
+        },
+    )
+}
+
+#[test]
+fn bdew_partner_encryption_cert_ou_and_uri_san() {
+    let pki = bdew();
+    for (cert, needle) in [
+        (
+            triple_cert(&pki, "9900000000003", &[B_URL]),
+            "does not carry the MP-ID",
+        ),
+        (triple_cert(&pki, B, &[]), "no URI subjectAltName"),
+        (
+            triple_cert(&pki, B, &[B_URL, "https://b2.example/as4"]),
+            "2 URI subjectAltNames",
+        ),
+    ] {
+        let partner = pki
+            .partner_b()
+            .signing_cert(pki.b.signing.certificate())
+            .encryption_cert(cert.certificate());
+        assert_refused(
+            pki.without_partner().partner(partner).build(),
+            &[
+                "Partner(9900000000002)::encryption_cert",
+                needle,
+                "RzÜ AS4 2.6 Kap. 5.2",
+            ],
+        );
+    }
+}
+
+#[test]
+fn bdew_partner_signing_cert_uri_san() {
+    let pki = bdew();
+    let partner = pki
+        .partner_b()
+        .signing_cert(triple_cert(&pki, B, &[]).certificate())
+        .encryption_cert(pki.b.encryption.certificate());
+    assert_refused(
+        pki.without_partner().partner(partner).build(),
+        &[
+            "Partner(9900000000002)::signing_cert",
+            "RzÜ AS4 2.6 Kap. 5.2",
+        ],
+    );
+}
+
+#[test]
+fn bdew_partner_endpoint_is_the_encryption_certificates_uri() {
+    let pki = bdew();
+    // Another address than the certificate names.
+    assert_refused(
+        pki.without_partner()
+            .partner(pki.b.partner("https://elsewhere.example/as4"))
+            .build(),
+        &["Partner(9900000000002)::endpoint", "RzÜ AS4 2.6 Kap. 2"],
+    );
+    // Normalised: case of scheme and host, the default port.
+    pki.without_partner()
+        .partner(pki.b.partner("HTTPS://B.Example:443/as4"))
+        .build()
+        .expect("the same address");
+    // No endpoint: taken from the certificate.
+    let derived = Partner::new(B)
+        .party_type(BDEW_PARTY_TYPE)
+        .signing_cert(pki.b.signing.certificate())
+        .encryption_cert(pki.b.encryption.certificate());
+    pki.without_partner()
+        .partner(derived)
+        .build()
+        .expect("derived");
+}
+
+#[test]
+fn bdew_endpoint_must_be_a_dns_name() {
+    let pki = bdew();
+    let at_ip = pki.ca.bdew_party_at(B, "https://192.0.2.10/as4");
+    assert_refused(
+        pki.without_partner()
+            .partner(at_ip.partner("https://192.0.2.10/as4"))
+            .build(),
+        &["Partner(9900000000002)::endpoint", "RzÜ AS4 2.6 Kap. 3"],
+    );
+}
+
+#[test]
+fn bdew_local_triple_ou_and_uri_san() {
+    let pki = bdew();
+    let wrong_ou = triple_cert(&pki, "9900000000003", &["https://a.example/as4"]);
+    let no_uri = triple_cert(&pki, A, &[]);
+    for (local, setting) in [
+        (
+            LocalParty::new(A)
+                .party_type(BDEW_PARTY_TYPE)
+                .signer(wrong_ou.key_pair())
+                .decrypter(pki.a.encryption.key_pair())
+                .tls_identity(pki.a.tls.key_pair()),
+            "LocalParty::signer",
+        ),
+        (
+            LocalParty::new(A)
+                .party_type(BDEW_PARTY_TYPE)
+                .signer(pki.a.signing.key_pair())
+                .decrypter(no_uri.key_pair())
+                .tls_identity(pki.a.tls.key_pair()),
+            "LocalParty::decrypter",
+        ),
+        (
+            pki.a.local().tls_identity(wrong_ou.key_pair()),
+            "LocalParty::tls_identity",
+        ),
+        (
+            pki.a.local().tls_identity(
+                triple_cert(
+                    &pki,
+                    A,
+                    &["https://a.example/as4", "https://a2.example/as4"],
+                )
+                .key_pair(),
+            ),
+            "LocalParty::tls_identity",
+        ),
+    ] {
+        assert_refused(
+            pki.without_local().local(local).build(),
+            &[setting, "RzÜ AS4 2.6 Kap. 5.2"],
+        );
+    }
 }

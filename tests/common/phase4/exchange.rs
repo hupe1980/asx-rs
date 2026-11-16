@@ -122,8 +122,20 @@ fn message(pki: &RunPki, variant: &ProfileVariant, case: &Case, message_id: &str
         Case::Payloads(_) => Message::to(&partner).service(variant.collaboration().service),
     };
     msg = msg.message_id(message_id);
-    for p in case.payloads() {
-        msg = msg.payload(Payload::new(p.bytes, p.mime_type));
+    let bdew = matches!(variant, ProfileVariant::Bdew);
+    let payloads = case.payloads();
+    for p in payloads {
+        let payload = Payload::new(p.bytes, p.mime_type);
+        // RzÜ AS4 2.6 Kap. 6: a market-process message carries the
+        // interchange's metadata; phase4 receives it as part properties.
+        msg = msg.payload(if bdew && matches!(case, Case::Payloads(_)) {
+            payload
+                .property("BDEWDocumentType", "UTILMD")
+                .property("BDEWDocumentDate", "2026-11-16")
+                .property("BDEWDocumentNo", "ASX-INTEROP-1")
+        } else {
+            payload
+        });
     }
     msg
 }

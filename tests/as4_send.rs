@@ -169,7 +169,8 @@ async fn unreachable_partner_is_retryable_and_nothing_is_recorded() {
     let p = pair(Preset::Bdew);
     // An unregistered partner (e.g. from a directory): validated at send,
     // and nothing is mounted at its endpoint.
-    let c = p.ca.bdew_party("9900000000003");
+    let c =
+        p.ca.bdew_party_at("9900000000003", "https://nowhere.example/as4");
     let elsewhere = c.partner("https://nowhere.example/as4");
     let err = p
         .sender
@@ -353,4 +354,161 @@ async fn send_works_on_a_current_thread_runtime() {
         .send(Preset::Edelivery.message(&p.to_b, b"x"))
         .await
         .expect("no block_on, no block_in_place");
+}
+
+// ── Part properties (ebMS3 Core §5.2.2.13; RzÜ AS4 2.6 Kap. 6, Kap. 7.2) ────
+
+/// A BDEW business payload with the Kap. 6 set plus `extra`.
+fn bdew_payload(extra: &[(&str, &str)]) -> Payload {
+    extra.iter().fold(
+        peers::bdew_metadata(Payload::new(&b"UNB+UNOC:3"[..], "application/edifact")),
+        |p, (n, v)| p.property(*n, *v),
+    )
+}
+
+#[tokio::test]
+async fn part_properties_round_trip_signed_in_order() {
+    use asx::as4::UserMessage;
+    use asx::{MemoryDedup, Verified};
+    let p = pair(Preset::Bdew);
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    {
+        let seen = seen.clone();
+        p.loopback.mount(
+            peers::B_URL,
+            p.receiver
+                .inbound(MemoryDedup::default(), move |m: Verified<UserMessage>| {
+                    let seen = seen.clone();
+                    async move {
+                        seen.lock()
+                            .unwrap()
+                            .push(m.payloads()[0].properties().to_vec());
+                        Ok::<(), asx::Reject>(())
+                    }
+                }),
+        );
+    }
+    let message = Message::to(&p.to_b)
+        .service(peers::MP)
+        .payload(bdew_payload(&[("BDEWApplicationReference", "TL & <2>")]));
+    p.sender.send(message).await.expect("receipt");
+    // On the wire: after MimeType and CompressionType, inside the signed header.
+    let wire = soap_part(p.loopback.last_request().unwrap().body());
+    let mime = wire.find("name=\"MimeType\"").expect("MimeType");
+    let doc_type = wire
+        .find("name=\"BDEWDocumentType\"")
+        .expect("BDEWDocumentType");
+    assert!(mime < doc_type, "library properties first");
+    assert!(wire.contains("TL &amp; &lt;2&gt;"), "values are escaped");
+    // At the receiver: exactly the embedder's, in order.
+    let got = seen.lock().unwrap().pop().expect("delivered");
+    let names: Vec<&str> = got.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(
+        names,
+        [
+            "BDEWDocumentType",
+            "BDEWDocumentDate",
+            "BDEWDocumentNo",
+            "BDEWApplicationReference"
+        ]
+    );
+    assert_eq!(got[3].1, "TL & <2>");
+}
+
+/// The market-process rules of RzÜ AS4 2.6 (Kap. 6: which BDEW properties a
+/// UTILMD carries; Kap. 7.2: one Übertragungsdatei per message) are the
+/// embedder's: the library sends what it is given under `Profile::bdew()`,
+/// several parts and any well-formed properties included (BDEW AS4-Profil
+/// 1.2 §2.3.5: KÖNNEN).
+#[tokio::test]
+async fn bdew_sends_the_parts_and_properties_it_is_given() {
+    use asx::as4::UserMessage;
+    use asx::{MemoryDedup, Verified};
+    let p = pair(Preset::Bdew);
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    {
+        let seen = seen.clone();
+        p.loopback.mount(
+            peers::B_URL,
+            p.receiver
+                .inbound(MemoryDedup::default(), move |m: Verified<UserMessage>| {
+                    let seen = seen.clone();
+                    async move {
+                        seen.lock().unwrap().push(
+                            m.payloads()
+                                .iter()
+                                .map(|p| p.properties().to_vec())
+                                .collect::<Vec<_>>(),
+                        );
+                        Ok::<(), asx::Reject>(())
+                    }
+                }),
+        );
+    }
+    let message = Message::to(&p.to_b)
+        .service(peers::MP)
+        .payload(bdew_payload(&[]))
+        .payload(Payload::new(&b"second"[..], "application/edifact").property("X-Note", "2"));
+    p.sender.send(message).await.expect("receipt");
+    let got = seen.lock().unwrap().pop().expect("delivered");
+    assert_eq!(got.len(), 2);
+    assert_eq!(got[0].len(), 3, "the Kap. 6 metadata of the first part");
+    assert_eq!(got[1], [("X-Note".to_string(), "2".to_string())]);
+}
+
+#[tokio::test]
+async fn invalid_part_properties_are_refused_under_every_profile() {
+    for preset in AS4_PRESETS {
+        let p = pair(preset);
+        for (name, value) in [
+            ("MimeType", "text/plain"),
+            ("CompressionType", "application/gzip"),
+            ("", "x"),
+            ("Two Words", "x"),
+            ("X", ""),
+            ("X", "a\r\nb"),
+        ] {
+            let err = p
+                .sender
+                .send(add_property(preset, &p.to_b, name, value))
+                .await
+                .expect_err("refused");
+            assert_eq!(
+                err.kind(),
+                ErrorKind::Config,
+                "{preset:?} {name:?}={value:?}: {err}"
+            );
+            assert!(err.to_string().contains("Payload::property"), "{err}");
+        }
+        let err = p
+            .sender
+            .send(duplicate_property(preset, &p.to_b))
+            .await
+            .expect_err("duplicate");
+        assert!(err.to_string().contains("twice"), "{err}");
+        assert_eq!(p.loopback.requests(), 0, "{preset:?}");
+    }
+}
+
+/// `preset`'s valid message with `name=value` added to its payload.
+fn add_property(preset: Preset, to: &asx::Partner, name: &str, value: &str) -> Message {
+    rebuild(preset, to, |p| p.property(name, value))
+}
+
+fn duplicate_property(preset: Preset, to: &asx::Partner) -> Message {
+    rebuild(preset, to, |p| p.property("X", "1").property("X", "2"))
+}
+
+fn rebuild(preset: Preset, to: &asx::Partner, f: impl FnOnce(Payload) -> Payload) -> Message {
+    match preset {
+        Preset::Bdew => Message::to(to).service(peers::MP).payload(f(bdew_payload(&[]))),
+        Preset::Peppol => Message::to(to)
+            .service("urn:fdc:peppol.eu:2017:poacc:billing:01:1.0")
+            .action("busdox-docid-qns::urn:oasis:names:specification:ubl:schema:xsd:Invoice-2::Invoice##urn:cen.eu:en16931:2017::2.1")
+            .payload(f(Payload::new(&b"<Invoice/>"[..], "application/xml"))),
+        Preset::Edelivery | Preset::Entsog => Message::to(to)
+            .service("urn:example:service")
+            .action("urn:example:action")
+            .payload(f(Payload::new(&b"x"[..], "application/octet-stream"))),
+    }
 }

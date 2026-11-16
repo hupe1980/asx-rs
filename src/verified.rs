@@ -4,9 +4,9 @@
 use crate::audit::AuditRecord;
 use crate::keys::Certificate;
 
-/// A value the library verified: signature, signer authorization, decryption,
-/// digests and replay checks passed, in that order. There
-/// is no public constructor.
+/// A value the library verified: signature, signer authorization,
+/// revocation, replay window, decryption and digests passed. There is no
+/// public constructor.
 ///
 /// ```compile_fail
 /// // Only the library creates a `Verified`.
@@ -106,6 +106,7 @@ pub struct Payload {
     bytes: bytes::Bytes,
     mime_type: String,
     name: Option<String>,
+    properties: Vec<(String, String)>,
 }
 
 impl Payload {
@@ -115,6 +116,7 @@ impl Payload {
             bytes: bytes.into(),
             mime_type: mime_type.into(),
             name: None,
+            properties: Vec::new(),
         }
     }
 
@@ -125,6 +127,30 @@ impl Payload {
             name: Some(name.into()),
             ..self
         }
+    }
+
+    /// Add an AS4 part property: an `eb:Property` in this part's
+    /// `eb:PartProperties`, after the library's `MimeType` and
+    /// `CompressionType`, in the order added (ebMS3 Core §5.2.2.13).
+    ///
+    /// Any profile: the names and values are the embedder's — for example the
+    /// BDEW metadata of RzÜ AS4 2.6 Kap. 6 (`BDEWDocumentType`,
+    /// `BDEWDocumentDate`, `BDEWDocumentNo`, `BDEWApplicationReference`),
+    /// which comes from the EDIFACT envelope the library does not read.
+    /// Validated at `send`: `MimeType` and `CompressionType` are the
+    /// library's, a name or value is non-empty without CR/LF, a name has no
+    /// whitespace and is not repeated in the part. AS2 has no part properties
+    /// and refuses a payload carrying any.
+    pub fn property(mut self, name: impl Into<String>, value: impl Into<String>) -> Payload {
+        self.properties.push((name.into(), value.into()));
+        self
+    }
+
+    /// The part properties: on a sent payload, those added; on a received
+    /// one, those the signed `eb:PartInfo` carried, in document order,
+    /// without `MimeType` and `CompressionType`.
+    pub fn properties(&self) -> &[(String, String)] {
+        &self.properties
     }
 
     /// The payload octets.

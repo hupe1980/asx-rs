@@ -376,7 +376,7 @@ impl VerifiedSmimeEntity {
     /// §3.1.1; handing that back undecoded would give the application base64
     /// text where it expected its document.
     pub fn decoded_content(&self) -> Result<Cow<'_, [u8]>> {
-        let encoding = header_value(self.headers(), "content-transfer-encoding")
+        let encoding = header_value(self.headers(), "content-transfer-encoding")?
             .unwrap_or_default()
             .to_ascii_lowercase();
 
@@ -410,7 +410,11 @@ impl VerifiedSmimeEntity {
     }
 
     /// Value of the entity's `Content-Type` header, if present.
-    pub fn content_type(&self) -> Option<String> {
+    ///
+    /// # Errors
+    ///
+    /// [`ErrorCode::InteropViolation`] when the header occurs twice.
+    pub fn content_type(&self) -> Result<Option<String>> {
         header_value(self.headers(), "content-type")
     }
 }
@@ -429,8 +433,10 @@ fn find_mime_header_break(bytes: &[u8]) -> Option<usize> {
 }
 
 /// Read a header value out of a raw MIME header block, unfolding continuation
-/// lines. Header names are matched case-insensitively per RFC 5322.
-fn header_value(headers: &[u8], wanted_lower: &str) -> Option<String> {
+/// lines. Header names are matched case-insensitively per RFC 5322. A header
+/// that occurs twice is ambiguous (which type, which encoding?) and refused,
+/// never resolved by order.
+fn header_value(headers: &[u8], wanted_lower: &str) -> Result<Option<String>> {
     let text = String::from_utf8_lossy(headers);
     let mut lines: Vec<String> = Vec::new();
     for raw in text.split('\n') {
@@ -450,12 +456,21 @@ fn header_value(headers: &[u8], wanted_lower: &str) -> Option<String> {
         lines.push(line.to_string());
     }
 
-    lines.iter().find_map(|line| {
+    let mut found = lines.iter().filter_map(|line| {
         let (name, value) = line.split_once(':')?;
         name.trim()
             .eq_ignore_ascii_case(wanted_lower)
             .then(|| value.trim().to_string())
-    })
+    });
+    let first = found.next();
+    if found.next().is_some() {
+        return Err(AsxError::new(
+            ErrorCode::InteropViolation,
+            format!("the signed MIME entity carries the {wanted_lower} header more than once"),
+            ErrorContext::new("as2_smime_entity_decode"),
+        ));
+    }
+    Ok(first)
 }
 
 fn hex_lower(bytes: &[u8]) -> String {
@@ -798,6 +813,28 @@ fn encrypt_smime_message_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_repeated_entity_header_is_refused() {
+        let entity = VerifiedSmimeEntity::from_entity_bytes(
+            b"Content-Type: application/edi-x12\r\nContent-Type: text/plain\r\n\r\nISA".to_vec(),
+        );
+        let err = entity.content_type().expect_err("two Content-Type headers");
+        assert_eq!(err.code, ErrorCode::InteropViolation);
+        let entity = VerifiedSmimeEntity::from_entity_bytes(
+            b"Content-Transfer-Encoding: base64\r\nContent-Transfer-Encoding: binary\r\n\r\nSVNB"
+                .to_vec(),
+        );
+        assert!(entity.decoded_content().is_err());
+        // One of each is read.
+        let entity = VerifiedSmimeEntity::from_entity_bytes(
+            b"Content-Type: application/edi-x12\r\n\r\nISA".to_vec(),
+        );
+        assert_eq!(
+            entity.content_type().unwrap().as_deref(),
+            Some("application/edi-x12")
+        );
+    }
 
     #[test]
     fn detect_smime_format_enveloped() {

@@ -56,6 +56,7 @@ pub async fn asx::peppol::Smp::lookup(&self, &str, &str, &str) -> asx::Result<as
 pub fn asx::peppol::Smp::production(impl asx::HttpClient, asx::Certificate) -> asx::peppol::Smp
 pub fn asx::peppol::Smp::test(impl asx::HttpClient, asx::Certificate) -> asx::peppol::Smp
 pub fn asx::peppol::not_serviced() -> asx::Reject
+pub mod asx::threat_model
 pub enum asx::AuditDurability
 pub asx::AuditDurability::BestEffort
 pub asx::AuditDurability::Durable
@@ -97,6 +98,7 @@ pub fn asx::Builder<C>::crl_signer(self, asx::Certificate) -> asx::Builder<C>
 pub fn asx::Builder<C>::http_client(self, impl asx::HttpClient) -> asx::Builder<C>
 pub fn asx::Builder<C>::local(self, asx::LocalParty) -> asx::Builder<C>
 pub fn asx::Builder<C>::partner(self, asx::Partner) -> asx::Builder<C>
+pub fn asx::Builder<C>::resolve(self, impl core::convert::Into<alloc::string::String>, core::net::socket_addr::SocketAddr) -> asx::Builder<C>
 pub fn asx::Builder<C>::trust_anchor(self, asx::Certificate) -> asx::Builder<C>
 impl<C> core::fmt::Debug for asx::Builder<C>
 pub fn asx::Builder<C>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
@@ -173,6 +175,8 @@ pub fn asx::Payload::mime_type(&self) -> &str
 pub fn asx::Payload::name(&self) -> core::option::Option<&str>
 pub fn asx::Payload::named(self, impl core::convert::Into<alloc::string::String>) -> asx::Payload
 pub fn asx::Payload::new(impl core::convert::Into<bytes::bytes::Bytes>, impl core::convert::Into<alloc::string::String>) -> asx::Payload
+pub fn asx::Payload::properties(&self) -> &[(alloc::string::String, alloc::string::String)]
+pub fn asx::Payload::property(self, impl core::convert::Into<alloc::string::String>, impl core::convert::Into<alloc::string::String>) -> asx::Payload
 pub struct asx::Profile
 impl asx::Profile
 pub fn asx::Profile::as2() -> asx::Profile
@@ -201,9 +205,9 @@ pub fn asx::Verified<T>::deref(&self) -> &T
 pub trait asx::AuditSink: core::marker::Send + core::marker::Sync + core::fmt::Debug
 pub fn asx::AuditSink::durability(&self) -> asx::AuditDurability
 pub fn asx::AuditSink::record<'a>(&'a self, &'a asx::AuditRecord) -> asx::BoxFuture<'a, core::result::Result<(), alloc::boxed::Box<(dyn core::error::Error + core::marker::Send + core::marker::Sync)>>>
-impl<T: asx::AuditSink + ?core::marker::Sized> asx::AuditSink for alloc::sync::Arc<T>
-pub fn alloc::sync::Arc<T>::durability(&self) -> asx::AuditDurability
-pub fn alloc::sync::Arc<T>::record<'a>(&'a self, &'a asx::AuditRecord) -> asx::BoxFuture<'a, core::result::Result<(), alloc::boxed::Box<(dyn core::error::Error + core::marker::Send + core::marker::Sync)>>>
+impl<T: asx::AuditSink + ?core::marker::Sized> asx::AuditSink for alloc::rcs::arc::Arc<T>
+pub fn alloc::rcs::arc::Arc<T>::durability(&self) -> asx::AuditDurability
+pub fn alloc::rcs::arc::Arc<T>::record<'a>(&'a self, &'a asx::AuditRecord) -> asx::BoxFuture<'a, core::result::Result<(), alloc::boxed::Box<(dyn core::error::Error + core::marker::Send + core::marker::Sync)>>>
 pub trait asx::Decrypter: core::marker::Send + core::marker::Sync + core::fmt::Debug + 'static
 pub fn asx::Decrypter::certificate(&self) -> &asx::Certificate
 pub fn asx::Decrypter::decrypt<'a>(&'a self, asx::KeyOp<'a>) -> asx::BoxFuture<'a, core::result::Result<zeroize::Zeroizing<alloc::vec::Vec<u8>>, alloc::boxed::Box<(dyn core::error::Error + core::marker::Send + core::marker::Sync)>>>

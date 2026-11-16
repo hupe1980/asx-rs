@@ -95,12 +95,18 @@ pub struct SoapEnvelopeBuilder {
     /// compressed stream (AS4 profile §3.1).
     payload_compression_type: Option<String>,
     payload_content_id: String,
-    /// Additional `eb:PartInfo` entries for a multi-payload UserMessage:
-    /// `(content_id, mime_type, compression_type)`.
-    extra_part_infos: Vec<(String, String, Option<String>)>,
+    /// The embedder's part properties of the primary part, after
+    /// `MimeType` and `CompressionType` (e.g. RzÜ AS4 2.6 Kap. 6).
+    payload_properties: Vec<(String, String)>,
+    /// Additional `eb:PartInfo` entries for a multi-payload UserMessage.
+    extra_part_infos: Vec<ExtraPartInfo>,
     /// Optional WS-Addressing headers to include in the SOAP Header.
     ws_addressing: Option<WsAddressingHeaders>,
 }
+
+/// One additional `eb:PartInfo`: Content-ID, `MimeType`, `CompressionType`
+/// and the embedder's part properties.
+pub type ExtraPartInfo = (String, String, Option<String>, Vec<(String, String)>);
 
 pub(crate) const SOAP_BODY_WSU_ID: &str = "as4-body";
 /// `wsu:Id` placed on the `<ebms:Messaging>` header block so the **entire**
@@ -177,6 +183,7 @@ impl SoapEnvelopeBuilder {
             detached_payload_reference: false,
             payload_mime_type: "application/octet-stream".into(),
             payload_compression_type: None,
+            payload_properties: Vec::new(),
             payload_content_id: "payload@example.org".into(),
             extra_part_infos: Vec::new(),
             ws_addressing: None,
@@ -252,10 +259,16 @@ impl SoapEnvelopeBuilder {
         self
     }
 
-    /// Additional `eb:PartInfo` entries after the primary:
-    /// `(content_id, mime_type, compression_type)` per part.
-    pub fn with_extra_part_infos(mut self, parts: Vec<(String, String, Option<String>)>) -> Self {
+    /// Additional `eb:PartInfo` entries after the primary.
+    pub fn with_extra_part_infos(mut self, parts: Vec<ExtraPartInfo>) -> Self {
         self.extra_part_infos = parts;
+        self
+    }
+
+    /// The embedder's part properties of the primary part, written after
+    /// `MimeType` and `CompressionType` in this order.
+    pub fn with_payload_properties(mut self, properties: Vec<(String, String)>) -> Self {
+        self.payload_properties = properties;
         self
     }
 
@@ -509,9 +522,16 @@ impl SoapEnvelopeBuilder {
                 &self.payload_content_id,
                 &self.payload_mime_type,
                 self.payload_compression_type.as_deref(),
+                &self.payload_properties,
             )?;
-            for (content_id, mime_type, compression_type) in &self.extra_part_infos {
-                write_part_info(&mut out, content_id, mime_type, compression_type.as_deref())?;
+            for (content_id, mime_type, compression_type, properties) in &self.extra_part_infos {
+                write_part_info(
+                    &mut out,
+                    content_id,
+                    mime_type,
+                    compression_type.as_deref(),
+                    properties,
+                )?;
             }
             out.end()?;
         }
@@ -555,6 +575,7 @@ fn write_part_info(
     content_id: &str,
     mime_type: &str,
     compression_type: Option<&str>,
+    properties: &[(String, String)],
 ) -> Result<()> {
     out.start("ebms:PartInfo")?
         .attr("href", &format!("cid:{content_id}"), "eb:PartInfo/@href")?;
@@ -562,6 +583,13 @@ fn write_part_info(
     write_property(out, "MimeType", mime_type)?;
     if let Some(compression_type) = compression_type {
         write_property(out, "CompressionType", compression_type)?;
+    }
+    // The embedder's, validated at `send`; the writer escapes the values.
+    for (name, value) in properties {
+        out.start("ebms:Property")?
+            .attr("name", name, "eb:Property/@name")?
+            .text(value, "eb:Property")?
+            .end()?;
     }
     out.end()?;
     out.end()?;

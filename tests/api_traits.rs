@@ -97,8 +97,8 @@ async fn inbound_is_a_tower_service_and_enforces_the_size_limit() {
     use tower::ServiceExt;
 
     let ca = TestCa::sm_pki();
-    let a = ca.bdew_party("9900000000001");
-    let b = ca.bdew_party("9900000000002");
+    let a = ca.bdew_party_at("9900000000001", "https://a.example/as4");
+    let b = ca.bdew_party_at("9900000000002", "https://b.example/as4");
     let client = As4::builder(Profile::bdew().max_message_bytes(16))
         .local(b.local())
         .trust_anchor(ca.anchor())

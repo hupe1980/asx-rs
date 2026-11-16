@@ -98,6 +98,8 @@ pub(crate) mod smp;
 #[cfg(feature = "peppol")]
 pub mod peppol;
 
+pub mod threat_model;
+
 /// Test support (`test-util` feature). This is the only item the feature
 /// gates: it adds helpers and never changes library behaviour (checked by
 /// `tests/source_gates.rs`).

@@ -8,7 +8,7 @@ aliases = ["/docs/reliability/"]
 
 ```toml
 [dependencies]
-asx-rs = "0.16"
+asx-rs = "0.17"
 ```
 
 The package is `asx-rs`; the library is `asx`. Features are additive and none
@@ -18,14 +18,13 @@ changes what is checked:
 |---|---|---|
 | `as2` | AS2 (RFC 4130): `asx::as2` | yes |
 | `as4` | AS4 (ebMS3, eDelivery, BDEW, Peppol, ENTSOG): `asx::as4` | yes |
-| `http-client` | built-in HTTPS client (HTTPS only, resolved addresses pinned, mTLS identity from `LocalParty::tls_identity`) | yes |
+| `http-client` | built-in HTTPS client (OpenSSL, pooled; see [outbound HTTP and TLS](@/docs/security.md#outbound-http-and-tls)) | yes |
 | `peppol` | `asx::peppol::Smp`: SMP lookup through BDXL; implies `as4` | no |
 | `metrics` | counters and histograms through the [`metrics`](https://docs.rs/metrics) facade | no |
 | `test-util` | `asx::testkit` (see [Testing](@/docs/testing.md)); `[dev-dependencies]` only | no |
 
 Without `http-client`, pass your own [`HttpClient`](https://docs.rs/asx-rs/latest/asx/trait.HttpClient.html)
-to `Builder::http_client`. For tests, enable `test-util` in
-`[dev-dependencies]` (see [Testing](@/docs/testing.md)).
+to `Builder::http_client`.
 
 ## Runtime
 
@@ -39,9 +38,9 @@ pool. Build one client per local party at startup and share it.
   `peppol()`, `edelivery_1_15()`, `entsog()`, `as2()`), the only source of
   security settings;
 - the **`LocalParty`**: your party id, a `Signer`, one or more `Decrypter`s
-  and, for the built-in client, a TLS identity;
-- the **`Partner`s**: party id, HTTPS endpoint, pinned signing certificates,
-  encryption certificate;
+  and a TLS identity (required under BDEW with the built-in client);
+- the **`Partner`s**: party id, HTTPS endpoint (BDEW: taken from the
+  encryption certificate), pinned signing certificates, encryption certificate;
 - at least one **trust anchor**: every signer, yours included, must chain to one.
 
 `build()` validates everything against the profile once and returns
@@ -55,12 +54,13 @@ The README's first golden path (`examples/as4_send.rs`) as a function:
 ```rust
 use asx::{as4::{As4, Message}, Certificate, KeyPair, LocalParty, Partner, Payload, Profile};
 
-async fn send(partner: Partner, sig: KeyPair, enc: KeyPair, root: Certificate, edi: Vec<u8>) -> asx::Result<()> {
+async fn send(partner: Partner, sig: KeyPair, enc: KeyPair, tls: KeyPair, root: Certificate, edi: Vec<u8>) -> asx::Result<()> {
     let as4 = As4::builder(Profile::bdew())
         .local(LocalParty::new("9900000000001")
             .party_type("urn:oasis:names:tc:ebcore:partyid-type:unregistered:BDEW")
             .signer(sig)
-            .decrypter(enc))
+            .decrypter(enc)
+            .tls_identity(tls))
         .trust_anchor(root)
         .partner(partner.clone())
         .build()?;
@@ -80,7 +80,9 @@ certificate that refers to your message id and echoes the digests you signed
 ([details](@/docs/as4.md#receipts-are-evidence)). Store `receipt.evidence()`:
 it is the audit record ([stored form](@/docs/observability.md#the-stored-form)).
 
-The partner is a plain value:
+The partner is a plain value. Under BDEW its endpoint is the URI
+subjectAltName of its encryption certificate (RzÜ AS4 2.6 Kap. 2); an
+explicit `endpoint` must equal it:
 
 ```rust
 use asx::{Certificate, Partner};
@@ -88,7 +90,6 @@ use asx::{Certificate, Partner};
 fn bdew_partner(sig_pem: &[u8], enc_pem: &[u8]) -> asx::Result<Partner> {
     Ok(Partner::new("9900000000002")
         .party_type("urn:oasis:names:tc:ebcore:partyid-type:unregistered:BDEW")
-        .endpoint("https://as4.partner.example/msh")
         .signing_cert(Certificate::from_pem(sig_pem)?)
         .encryption_cert(Certificate::from_pem(enc_pem)?))
 }
@@ -122,8 +123,7 @@ The endpoint verifies the message, claims it in the `DedupStore`, calls your
 handler and answers: `Ok` gets a signed receipt, `Err(Reject::new(..))` an
 `EBMS:0202` delivery failure the sender may retry, `Err(Reject::permanent(..))`
 an `EBMS:0004` it does not retry (use it after dead-lettering), a duplicate a
-fresh receipt without calling the handler. The full
-table is on the [AS4 page](@/docs/as4.md#what-the-sender-is-told); the complete
+fresh receipt without calling the handler. The full table is on the [AS4 page](@/docs/as4.md#what-the-sender-is-told); the complete
 program is `examples/as4_receive_axum.rs`.
 
 `MemoryDedup` forgets everything on restart; in production implement
@@ -188,8 +188,7 @@ async fn attempt(as4: &As4, partner: &Partner, id: &str, first_attempt: SystemTi
 }
 ```
 
-An asx receiver accepts an `eb:Timestamp` up to 300 s ahead and 7 days behind,
-so a retry within that time (BDEW: 72 h) is answered as a duplicate with a fresh
-receipt.
-Message ids must be RFC 2822 `id-left@id-right` (`"{outbox_id}@{your-domain}"`);
+An asx receiver accepts an `eb:Timestamp` up to 300 s ahead and 7 days
+behind, so a retry within 7 days is answered as a duplicate with a fresh
+receipt. Message ids must be RFC 2822 `id-left@id-right` (`"{outbox_id}@{your-domain}"`);
 `send` refuses anything else with `Config`.

@@ -146,17 +146,20 @@ pub(crate) struct ReceiveView {
     pub(crate) require_encrypted: bool,
     pub(crate) mdn_signed: bool,
     pub(crate) detect_duplicates: bool,
+    /// The most an RFC 5402 compressed entity may expand to: the profile's
+    /// `max_message_bytes`.
+    pub(crate) max_decompressed_bytes: u64,
 }
 
 /// The AS2 inbound view of `profile`: the same for every sender, because
 /// inbound acceptance is the profile's (the sender must be configured).
 pub(crate) fn receive_view(profile: &Profile) -> ReceiveView {
-    let _ = profile;
     let view = ReceiveView {
         require_signed: true,
         require_encrypted: true,
         mdn_signed: true,
         detect_duplicates: true,
+        max_decompressed_bytes: profile.max_bytes(),
     };
     crate::profile::probe::record("as2.receive", &view);
     view
@@ -433,6 +436,14 @@ pub(crate) fn check_message(config: &ClientConfig, message: &Message) -> Result<
         return Err(refuse(
             "payload",
             "an AS2 message carries no file name (RFC 4130 sends one MIME entity); remove Payload::named",
+        ));
+    }
+    // AS2 has no part properties: a setting that would be dropped fails.
+    if !payload.properties().is_empty() {
+        return Err(refuse(
+            "payload",
+            "an AS2 message carries no part properties (they are AS4 eb:PartProperties); \
+             remove Payload::property",
         ));
     }
     let total = payload.bytes().len() as u64;

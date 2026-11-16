@@ -120,7 +120,9 @@ impl Partner {
     }
 
     /// HTTPS only; validated at `build()` (or at `send` for an unregistered
-    /// partner).
+    /// partner). Under `Profile::bdew()` optional: the endpoint is the URI
+    /// its encryption certificate names, and another one is refused
+    /// (RzÜ AS4 2.6 Kap. 2).
     pub fn endpoint(self, url: impl AsRef<str>) -> Partner {
         let url = url.as_ref().to_string();
         self.with(|p| p.endpoint = Some(url))

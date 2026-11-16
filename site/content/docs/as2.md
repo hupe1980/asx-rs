@@ -100,6 +100,7 @@ compressed entity, that of the MIME entity inside the CompressedData.
 | Situation | Answer | Handler | Dedup |
 |---|---|---|---|
 | Body above `max_message_bytes` | HTTP 413 | no | — |
+| A receiver header (`Message-ID`, `AS2-From`, `AS2-To`, `Content-Type`, …) repeated | HTTP 400, no MDN | no | — |
 | Unparseable | HTTP 400, with an MDN `processed/error: unexpected-processing-error` when one can be addressed | no | — |
 | Unknown sender, bad signature or unpinned signer | MDN `processed/error: authentication-failed` | no | — |
 | `AS2-To` is not the local party | MDN `processed/error: unexpected-processing-error` | no | — |
@@ -120,4 +121,4 @@ operation.
 ## Not supported
 
 Sending asynchronous MDNs as receiver, streaming receive, outbound
-compression. See the [migration page](@/docs/migration.md) for 0.15 users.
+compression.

@@ -78,10 +78,12 @@ fn envelope(value: &str) -> SoapEnvelopeBuilder {
     .with_payload_content_id(format!("cid-{value}"))
     .with_payload_mime_type(format!("mime-{value}"))
     .with_payload_compression_type(format!("gz-{value}"))
+    .with_payload_properties(vec![(format!("pn-{value}"), format!("pv-{value}"))])
     .with_extra_part_infos(vec![(
         format!("x-{value}"),
         format!("xm-{value}"),
         Some(format!("xg-{value}")),
+        vec![(format!("xpn-{value}"), format!("xpv-{value}"))],
     )])
     .with_ws_addressing(WsAddressingHeaders {
         message_id: format!("wsa-id-{value}"),
@@ -129,6 +131,16 @@ fn soap_envelope_values_round_trip() {
     ] {
         assert!(
             properties.contains(&(name.to_string(), value.clone())),
+            "{name}={value} missing in {properties:?}"
+        );
+    }
+    // The embedder's part properties survive escaping, names included.
+    for (name, value) in [
+        (format!("pn-{TRICKY}"), format!("pv-{TRICKY}")),
+        (format!("xpn-{TRICKY}"), format!("xpv-{TRICKY}")),
+    ] {
+        assert!(
+            properties.contains(&(name.clone(), value.clone())),
             "{name}={value} missing in {properties:?}"
         );
     }

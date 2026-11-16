@@ -17,6 +17,62 @@ Versioning follows the [SemVer policy](#semver-policy) below.
 
 ## [Unreleased]
 
+## [0.17.0] — 2026-11-16
+
+BDEW end to end: SM-PKI mutual TLS and the *Regelungen zum Übertragungsweg
+für AS4* 2.6 (RzÜ). A hard cut; see the
+[migration page](https://hupe1980.github.io/asx-rs/docs/migration/).
+
+### Wire / crypto
+
+- **The built-in HTTPS client is OpenSSL** (hyper, pooled per client). rustls
+  could not use a BrainpoolP256r1 key, so a BDEW `tls_identity` failed every
+  send. Under `Profile::bdew()`: BSI TR-03116-3 §4 (TLS ≥ 1.2, TLS 1.3 from
+  OpenSSL 3.2; ECDHE-ECDSA suites, ECDSA signature schemes, Brainpool groups
+  first), the trust anchors as the only TLS roots, no wildcard host names,
+  and the server chain CRL-checked before a request is written (BDEW
+  AS4-Profil 1.2 §2.2.6.1, §2.3.7). Other profiles use the platform's roots.
+- **SNI** for every DNS name (RzÜ AS4 2.6 Kap. 3).
+- **The private-address filter runs per connection**, inside the connector.
+- **Part properties**: the embedder's `eb:Property` entries after `MimeType`
+  and `CompressionType`, under every AS4 profile.
+- **Inbound BDEW signers** need exactly one URI subjectAltName (RzÜ AS4 2.6
+  Kap. 5.2), else `EBMS:0101`.
+- **Repeated headers are refused**: an AS2 header the receiver reads
+  (`AS2-From`, `AS2-To`, `Message-ID`, `Content-Type`, …) with a bare 400; an
+  AS4 `Content-Type`, a MIME part's `Content-ID`/`Content-Type` and a signed
+  AS2 entity's `Content-Type`/`Content-Transfer-Encoding` as malformed.
+  They were read first-wins.
+- **Decompression is limited to `max_message_bytes` per message** (was
+  128 MiB per part).
+- Without OS randomness the implicit-rejection content key fails closed
+  instead of being all zero.
+
+### API
+
+- `Builder::build()` under BDEW checks the SM-PKI certificate triple (RzÜ AS4
+  2.6 Kap. 1.3, 5.2): MP-ID in the OU and exactly one URI subjectAltName on
+  the local signing, decryption and TLS certificates and the partner's signing
+  and encryption certificates. The partner endpoint must be the encryption
+  certificate's URI (Kap. 2); omit it and it is taken from there. The
+  built-in client needs an EC `tls_identity`, loaded at `build()`.
+- `Payload::property(name, value)` and `Payload::properties()`. `send`
+  refuses `MimeType`/`CompressionType`, empty or whitespace names, empty
+  values, CR/LF and repeated names; AS2 refuses part properties.
+- `Builder::resolve(host, SocketAddr)`: pin a host to an address (exempt from
+  the private-address filter, shown in `Debug`).
+- `asx::threat_model`: the threat model, also `THREAT_MODEL.md`.
+- testkit: `TestCa::bdew_party_at(mp_id, url)`; `bdew_party(mp_id)` issues
+  at `https://mp<mp_id>.testkit.example/as4`; `IssueOptions::{uri_sans,
+  dns_sans, eku}`, `pki::Eku`, `pki::CRL_HOST`, `TestParty::endpoint`;
+  `tls::TlsMsh`, a TLS MSH on 127.0.0.1 that requires client certificates.
+- reqwest is no longer a dependency.
+
+### Fixed
+
+- Dependency advisories RUSTSEC-2026-0382, -0383 (dev only) and -0385
+  (`ctutils`): lock updated.
+
 ## [0.16.2] — 2026-10-18
 
 ### Fixed

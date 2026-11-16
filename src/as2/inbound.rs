@@ -156,6 +156,28 @@ impl Opened {
     }
 }
 
+/// The AS2 headers a receiver acts on. A second occurrence of any of them is
+/// ambiguous — which `AS2-From` or `Message-ID` is the message's? — and the
+/// message is refused before anything else is read (constitution III: an
+/// ambiguity is rejected, never resolved by order).
+const SINGLE_HEADERS: [&str; 8] = [
+    "message-id",
+    "as2-from",
+    "as2-to",
+    "as2-version",
+    "content-type",
+    "disposition-notification-to",
+    "disposition-notification-options",
+    "receipt-delivery-option",
+];
+
+/// The first of [`SINGLE_HEADERS`] that occurs more than once.
+fn repeated_header(headers: &http::HeaderMap) -> Option<&'static str> {
+    SINGLE_HEADERS
+        .into_iter()
+        .find(|name| headers.get_all(*name).iter().nth(1).is_some())
+}
+
 fn header(headers: &http::HeaderMap, name: &str) -> Option<String> {
     headers
         .get(name)
@@ -169,6 +191,15 @@ impl As2Inbound {
     async fn handle(&self, request: http::Request<Bytes>) -> Answer {
         let config = self.client.config();
         let headers = request.headers();
+        if let Some(name) = repeated_header(headers) {
+            tracing::debug!(target: "asx", header = name, "AS2 header repeated; refused");
+            return (
+                empty(StatusCode::BAD_REQUEST),
+                ReceiveOutcome::Rejected,
+                None,
+                None,
+            );
+        }
         let message_id = header(headers, "message-id")
             .map(|v| super::normalize_message_id(&v).to_string())
             .filter(|id| !id.is_empty() && !id.bytes().any(|b| b.is_ascii_control()));
@@ -690,6 +721,7 @@ impl As2Inbound {
                 decrypted,
                 mic_algorithm,
                 view.require_signed,
+                usize::try_from(view.max_decompressed_bytes).unwrap_or(usize::MAX),
             ))
         })
         .await
@@ -731,6 +763,7 @@ fn authenticate(
     decrypted: Vec<u8>,
     mic_algorithm: As2MicAlgorithm,
     require_signed: bool,
+    decompress_limit: usize,
 ) -> Result<Opened, (Refusal, String)> {
     // Unsigned is insufficient.
     if !matches!(
@@ -767,15 +800,19 @@ fn authenticate(
             "the signer is not a pinned certificate of the partner".to_string(),
         ));
     }
-    let entity_type = verified.content_type().unwrap_or_default();
+    let entity_type = verified
+        .content_type()
+        .map_err(|err| (Refusal::Unexpected, err.message))?
+        .unwrap_or_default();
     let compressed = crate::crypto::compression::is_as2_compressed_content_type(&entity_type);
-    let content = super::decode_entity_content(session, &verified).map_err(|err| {
-        if err.context.stage.contains("decompress") {
-            (Refusal::DecompressionFailed, err.message)
-        } else {
-            (Refusal::Unexpected, err.message)
-        }
-    })?;
+    let content =
+        super::decode_entity_content(session, &verified, decompress_limit).map_err(|err| {
+            if err.context.stage.contains("decompress") {
+                (Refusal::DecompressionFailed, err.message)
+            } else {
+                (Refusal::Unexpected, err.message)
+            }
+        })?;
     let (content, media_type) = if compressed {
         compressed_entity(&content).map_err(|detail| (Refusal::DecompressionFailed, detail))?
     } else if entity_type.trim().is_empty() {

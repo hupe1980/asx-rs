@@ -28,12 +28,6 @@ pub const AS2_COMPRESSED_CONTENT_TYPE: &str =
 /// `CompressionType` value the AS4 profile requires for compressed payloads.
 pub const AS4_COMPRESSION_TYPE: &str = "application/gzip";
 
-/// Upper bound on decompressed output, guarding against compression bombs.
-///
-/// A 100:1 ratio is far beyond what EDI or XML achieves in practice, so this
-/// only trips on hostile input.
-const MAX_DECOMPRESSED_BYTES: usize = 128 * 1024 * 1024;
-
 // ── AS4: raw gzip ───────────────────────────────────────────────────────────
 
 /// Compress an AS4 payload attachment with gzip.
@@ -61,10 +55,13 @@ pub fn compress_gzip(payload: &[u8], compression_level: u32) -> Result<Vec<u8>> 
     })
 }
 
-/// Decompress an AS4 gzip payload attachment.
-pub fn decompress_gzip(compressed: &[u8]) -> Result<Vec<u8>> {
+/// Decompress an AS4 gzip payload attachment, refusing more than `limit`
+/// output bytes (a compression bomb): the receiver passes what is left of
+/// the profile's `max_message_bytes` for the whole message.
+pub fn decompress_gzip(compressed: &[u8], limit: usize) -> Result<Vec<u8>> {
     read_bounded(
         GzDecoder::new(compressed),
+        limit,
         "decompression_gzip",
         "failed to decompress gzip payload",
     )
@@ -140,8 +137,9 @@ pub fn compress_cms_zlib(payload: &[u8], compression_level: u32) -> Result<Vec<u
     Ok(der_tlv(TAG_SEQUENCE, &content_info))
 }
 
-/// Unwrap a CMS `CompressedData` structure produced by an AS2 partner.
-pub fn decompress_cms_zlib(der: &[u8]) -> Result<Vec<u8>> {
+/// Unwrap a CMS `CompressedData` structure produced by an AS2 partner,
+/// refusing more than `limit` output bytes.
+pub fn decompress_cms_zlib(der: &[u8], limit: usize) -> Result<Vec<u8>> {
     let stage = "decompression_cms_zlib";
     let fail = |msg: String| AsxError::new(ErrorCode::ParseFailed, msg, ErrorContext::new(stage));
 
@@ -176,6 +174,7 @@ pub fn decompress_cms_zlib(der: &[u8]) -> Result<Vec<u8>> {
 
     read_bounded(
         ZlibDecoder::new(deflated),
+        limit,
         stage,
         "failed to decompress AS2 CMS CompressedData payload",
     )
@@ -190,10 +189,15 @@ pub fn is_as2_compressed_content_type(content_type: &str) -> bool {
 
 // ── shared helpers ──────────────────────────────────────────────────────────
 
-fn read_bounded<R: Read>(mut reader: R, stage: &'static str, message: &str) -> Result<Vec<u8>> {
+fn read_bounded<R: Read>(
+    mut reader: R,
+    limit: usize,
+    stage: &'static str,
+    message: &str,
+) -> Result<Vec<u8>> {
     let mut output = Vec::new();
     let read = (&mut reader)
-        .take(MAX_DECOMPRESSED_BYTES as u64 + 1)
+        .take(limit as u64 + 1)
         .read_to_end(&mut output)
         .map_err(|err| {
             AsxError::new(
@@ -203,12 +207,12 @@ fn read_bounded<R: Read>(mut reader: R, stage: &'static str, message: &str) -> R
             )
         })?;
 
-    if read > MAX_DECOMPRESSED_BYTES {
+    if read > limit {
         return Err(AsxError::new(
             ErrorCode::PolicyViolation,
             format!(
-                "{message}: decompressed output exceeds {MAX_DECOMPRESSED_BYTES} byte limit \
-                 (possible decompression bomb)"
+                "{message}: decompressed output exceeds the {limit} byte limit \
+                 (max_message_bytes; possible decompression bomb)"
             ),
             ErrorContext::new(stage),
         ));
@@ -301,13 +305,18 @@ fn der_expect<'a>(input: &'a [u8], tag: u8, stage: &'static str) -> Result<&'a [
 mod tests {
     use super::*;
 
+    const LIMIT: usize = 16 * 1024 * 1024;
+
     #[test]
     fn gzip_roundtrips() {
         let original = b"EDI segment. ".repeat(64);
         let compressed = compress_gzip(&original, 6).expect("compress");
         assert_eq!(&compressed[..2], &[0x1f, 0x8b]);
         assert!(compressed.len() < original.len());
-        assert_eq!(decompress_gzip(&compressed).expect("decompress"), original);
+        assert_eq!(
+            decompress_gzip(&compressed, LIMIT).expect("decompress"),
+            original
+        );
     }
 
     #[test]
@@ -315,7 +324,10 @@ mod tests {
         let original = b"ISA*00*          *00*          *ZZ*SENDER~".repeat(32);
         let der = compress_cms_zlib(&original, 6).expect("compress");
         assert!(der.len() < original.len(), "compression must shrink EDI");
-        assert_eq!(decompress_cms_zlib(&der).expect("decompress"), original);
+        assert_eq!(
+            decompress_cms_zlib(&der, LIMIT).expect("decompress"),
+            original
+        );
     }
 
     /// The wrapper must be a real CMS structure, not a bare deflate stream —
@@ -339,7 +351,7 @@ mod tests {
     #[test]
     fn a_bare_gzip_stream_is_rejected_as_cms() {
         let gzip = compress_gzip(b"payload", 6).expect("compress");
-        let err = decompress_cms_zlib(&gzip).expect_err("gzip is not CMS CompressedData");
+        let err = decompress_cms_zlib(&gzip, LIMIT).expect_err("gzip is not CMS CompressedData");
         assert_eq!(err.code, ErrorCode::ParseFailed);
     }
 
@@ -348,7 +360,7 @@ mod tests {
         let der = compress_cms_zlib(b"payload here", 6).expect("compress");
         for cut in [1usize, der.len() / 2, der.len() - 1] {
             assert!(
-                decompress_cms_zlib(&der[..cut]).is_err(),
+                decompress_cms_zlib(&der[..cut], LIMIT).is_err(),
                 "truncated CMS at {cut} bytes must not decode"
             );
         }
@@ -374,7 +386,7 @@ mod tests {
             let original: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
             let der = compress_cms_zlib(&original, 1).expect("compress");
             assert_eq!(
-                decompress_cms_zlib(&der).expect("decompress"),
+                decompress_cms_zlib(&der, LIMIT).expect("decompress"),
                 original,
                 "roundtrip failed at {size} bytes"
             );
@@ -386,5 +398,33 @@ mod tests {
         assert_eq!(der_tlv(0x04, &[1, 2, 3]), vec![0x04, 0x03, 1, 2, 3]);
         let long = der_tlv(0x04, &vec![0u8; 300]);
         assert_eq!(&long[..4], &[0x04, 0x82, 0x01, 0x2c]);
+    }
+
+    /// A compression bomb is refused at the limit, not after expanding: 64 MiB
+    /// of zeros compress to about 64 KiB.
+    #[test]
+    fn a_bomb_is_refused_at_the_limit() {
+        let zeros = vec![0u8; 64 * 1024 * 1024];
+        let gz = compress_gzip(&zeros, 9).expect("compress");
+        assert!(gz.len() < 1024 * 1024, "{} compressed bytes", gz.len());
+        let err = decompress_gzip(&gz, 1024 * 1024).expect_err("bomb");
+        assert_eq!(err.code, ErrorCode::PolicyViolation);
+        assert!(
+            err.message.contains("1048576 byte limit"),
+            "{}",
+            err.message
+        );
+        let cms = compress_cms_zlib(&zeros, 9).expect("compress");
+        let err = decompress_cms_zlib(&cms, 1024 * 1024).expect_err("bomb");
+        assert_eq!(err.code, ErrorCode::PolicyViolation);
+        // At exactly the limit it is accepted.
+        let small = vec![0u8; 4096];
+        assert_eq!(
+            decompress_gzip(&compress_gzip(&small, 9).unwrap(), 4096)
+                .unwrap()
+                .len(),
+            4096
+        );
+        assert!(decompress_gzip(&compress_gzip(&small, 9).unwrap(), 4095).is_err());
     }
 }

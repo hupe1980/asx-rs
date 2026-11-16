@@ -404,6 +404,41 @@ pub fn resign(
     unsigned.replace(PLACEHOLDER, &fresh)
 }
 
+/// [`resign`] by `signer` *as the token*: the `wsse:BinarySecurityToken`
+/// carries `signer`'s certificate, so the signature verifies and the
+/// receiver judges the certificate itself (its subject, its SANs).
+pub fn resign_as(
+    soap: &str,
+    attachments: &[(String, Vec<u8>)],
+    signer: &asx::testkit::pki::KeyPair,
+) -> String {
+    use base64::Engine as _;
+    let open = soap
+        .find("<wsse:BinarySecurityToken")
+        .expect("BinarySecurityToken");
+    let content = open + soap[open..].find('>').expect("token start tag") + 1;
+    let close = content
+        + soap[content..]
+            .find("</wsse:BinarySecurityToken>")
+            .expect("token end");
+    let der = openssl::x509::X509::from_pem(&signer.cert_pem)
+        .expect("certificate")
+        .to_der()
+        .expect("der");
+    let token = if soap[open..content].contains("X509PKIPathv1") {
+        asx::__fuzz::soap_builder::build_pkipath_der(&der)
+    } else {
+        der
+    };
+    let swapped = format!(
+        "{}{}{}",
+        &soap[..content],
+        base64::engine::general_purpose::STANDARD.encode(token),
+        &soap[close..]
+    );
+    resign(&swapped, attachments, signer)
+}
+
 /// Wrap a hand-crafted SOAP envelope as SwA (`multipart/related`, the SOAP
 /// root plus one octet-stream attachment), so the parser judges the envelope
 /// rather than refusing a non-SwA body.

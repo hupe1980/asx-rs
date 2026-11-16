@@ -90,28 +90,34 @@ fn body_with_mime_headers(
 fn decode_entity_content(
     session: &SessionContext,
     entity: &crate::crypto::as2_smime::VerifiedSmimeEntity,
+    decompress_limit: usize,
 ) -> Result<Arc<[u8]>> {
-    let content_type = entity.content_type().unwrap_or_default();
+    let content_type = entity.content_type()?.unwrap_or_default();
     let decoded = entity.decoded_content()?;
     if crate::crypto::compression::is_as2_compressed_content_type(&content_type) {
-        return decompress_as2_entity(session, &decoded);
+        return decompress_as2_entity(session, &decoded, decompress_limit);
     }
     Ok(Arc::from(decoded.as_ref()))
 }
 
 /// Unwrap an RFC 5402 CMS `CompressedData` body.
-fn decompress_as2_entity(session: &SessionContext, compressed: &[u8]) -> Result<Arc<[u8]>> {
+fn decompress_as2_entity(
+    session: &SessionContext,
+    compressed: &[u8],
+    limit: usize,
+) -> Result<Arc<[u8]>> {
     {
-        let plain = crate::crypto::compression::decompress_cms_zlib(compressed).map_err(|err| {
-            AsxError::new(
-                err.code,
-                format!(
-                    "failed to decompress AS2 payload (RFC 5402): {}",
-                    err.message
-                ),
-                ErrorContext::for_session("as2_receive_decompress", session),
-            )
-        })?;
+        let plain =
+            crate::crypto::compression::decompress_cms_zlib(compressed, limit).map_err(|err| {
+                AsxError::new(
+                    err.code,
+                    format!(
+                        "failed to decompress AS2 payload (RFC 5402): {}",
+                        err.message
+                    ),
+                    ErrorContext::for_session("as2_receive_decompress", session),
+                )
+            })?;
         Ok(Arc::from(plain))
     }
 }

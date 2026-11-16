@@ -1,7 +1,38 @@
 +++
-title = "Migrating from 0.15"
-description = "Every 0.15 to 0.16 wire change and API replacement, grouped by task."
+title = "Migrating"
+description = "Every 0.16 to 0.17 and 0.15 to 0.16 wire change and API replacement, grouped by task."
 +++
+
+## 0.16 to 0.17: BDEW end to end
+
+The built-in client speaks SM-PKI mutual TLS, and the RzÜ AS4 2.6
+certificate rules are checked at `build()`. No compatibility switches.
+
+### Wire changes
+
+| Change | 0.16 | 0.17 | Consequence |
+|---|---|---|---|
+| **TLS stack** | rustls: no Brainpool, platform roots | OpenSSL; under BDEW BSI TR-03116-3 §4 with Brainpool, the trust anchors as the only TLS roots, the server chain CRL-checked before writing | BDEW partners are reachable; a non-SM-PKI server is refused |
+| **SNI** | — | always for a DNS name; BDEW endpoints must be DNS names (Kap. 3) | |
+| **Connections** | one per request | pooled, HTTP/2 by ALPN | one handshake per partner per idle period |
+| **Part properties** | `MimeType`, `CompressionType` | plus `Payload::property` entries, every profile | |
+| **Inbound BDEW signer** | MP-ID in the OU | also exactly one URI subjectAltName, else `EBMS:0101` (Kap. 5.2) | |
+| **Repeated headers** | first value used | refused (AS2 headers: 400; AS4 `Content-Type`, MIME part headers) | |
+| **Decompression limit** | 128 MiB per part | `max_message_bytes` per message | |
+
+### API changes
+
+| 0.16 | 0.17 |
+|---|---|
+| BDEW without `tls_identity` (built-in client) | refused at `build()`; the TLS key must be EC; loaded at `build()` |
+| BDEW certificates: OU checked on the partner signing certificate | OU and exactly one URI subjectAltName on every certificate of the local and partner triple (Kap. 5.2) |
+| BDEW `Partner::endpoint` free | must equal the encryption certificate's URI subjectAltName; omitted, it is taken from it (Kap. 2) |
+| no part-property API | `Payload::property(name, value)`, `Payload::properties()` (AS2 refuses properties) |
+| loopback and private addresses always refused | `Builder::resolve(host, SocketAddr)` pins one host, exempt from the filter, shown in `Debug` |
+| `testkit::pki::TestCa::bdew_party(mp_id)` | issues the triple at `https://mp<mp_id>.testkit.example/as4`; `bdew_party_at(mp_id, url)` at `url`; `IssueOptions` gains `uri_sans`, `dns_sans`, `eku`; `TestParty::endpoint` |
+| — | `testkit::tls::TlsMsh` (TLS MSH on 127.0.0.1), `pki::CRL_HOST` |
+
+## 0.15 to 0.16
 
 0.16 replaces the public API in one step, without deprecation shims. The new
 shape: a `Profile` preset is the only source of security settings; `As4` and
@@ -13,7 +44,7 @@ traits; there is one `Error`.
 **0.15 and 0.16 cannot exchange encrypted AS4 messages**: upgrade every asx
 instance in a trading relationship together.
 
-## Wire changes a 0.15 peer will see
+### Wire changes a 0.15 peer will see
 
 | Change | 0.15 | 0.16 | Consequence |
 |---|---|---|---|
@@ -26,7 +57,7 @@ instance in a trading relationship together.
 | **`eb:Property`** | value in a `value` attribute; compression properties read from `eb:Properties` | value as element text; compression properties from the signed `eb:PartProperties` only; a `value` attribute or a part property repeated in one `eb:PartInfo` is refused | |
 | **Message ids** | AS2 sent `Message-ID: <id@asx>` | AS2 `<id>` with your RFC 2822 `id-left@id-right`; AS4 ids are RFC 2822 msg-ids too | build ids as `"{id}@{your-domain}"` |
 | **Unsigned AS4 message** | answered `EBMS:0101` | answered `EBMS:0103` PolicyNoncompliance | |
-| **BDEW unconfigured senders** | refused unless pinned | accepted when the verified SM-PKI certificate carries the claimed MP-ID as subject **OU** (BDEW 1.2 §2.3.2, §2.3.4.4; RzÜ AS4 2.6 §5.2) | MP-ID only in the CN is refused, also at `build()` |
+| **BDEW unconfigured senders** | refused unless pinned | accepted when the verified SM-PKI certificate carries the claimed MP-ID as subject **OU** (BDEW 1.2 §2.3.2, §2.3.4.4; RzÜ AS4 2.6 Kap. 5.2) | MP-ID only in the CN is refused, also at `build()` |
 | **`eb:Timestamp` window** | 300 s both ways | 300 s ahead, 7 days behind (the dedup retention) | a retry within 7 days (BDEW: 72 h) is a duplicate, not a replay |
 | **BDEW header** | caller-set action, roles, conversation id, agreement | always gzip; fixed Action, roles and `AgreementRef` ([profiles](@/docs/profiles.md#what-each-preset-fixes)); empty `ConversationId`; no `eb:MessageProperties`; PKIPath token | setting a conversation id is refused |
 | **Content-IDs** | random | `part<N>.<hash>@asx` from message id and part index; deterministic gzip | identical resends |
@@ -40,9 +71,9 @@ instance in a trading relationship together.
 | **Decryption failures** | distinguishable errors | one indistinguishable answer (`EBMS:0102` / `decryption-failed`) | |
 | **Inbound XML Encryption parameters** | KDF, curve and OAEP parameters ignored | required and checked before the key is used; `rsa-1_5`, `rsa-oaep-mgf1p`, `mgf1sha1`, CBC refused | |
 | **BDEW path switch** | not implemented | `requestSwitch`/`confirmSwitch` sent and accepted (BDEW 1.2 §2.2.8) | |
-| **Revocation** | OCSP modes, failure modes, static CRL lists (`revocation_crl_pems`); AS2 checked the signer only | the profile's rule (BDEW: CRL-DP with the RzÜ §5.4 three-day rule; others: CRL-DP then OCSP) over the signer's whole path, via the client's `HttpClient`; `Builder::crl_signer` for indirect CRLs ([security](@/docs/security.md#revocation)) | no revocation settings, no stapled responses |
+| **Revocation** | OCSP modes, failure modes, static CRL lists (`revocation_crl_pems`); AS2 checked the signer only | the profile's rule (BDEW: CRL-DP with the RzÜ AS4 2.6 Kap. 5.4 three-day rule; others: CRL-DP then OCSP) over the signer's whole path, via the client's `HttpClient`; `Builder::crl_signer` for indirect CRLs ([security](@/docs/security.md#revocation)) | no revocation settings, no stapled responses |
 
-## Cargo
+### Cargo
 
 | 0.15 | 0.16 |
 |---|---|
@@ -56,7 +87,7 @@ instance in a trading relationship together.
 | feature `testing` | removed: the additive `test-util` feature (`asx::testkit`) in dev-dependencies |
 | feature `interop-strict`, `interop-relaxed` | removed: strict only; per-partner `Quirk`s |
 
-## Configure
+### Configure
 
 | 0.15 | 0.16 |
 |---|---|
@@ -71,7 +102,7 @@ instance in a trading relationship together.
 | `DEFAULT_MAX_BODY_BYTES`, `enforce_payload_limit`, `RouterConfig` (body limit) | `Profile::max_message_bytes`; a body timeout is a `tower_http` layer on the route |
 | `CryptoAdmissionControl`, `ASX_BLOCKING_CRYPTO_CONCURRENCY` | removed: the blocking pool is sized from available parallelism |
 
-## Keys
+### Keys
 
 | 0.15 | 0.16 |
 |---|---|
@@ -84,7 +115,7 @@ instance in a trading relationship together.
 
 See [keys and certificates](@/docs/keys.md).
 
-## Send
+### Send
 
 | 0.15 | 0.16 |
 |---|---|
@@ -98,7 +129,7 @@ See [keys and certificates](@/docs/keys.md).
 | `smp` (`SmpClient`, `SmpConfig`, `SmpEndpoint`, `SmpLookupRequest`, `SmpSignaturePolicy`), `bdxl` (`SmlDiscovery`, `NaptrRecord`, `BdxlResolver`, `StaticBdxlResolver`, `HickoryBdxlResolver`, `bdxl_dns_name`, `legacy_cname_host`, `select_smp_base_url`) | `peppol::Smp::{production, test}(http, anchor).lookup(..)` → `Partner`; the SMP signature is always verified |
 | `sbdh`, `mls` | crate-private: put the complete document in the `Payload` |
 
-## Receive
+### Receive
 
 | 0.15 | 0.16 |
 |---|---|
@@ -117,7 +148,7 @@ See [keys and certificates](@/docs/keys.md).
 | split/join: `large_message`, `As4FragmentJoiner`, `As4JoinProgress`, `As4JoinedLargeMessage`, `As4SplitFragmentOutput` | removed: no split/join |
 | ordering: `conversation_gate`, `coordination`, `As4ConversationOrderGate`, `ConversationGuard`, `ConversationTurnHandle`, `ConversationOrderGate`, `As4TopologyCoordination` | removed: order in the application if your process needs it |
 
-## Store
+### Store
 
 | 0.15 | 0.16 |
 |---|---|
@@ -129,7 +160,7 @@ See [keys and certificates](@/docs/keys.md).
 
 See [persistence](@/docs/persistence.md).
 
-## Observe
+### Observe
 
 | 0.15 | 0.16 |
 |---|---|
@@ -138,7 +169,7 @@ See [persistence](@/docs/persistence.md).
 | `fail_closed_audit_events` | the sink's declared `AuditDurability` |
 | `AsxError`, `ErrorCode`, `ErrorContext` | `Error`: `kind()`, `is_retryable()`, `ebms_code()`, `mdn_disposition()`, `evidence()` |
 
-## Test
+### Test
 
 | 0.15 | 0.16 |
 |---|---|
@@ -148,12 +179,12 @@ See [persistence](@/docs/persistence.md).
 | `storage::conformance`, `DurableInMemoryDedupBackend` | `asx::testkit::dedup::conformance`, `asx::testkit::audit::conformance` |
 | `EventBus::new_for_testing` | `asx::testkit::trace::TraceCapture`, `asx::testkit::audit::MemoryAuditSink` |
 
-## Internal helpers that became private
+### Internal helpers that became private
 
 `escape_xml`, `constant_time_eq` and `crypto_permit`: crate-private, no
 replacement needed.
 
-## Recipes and tooling
+### Recipes and tooling
 
 Removed: `just interop-matrix`, `just fuzz-gate`, `profile-lint`,
 `profile-diff`, `profile-coverage`, `fixtures-validate`.

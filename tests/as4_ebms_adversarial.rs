@@ -425,9 +425,7 @@ async fn rejects_duplicate_action_in_strict_mode() {
     answer.assert_refused_because("EBMS:0004", "AS4 UserMessage contains duplicate Action");
 }
 
-/// ebMS3 §5.2.2.4 allows multiple <eb:PartyId> per party for multi-scheme identifiers.
-/// Strict mode MUST accept them; rejection was a conformance bug.
-/// ebMS3 §5.2.2.4 allows multiple <eb:PartyId> per party for multi-scheme identifiers.
+/// An `eb:Messaging` header with `mustUnderstand="false"` is refused.
 #[tokio::test]
 async fn rejects_messaging_must_understand_false_in_strict_mode() {
     let answer = refused(
@@ -2247,4 +2245,46 @@ async fn fragment_message_is_refused() {
     body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
     let answer = refused(&body, "a fragment is refused").await;
     answer.assert_refused("EBMS:0004");
+}
+
+// ── Repeated headers (constitution III: ambiguity is refused) ───────────────
+
+/// Two `Content-Type` headers on the request: two readings of the MIME
+/// structure, neither chosen.
+#[tokio::test]
+async fn a_repeated_content_type_header_is_refused() {
+    let (g, r) = edelivery().await;
+    let mut request = g.with_parts(&g.parts());
+    let extra = http::HeaderValue::from_static("text/xml");
+    request
+        .headers_mut()
+        .append(http::header::CONTENT_TYPE, extra);
+    let answer = r.post(request).await;
+    assert_eq!(
+        answer.status,
+        http::StatusCode::BAD_REQUEST,
+        "{}",
+        answer.body
+    );
+    r.assert_not_delivered();
+}
+
+/// A MIME part with two `Content-ID` (or two `Content-Type`) headers: which
+/// part does the signed `eb:PartInfo` reference?
+#[tokio::test]
+async fn a_repeated_mime_part_header_is_refused() {
+    for header in ["Content-ID: <other@asx.test>", "Content-Type: text/plain"] {
+        let (g, r) = edelivery().await;
+        let mut parts = g.parts();
+        let last = parts.len() - 1;
+        parts[last].headers = format!("{}\r\n{header}", parts[last].headers);
+        let answer = r.post(g.with_parts(&parts)).await;
+        assert_eq!(
+            answer.status,
+            http::StatusCode::BAD_REQUEST,
+            "{header}: {}",
+            answer.body
+        );
+        r.assert_not_delivered();
+    }
 }

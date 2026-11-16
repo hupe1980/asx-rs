@@ -30,6 +30,8 @@ pub(crate) struct As4AdditionalPayload {
     pub content_id: Option<String>,
     /// `Content-Disposition` filename on the MIME part.
     pub filename: Option<PayloadFilename>,
+    /// The embedder's part properties.
+    pub properties: Vec<(String, String)>,
 }
 
 impl As4AdditionalPayload {
@@ -39,7 +41,13 @@ impl As4AdditionalPayload {
             mime_type: mime_type.into(),
             content_id: None,
             filename: None,
+            properties: Vec::new(),
         }
+    }
+
+    pub(crate) fn with_properties(mut self, properties: Vec<(String, String)>) -> Self {
+        self.properties = properties;
+        self
     }
 
     pub(crate) fn with_filename(mut self, filename: PayloadFilename) -> Self {
@@ -63,6 +71,8 @@ fn generated_xml_bytes_to_string(bytes: Vec<u8>) -> String {
 pub(crate) struct PrimaryPartOverrides {
     pub(crate) mime_type: Option<String>,
     pub(crate) content_id: Option<String>,
+    /// The embedder's part properties.
+    pub(crate) properties: Vec<(String, String)>,
 }
 
 /// An additional part after per-part transforms, ready for signing/packaging.
@@ -71,6 +81,7 @@ struct OutboundExtraPart {
     mime_type: String,
     bytes: Vec<u8>,
     filename: Option<PayloadFilename>,
+    properties: Vec<(String, String)>,
 }
 
 /// The part's type **before encryption**: what the SwA
@@ -178,7 +189,7 @@ pub(crate) fn draft_send(
         payload,
         policy,
         payload_filename,
-        primary_overrides,
+        mut primary_overrides,
         additional_payloads,
         timestamp,
         signer,
@@ -283,6 +294,7 @@ pub(crate) fn draft_send(
     // and compression is advertised separately via `CompressionType`. Labelling
     // the part `application/gzip` and stopping there would discard the original
     // media type and leave the receiver no conformant signal to decompress.
+    let primary_properties = std::mem::take(&mut primary_overrides.properties);
     let payload_mime_type: String = primary_overrides.mime_type.unwrap_or_else(|| {
         if policy.encrypt {
             "application/xml".to_string()
@@ -317,6 +329,7 @@ pub(crate) fn draft_send(
             mime_type: part.mime_type,
             bytes,
             filename: part.filename,
+            properties: part.properties,
         });
     }
 
@@ -371,7 +384,7 @@ pub(crate) fn draft_send(
         || policy.tracking_identifier.is_some()
         || policy.sbdh_header.is_some();
     let envelope_builder = || -> SoapEnvelopeBuilder {
-        let extra_part_infos: Vec<(String, String, Option<String>)> = extra_parts
+        let extra_part_infos: Vec<crate::crypto::soap_builder::ExtraPartInfo> = extra_parts
             .iter()
             .map(|part| {
                 (
@@ -380,6 +393,7 @@ pub(crate) fn draft_send(
                     policy
                         .compress
                         .then(|| crate::crypto::compression::AS4_COMPRESSION_TYPE.to_string()),
+                    part.properties.clone(),
                 )
             })
             .collect();
@@ -398,6 +412,7 @@ pub(crate) fn draft_send(
             builder = builder
                 .with_payload_content_id(&payload_content_id)
                 .with_payload_mime_type(&payload_mime_type)
+                .with_payload_properties(primary_properties.clone())
                 .with_detached_payload_reference();
         }
         builder = if four_corner || !session_is_profile_built(session) {

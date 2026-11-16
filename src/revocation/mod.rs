@@ -9,7 +9,7 @@
 //! and the signer's authorization, outside the crypto pool, so
 //! only an authenticated, authorized sender can make the client fetch.
 //!
-//! BDEW (RzÜ AS4 2.6 §5.4): "Wenn die CRL einer CA über die im Zertifikat
+//! BDEW (RzÜ AS4 2.6 Kap. 5.4): "Wenn die CRL einer CA über die im Zertifikat
 //! eingetragene Certificate Revocation List Distribution Point (CRL-DP) von
 //! einer CA über 3 Tage nicht abrufbar ist oder im Gültigkeitszeitraum nicht
 //! verlängert wurde, dann ist der ausstellenden CA und aller darunter
@@ -78,7 +78,7 @@ pub(crate) struct RevocationRule {
     pub(crate) next_update_required: bool,
     /// Refetch a CRL this long after the last successful fetch (CP Tab. 10).
     pub(crate) refresh_after: Duration,
-    /// Distrust a CA whose CRL could not be fetched for longer (RzÜ §5.4).
+    /// Distrust a CA whose CRL could not be fetched for longer (RzÜ AS4 2.6 Kap. 5.4).
     pub(crate) distrust_after: Option<Duration>,
     pub(crate) missing_source: MissingSource,
     /// A status that cannot be obtained is accepted (and recorded). Only the
@@ -157,7 +157,7 @@ impl Source {
     }
 }
 
-/// Why a CA is distrusted (RzÜ §5.4's two branches).
+/// Why a CA is distrusted (RzÜ AS4 2.6 Kap. 5.4's two branches).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DistrustReason {
     /// "über 3 Tage nicht abrufbar".

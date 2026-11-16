@@ -1,6 +1,6 @@
 //! Per-run identities for both sides of a variant, issued by one test CA.
 //!
-//! BDEW (AS4-Profil 1.2 §2.3.4.4, RzÜ AS4 2.6 §5.2): separate
+//! BDEW (AS4-Profil 1.2 §2.3.4.4, RzÜ AS4 2.6 Kap. 5.2): separate
 //! BrainpoolP256r1 pairs for signing, encryption and TLS; the MP-ID is the
 //! subject's OU. phase4's BDEW validator additionally requires `EMT.MAK` in
 //! the signing certificate's CN (`BDEWCompatibilityValidator
@@ -105,6 +105,10 @@ pub struct PeerIdentity {
     pub party_type: String,
 }
 
+/// The AS4 address the crate's own certificates name (its receive side is
+/// reached over the harness's plain-HTTP bridge, which never reads it).
+const CRATE_ENDPOINT: &str = "https://asx.peer.test/as4";
+
 /// The run's PKI: one CA, the crate's and phase4's identities for a variant.
 #[derive(Debug)]
 pub struct RunPki {
@@ -113,20 +117,51 @@ pub struct RunPki {
     pub phase4_side: PeerIdentity,
 }
 
-fn identity(ca: &TestCa, suite: KeySuite, party: &(String, String), label: &str) -> PeerIdentity {
+fn identity(
+    ca: &TestCa,
+    suite: KeySuite,
+    party: &(String, String),
+    label: &str,
+    endpoint: &str,
+) -> PeerIdentity {
     let (party_id, party_type) = party;
     let issue = |role: &str| {
         let cn = match suite {
             KeySuite::BrainpoolP256r1 => format!("{label} {role} {party_id}.EMT.MAK"),
             KeySuite::Rsa2048 => format!("{label} {role} {party_id}"),
         };
-        PemPair::from_testkit(ca.issue_named(
-            &[
-                (Nid::COMMONNAME, cn.as_str()),
-                (Nid::ORGANIZATIONALUNITNAME, party_id.as_str()),
-                (Nid::ORGANIZATIONNAME, "asx phase4 interop"),
-            ],
+        // RzÜ AS4 2.6 Kap. 5.2: every certificate of the triple names the
+        // AS4 endpoint; the TLS one also its host (CP SM-PKI Anhang A.7.1).
+        let host = endpoint
+            .parse::<http::Uri>()
+            .ok()
+            .and_then(|u| u.host().map(str::to_owned))
+            .unwrap_or_default();
+        PemPair::from_testkit(ca.issue_with_options(
+            &cn,
             suite.alg(),
+            asx::testkit::pki::IssueOptions {
+                subject: vec![
+                    (Nid::COMMONNAME, cn.clone()),
+                    (Nid::ORGANIZATIONALUNITNAME, party_id.clone()),
+                    (Nid::ORGANIZATIONNAME, "asx phase4 interop".to_string()),
+                ],
+                uri_sans: vec![endpoint.to_string()],
+                dns_sans: if role == "tls" {
+                    vec![host]
+                } else {
+                    Vec::new()
+                },
+                eku: if role == "tls" {
+                    vec![
+                        asx::testkit::pki::Eku::ServerAuth,
+                        asx::testkit::pki::Eku::ClientAuth,
+                    ]
+                } else {
+                    Vec::new()
+                },
+                ..asx::testkit::pki::IssueOptions::default()
+            },
         ))
     };
     PeerIdentity {
@@ -150,8 +185,14 @@ impl RunPki {
                 KeySuite::Rsa2048,
             ),
         };
-        let crate_side = identity(&ca, suite, &collab.crate_party, "asx");
-        let phase4_side = identity(&ca, suite, &collab.phase4_party, "phase4");
+        let crate_side = identity(&ca, suite, &collab.crate_party, "asx", CRATE_ENDPOINT);
+        let phase4_side = identity(
+            &ca,
+            suite,
+            &collab.phase4_party,
+            "phase4",
+            &format!("https://{PHASE4_HOST}{}", variant.path()),
+        );
         RunPki {
             ca,
             crate_side,

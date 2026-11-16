@@ -22,6 +22,9 @@ pub struct Builder<C> {
     anchors: Vec<Certificate>,
     crl_signers: Vec<Certificate>,
     http: Option<Arc<dyn HttpClient>>,
+    /// Operator pins for the built-in client, in the order given (a
+    /// duplicate host is refused at `build()`).
+    pins: Vec<(String, std::net::SocketAddr)>,
     audit: Option<Arc<dyn AuditSink>>,
     /// Always the system clock outside crate tests.
     clock: SharedClock,
@@ -36,6 +39,7 @@ impl<C> std::fmt::Debug for Builder<C> {
             .field("partners", &self.partners.len())
             .field("anchors", &self.anchors.len())
             .field("crl_signers", &self.crl_signers.len())
+            .field("resolve", &self.pins)
             .finish_non_exhaustive()
     }
 }
@@ -49,6 +53,7 @@ impl<C> Builder<C> {
             anchors: Vec::new(),
             crl_signers: Vec::new(),
             http: None,
+            pins: Vec::new(),
             audit: None,
             clock: crate::clock::system(),
             _client: PhantomData,
@@ -100,6 +105,21 @@ impl<C> Builder<C> {
             http: Some(Arc::new(client)),
             ..self
         }
+    }
+
+    /// Connect every connection of the built-in client to `host` — whatever
+    /// the URL's port — to `addr`. SNI and certificate verification still use
+    /// `host`. A pinned host is exempt from the private-address filter: the
+    /// pin is your decision, made in code, and shown in `Debug`. Every other
+    /// host stays filtered.
+    ///
+    /// For a partner on a private interconnect, split-horizon DNS, or an
+    /// end-to-end test against a local MSH (`testkit::tls::TlsMsh`).
+    /// Refused at `build()` when a host is pinned twice or when a custom
+    /// [`HttpClient`] is set (the pin would configure nothing).
+    pub fn resolve(mut self, host: impl Into<String>, addr: std::net::SocketAddr) -> Builder<C> {
+        self.pins.push((host.into().to_ascii_lowercase(), addr));
+        self
     }
 
     /// Write one evidence record per verified receipt or MDN, sent or
@@ -174,7 +194,7 @@ pub(crate) fn is_mp_id(id: &str) -> bool {
     id.len() == 13 && id.bytes().all(|b| b.is_ascii_digit())
 }
 
-/// BDEW: the MP-ID is carried in the subject's OU (RzÜ AS4 2.6 §5.2: "Das
+/// BDEW: the MP-ID is carried in the subject's OU (RzÜ AS4 2.6 Kap. 5.2: "Das
 /// Feld Organisational Unit („OU") des Subject muss die MP-ID enthalten";
 /// B §2.3.4.4). One OU value must equal the MP-ID exactly; a CN or a
 /// substring does not count.
@@ -182,6 +202,63 @@ pub(crate) fn bdew_subject_carries(cert: &Certificate, mp_id: &str) -> bool {
     cert.subject_values().iter().any(|(nid, value)| {
         *nid == openssl::nid::Nid::ORGANIZATIONALUNITNAME && value.trim() == mp_id
     })
+}
+
+/// RzÜ AS4 2.6 Kap. 5.2: "Der Parameter im Feld „Alternativer
+/// Antragstellername" mit der Ausprägung UniformResourceIdentifier muss
+/// vorhanden sein und mit der Kommunikationsadresse des WebServices befüllt
+/// werden. Mehrere Kommunikationsadressen in einem Zertifikat sind nicht
+/// zulässig." The one URI, or why there is not exactly one.
+pub(crate) fn bdew_endpoint_uri(cert: &Certificate) -> std::result::Result<String, String> {
+    match cert.uri_sans().as_slice() {
+        [one] => Ok(one.clone()),
+        [] => Err(
+            "the certificate carries no URI subjectAltName (the AS4 web-service address)".into(),
+        ),
+        many => Err(format!(
+            "the certificate carries {} URI subjectAltNames; exactly one AS4 web-service address is allowed",
+            many.len()
+        )),
+    }
+}
+
+/// The citation of the triple rules.
+const RZUE_5_2: &str = "RzÜ AS4 2.6 Kap. 5.2";
+
+/// Both rules of RzÜ AS4 2.6 Kap. 5.2 for one certificate of `mp_id`'s
+/// triple: the MP-ID in the subject's OU and exactly one URI SAN.
+fn check_bdew_triple_cert(
+    profile: &Profile,
+    setting: &str,
+    cert: &Certificate,
+    mp_id: &str,
+) -> Result<()> {
+    if !bdew_subject_carries(cert, mp_id) {
+        return Err(refuse(
+            profile,
+            setting,
+            format!("the certificate subject (OU) does not carry the MP-ID {mp_id} ({RZUE_5_2})"),
+            "§2.3.4.4",
+        ));
+    }
+    bdew_endpoint_uri(cert)
+        .map(|_| ())
+        .map_err(|detail| refuse(profile, setting, format!("{detail} ({RZUE_5_2})"), ""))
+}
+
+/// An endpoint URL in comparable form (RFC 3986 §6.2.2–6.2.3): scheme and
+/// host lowercased, the default port dropped, an empty path as `/`.
+pub(crate) fn normalize_endpoint(url: &str) -> Option<String> {
+    let uri: http::Uri = url.parse().ok()?;
+    let scheme = uri.scheme_str()?.to_ascii_lowercase();
+    let host = uri.host()?.to_ascii_lowercase();
+    let port = match (scheme.as_str(), uri.port_u16()) {
+        ("https", Some(443)) | ("http", Some(80)) | (_, None) => String::new(),
+        (_, Some(port)) => format!(":{port}"),
+    };
+    let path = uri.path_and_query().map_or("/", |pq| pq.as_str());
+    let path = if path.is_empty() { "/" } else { path };
+    Some(format!("{scheme}://{host}{port}{path}"))
 }
 
 /// RFC 4130 §6.2: AS2 identifiers are 1–128 printable ASCII characters.
@@ -247,6 +324,59 @@ pub(crate) fn chains_to(
     };
     ctx.init(&store, leaf.x509(), &chain, |c| c.verify_cert())
         .unwrap_or(false)
+}
+
+/// BDEW: the partner's triple (RzÜ AS4 2.6 Kap. 5.2) and its endpoint
+/// (Kap. 2: taken from the certificate; Kap. 3: SNI needs a DNS name).
+fn check_bdew_partner(profile: &Profile, partner: &Partner) -> Result<()> {
+    let id = partner.id();
+    let setting = |what: &str| format!("Partner({id})::{what}");
+    for cert in partner.signing_certs() {
+        bdew_endpoint_uri(cert).map_err(|detail| {
+            refuse(
+                profile,
+                &setting("signing_cert"),
+                format!("{detail} ({RZUE_5_2})"),
+                "",
+            )
+        })?;
+    }
+    let Some(enc) = partner.encryption_certificate() else {
+        return Ok(());
+    };
+    check_bdew_triple_cert(profile, &setting("encryption_cert"), enc, id)?;
+    let san = bdew_endpoint_uri(enc).unwrap_or_default();
+    let endpoint = partner.endpoint_url().unwrap_or(&san);
+    if let Some(url) = partner.endpoint_url()
+        && normalize_endpoint(url) != normalize_endpoint(&san)
+    {
+        return Err(refuse(
+            profile,
+            &setting("endpoint"),
+            format!(
+                "{url:?} is not the AS4 address its encryption certificate names ({san:?}); \
+                 the endpoint is taken from the certificate (RzÜ AS4 2.6 Kap. 2)"
+            ),
+            "",
+        ));
+    }
+    let host = endpoint
+        .parse::<http::Uri>()
+        .ok()
+        .and_then(|u| u.host().map(|h| h.trim_matches(['[', ']']).to_owned()))
+        .unwrap_or_default();
+    if host.parse::<std::net::IpAddr>().is_ok() {
+        return Err(refuse(
+            profile,
+            &setting("endpoint"),
+            format!(
+                "{endpoint:?} names an IP address; TLS needs a DNS name for SNI \
+                 (RzÜ AS4 2.6 Kap. 3, RFC 6066 §3)"
+            ),
+            "",
+        ));
+    }
+    check_endpoint(endpoint).map_err(|d| refuse(profile, &setting("endpoint"), d, ""))
 }
 
 /// Check one partner against the profile. Shared with
@@ -325,6 +455,9 @@ pub(crate) fn check_partner(
             }
             _ => {}
         }
+    }
+    if profile.sender_rule() == SenderRule::AnchorAndSubject {
+        check_bdew_partner(profile, partner)?;
     }
     if let Some(cert) = partner.encryption_certificate() {
         let kind = cert.key_kind();
@@ -434,6 +567,7 @@ fn validate<C>(builder: Builder<C>, protocol: Protocol) -> Result<ClientConfig> 
         anchors,
         crl_signers,
         http,
+        pins,
         audit,
         clock,
         ..
@@ -570,6 +704,36 @@ fn validate<C>(builder: Builder<C>, protocol: Protocol) -> Result<ClientConfig> 
             ));
         }
     }
+    if let Some(tls) = &local.tls
+        && p.separate_keys()
+        && !matches!(tls.key_kind(), KeyKind::Ec { .. })
+    {
+        // BDEW AS4-Profil 1.2 §2.3.4.4: "Die Schlüsselpaare MÜSSEN EC-basiert
+        // sein" — the TLS pair too.
+        return Err(refuse(
+            p,
+            "LocalParty::tls_identity",
+            format!(
+                "{} key not allowed, the TLS key pair must be EC",
+                tls.key_kind().describe()
+            ),
+            "§2.3.4.4",
+        ));
+    }
+    if p.sender_rule() == SenderRule::AnchorAndSubject {
+        check_bdew_triple_cert(p, "LocalParty::signer", signer_leaf, &local.id)?;
+        for decrypter in &local.decrypters {
+            check_bdew_triple_cert(
+                p,
+                "LocalParty::decrypter",
+                decrypter.decrypter.certificate(),
+                &local.id,
+            )?;
+        }
+        if let Some(tls) = &local.tls {
+            check_bdew_triple_cert(p, "LocalParty::tls_identity", tls.leaf(), &local.id)?;
+        }
+    }
     if p.id() == ProfileId::Bdew12 && !is_mp_id(&local.id) {
         return Err(refuse(
             p,
@@ -626,9 +790,10 @@ fn validate<C>(builder: Builder<C>, protocol: Protocol) -> Result<ClientConfig> 
         resolved.insert(key, crate::profile::resolve(p, partner, &clock));
     }
     check_crl_signers(p, &crl_signers, &anchors, now)?;
-    let http = match http {
-        Some(http) => http,
-        None => default_http(p, &local)?,
+    let pins = check_pins(p, pins, http.is_some())?;
+    let (http, builtin) = match http {
+        Some(http) => (http, None),
+        None => default_http(p, &local, &anchors, pins)?,
     };
     let revocation = Arc::new(crate::revocation::Revocation::new(
         profile.revocation(),
@@ -638,6 +803,7 @@ fn validate<C>(builder: Builder<C>, protocol: Protocol) -> Result<ClientConfig> 
         crl_signers.iter().map(|c| c.x509().clone()).collect(),
         None,
     ));
+    wire_revocation(builtin, &revocation);
     Ok(ClientConfig {
         profile,
         local,
@@ -709,15 +875,77 @@ pub(crate) fn base_session(
     Ok(session.with_profile_metadata(pins, config.clock.clone()))
 }
 
+/// The validated pins: lowercased, non-empty, unique, and only with the
+/// built-in client.
+fn check_pins(
+    profile: &Profile,
+    pins: Vec<(String, std::net::SocketAddr)>,
+    custom_http: bool,
+) -> Result<HashMap<String, std::net::SocketAddr>> {
+    let refuse_pin = |detail: String| refuse(profile, "Builder::resolve", detail, "");
+    if custom_http && !pins.is_empty() {
+        return Err(refuse_pin(
+            "pins apply to the built-in HTTP client only; a custom HttpClient resolves itself"
+                .into(),
+        ));
+    }
+    let mut out = HashMap::new();
+    for (host, addr) in pins {
+        if host.is_empty() || host.contains(['/', ':', '@', ' ']) {
+            return Err(refuse_pin(format!("{host:?} is not a host name")));
+        }
+        if out.insert(host.clone(), addr).is_some() {
+            return Err(refuse_pin(format!("{host:?} is pinned twice")));
+        }
+    }
+    Ok(out)
+}
+
+/// The built-in client, when it is the one in use: its TLS policy comes from
+/// the profile, never from the peer (D92).
 #[cfg(feature = "http-client")]
-fn default_http(_profile: &Profile, local: &LocalParty) -> Result<Arc<dyn HttpClient>> {
-    Ok(Arc::new(crate::http_client::BuiltinClient::new(
-        local.tls.as_ref(),
-    )?))
+type Builtin = Option<crate::http_client::BuiltinClient>;
+#[cfg(not(feature = "http-client"))]
+type Builtin = Option<std::convert::Infallible>;
+
+#[cfg(feature = "http-client")]
+fn default_http(
+    profile: &Profile,
+    local: &LocalParty,
+    anchors: &[Certificate],
+    pins: HashMap<String, std::net::SocketAddr>,
+) -> Result<(Arc<dyn HttpClient>, Builtin)> {
+    use crate::transport::tls::TlsPolicy;
+    let bdew = profile.id() == ProfileId::Bdew12;
+    // BDEW AS4-Profil 1.2 §2.2.6.1: "Client-Authentifizierung ist
+    // ERFORDERLICH."
+    if bdew && local.tls.is_none() {
+        return Err(refuse(
+            profile,
+            "LocalParty::tls_identity",
+            "the built-in client needs a TLS identity: client authentication is required",
+            "§2.2.6.1",
+        ));
+    }
+    let policy = if bdew {
+        TlsPolicy::Bdew {
+            anchors: anchors.to_vec(),
+        }
+    } else {
+        TlsPolicy::Platform
+    };
+    let client = crate::http_client::BuiltinClient::new(policy, local.tls.as_ref(), Arc::new(pins))
+        .map_err(|detail| refuse(profile, "LocalParty::tls_identity", detail, ""))?;
+    Ok((Arc::new(client.clone()), Some(client)))
 }
 
 #[cfg(not(feature = "http-client"))]
-fn default_http(profile: &Profile, _local: &LocalParty) -> Result<Arc<dyn HttpClient>> {
+fn default_http(
+    profile: &Profile,
+    _local: &LocalParty,
+    _anchors: &[Certificate],
+    _pins: HashMap<String, std::net::SocketAddr>,
+) -> Result<(Arc<dyn HttpClient>, Builtin)> {
     Err(refuse(
         profile,
         "Builder::http_client",
@@ -725,6 +953,16 @@ fn default_http(profile: &Profile, _local: &LocalParty) -> Result<Arc<dyn HttpCl
         "",
     ))
 }
+
+#[cfg(feature = "http-client")]
+fn wire_revocation(builtin: Builtin, revocation: &Arc<crate::revocation::Revocation>) {
+    if let Some(client) = builtin {
+        client.set_revocation(Arc::downgrade(revocation));
+    }
+}
+
+#[cfg(not(feature = "http-client"))]
+fn wire_revocation(_builtin: Builtin, _revocation: &Arc<crate::revocation::Revocation>) {}
 
 #[cfg(feature = "as4")]
 impl Builder<crate::as4::As4> {

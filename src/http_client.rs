@@ -1,16 +1,21 @@
 //! The one-method HTTP seam and the built-in client (feature
-//! `http-client`): HTTPS only, resolved addresses pinned, the mTLS
-//! identity from `LocalParty::tls_identity`, a 10 s connect and a 300 s
-//! request timeout. A revocation fetch (marked by the
-//! crate-private [`crate::revocation::RevocationFetch`]) may be plain
-//! `http`, presents no identity, times out at 3 s / 10 s and reads at most
-//! its cap.
+//! `http-client`): OpenSSL TLS under the profile's policy (BSI TR-03116-3
+//! with Brainpool under BDEW), SNI, pooled connections, the private-address
+//! filter on every connection, the mTLS identity from
+//! `LocalParty::tls_identity`, a 10 s connect (TCP and TLS) and a 300 s
+//! request timeout. A revocation fetch (marked by the crate-private
+//! [`crate::revocation::RevocationFetch`]) may be plain `http`, presents no
+//! identity, times out at 3 s / 10 s and reads at most its cap.
 
 use crate::error::{BoxError, BoxFuture, Error, ErrorKind, Stage};
 
 /// An HTTP exchange. The built-in implementation (feature `http-client`) is
-/// HTTPS-only for messages, pins resolved addresses and presents
-/// `LocalParty::tls_identity`. An error of an embedder-supplied client is
+/// HTTPS-only for messages, built on OpenSSL with connection pooling, sends
+/// SNI, refuses private addresses unless pinned with `Builder::resolve`,
+/// presents `LocalParty::tls_identity`, and under `Profile::bdew()` speaks
+/// BSI TR-03116-3 (Brainpool), trusts only the builder's trust anchors (the
+/// SM-PKI root) and checks the server chain's revocation status before
+/// writing a request. An error of an embedder-supplied client is
 /// classified [`ErrorKind::Indeterminate`]: the request may have been
 /// written, and every target profile requires receiver duplicate detection,
 /// so resending is safe.
@@ -80,115 +85,100 @@ pub(crate) fn classify(err: BoxError) -> Error {
 #[cfg(feature = "http-client")]
 const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 
-/// The built-in client.
-#[cfg(all(feature = "http-client", any(feature = "as2", feature = "as4")))]
-#[derive(Debug, Clone, Default)]
+#[cfg(feature = "http-client")]
+type Pool = hyper_util::client::legacy::Client<
+    crate::transport::connector::Connector,
+    http_body_util::Full<bytes::Bytes>,
+>;
+
+/// The built-in client (D92): two pooled hyper clients over the crate's
+/// connector — one for messages (HTTPS only, the client identity, the
+/// profile's TLS policy, under BDEW the server-chain revocation check) and
+/// one for revocation fetches (HTTP or HTTPS, no identity, platform roots).
+/// Both share the operator's pins. Cheap to clone; clones share the pools.
+#[cfg(feature = "http-client")]
+#[derive(Clone)]
 pub(crate) struct BuiltinClient {
-    identity: Option<crate::transport::egress::ClientIdentity>,
-    /// Unit tests only: connect revocation fetches to this local address
-    /// instead of resolving (the recording server of the revocation tests).
-    #[cfg(test)]
-    test_resolve: Option<std::net::SocketAddr>,
+    messages: Pool,
+    revocation: Pool,
+    hook: crate::transport::connector::RevocationHook,
+    pins: crate::transport::connector::Pins,
+    policy: crate::transport::tls::TlsPolicy,
 }
 
-#[cfg(all(feature = "http-client", any(feature = "as2", feature = "as4")))]
+#[cfg(feature = "http-client")]
+impl std::fmt::Debug for BuiltinClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BuiltinClient")
+            .field("policy", &self.policy)
+            .field("pins", &self.pins)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(feature = "http-client")]
 impl BuiltinClient {
-    pub(crate) fn new(tls: Option<&crate::keys::KeyPair>) -> crate::error::Result<Self> {
-        let identity = match tls {
-            Some(pair) => Some(
-                crate::transport::egress::ClientIdentity::from_pem(
-                    pair.chain_pem(),
-                    pair.key_pem(),
-                )
-                .map_err(Error::internal)?,
-            ),
-            None => None,
+    /// Build both pools. The TLS identity is loaded into the TLS context
+    /// here, so an unusable key fails `build()` instead of the first send.
+    ///
+    /// # Errors
+    ///
+    /// A description of what the TLS context refused.
+    pub(crate) fn new(
+        policy: crate::transport::tls::TlsPolicy,
+        identity: Option<&crate::keys::KeyPair>,
+        pins: crate::transport::connector::Pins,
+    ) -> std::result::Result<Self, String> {
+        use crate::transport::connector::Connector;
+        use crate::transport::tls::{TlsPolicy, connector};
+        use std::time::Duration;
+        let hook: crate::transport::connector::RevocationHook = std::sync::Arc::default();
+        let message_tls = connector(&policy, identity, true)?;
+        let messages = Connector::new(
+            message_tls,
+            policy.clone(),
+            pins.clone(),
+            false,
+            Duration::from_secs(10),
+            policy.is_bdew().then(|| hook.clone()),
+            "http_client",
+        );
+        // CDPs and responders are third parties: no client certificate
+        // (CP SM-PKI §2.4: CRL access is anonymous), the platform's roots for
+        // an https CDP (the CRL itself is signed), HTTP/1.1.
+        let revocation_tls = connector(&TlsPolicy::Platform, None, false)?;
+        let revocation = Connector::new(
+            revocation_tls,
+            TlsPolicy::Platform,
+            pins.clone(),
+            true,
+            Duration::from_secs(3),
+            None,
+            "revocation_fetch",
+        );
+        let pool = |connector: Connector| -> Pool {
+            hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
+                .pool_timer(hyper_util::rt::TokioTimer::new())
+                .pool_idle_timeout(Duration::from_secs(90))
+                .pool_max_idle_per_host(4)
+                .build(connector)
         };
         Ok(Self {
-            identity,
-            #[cfg(test)]
-            test_resolve: None,
+            messages: pool(messages),
+            revocation: pool(revocation),
+            hook,
+            pins,
+            policy,
         })
     }
 
-    /// A revocation fetch: `http` or `https`, the egress
-    /// address filter and pinning, no redirects, no client identity, 3 s
-    /// connect and 10 s request timeouts, at most `max_bytes` read.
-    async fn revocation(
+    /// Wire the client's revocation validator into the BDEW server-chain
+    /// check (it holds this client, hence weak).
+    pub(crate) fn set_revocation(
         &self,
-        request: http::Request<bytes::Bytes>,
-        max_bytes: usize,
-    ) -> std::result::Result<http::Response<bytes::Bytes>, BoxError> {
-        use crate::core::{AsxError, ErrorCode, ErrorContext};
-        const STAGE: &str = "revocation_fetch";
-        let config = crate::transport::egress::TransportConfig {
-            connect_timeout: std::time::Duration::from_secs(3),
-            request_timeout: std::time::Duration::from_secs(10),
-            client_identity: None,
-            ..crate::transport::egress::TransportConfig::default()
-        };
-        let url = request.uri().to_string();
-        #[cfg(test)]
-        let client = match self.test_resolve {
-            Some(addr) => reqwest::Client::builder()
-                .redirect(reqwest::redirect::Policy::none())
-                .resolve_to_addrs(request.uri().host().unwrap_or_default(), &[addr])
-                .build()
-                .map_err(|e| {
-                    NotWritten(AsxError::new(
-                        ErrorCode::TransportFailure,
-                        e.to_string(),
-                        ErrorContext::new(STAGE),
-                    ))
-                })?,
-            None => {
-                crate::transport::egress::validated_pinned_revocation_client(&url, &config, STAGE)
-                    .await
-                    .map_err(NotWritten)?
-            }
-        };
-        #[cfg(not(test))]
-        let client =
-            crate::transport::egress::validated_pinned_revocation_client(&url, &config, STAGE)
-                .await
-                .map_err(NotWritten)?;
-        let (parts, body) = request.into_parts();
-        let method = match parts.method {
-            http::Method::GET => reqwest::Method::GET,
-            http::Method::POST => reqwest::Method::POST,
-            _ => {
-                return Err(Box::new(NotWritten(AsxError::new(
-                    ErrorCode::InvalidInput,
-                    "a revocation fetch is a GET or a POST",
-                    ErrorContext::new(STAGE),
-                ))));
-            }
-        };
-        let mut builder = client.request(method, &url);
-        for (name, value) in &parts.headers {
-            builder = builder.header(name.as_str(), value.as_bytes());
-        }
-        let response = builder.body(body).send().await.map_err(|err| -> BoxError {
-            Box::new(Written(AsxError::new(
-                ErrorCode::TransportFailure,
-                format!("revocation fetch failed: {}", flatten(&err)),
-                ErrorContext::new(STAGE),
-            )))
-        })?;
-        let status = response.status().as_u16();
-        let body = crate::transport::egress::read_body_capped(response, max_bytes, STAGE)
-            .await
-            .map_err(Written)?;
-        http::Response::builder()
-            .status(status)
-            .body(body)
-            .map_err(|err| {
-                Box::new(Written(AsxError::new(
-                    ErrorCode::ParseFailed,
-                    format!("unrepresentable HTTP response: {err}"),
-                    ErrorContext::new(STAGE),
-                ))) as BoxError
-            })
+        revocation: std::sync::Weak<crate::revocation::Revocation>,
+    ) {
+        let _ = self.hook.set(revocation);
     }
 
     async fn exchange(
@@ -196,71 +186,104 @@ impl BuiltinClient {
         request: http::Request<bytes::Bytes>,
     ) -> std::result::Result<http::Response<bytes::Bytes>, BoxError> {
         use crate::core::{AsxError, ErrorCode, ErrorContext};
-        const STAGE: &str = "http_client";
-        if let Some(fetch) = request
+        use std::time::Duration;
+        let (pool, stage, timeout, cap) = match request
             .extensions()
             .get::<crate::revocation::RevocationFetch>()
             .copied()
         {
-            return self.revocation(request, fetch.max_bytes).await;
-        }
-        let config = crate::transport::egress::TransportConfig {
-            connect_timeout: std::time::Duration::from_secs(10),
-            request_timeout: std::time::Duration::from_secs(300),
-            client_identity: self.identity.clone(),
-            ..crate::transport::egress::TransportConfig::default()
+            Some(fetch) => (
+                &self.revocation,
+                "revocation_fetch",
+                Duration::from_secs(10),
+                fetch.max_bytes,
+            ),
+            None => (
+                &self.messages,
+                "http_client",
+                Duration::from_secs(300),
+                MAX_RESPONSE_BYTES,
+            ),
         };
+        let mut request = request.map(http_body_util::Full::new);
+        request.headers_mut().insert(
+            http::header::USER_AGENT,
+            http::HeaderValue::from_static(concat!("asx/", env!("CARGO_PKG_VERSION"))),
+        );
         let url = request.uri().to_string();
-        let client = crate::transport::egress::validated_pinned_client(&url, &config, STAGE)
-            .await
-            .map_err(NotWritten)?;
-        let (parts, body) = request.into_parts();
-        let method =
-            reqwest::Method::from_bytes(parts.method.as_str().as_bytes()).map_err(|_| {
-                NotWritten(AsxError::new(
-                    ErrorCode::InvalidInput,
-                    "bad method",
-                    ErrorContext::new(STAGE),
-                ))
+        let exchange = async {
+            let response = pool.request(request).await.map_err(|err| {
+                // The connector's refusals arrive wrapped: unwrap them so the
+                // caller sees what was refused and that nothing was written.
+                if let Some(not_written) = find::<NotWritten>(&err) {
+                    return Box::new(NotWritten(not_written.0.clone())) as BoxError;
+                }
+                let internal = AsxError::new(
+                    ErrorCode::TransportFailure,
+                    format!("HTTP request to {url} failed: {}", flatten(&err)),
+                    ErrorContext::new(stage),
+                );
+                if err.is_connect() {
+                    Box::new(NotWritten(internal))
+                } else {
+                    Box::new(Written(internal))
+                }
             })?;
-        let mut builder = client.request(method, &url);
-        for (name, value) in &parts.headers {
-            builder = builder.header(name.as_str(), value.as_bytes());
-        }
-        let response = builder.body(body).send().await.map_err(|err| -> BoxError {
-            let internal = AsxError::new(
-                ErrorCode::TransportFailure,
-                format!("HTTP request failed: {}", flatten(&err)),
-                ErrorContext::new(STAGE),
-            );
-            if err.is_connect() || err.is_builder() {
-                Box::new(NotWritten(internal))
-            } else {
-                Box::new(Written(internal))
+            let (parts, body) = response.into_parts();
+            let mut out = http::Response::builder().status(parts.status);
+            for (name, value) in &parts.headers {
+                out = out.header(name, value);
             }
-        })?;
-        let status = response.status().as_u16();
-        let mut out = http::Response::builder().status(status);
-        for (name, value) in response.headers() {
-            out = out.header(name.as_str(), value.as_bytes());
-        }
-        let body = crate::transport::egress::read_body_capped(response, MAX_RESPONSE_BYTES, STAGE)
+            let body = crate::transport::egress::read_body_capped(
+                http::Response::from_parts(parts, body),
+                cap,
+                stage,
+            )
             .await
-            .map_err(Written)?;
-        out.body(body).map_err(|err| {
-            Box::new(Written(AsxError::new(
-                ErrorCode::ParseFailed,
-                format!("unrepresentable HTTP response: {err}"),
-                ErrorContext::new(STAGE),
-            ))) as BoxError
-        })
+            .map_err(|e| Box::new(Written(e)) as BoxError)?;
+            out.body(body).map_err(|err| {
+                Box::new(Written(AsxError::new(
+                    ErrorCode::ParseFailed,
+                    format!("unrepresentable HTTP response: {err}"),
+                    ErrorContext::new(stage),
+                ))) as BoxError
+            })
+        };
+        // The connect timeout is the connector's (not written); past it the
+        // request may have been written.
+        match tokio::time::timeout(timeout, exchange).await {
+            Ok(result) => result,
+            Err(_) => Err(Box::new(Written(AsxError::new(
+                ErrorCode::TransportFailure,
+                format!(
+                    "HTTP exchange with {url} did not complete within {} s",
+                    timeout.as_secs()
+                ),
+                ErrorContext::new(stage),
+            )))),
+        }
     }
 }
 
-#[cfg(all(feature = "http-client", any(feature = "as2", feature = "as4")))]
-fn flatten(err: &reqwest::Error) -> String {
+/// The first error of type `T` in `err`'s source chain.
+#[cfg(feature = "http-client")]
+fn find<'a, T: std::error::Error + 'static>(
+    err: &'a (dyn std::error::Error + 'static),
+) -> Option<&'a T> {
+    let mut current = Some(err);
+    while let Some(e) = current {
+        if let Some(found) = e.downcast_ref::<T>() {
+            return Some(found);
+        }
+        current = e.source();
+    }
+    None
+}
+
+#[cfg(feature = "http-client")]
+fn flatten(err: &(dyn std::error::Error + 'static)) -> String {
     let mut message = err.to_string();
-    let mut source = std::error::Error::source(err);
+    let mut source = err.source();
     while let Some(cause) = source {
         message.push_str(": ");
         message.push_str(&cause.to_string());
@@ -269,7 +292,7 @@ fn flatten(err: &reqwest::Error) -> String {
     message
 }
 
-#[cfg(all(feature = "http-client", any(feature = "as2", feature = "as4")))]
+#[cfg(feature = "http-client")]
 impl HttpClient for BuiltinClient {
     fn send(
         &self,
@@ -279,13 +302,22 @@ impl HttpClient for BuiltinClient {
     }
 }
 
-#[cfg(all(test, feature = "http-client", any(feature = "as2", feature = "as4")))]
+#[cfg(all(test, feature = "http-client"))]
 mod tests {
     use super::*;
 
+    fn builtin(pins: &[(&str, std::net::SocketAddr)]) -> BuiltinClient {
+        BuiltinClient::new(
+            crate::transport::tls::TlsPolicy::Platform,
+            None,
+            Arc::new(pins.iter().map(|(h, a)| (h.to_string(), *a)).collect()),
+        )
+        .expect("client")
+    }
+
     #[tokio::test]
     async fn plain_http_is_refused_before_writing() {
-        let client = BuiltinClient::default();
+        let client = builtin(&[]);
         let err = client
             .send(
                 http::Request::post("http://example.org/as4")
@@ -299,7 +331,7 @@ mod tests {
 
     #[tokio::test]
     async fn private_address_is_refused_before_writing() {
-        let client = BuiltinClient::default();
+        let client = builtin(&[]);
         let err = client
             .send(
                 http::Request::post("https://127.0.0.1:1/as4")
@@ -351,10 +383,7 @@ mod tests {
     }
 
     fn recorded(addr: std::net::SocketAddr) -> BuiltinClient {
-        BuiltinClient {
-            test_resolve: Some(addr),
-            ..BuiltinClient::default()
-        }
+        builtin(&[("crl.example", addr), ("ocsp.example", addr)])
     }
 
     #[tokio::test]
@@ -362,7 +391,7 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let port = listener.local_addr().unwrap().port();
-        let client = BuiltinClient::default();
+        let client = builtin(&[]);
         for url in [
             format!("http://127.0.0.1:{port}/root.crl"),
             format!("http://localhost:{port}/root.crl"),
@@ -378,7 +407,7 @@ mod tests {
 
     #[tokio::test]
     async fn revocation_fetch_with_another_scheme_is_refused() {
-        let client = BuiltinClient::default();
+        let client = builtin(&[]);
         for url in [
             "ldap://dir.example/cn=ca",
             "gopher://x.example/",
@@ -391,7 +420,7 @@ mod tests {
 
     #[tokio::test]
     async fn revocation_may_use_plain_http_messages_may_not() {
-        let client = BuiltinClient::default();
+        let client = builtin(&[]);
         let err = client
             .send(revocation_get(
                 "http://crl.invalid-tld-for-tests./ca.crl",
@@ -452,6 +481,27 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(ok.body().len(), 70_000);
+    }
+
+    #[tokio::test]
+    async fn a_chunked_body_past_the_cap_is_refused() {
+        static CHUNKED: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+        let chunked = CHUNKED.get_or_init(|| {
+            let mut r = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
+            for _ in 0..16 {
+                r.extend_from_slice(b"100\r\n");
+                r.extend(vec![b'b'; 256]);
+                r.extend_from_slice(b"\r\n");
+            }
+            r.extend_from_slice(b"0\r\n\r\n");
+            r
+        });
+        let (addr, _) = recording_server(chunked).await;
+        let err = recorded(addr)
+            .send(revocation_get("http://crl.example/chunked.crl", 1024))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("exceeds"), "{err}");
     }
 
     #[test]

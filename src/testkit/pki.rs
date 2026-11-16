@@ -12,7 +12,8 @@ pub use openssl::nid::Nid;
 use openssl::pkey::{PKey, Private};
 use openssl::rsa::Rsa;
 use openssl::x509::extension::{
-    AuthorityKeyIdentifier, BasicConstraints, KeyUsage, SubjectKeyIdentifier,
+    AuthorityKeyIdentifier, BasicConstraints, ExtendedKeyUsage, KeyUsage, SubjectAlternativeName,
+    SubjectKeyIdentifier,
 };
 use openssl::x509::{X509, X509Extension, X509Name, X509NameBuilder, X509Ref};
 use std::collections::HashMap;
@@ -253,6 +254,21 @@ pub enum Cdp {
     },
 }
 
+/// The host every [`TestCa`] publishes its CRL under
+/// (`http://crl.testkit.example/<id>.crl`). Pin it to
+/// [`super::tls::TlsMsh::crl_addr`] with `Builder::resolve` when the built-in
+/// client fetches CRLs over the network.
+pub const CRL_HOST: &str = "crl.testkit.example";
+
+/// An extended key usage (RFC 5280 §4.2.1.12).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Eku {
+    /// `id-kp-serverAuth`.
+    ServerAuth,
+    /// `id-kp-clientAuth`.
+    ClientAuth,
+}
+
 /// How [`TestCa::issue_with_options`] issues a certificate.
 #[derive(Debug, Clone, Default)]
 pub struct IssueOptions {
@@ -264,6 +280,13 @@ pub struct IssueOptions {
     pub ocsp: Vec<String>,
     /// Subject attributes; the CN argument alone when empty.
     pub subject: Vec<(Nid, String)>,
+    /// `uniformResourceIdentifier` subjectAltNames (RzÜ AS4 2.6 Kap. 5.2:
+    /// the AS4 web-service address).
+    pub uri_sans: Vec<String>,
+    /// `dNSName` subjectAltNames (a TLS server's host name).
+    pub dns_sans: Vec<String>,
+    /// Extended key usages; the extension is absent when empty.
+    pub eku: Vec<Eku>,
 }
 
 impl TestCa {
@@ -435,26 +458,49 @@ impl TestCa {
         TestCa::new("asx-testkit SM-PKI root", KeyAlg::EcBrainpoolP256r1)
     }
 
-    /// A BDEW market participant (BDEW AS4-Profil 1.2 §2.3.4.4, RzÜ AS4 2.6
-    /// §5.2): separate BrainpoolP256r1 key pairs for signing, encryption and
-    /// TLS, each with the MP-ID as the subject's OU.
+    /// A BDEW market participant at `https://mp<mp_id>.testkit.example/as4`;
+    /// see [`TestCa::bdew_party_at`].
     pub fn bdew_party(&self, mp_id: &str) -> TestParty {
-        let issue = |role: &str| {
-            self.issue_named(
-                &[
-                    (Nid::COMMONNAME, &format!("Test MP {mp_id} {role}")),
-                    (Nid::ORGANIZATIONALUNITNAME, mp_id),
-                    (Nid::ORGANIZATIONNAME, "asx testkit"),
+        self.bdew_party_at(mp_id, &format!("https://mp{mp_id}.testkit.example/as4"))
+    }
+
+    /// A BDEW market participant whose AS4 endpoint is `url` (BDEW
+    /// AS4-Profil 1.2 §2.3.4.4; RzÜ AS4 2.6 Kap. 5.2; CP SM-PKI Anhang A.7.1
+    /// Tabelle 28): separate BrainpoolP256r1 key pairs for signing,
+    /// encryption and TLS, each with the MP-ID as the subject's OU and `url`
+    /// as its one URI subjectAltName. The TLS certificate also carries the
+    /// URL's host as DNS name and the serverAuth and clientAuth key usages
+    /// (TR-03109-4 Tabelle 26), so it serves both ends of a handshake.
+    pub fn bdew_party_at(&self, mp_id: &str, url: &str) -> TestParty {
+        let host = http::Uri::try_from(url)
+            .ok()
+            .and_then(|u| u.host().map(str::to_owned))
+            .expect("the endpoint URL has a host");
+        let issue = |role: &str, tls: bool| {
+            let options = IssueOptions {
+                subject: vec![
+                    (Nid::COMMONNAME, format!("Test MP {mp_id} {role}")),
+                    (Nid::ORGANIZATIONALUNITNAME, mp_id.to_string()),
+                    (Nid::ORGANIZATIONNAME, "asx testkit".to_string()),
                 ],
-                KeyAlg::EcBrainpoolP256r1,
-            )
+                uri_sans: vec![url.to_string()],
+                dns_sans: if tls { vec![host.clone()] } else { Vec::new() },
+                eku: if tls {
+                    vec![Eku::ServerAuth, Eku::ClientAuth]
+                } else {
+                    Vec::new()
+                },
+                ..IssueOptions::default()
+            };
+            self.issue_with_options(role, KeyAlg::EcBrainpoolP256r1, options)
         };
         TestParty {
             id: mp_id.to_string(),
             party_type: Some(BDEW_PARTY_TYPE.to_string()),
-            signing: issue("sig"),
-            encryption: issue("enc"),
-            tls: issue("tls"),
+            endpoint: Some(url.to_string()),
+            signing: issue("sig", false),
+            encryption: issue("enc", false),
+            tls: issue("tls", true),
             anchor_pem: self.root_pem(),
         }
     }
@@ -464,6 +510,7 @@ impl TestCa {
     pub fn peppol_party(&self, cn: &str) -> TestParty {
         let ap = self.issue(cn, KeyAlg::Rsa2048);
         TestParty {
+            endpoint: None,
             id: cn.to_string(),
             party_type: None,
             signing: ap.clone(),
@@ -476,6 +523,7 @@ impl TestCa {
     /// An RSA party (eDelivery 1.15, ENTSOG): separate RSA 2048 pairs.
     pub fn rsa_party(&self, name: &str) -> TestParty {
         TestParty {
+            endpoint: None,
             id: name.to_string(),
             party_type: Some(UNREGISTERED_PARTY_TYPE.to_string()),
             signing: self.issue(&format!("{name} sig"), KeyAlg::Rsa2048),
@@ -489,6 +537,7 @@ impl TestCa {
     pub fn as2_party(&self, as2_id: &str) -> TestParty {
         let pair = self.issue(as2_id, KeyAlg::Rsa2048);
         TestParty {
+            endpoint: None,
             id: as2_id.to_string(),
             party_type: None,
             signing: pair.clone(),
@@ -600,6 +649,29 @@ impl TestCa {
                 false,
                 &der::authority_info_access(&options.ocsp),
             ));
+        }
+        // SAN and EKU need no issuer context; an empty builder supplies one.
+        let scratch = X509::builder().expect("x509 builder");
+        let ctx = scratch.x509v3_context(None, None);
+        if !options.uri_sans.is_empty() || !options.dns_sans.is_empty() {
+            let mut san = SubjectAlternativeName::new();
+            for dns in &options.dns_sans {
+                san.dns(dns);
+            }
+            for uri in &options.uri_sans {
+                san.uri(uri);
+            }
+            out.push(san.build(&ctx).expect("subjectAltName"));
+        }
+        if !options.eku.is_empty() {
+            let mut eku = ExtendedKeyUsage::new();
+            for usage in &options.eku {
+                match usage {
+                    Eku::ServerAuth => eku.server_auth(),
+                    Eku::ClientAuth => eku.client_auth(),
+                };
+            }
+            out.push(eku.build().expect("extendedKeyUsage"));
         }
         out
     }
@@ -918,6 +990,9 @@ pub struct TestParty {
     pub id: String,
     /// The party-id type the profile expects, if the caller sets one.
     pub party_type: Option<String>,
+    /// The AS4 endpoint its certificates name (a BDEW party's URI
+    /// subjectAltName); `None` for the other profiles.
+    pub endpoint: Option<String>,
     /// Signs messages, receipts and MDNs.
     pub signing: KeyPair,
     /// Decrypts inbound messages.
