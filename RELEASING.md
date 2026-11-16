@@ -21,7 +21,7 @@ Two workflows, mirrored by two `just` recipes:
 | `interop` | the `#[ignore]`d oracle suites: openssl CLI (AS2 S/MIME, BDEW mutual TLS), xmlsec1, Redis, and phase4 4.8.1 as the BDEW counterparty. The phase4 peer is built in the job from `tests/fixtures/phase4` (GitHub Actions layer cache) and passed in `ASX_PHASE4_IMAGE` |
 
 Not in CI: `just public-api` (needs nightly and `cargo-public-api`; run it on
-every API change, the snapshot is `tests/public-api.txt`, budget 160 items) and
+every API change, the snapshot is `tests/public-api.txt`, budget 161 items) and
 Holodeck B2B (`tests/interop_holodeck_counterparty.rs`, arm64-only image).
 
 `site.yml` builds the documentation site on pull requests that touch `site/`

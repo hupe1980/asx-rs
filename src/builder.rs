@@ -257,6 +257,52 @@ fn check_key_roles(p: &Profile, local: &LocalParty, signer: &Certificate) -> Res
     Ok(())
 }
 
+/// Every pair of decrypters must leave inbound key selection unambiguous.
+/// Two certificates over one key (a renewal) act as one key, refused only
+/// where the PKI forbids renewals (CP SM-PKI §4.5); one SKI over different
+/// keys would name two keys. Refusals name both positions (from 1).
+fn check_decrypter_pairs(p: &Profile, local: &LocalParty) -> Result<()> {
+    let certs: Vec<&Certificate> = local
+        .decrypters
+        .iter()
+        .map(|d| d.decrypter.certificate())
+        .collect();
+    for (i, cert) in certs.iter().enumerate() {
+        for (j, earlier) in certs[..i].iter().enumerate() {
+            let pair = format!("decrypters {} and {}", j + 1, i + 1);
+            let serials = format!("serials {} and {}", earlier.serial_hex(), cert.serial_hex());
+            let refusal = |detail: String| refuse(p, "LocalParty::decrypter", detail, "");
+            if earlier == cert {
+                return Err(refusal(format!(
+                    "{pair} are the same certificate (serial {})",
+                    cert.serial_hex()
+                )));
+            }
+            if earlier.same_key(cert) {
+                if p.renewals_allowed() {
+                    continue;
+                }
+                return Err(refusal(format!(
+                    "{pair} ({serials}) certify one key; a key certified twice is a renewal, \
+                     which the PKI forbids (CP SM-PKI §4.5)"
+                )));
+            }
+            let earlier_skis = earlier.ski_candidates();
+            if cert
+                .ski_candidates()
+                .iter()
+                .any(|s| earlier_skis.contains(s))
+            {
+                return Err(refusal(format!(
+                    "{pair} ({serials}) certify different keys under one key identifier \
+                     (an SKI reference would be ambiguous)"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Both rules of RzÜ AS4 2.6 Kap. 5.2 for one certificate of `mp_id`'s
 /// triple: the MP-ID in the subject's OU and exactly one URI SAN.
 fn check_bdew_triple_cert(
@@ -697,8 +743,7 @@ fn validate<C>(builder: Builder<C>, protocol: Protocol) -> Result<ClientConfig> 
             signature_section(p),
         ));
     }
-    let mut seen_skis: Vec<Vec<u8>> = Vec::new();
-    for (i, decrypter) in local.decrypters.iter().enumerate() {
+    for decrypter in &local.decrypters {
         let cert = decrypter.decrypter.certificate();
         let kind = cert.key_kind();
         if !encryption_allowed(p, kind) {
@@ -713,31 +758,8 @@ fn validate<C>(builder: Builder<C>, protocol: Protocol) -> Result<ClientConfig> 
                 encryption_section(p),
             ));
         }
-        // Inbound key selection would be ambiguous: by key (a CA can
-        // certify one key twice), and by SKI (two decrypters answering to
-        // one identifier, whatever their keys).
-        if local.decrypters[..i]
-            .iter()
-            .any(|earlier| earlier.decrypter.certificate().same_key(cert))
-        {
-            return Err(refuse(
-                p,
-                "LocalParty::decrypter",
-                "two decrypters certify the same key (inbound key selection would be ambiguous)",
-                "",
-            ));
-        }
-        let skis = cert.ski_candidates();
-        if skis.iter().any(|s| seen_skis.contains(s)) {
-            return Err(refuse(
-                p,
-                "LocalParty::decrypter",
-                "two decrypters with the same key identifier (inbound key selection would be ambiguous)",
-                "",
-            ));
-        }
-        seen_skis.extend(skis);
     }
+    check_decrypter_pairs(p, &local)?;
     if let Some(tls) = &local.tls
         && p.separate_keys()
         && !matches!(tls.key_kind(), KeyKind::Ec { .. })

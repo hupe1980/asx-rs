@@ -17,6 +17,29 @@ Versioning follows the [SemVer policy](#semver-policy) below.
 
 ## [Unreleased]
 
+## [0.19.0] — 2026-11-16
+
+Decryption keys selected by key; the key comparison public. A hard cut; see
+the [migration page](https://hupe1980.github.io/asx-rs/docs/migration/).
+
+### Wire / crypto
+
+- **Inbound key selection by key.** A key reference (AS4 issuer-serial,
+  certificate or SKI; AS2 recipient identifier) may name several decrypters
+  over one key: the first configured performs the one key operation. A
+  reference naming several keys, or two matching AS2 recipient infos, stays
+  the uniform decryption failure. A message encrypted to either certificate of
+  a renewed key is decrypted (RzÜ AS4 2.6 Kap. 5.3).
+
+### API
+
+- **`Certificate::same_key`** is public: the value comparison (`EVP_PKEY_eq`)
+  `build()` uses.
+- **Two decrypter certificates over one key** (a renewal) build, except under
+  `Profile::bdew()` (CP SM-PKI §4.5).
+- **Decrypter refusals** name both decrypters by position and serial.
+- **testkit:** `IssueOptions::compressed_point`, `IssueOptions::ski`.
+
 ## [0.18.0] — 2026-11-16
 
 BDEW key pairs separated by key, and every citation in its source's own

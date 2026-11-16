@@ -166,6 +166,7 @@ impl Profile {
     /// | Signing token | BST `#X509PKIPathv1` (B Kap. 2.2.6.2.1) |
     /// | Encryption | ECDH-ES + ConcatKDF (SHA-256) + `kw-aes128`, `aes128-gcm`, recipient by `X509SKI` (B Kap. 2.2.6.2.2, 2.3.4.3; TR §9.2) |
     /// | Keys | separate EC BrainpoolP256r1 key pairs for signing, encryption and TLS, compared by key, not by certificate: locally, the partner's signing and encryption certificates, and an inbound signer against the configured partner's encryption key (B Kap. 2.3.4.4) |
+    /// | Decryption keys | one certificate per key: a renewal is refused (CP SM-PKI §4.5); a rollover runs the old and the new key side by side (RzÜ AS4 2.6 Kap. 5.3) |
     /// | Certificates | each of the triple names the MP-ID in its subject's OU and exactly one AS4 address as URI subjectAltName; the partner's endpoint is that address (RzÜ AS4 2.6 Kap. 2, Kap. 5.2) |
     /// | TLS (built-in client) | mutual, with `LocalParty::tls_identity` (B Kap. 2.2.6.1); BSI TR-03116-3 suites and Brainpool groups; the server chain verified against the trust anchors and its CRLs checked before a request is written (B Kap. 2.3.7); SNI, so the endpoint must be a DNS name (RzÜ AS4 2.6 Kap. 3) |
     /// | Party id | the 13-digit MP-ID; type one of `…:iso6523:0088`, `…:unregistered:BDEW`, `…:DVGW`, `…:BAHN` (B Kap. 2.3.1.1) |
@@ -209,6 +210,7 @@ impl Profile {
     /// | Signature | `rsa-sha256`, SHA-256 (P §3 → eDelivery 1.15 §3.2.6); RSA >= 2048 |
     /// | Signing token | BST `#X509v3` (P §4.7) |
     /// | Encryption | RSA-OAEP (MGF1-SHA-256, SHA-256), `aes128-gcm` (eDelivery 1.15 §3.2.6) |
+    /// | Decryption keys | a renewal (two certificates over one key) acts as one key |
     /// | Party id | fixed type `urn:fdc:peppol.eu:2017:identifiers:ap`; id = AP certificate CN (P §4.5) |
     /// | Service / Action | the process id / document type id (P §4.6), caller-set |
     /// | Roles | fixed initiator / responder (P §4.5) |
@@ -231,6 +233,7 @@ impl Profile {
     /// | Signature | `rsa-sha256`, SHA-256 (E §3.2.6); RSA >= 2048 |
     /// | Signing token | BST `#X509v3` (E §3.2.6) |
     /// | Encryption | RSA-OAEP (MGF1-SHA-256, SHA-256), `aes128-gcm` (E §3.2.6) |
+    /// | Decryption keys | a renewal (two certificates over one key) acts as one key |
     /// | Service / Action | caller-set (E §3.4.4); the service is required |
     /// | Inbound senders | configured partners with pinned certificates only (the Dynamic Receiver, E §4.3, is not selected) |
     /// | Test service | answered, never delivered (E §3.2.4, §3.4.3) |
@@ -251,6 +254,7 @@ impl Profile {
     /// | Compression | gzip, always (3.6 "Mandatory", G-FAQ §2.4 on §2.2.3.3) |
     /// | Signature | `rsa-sha256` (3.6 RSA, G-FAQ §2.4 on §2.2.6.2); RSA >= 2048 |
     /// | Encryption | RSA-OAEP, `aes128-gcm` (G-FAQ §2.4 on §2.2.6.3) |
+    /// | Decryption keys | a renewal (two certificates over one key) acts as one key |
     /// | Inbound senders | configured partners with pinned certificates only |
     /// | Revocation | CRL-DP, then OCSP from the AIA; a pinned certificate publishing neither is accepted and recorded |
     /// | Not implemented | ebCore Agreement Update; the 3.6 primary text |
@@ -270,6 +274,7 @@ impl Profile {
     /// | Inbound async-MDN request | answered synchronously (asynchronous MDNs are not implemented) |
     /// | Senders | configured partners with pinned certificates |
     /// | Signer key | RSA >= 2048 or EC P-256/P-384 |
+    /// | Decryption keys | RSA, selected by the CMS recipient; a renewal (two certificates over one key) acts as one key |
     /// | Revocation | the signer's whole path (and an MDN signer's): CRL-DP, then OCSP from the AIA; a pinned certificate publishing neither is accepted and recorded |
     #[cfg(feature = "as2")]
     pub fn as2() -> Profile {
@@ -448,6 +453,12 @@ impl Profile {
 
     pub(crate) fn separate_keys(&self) -> bool {
         self.id == ProfileId::Bdew12
+    }
+
+    /// Whether the profile's PKI allows a renewal (one key certified twice).
+    /// The SM-PKI does not (CP SM-PKI §4.5, §3.3).
+    pub(crate) fn renewals_allowed(&self) -> bool {
+        self.id != ProfileId::Bdew12
     }
 
     pub(crate) fn compress(&self) -> bool {

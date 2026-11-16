@@ -9,7 +9,7 @@ throw-away keys.
 
 ```toml
 [dev-dependencies]
-asx-rs = { version = "0.18", features = ["test-util"] }
+asx-rs = { version = "0.19", features = ["test-util"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "test-util"] }
 ```
 

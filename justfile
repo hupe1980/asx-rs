@@ -60,7 +60,7 @@ interop:
     done
 
 # `bash scripts/public-api-check.sh --update` rewrites tests/public-api.txt.
-[doc('Public-API gate: snapshot, at most 160 items, no deleted name (nightly + cargo-public-api)')]
+[doc('Public-API gate: snapshot, at most 161 items, no deleted name (nightly + cargo-public-api)')]
 public-api:
     bash scripts/public-api-check.sh
 

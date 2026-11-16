@@ -1,7 +1,19 @@
 +++
 title = "Migrating"
-description = "Every 0.17 to 0.18, 0.16 to 0.17 and 0.15 to 0.16 wire change and API replacement, grouped by task."
+description = "Every 0.18 to 0.19, 0.17 to 0.18, 0.16 to 0.17 and 0.15 to 0.16 wire change and API replacement, grouped by task."
 +++
+
+## 0.18 to 0.19: decryption keys by key
+
+No wire change. Decrypters are grouped by the key they certify.
+
+| Change | 0.18 | 0.19 | Consequence |
+|---|---|---|---|
+| **Key comparison** | crate-private | `Certificate::same_key` | drop your own `subjectPublicKeyInfo` comparison; it disagrees with `build()` on re-encoded keys |
+| **Two certificates over one key** | refused under every profile | accepted and answered as one key; refused under `bdew()` (CP SM-PKI §4.5) | keep both certificates of a renewal through the overlap |
+| **Inbound selection** | exactly one decrypter per reference | the decrypters a reference names, when they certify one key; the first configured answers | |
+| **Decrypter refusals** | „two decrypters certify the same key", „two decrypters with the same key identifier" | „decrypters i and j are the same certificate", „… certify one key; … (CP SM-PKI §4.5)", „… certify different keys under one key identifier", with serials | tests matching refusal texts change |
+| **testkit** | — | `IssueOptions::compressed_point`, `IssueOptions::ski` | test re-encoded keys and colliding identifiers |
 
 ## 0.17 to 0.18: key pairs by key
 

@@ -4,7 +4,7 @@
 #   1. The snapshot `cargo +nightly public-api -sss --features as2,as4,http-client,peppol,metrics` equals
 #      tests/public-api.txt (regenerate with `just public-api-update` and
 #      review the diff in the same change).
-#   2. The declared item count is at most 160: lines starting with `pub `,
+#   2. The declared item count is at most 161: lines starting with `pub `,
 #      excluding members of `impl Trait for Type` blocks (fixed by the trait)
 #      and modules that declare no item (documentation only, such as
 #      `asx::threat_model`: nothing to call, nothing to break).
@@ -19,7 +19,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-BUDGET=160
+BUDGET=161
 committed=tests/public-api.txt
 failed=0
 

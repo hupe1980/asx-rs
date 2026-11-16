@@ -106,6 +106,7 @@ pub struct asx::Certificate(_)
 impl asx::Certificate
 pub fn asx::Certificate::der(&self) -> &[u8]
 pub fn asx::Certificate::from_pem(&[u8]) -> asx::Result<asx::Certificate>
+pub fn asx::Certificate::same_key(&self, &asx::Certificate) -> bool
 impl core::cmp::Eq for asx::Certificate
 impl core::cmp::PartialEq for asx::Certificate
 pub fn asx::Certificate::eq(&self, &Self) -> bool

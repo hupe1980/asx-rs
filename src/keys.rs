@@ -101,6 +101,17 @@ impl Certificate {
         &self.0.x509
     }
 
+    /// The serial number in hexadecimal, for messages.
+    pub(crate) fn serial_hex(&self) -> String {
+        self.0
+            .x509
+            .serial_number()
+            .to_bn()
+            .ok()
+            .and_then(|bn| bn.to_hex_str().ok().map(|s| s.to_string()))
+            .unwrap_or_default()
+    }
+
     pub(crate) fn fingerprint(&self) -> &crate::crypto::CertFingerprint {
         &self.0.fingerprint
     }
@@ -215,18 +226,49 @@ impl Certificate {
         out
     }
 
-    /// Whether `self` and `other` certify the same public key, compared by
-    /// value (`EVP_PKEY_eq`): a compressed and an uncompressed EC point, or a
-    /// named and an explicit curve, are one key. Certificates are labels; two
-    /// of them with different serials can certify one key pair (BDEW
-    /// AS4-Profil 1.2 Kap. 2.3.4.4 separates key pairs, not certificates).
-    /// A key that cannot be read is no key and matches nothing.
-    pub(crate) fn same_key(&self, other: &Certificate) -> bool {
+    /// Whether `self` and `other` certify the same public key.
+    ///
+    /// Compared by value (OpenSSL `EVP_PKEY_eq`), not by encoding: a
+    /// compressed and an uncompressed EC point, or a named and an explicit
+    /// curve, are one key. A key that cannot be read matches nothing. `build()`
+    /// and inbound key selection use this comparison (see
+    /// [`LocalParty::decrypter`](crate::LocalParty::decrypter)).
+    ///
+    /// ```no_run
+    /// use asx::Certificate;
+    ///
+    /// # fn rollover(current_pem: &[u8], successor_pem: &[u8]) -> asx::Result<()> {
+    /// let current = Certificate::from_pem(current_pem)?;
+    /// let successor = Certificate::from_pem(successor_pem)?;
+    /// if successor.same_key(&current) {
+    ///     // A renewal: one key, a second certificate.
+    /// } else {
+    ///     // A new key pair: keep the current one decrypting until the
+    ///     // overlap ends.
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn same_key(&self, other: &Certificate) -> bool {
         match (self.0.x509.public_key(), other.0.x509.public_key()) {
             (Ok(a), Ok(b)) => a.public_eq(&b),
             _ => false,
         }
     }
+}
+
+/// The decrypter a key reference selects: of the decrypters it names
+/// (`matching`, in configuration order), the first, when they all certify one
+/// key. Several keys, or none, select nothing: order never decides between
+/// keys.
+pub(crate) fn one_key<'a>(
+    matching: &[usize],
+    cert: impl Fn(usize) -> &'a Certificate,
+) -> Option<usize> {
+    let (&first, rest) = matching.split_first()?;
+    rest.iter()
+        .all(|&i| cert(i).same_key(cert(first)))
+        .then_some(first)
 }
 
 /// The `subjectPublicKey` BIT STRING contents of `cert`.
@@ -265,16 +307,10 @@ impl fmt::Debug for Certificate {
                 .join(", ")
         };
         let x509 = &self.0.x509;
-        let serial = x509
-            .serial_number()
-            .to_bn()
-            .ok()
-            .and_then(|bn| bn.to_hex_str().ok().map(|s| s.to_string()))
-            .unwrap_or_default();
         f.debug_struct("Certificate")
             .field("subject", &name(x509.subject_name()))
             .field("issuer", &name(x509.issuer_name()))
-            .field("serial", &serial)
+            .field("serial", &self.serial_hex())
             .field("sha256", &self.0.fingerprint.as_str())
             .finish()
     }
@@ -730,6 +766,24 @@ mod tests {
         let mut out = vec![0x30, body.len() as u8];
         out.extend(body);
         out
+    }
+
+    #[test]
+    fn a_reference_selects_one_key_or_nothing() {
+        let key = brainpool();
+        let old = certify(&public_of(&key), 1);
+        let renewed = certify(&public_of(&key), 2);
+        let other = certify(&public_of(&brainpool()), 3);
+        let certs = [&old, &other, &renewed];
+        let select = |matching: &[usize]| one_key(matching, |i| certs[i]);
+        assert_eq!(select(&[]), None, "no decrypter named");
+        assert_eq!(select(&[1]), Some(1));
+        // A renewal: two certificates, one key, the first configured answers.
+        assert_eq!(select(&[0, 2]), Some(0));
+        assert_eq!(select(&[2, 0]), Some(2));
+        // Two keys behind one reference: order never decides.
+        assert_eq!(select(&[0, 1]), None);
+        assert_eq!(select(&[0, 2, 1]), None);
     }
 
     #[test]

@@ -15,6 +15,11 @@ in an HSM or KMS.
 subject, issuer, serial and SHA-256 fingerprint; equality and hashing compare
 the DER (`der()`).
 
+`Certificate::same_key(&other)` compares the certified public keys by value
+(OpenSSL `EVP_PKEY_eq`): one key with a compressed or uncompressed point, or a
+named or explicit curve, is one key. `build()` and inbound key selection use
+the same comparison.
+
 ## `KeyPair`: keys in memory
 
 ```rust
@@ -121,10 +126,15 @@ decryption failure as a wrong key. For tests,
 
 ## Key rollover
 
-- **Your decryption key.** Call `LocalParty::decrypter` once per key; inbound
-  messages select it by the `xenc:EncryptedKey` reference (SKI, BST or
-  issuer-serial), and no match is refused without trying any. Keep the old key
-  until partners use the new certificate.
+- **Your decryption key.** Configure the old and the new key with
+  `LocalParty::decrypter` until every partner encrypts to the new certificate
+  (RzÜ AS4 2.6 Kap. 5.3). The message's key reference (SKI, BST or
+  issuer-serial; in AS2 the CMS recipient) selects the key; a reference naming
+  no key, or several, is refused without trying any.
+- **A renewal** (a new certificate over the same key): configure both; they
+  act as one key. `Profile::bdew()` refuses it (CP SM-PKI §4.5).
+- `build()` refuses one certificate configured twice and one subject key
+  identifier over different keys, naming both decrypters.
 - **Your signing key.** Exactly one signer (a second is refused). Partners pin your certificate, so
   send them the new one first.
 - **A partner's signing key.** Call `Partner::signing_cert` for old and new.

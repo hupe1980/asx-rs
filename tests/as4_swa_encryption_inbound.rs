@@ -601,9 +601,8 @@ async fn second_decrypter_selected_by_reference() {
     assert_eq!(r.keys[1].decrypts(), 1);
 }
 
-/// Two decrypters a reference could both select are refused when the
-/// client is built, so inbound selection is never ambiguous; a reference
-/// matching none is answered like a tag failure.
+/// One certificate configured as two decrypters is refused when the client
+/// is built, naming both positions.
 #[tokio::test]
 async fn ambiguous_reference_refused() {
     let g = bdew2().await;
@@ -620,8 +619,12 @@ async fn ambiguous_reference_refused() {
         .partner(g.pair.a.partner(A_URL))
         .http_client(g.pair.loopback.clone())
         .build()
-        .expect_err("an ambiguous key reference is refused at build()");
-    assert!(err.to_string().contains("ambiguous"), "{err}");
+        .expect_err("one certificate as two decrypters is refused at build()");
+    assert!(
+        err.to_string()
+            .contains("decrypters 1 and 2 are the same certificate"),
+        "{err}"
+    );
 }
 
 // ── phase4 shape: a standalone ReferenceList (WSS 1.1 §9.3) ─────────────────
@@ -668,4 +671,125 @@ async fn encrypted_data_named_in_two_reference_lists_is_refused() {
         }))
         .await;
     r.assert_pre_key(&answer, "EBMS:0004");
+}
+
+// ── A renewal: two certificates over one key ─────────────────────────────────
+
+/// A second certificate over `b`'s encryption key (a renewal: new serial,
+/// one key, one SKI).
+fn renewed(g: &Genuine) -> asx::testkit::pki::KeyPair {
+    use asx::testkit::pki::{IssueOptions, KeyAlg};
+    g.pair.ca.issue_with_options(
+        "party-b enc renewed",
+        KeyAlg::Rsa2048,
+        IssueOptions {
+            key_pem: Some(g.pair.b.encryption.key_pem.clone()),
+            ..IssueOptions::default()
+        },
+    )
+}
+
+/// The encrypted key's `wsse:SecurityTokenReference` content replaced by
+/// `reference`: what a sender writes that refers to the recipient by
+/// issuer and serial or by SKI instead of by BST.
+fn with_reference(soap: &str, reference: &str) -> String {
+    in_key(soap, |k| {
+        let open = k.find("<wsse:SecurityTokenReference").unwrap();
+        let start = open + k[open..].find('>').unwrap() + 1;
+        let end = start + k[start..].find("</wsse:SecurityTokenReference>").unwrap();
+        format!("{}{reference}{}", &k[..start], &k[end..])
+    })
+}
+
+fn x509(pair: &asx::testkit::pki::KeyPair) -> openssl::x509::X509 {
+    openssl::x509::X509::from_pem(&pair.cert_pem).unwrap()
+}
+
+fn issuer_serial(pair: &asx::testkit::pki::KeyPair) -> String {
+    let cert = x509(pair);
+    let issuer = cert
+        .issuer_name()
+        .entries()
+        .map(|e| {
+            format!(
+                "{}={}",
+                e.object().nid().short_name().unwrap(),
+                String::from_utf8_lossy(e.data().as_slice())
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    let serial = cert.serial_number().to_bn().unwrap().to_dec_str().unwrap();
+    format!(
+        "<ds:X509Data xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\"><ds:X509IssuerSerial>\
+         <ds:X509IssuerName>{issuer}</ds:X509IssuerName>\
+         <ds:X509SerialNumber>{serial}</ds:X509SerialNumber>\
+         </ds:X509IssuerSerial></ds:X509Data>"
+    )
+}
+
+fn ski(pair: &asx::testkit::pki::KeyPair) -> String {
+    use base64::Engine;
+    let ski = x509(pair).subject_key_id().unwrap().as_slice().to_vec();
+    format!(
+        "<wsse:KeyIdentifier EncodingType=\"http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-soap-message-security-1.0#Base64Binary\" \
+         ValueType=\"http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-x509-token-profile-1.0#X509SubjectKeyIdentifier\">{}</wsse:KeyIdentifier>",
+        base64::engine::general_purpose::STANDARD.encode(ski)
+    )
+}
+
+/// RzÜ AS4 2.6 Kap. 5.3 and its eDelivery counterpart: through a renewal
+/// overlap a message encrypted to either certificate is processed. Each
+/// issuer-serial reference names one certificate; that decrypter answers.
+#[tokio::test]
+async fn a_renewal_decrypts_by_either_certificate() {
+    let g = genuine2(Preset::Edelivery).await;
+    let renewed = renewed(&g);
+    let current = &g.pair.b.encryption;
+    for (target, index) in [(current, 0), (&renewed, 1)] {
+        let r = counted_with(&g, &[current, &renewed]);
+        let answer = r
+            .post(g.mutated(|s| with_reference(&s, &issuer_serial(target))))
+            .await;
+        assert!(answer.is_receipt(), "{answer:?}");
+        assert_eq!(r.keys[index].decrypts(), 1, "the named certificate's key");
+        assert_eq!(r.keys[1 - index].decrypts(), 0);
+        assert_eq!(r.calls.load(Ordering::SeqCst), 1, "delivered");
+    }
+}
+
+/// An SKI both certificates carry names one key: the first configured
+/// decrypter performs the one key operation, whichever certificate it holds.
+#[tokio::test]
+async fn a_shared_ski_selects_the_first_configured_handle() {
+    let g = genuine2(Preset::Edelivery).await;
+    let renewed = renewed(&g);
+    let current = &g.pair.b.encryption;
+    assert_eq!(ski(current), ski(&renewed), "one key, one SKI");
+    for order in [[current, &renewed], [&renewed, current]] {
+        let r = counted_with(&g, &order);
+        let answer = r
+            .post(g.mutated(|s| with_reference(&s, &ski(current))))
+            .await;
+        assert!(answer.is_receipt(), "{answer:?}");
+        assert_eq!(r.keys[0].decrypts(), 1, "the first configured handle");
+        assert_eq!(r.keys[1].decrypts(), 0, "never a second handle");
+    }
+}
+
+/// One key operation, never a retry: when the first handle of the key fails,
+/// the message fails uniformly and the second handle is not called.
+#[tokio::test]
+async fn a_failing_first_handle_is_not_retried_with_the_second() {
+    let g = genuine2(Preset::Edelivery).await;
+    let renewed = renewed(&g);
+    let current = &g.pair.b.encryption;
+    let r = counted_with(&g, &[current, &renewed]);
+    r.keys[0].fail();
+    let answer = r
+        .post(g.mutated(|s| with_reference(&s, &ski(current))))
+        .await;
+    answer.assert_refused("EBMS:0102");
+    assert_eq!(r.keys[1].decrypts(), 0, "the second handle is not tried");
+    assert_eq!(r.calls.load(Ordering::SeqCst), 0, "not delivered");
 }

@@ -58,8 +58,17 @@ impl LocalParty {
         self
     }
 
-    /// A decryption key. Repeat for key rollover; inbound selection is by key
-    /// reference.
+    /// A decryption key. Repeat for a rollover (RzÜ AS4 2.6 Kap. 5.3).
+    ///
+    /// Inbound, the encrypted key's reference (issuer and serial, the
+    /// certificate, or its SKI) selects the key ([`Certificate::same_key`]);
+    /// of several decrypters over that key, the first configured answers.
+    /// A reference naming no key, or several, uses none.
+    ///
+    /// `build()` refuses one certificate configured twice, one subject key
+    /// identifier over different keys, and under
+    /// [`Profile::bdew`](crate::Profile::bdew) two certificates over one key
+    /// (CP SM-PKI §4.5). Refusals name both decrypters by position (from 1).
     pub fn decrypter(mut self, decrypter: impl Decrypter) -> LocalParty {
         let key_pair = crate::keys::as_key_pair(&decrypter);
         self.decrypters.push(LocalDecrypter {

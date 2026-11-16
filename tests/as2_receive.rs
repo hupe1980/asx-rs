@@ -782,3 +782,68 @@ async fn as2_version_is_checked() {
         assert_eq!(mdn_disposition(&resp), "processed", "{version}");
     }
 }
+
+/// A renewal overlap: `b` decrypts with two certificates over one key, and a
+/// message encrypted to either (CMS `IssuerAndSerialNumber`) is processed.
+#[tokio::test]
+async fn a_renewal_decrypts_messages_to_either_certificate() {
+    use asx::as2::{As2, Message};
+    use asx::testkit::loopback::Loopback;
+    use asx::testkit::pki::{IssueOptions, KeyAlg, TestCa};
+    use asx::{MemoryDedup, Partner, Payload, Profile, Reject, Verified};
+
+    let ca = TestCa::new("asx-test AS2 root", KeyAlg::Rsa2048);
+    let (a, b) = (ca.as2_party(A_ID), ca.as2_party(B_ID));
+    let renewed = ca.issue_with_options(
+        B_ID,
+        KeyAlg::Rsa2048,
+        IssueOptions {
+            key_pem: Some(b.encryption.key_pem.clone()),
+            ..IssueOptions::default()
+        },
+    );
+    assert!(renewed.certificate().same_key(&b.encryption.certificate()));
+    let loopback = Loopback::new();
+    let receiver = As2::builder(Profile::as2())
+        .local(b.local().decrypter(renewed.key_pair()))
+        .trust_anchor(ca.anchor())
+        .partner(a.partner("https://a.example/as2"))
+        .http_client(loopback.clone())
+        .build()
+        .expect("a renewal builds");
+    let delivered = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    {
+        let delivered = delivered.clone();
+        loopback.mount(
+            B_URL,
+            receiver.inbound(
+                MemoryDedup::default(),
+                move |_m: Verified<asx::as2::Received>| {
+                    let delivered = delivered.clone();
+                    async move {
+                        delivered.fetch_add(1, Ordering::SeqCst);
+                        Ok::<(), Reject>(())
+                    }
+                },
+            ),
+        );
+    }
+    for (n, target) in [&b.encryption, &renewed].into_iter().enumerate() {
+        let to_b = Partner::new(B_ID)
+            .endpoint(B_URL)
+            .signing_cert(b.signing.certificate())
+            .encryption_cert(target.certificate());
+        let sender = As2::builder(Profile::as2())
+            .local(a.local())
+            .trust_anchor(ca.anchor())
+            .partner(to_b.clone())
+            .http_client(loopback.clone())
+            .build()
+            .expect("sender builds");
+        sender
+            .send(Message::to(&to_b, Payload::new(PAYLOAD.to_vec(), EDI)))
+            .await
+            .expect("processed");
+        assert_eq!(delivered.load(Ordering::SeqCst), n + 1);
+    }
+}

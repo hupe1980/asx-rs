@@ -413,8 +413,10 @@ fn content_info_der(smime: &[u8]) -> Option<Vec<u8>> {
 }
 
 /// Parse the S/MIME `EnvelopedData` in `smime` and select the one
-/// `KeyTransRecipientInfo` that names one of `recipients` (RSA keys only).
-/// No match, or more than one, is [`DecryptionFailed`]; no key is tried.
+/// `KeyTransRecipientInfo` that names `recipients` (RSA keys only), and of
+/// the recipients it names the first, when they all certify one key. No
+/// match, more than one matching recipient info, or several keys is
+/// [`DecryptionFailed`]; no key is tried.
 pub(crate) fn parse_envelope(
     smime: &[u8],
     recipients: &[Certificate],
@@ -443,24 +445,30 @@ pub(crate) fn parse_envelope(
                 .flatten()
         })
         .collect();
+    // Exactly one recipient info may name configured decrypters (message
+    // order never chooses the wrapped key), and they must certify one key.
     let mut selected = Vec::new();
     for info in enveloped.recip_infos.0.iter() {
         let RecipientInfo::Ktri(ktri) = info else {
             continue;
         };
-        for (index, cert) in recipients.iter().enumerate() {
-            if let Some(parsed) = &parsed[index]
-                && names(&ktri.rid, cert, parsed)
-            {
-                selected.push((index, ktri));
-            }
+        let named: Vec<usize> = (0..recipients.len())
+            .filter(|&index| {
+                parsed[index]
+                    .as_ref()
+                    .is_some_and(|parsed| names(&ktri.rid, &recipients[index], parsed))
+            })
+            .collect();
+        if !named.is_empty() {
+            selected.push((named, ktri));
         }
     }
-    let [(decrypter, ktri)] = selected.as_slice() else {
+    let [(named, ktri)] = selected.as_slice() else {
         return Err(DecryptionFailed);
     };
+    let decrypter = crate::keys::one_key(named, |i| &recipients[i]).ok_or(DecryptionFailed)?;
     Ok(Envelope {
-        decrypter: *decrypter,
+        decrypter,
         transport: transport(&ktri.key_enc_alg).ok_or(DecryptionFailed)?,
         wrapped: ktri.enc_key.as_bytes().to_vec(),
         cipher,
@@ -712,13 +720,44 @@ mod tests {
         let (_, other, _) = pair(true);
         let smime = encrypt(&other, openssl::symm::Cipher::aes_256_cbc());
         assert!(parse_envelope(&smime, &[Decrypter::certificate(&keys).clone()]).is_err());
-        // Two configured decrypters naming the same certificate are ambiguous.
+        // Two certificates naming one key answer as one key: the first.
         let smime = encrypt(
             &openssl::x509::X509::from_der(Decrypter::certificate(&keys).der()).unwrap(),
             openssl::symm::Cipher::aes_256_cbc(),
         );
         let cert = Decrypter::certificate(&keys).clone();
-        assert!(parse_envelope(&smime, &[cert.clone(), cert]).is_err());
+        let envelope = parse_envelope(&smime, &[cert.clone(), cert.clone()]).unwrap();
+        assert_eq!(envelope.decrypter, 0);
+    }
+
+    #[test]
+    fn two_matching_recipient_infos_are_the_uniform_failure() {
+        let (a, a_cert, _) = pair(true);
+        let (b, b_cert, _) = pair(true);
+        let mut certs = openssl::stack::Stack::new().unwrap();
+        certs.push(a_cert).unwrap();
+        certs.push(b_cert).unwrap();
+        let p7 = openssl::pkcs7::Pkcs7::encrypt(
+            &certs,
+            ENTITY,
+            openssl::symm::Cipher::aes_256_cbc(),
+            openssl::pkcs7::Pkcs7Flags::BINARY,
+        )
+        .unwrap();
+        let smime = p7
+            .to_smime(ENTITY, openssl::pkcs7::Pkcs7Flags::BINARY)
+            .unwrap();
+        let a = Decrypter::certificate(&a).clone();
+        let b = Decrypter::certificate(&b).clone();
+        // One configured: its recipient info alone matches.
+        assert_eq!(
+            parse_envelope(&smime, std::slice::from_ref(&a))
+                .unwrap()
+                .decrypter,
+            0
+        );
+        // Both configured: which wrapped key to open would be chosen by order.
+        assert!(parse_envelope(&smime, &[a, b]).is_err());
     }
 
     #[tokio::test]

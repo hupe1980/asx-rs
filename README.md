@@ -26,7 +26,7 @@ stay yours.
 
 ```toml
 [dependencies]
-asx-rs = "0.18"
+asx-rs = "0.19"
 ```
 
 The package is `asx-rs`; the library is `asx`. Features are additive and
@@ -168,6 +168,8 @@ carries its audit record (`evidence()`).
 TLS certificates carry the MP-ID and the AS4 address (RzÜ AS4 2.6 Kap. 5.2),
 and the three key pairs differ by key, not just by certificate, as do the
 partner's signing and encryption keys (BDEW AS4-Profil 1.2 Kap. 2.3.4.4).
+Inbound decryption selects the key, not the certificate, so a rollover runs
+the old and the new key side by side.
 
 ## Design
 

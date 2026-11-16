@@ -1,6 +1,7 @@
-//! A minimal DER writer (and the one reader step the OCSP `CertID` needs) for
-//! the CRLs and OCSP responses the test CA signs. OpenSSL's Rust binding
-//! builds neither, and the CLI cannot set `thisUpdate`.
+//! A minimal DER writer for the CRLs and OCSP responses the test CA signs
+//! (OpenSSL's Rust binding builds neither, and the CLI cannot set
+//! `thisUpdate`), and the `SubjectPublicKeyInfo` reader steps the OCSP
+//! `CertID` and compressed-point certificates need.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -220,25 +221,34 @@ pub(crate) fn time(t: SystemTime) -> Vec<u8> {
     }
 }
 
-/// The content of the BIT STRING of a DER `SubjectPublicKeyInfo` (without
-/// the unused-bits octet): what an OCSP `issuerKeyHash` hashes.
-pub(crate) fn spki_key_bits(spki: &[u8]) -> &[u8] {
-    fn header(bytes: &[u8]) -> (usize, usize) {
-        let first = bytes[1];
-        if first < 0x80 {
-            (2, first as usize)
-        } else {
-            let n = (first & 0x7f) as usize;
-            let len = bytes[2..2 + n]
-                .iter()
-                .fold(0usize, |acc, b| (acc << 8) | *b as usize);
-            (2 + n, len)
-        }
+/// The header length and content length of the DER element at `bytes`.
+fn header(bytes: &[u8]) -> (usize, usize) {
+    let first = bytes[1];
+    if first < 0x80 {
+        (2, first as usize)
+    } else {
+        let n = (first & 0x7f) as usize;
+        let len = bytes[2..2 + n]
+            .iter()
+            .fold(0usize, |acc, b| (acc << 8) | *b as usize);
+        (2 + n, len)
     }
+}
+
+/// The `AlgorithmIdentifier` element of a DER `SubjectPublicKeyInfo`.
+pub(crate) fn spki_algorithm(spki: &[u8]) -> &[u8] {
     let (outer_head, _) = header(spki);
     let inner = &spki[outer_head..];
     let (alg_head, alg_len) = header(inner);
-    let bit_string = &inner[alg_head + alg_len..];
+    &inner[..alg_head + alg_len]
+}
+
+/// The content of the BIT STRING of a DER `SubjectPublicKeyInfo` (without
+/// the unused-bits octet): what an OCSP `issuerKeyHash` hashes.
+pub(crate) fn spki_key_bits(spki: &[u8]) -> &[u8] {
+    let (outer_head, _) = header(spki);
+    let algorithm = spki_algorithm(spki);
+    let bit_string = &spki[outer_head + algorithm.len()..];
     assert_eq!(
         bit_string[0], 0x03,
         "SubjectPublicKeyInfo without a BIT STRING"

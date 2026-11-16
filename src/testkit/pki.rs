@@ -292,6 +292,15 @@ pub struct IssueOptions {
     /// [`KeyPair::key_pem`]); a fresh key of the given algorithm when `None`.
     /// The key must be of that algorithm (it selects the key usage).
     pub key_pem: Option<Vec<u8>>,
+    /// Certify an EC public key as a compressed point (SEC 1 §2.3.3) instead
+    /// of an uncompressed one: one key, another `subjectPublicKeyInfo`
+    /// encoding. The returned [`KeyPair::key_pem`] is the private key either
+    /// way. Ignored for RSA.
+    pub compressed_point: bool,
+    /// The subjectKeyIdentifier to write instead of the one derived from
+    /// the encoded public key (RFC 5280 §4.2.1.2 method 1). A CA chooses the
+    /// SKI; two certificates over different keys can carry one value.
+    pub ski: Option<Vec<u8>>,
 }
 
 impl TestCa {
@@ -618,16 +627,22 @@ impl TestCa {
             None => alg.generate(),
         };
         let extensions = self.locator_extensions(&options);
-        let cert = build_cert(
+        let public = match key.ec_key() {
+            Ok(ec) if options.compressed_point => compressed_public_key(&ec),
+            _ => PKey::public_key_from_der(&key.public_key_to_der().expect("spki"))
+                .expect("public key"),
+        };
+        let cert = build_cert_with(
             &subject,
             &self.inner.name,
-            &key,
+            &public,
             &self.inner.key,
             Some(&self.inner.cert),
             alg,
             Role::Leaf,
             options.validity.unwrap_or_else(Validity::ten_years),
             &extensions,
+            options.ski.as_deref(),
         );
         KeyPair {
             cert_pem: cert.to_pem().expect("leaf pem"),
@@ -1059,6 +1074,25 @@ enum Role {
     CrlSigner,
 }
 
+/// The public half of `key` as a key whose `subjectPublicKeyInfo` carries a
+/// compressed point (SEC 1 §2.3.3). OpenSSL keeps the form it decoded and
+/// writes it back into a certificate.
+fn compressed_public_key(key: &EcKey<Private>) -> PKey<openssl::pkey::Public> {
+    let spki = key.public_key_to_der().expect("spki");
+    let algorithm = der::spki_algorithm(&spki);
+    let mut ctx = openssl::bn::BigNumContext::new().expect("bn ctx");
+    let point = key
+        .public_key()
+        .to_bytes(
+            key.group(),
+            openssl::ec::PointConversionForm::COMPRESSED,
+            &mut ctx,
+        )
+        .expect("compressed point");
+    let compressed = der::seq(&[algorithm, &der::bits(&point)]);
+    PKey::public_key_from_der(&compressed).expect("compressed spki")
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_cert(
     subject: &X509Name,
@@ -1070,6 +1104,33 @@ fn build_cert(
     role: Role,
     validity: Validity,
     extra: &[X509Extension],
+) -> X509 {
+    build_cert_with(
+        subject,
+        issuer,
+        key,
+        issuer_key,
+        issuer_cert,
+        alg,
+        role,
+        validity,
+        extra,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_cert_with<T: openssl::pkey::HasPublic>(
+    subject: &X509Name,
+    issuer: &X509Name,
+    key: &openssl::pkey::PKeyRef<T>,
+    issuer_key: &PKey<Private>,
+    issuer_cert: Option<&X509Ref>,
+    alg: KeyAlg,
+    role: Role,
+    validity: Validity,
+    extra: &[X509Extension],
+    ski: Option<&[u8]>,
 ) -> X509 {
     let mut serial = BigNum::new().expect("serial");
     serial
@@ -1129,9 +1190,12 @@ fn build_cert(
             .expect("ku");
     }
 
-    let ski = SubjectKeyIdentifier::new()
-        .build(&builder.x509v3_context(issuer_cert, None))
-        .expect("ski");
+    let ski = match ski {
+        Some(value) => raw_extension("2.5.29.14", false, &der::octets(value)),
+        None => SubjectKeyIdentifier::new()
+            .build(&builder.x509v3_context(issuer_cert, None))
+            .expect("ski"),
+    };
     builder.append_extension(ski).expect("ski");
     if issuer_cert.is_some() {
         let aki = AuthorityKeyIdentifier::new()

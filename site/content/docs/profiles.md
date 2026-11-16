@@ -41,6 +41,7 @@ Sources: **B** BDEW AS4-Profil 1.2 (01.04.2026); **RzÜ** Regelungen zum
 | Key transport | ECDH-ES + ConcatKDF (SHA-256) + `kw-aes128` (B Kap. 2.2.6.2.2; TR §9.2) | RSA-OAEP, MGF1-SHA-256, SHA-256 (E §3.2.6) | RSA-OAEP, MGF1-SHA-256, SHA-256 (E §3.2.6) | RSA-OAEP (G-FAQ §2.4 on §2.2.6.3) |
 | Recipient reference | `X509SKI` (B Kap. 2.2.6.2.2, 2.3.4.3) | BST `#X509v3` (P §4.7) | BST (E §3.2.6) | BST |
 | Keys | separate EC BrainpoolP256r1 pairs for signing, encryption and TLS (B Kap. 2.3.4.4), compared by key, not by certificate, for the local triple and the partner's signing and encryption certificates; each certificate carries the MP-ID in the OU and the AS4 address as its one URI subjectAltName (RzÜ AS4 2.6 Kap. 5.2) | one AP certificate for both (P §4.7) | not required to differ | not required to differ |
+| Decryption keys | one certificate per key: a renewal is refused (CP SM-PKI §4.5); a rollover runs the old and the new key side by side (RzÜ AS4 2.6 Kap. 5.3) | a renewal (two certificates over one key) acts as one key | as Peppol | as Peppol |
 | Endpoint | taken from the encryption certificate's URI subjectAltName (RzÜ AS4 2.6 Kap. 2); a DNS name (Kap. 3, SNI) | set on the `Partner` (or from the SMP) | set on the `Partner` | set on the `Partner` |
 | Transport | mutual TLS, BSI TR-03116-3 §4: TLS ≥ 1.2, ECDHE-ECDSA suites, Brainpool groups, the SM-PKI root as the only TLS trust, server chain CRL-checked (B Kap. 2.2.6.1, 2.3.7) | TLS ≥ 1.2, platform roots | TLS ≥ 1.2, platform roots | TLS ≥ 1.2, platform roots |
 | Party id | the 13-digit MP-ID; type one of `urn:oasis:names:tc:ebcore:partyid-type:iso6523:0088`, `…:unregistered:BDEW`, `…:unregistered:DVGW`, `…:unregistered:BAHN` (B Kap. 2.3.1.1) | fixed type `urn:fdc:peppol.eu:2017:identifiers:ap`; id = the AP certificate's CN (P §4.5) | caller-set (E §3.4.1) | caller-set |
@@ -87,6 +88,7 @@ Update.
 | MDN request | synchronous unless `send_async_mdn`, signed, `signed-receipt-micalg=sha-256` (R4130 §7.3) |
 | MDN verification | signed by a pinned partner certificate (absent only with `Quirk::UnsignedMdn`); `Original-Message-ID` = the sent id; MIC = the computed MIC; disposition `processed`, warnings allowed (R4130 §7.3.1, §7.4.3, §7.5) |
 | Inbound | must be signed and encrypted, else `processed/error: insufficient-message-security` (R4130 §7.5.3); compressed accepted |
+| Decryption keys | selected by the CMS recipient (issuer and serial or SKI); a renewal (two certificates over one key) acts as one key; two matching recipient infos are refused |
 | Inbound duplicates | `(AS2-From, Message-ID)` claimed; a duplicate is answered `processed/warning: duplicate-document` (R4130 §9.3, §7.5.6) |
 | Inbound asynchronous-MDN request | answered synchronously |
 | Senders | configured partners with pinned certificates |
@@ -140,8 +142,8 @@ section (tested in `tests/build_rejections.rs`).
 
 | Area | Refused |
 |---|---|
-| Local party | missing; no signer; no decrypter (every preset encrypts inbound); signer or decrypter key type not allowed by the profile; empty signer chain or a leaf not valid now; signer not chaining to a trust anchor; two decrypters with the same certificate, key or key identifier |
-| BDEW local party | signer, decrypter and TLS identity not on three different keys (B Kap. 2.3.4.4; compared by key, so two certificates over one key count as one); TLS identity missing with the built-in client (B Kap. 2.2.6.1) or not EC (B Kap. 2.3.4.4); a signing, decryption or TLS certificate whose OU is not the local MP-ID or which does not carry exactly one URI subjectAltName (RzÜ AS4 2.6 Kap. 5.2); party id not a 13-digit MP-ID; party type missing or not one of the four of B Kap. 2.3.1.1 |
+| Local party | missing; no signer; no decrypter (every preset encrypts inbound); signer or decrypter key type not allowed by the profile; empty signer chain or a leaf not valid now; signer not chaining to a trust anchor; one certificate configured as two decrypters; two decrypters over different keys with one subject key identifier (refusals name both positions) |
+| BDEW local party | signer, decrypter and TLS identity not on three different keys (B Kap. 2.3.4.4; compared by key, so two certificates over one key count as one); TLS identity missing with the built-in client (B Kap. 2.2.6.1) or not EC (B Kap. 2.3.4.4); a signing, decryption or TLS certificate whose OU is not the local MP-ID or which does not carry exactly one URI subjectAltName (RzÜ AS4 2.6 Kap. 5.2); party id not a 13-digit MP-ID; party type missing or not one of the four of B Kap. 2.3.1.1; two decrypters over one key (a renewal, CP SM-PKI §4.5) |
 | Peppol local party | a party type set (the profile fixes it) |
 | Trust | no trust anchor |
 | Partners | endpoint not `https`, unparseable or carrying userinfo; an endpoint without an encryption certificate (except BDEW, where the path switch needs none); a registered partner without a signing certificate (eDelivery, ENTSOG, AS2); a certificate key type the profile does not allow; an expired or not-yet-valid certificate; two partners with the same (type, id); a partner id equal to the local id |

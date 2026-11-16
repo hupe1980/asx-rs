@@ -746,14 +746,12 @@ impl xmlenc::RecipientKeys for Keys {
                 }
             })
             .collect();
-        let [index] = matching.as_slice() else {
-            return None;
-        };
-        let key = &self.keys[*index];
+        let index = crate::keys::one_key(&matching, |i| &self.keys[i].cert)?;
+        let key = &self.keys[index];
         let recipient = crate::keys::recipient_key(&key.cert)?;
         let decrypter: &dyn xmlenc::PrivateKeyStep = match &key.key_pair {
             Some(pair) => pair,
-            None => &self.deferred[*index],
+            None => &self.deferred[index],
         };
         Some((recipient, decrypter))
     }

@@ -459,14 +459,14 @@ fn bdew_recertified_triple_with_distinct_keys_builds() {
         .expect("distinct keys build");
 }
 
-/// Two decrypters over one key make inbound key selection ambiguous under
-/// every profile, also when the certificates differ.
+/// A renewal (a second certificate over one key) answers as one key: it
+/// builds where the PKI allows renewals.
 #[test]
-fn two_decrypters_certifying_one_key() {
+fn a_renewal_builds_outside_bdew() {
     let ca = rsa_ca();
     let a = ca.rsa_party("party-a");
     let b = ca.rsa_party("party-b");
-    let again = ca.issue_with_options(
+    let renewed = ca.issue_with_options(
         "party-a",
         KeyAlg::Rsa2048,
         IssueOptions {
@@ -474,8 +474,43 @@ fn two_decrypters_certifying_one_key() {
             ..IssueOptions::default()
         },
     );
-    assert_ne!(again.certificate(), a.encryption.certificate());
-    let local = a.local().decrypter(again.key_pair());
+    assert_ne!(renewed.certificate(), a.encryption.certificate());
+    assert!(renewed.certificate().same_key(&a.encryption.certificate()));
+    let local = a.local().decrypter(renewed.key_pair());
+    for profile in [Profile::edelivery_1_15(), Profile::entsog()] {
+        As4::builder(profile)
+            .local(local.clone())
+            .trust_anchor(ca.anchor())
+            .partner(b.partner(B_URL))
+            .http_client(Loopback::new())
+            .build()
+            .expect("a renewal builds");
+    }
+}
+
+/// Two different keys under one subject key identifier: an SKI reference
+/// would name both. Refused under every profile, naming both positions.
+#[test]
+fn two_decrypters_different_keys_one_ski() {
+    let ca = rsa_ca();
+    let a = ca.rsa_party("party-a");
+    let b = ca.rsa_party("party-b");
+    let issue = |cn: &str| {
+        ca.issue_with_options(
+            cn,
+            KeyAlg::Rsa2048,
+            IssueOptions {
+                ski: Some(vec![0x5a; 20]),
+                ..IssueOptions::default()
+            },
+        )
+    };
+    let (first, second) = (issue("enc-1"), issue("enc-2"));
+    assert!(!first.certificate().same_key(&second.certificate()));
+    let local = a
+        .local()
+        .decrypter(first.key_pair())
+        .decrypter(second.key_pair());
     for profile in [Profile::edelivery_1_15(), Profile::entsog()] {
         assert_refused(
             As4::builder(profile)
@@ -484,9 +519,70 @@ fn two_decrypters_certifying_one_key() {
                 .partner(b.partner(B_URL))
                 .http_client(Loopback::new())
                 .build(),
-            &["LocalParty::decrypter", "certify the same key"],
+            &[
+                "LocalParty::decrypter",
+                "decrypters 2 and 3",
+                "different keys under one key identifier",
+            ],
         );
     }
+}
+
+/// The SM-PKI forbids renewals (CP SM-PKI §4.5), so under BDEW two
+/// decrypters over one key are refused — in either point encoding.
+#[test]
+fn bdew_two_decrypters_over_one_key() {
+    let pki = bdew();
+    let url = "https://a.example/as4";
+    let renewed = recertify(&pki.ca, &pki.a.encryption, A, url, false);
+    let compressed = pki.ca.issue_with_options(
+        "recertified",
+        KeyAlg::EcBrainpoolP256r1,
+        IssueOptions {
+            subject: vec![
+                (Nid::COMMONNAME, format!("Test MP {A} compressed")),
+                (Nid::ORGANIZATIONALUNITNAME, A.to_string()),
+            ],
+            uri_sans: vec![url.to_string()],
+            key_pem: Some(pki.a.encryption.key_pem.clone()),
+            compressed_point: true,
+            ..IssueOptions::default()
+        },
+    );
+    for again in [renewed, compressed] {
+        let local = pki.a.local().decrypter(again.key_pair());
+        assert_refused(
+            pki.without_local().local(local).build(),
+            &[
+                "LocalParty::decrypter",
+                "decrypters 1 and 2",
+                &format!("serials {}", hex_serial(&pki.a.encryption)),
+                "certify one key",
+                "CP SM-PKI §4.5",
+            ],
+        );
+    }
+}
+
+/// A BDEW rollover with a new key pair builds: the old and the new key
+/// decrypt side by side (RzÜ AS4 2.6 Kap. 5.3).
+#[test]
+fn bdew_rotation_with_a_new_key_builds() {
+    let pki = bdew();
+    let fresh = pki.ca.issue("fresh", KeyAlg::EcBrainpoolP256r1);
+    let successor = recertify(&pki.ca, &fresh, A, "https://a.example/as4", false);
+    let local = pki.a.local().decrypter(successor.key_pair());
+    pki.without_local()
+        .local(local)
+        .build()
+        .expect("a rollover to a new key builds");
+}
+
+/// The serial of `pair`'s certificate as the refusals print it.
+fn hex_serial(pair: &TestKeyPair) -> String {
+    let text = format!("{:?}", pair.certificate());
+    let start = text.find("serial: \"").expect("Debug prints the serial") + 9;
+    text[start..].split('"').next().unwrap().to_string()
 }
 
 /// Profiles that do not separate key pairs accept one key in every role
@@ -593,7 +689,10 @@ fn two_decrypters_same_certificate() {
     let local = pki.a.local().decrypter(pki.a.encryption.key_pair());
     assert_refused(
         pki.without_local().local(local).build(),
-        &["LocalParty::decrypter", "certify the same key"],
+        &[
+            "LocalParty::decrypter",
+            "decrypters 1 and 2 are the same certificate",
+        ],
     );
 }
 
